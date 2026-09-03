@@ -43,8 +43,9 @@
 //! one to serve one section. `[mesh]` is validated directly in [`validate`]
 //! instead, so a typo or an out-of-vocabulary grant still fails loudly; it is
 //! simply never reachable from `aoide config set`, which walks [`SCHEMA`]
-//! alone. `aoide mesh` (`aoide-client`) is the read; a later converge command
-//! is the write — neither is ever a `config set` target.
+//! alone. `aoide mesh` (`aoide-client`) is the read and `aoide mesh pair` is
+//! the converge that acts on it — and neither writes this file, nor is ever
+//! a `config set` target.
 //!
 //! **Resolution ([`source`]), identical at every entry point** — the `aoide`
 //! CLI, the `aoided` daemon, and the stdio MCP façade all reach this one
@@ -159,20 +160,21 @@ impl Default for Upkeep {
 pub struct Mesh {
     /// A capability set, declared against the same closed vocabulary
     /// `pairing.defaultGrant` uses (`peer_store::PEER_CAPABILITIES`), never
-    /// a second list. Declared, validated, stored, and shown back by both
-    /// `aoide config` and `aoide mesh` today; what — if anything — reads it
-    /// to actually grant a capability at first-verify is not yet decided
-    /// (`docs/architecture/PAIRING.md`'s "Mesh declaration" section). Until
-    /// that is ruled, `resolve_grant` (`aoide-client`) is the only grant
-    /// resolution path, and it never reads this field. Absent is simply
-    /// "this mesh declares no override" — not "use `pairing.defaultGrant`,"
-    /// since nothing yet makes that substitution.
+    /// a second list. `aoide mesh pair` stamps it at a FIRST verification —
+    /// it rides the ceremony as `PairFinish::grant` exactly as a typed
+    /// `aoide pair --allow` would, so `peer_store::upsert_paired_peer`
+    /// leaves an already-verified peer's `allows` untouched and a re-pair
+    /// never re-grants. Absent means "this mesh declares no override": the
+    /// commit then falls through to `resolve_grant` (`aoide-client`), which
+    /// reads `pairing.defaultGrant`. An EMPTY list is the distinct, real
+    /// "grant nothing" intent, never the same thing as absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<Vec<String>>,
     /// A declared claim that every peer in this mesh is operated by the
-    /// SAME human. Validated, stored, and shown back by both `aoide config`
-    /// and `aoide mesh` today. What, if anything, may ever act on that
-    /// claim is not yet decided — it touches the mutual-code pairing
+    /// SAME human. Validated and stored; shown back by `aoide config` and
+    /// `aoide mesh`, and read by `mesh pair` for the one line saying the
+    /// claim was declared and not acted on. What, if anything, may ever act
+    /// on it is not yet decided — it touches the mutual-code pairing
     /// invariant (`docs/architecture/PAIRING.md`'s "Mesh declaration"
     /// section) and is deferred. Default `false`.
     #[serde(rename = "sameOperator", default)]

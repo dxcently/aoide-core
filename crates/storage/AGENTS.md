@@ -558,10 +558,11 @@
   keys the operator invents). `config set` cannot reach it —
   `SetRefusal::UnknownKey` refuses any key under that section by name, same
   as a typo — so the ONLY writer is a direct edit to `config.toml`'s text.
-  Reading what the declaration implies about live state (if it implies
-  anything) is the consuming crate's job, never this one's — `aoide mesh`
-  (`aoide_client::mesh`) reads `[mesh.*]` plus `peer_store::load_peers()` to
-  report drift; this crate only parses and validates the declaration.
+  Reading what the declaration implies about live state, and acting on it,
+  are the consuming crate's job, never this one's — `aoide_client::mesh`
+  reads `[mesh.*]` plus `peer_store::load_peers()` to report drift (`aoide
+  mesh`) and to converge it (`aoide mesh pair`); this crate only parses and
+  validates the declaration.
   Updates CONTRACTS.md §4's `config.toml` subsection in the same commit,
   same as a settable section.
 - **A new CLI command** (this crate has four groups today, `usage`, `inbox

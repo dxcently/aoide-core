@@ -1672,7 +1672,7 @@ fn auto_abort_outbound(cmd: &str, id: &str, name: &str, now_epoch: i64) -> Outco
 /// outright — the one flag `pair`'s url arm needs when the door binds
 /// somewhere this default can't guess (a non-default port, a reverse
 /// proxy/tunnel hostname).
-fn default_self_url() -> String {
+pub(crate) fn default_self_url() -> String {
     let host = aoide_storage::display::local_host_name();
     format!("http://{host}:{}/", default_a2a_port())
 }
@@ -1704,7 +1704,7 @@ fn default_self_url() -> String {
 /// env var is set (no guessed literal there either). `--self-via`
 /// overrides this whole function outright, mirroring `--self-url`; every
 /// caller only ever reaches this as an `Option::or_else` fallback.
-fn default_self_via(toward: &str) -> Option<String> {
+pub(crate) fn default_self_via(toward: &str) -> Option<String> {
     let login = crate::tunnel::local_login().ok()?;
     let host = outbound_ip_toward(toward)
         .map(|ip| ip.to_string())
@@ -1735,7 +1735,7 @@ fn outbound_ip_toward(toward: &str) -> Option<std::net::IpAddr> {
 /// carries no door URL, so there is no per-peer port to read off the
 /// wire); a peer on a non-default port takes the explicit `pair
 /// <url>` path instead.
-fn default_a2a_port() -> u16 {
+pub(crate) fn default_a2a_port() -> u16 {
     std::env::var("AOIDE_A2A_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
@@ -1873,7 +1873,7 @@ fn pair_via_url(cmd: &str, inv: &Invocation, url: &str, usage: &str) -> Outcome 
 /// which can only ever OBSERVE this request arriving over the tunnel (i.e.
 /// loopback), has something to record a working `via` from at ITS OWN
 /// approve-commit time ([`approve_inbound`]'s own doc).
-fn run_pair_request(
+pub(crate) fn run_pair_request(
     cmd: &str,
     url: &str,
     name: &str,
@@ -2011,7 +2011,10 @@ pub(crate) struct PairFinish {
     /// approver's own `--yes` gives; it was never a bypass of the code that
     /// actually secures the pair, only of the prompts that precede it.
     pub skip_confirm: bool,
-    /// `--allow`, or `None` to read `[pairing] defaultGrant`.
+    /// `--allow` — or, on a converge, `mesh.<name>.grant`
+    /// (`crate::mesh::converge_finish`) — and `None` to read `[pairing]
+    /// defaultGrant`. Only `None` reaches that fallback: an EMPTY list is
+    /// the distinct "grant nothing" intent, from either source.
     pub grant: Option<Vec<String>>,
     /// `--code NNN-NNN` (the mutual-code redesign, R1) — the scripted reply
     /// code, carried through so a resumed blocking wait
@@ -2059,7 +2062,7 @@ fn wait_is_over(elapsed_secs: u64, wait_secs: u64) -> bool {
 /// Build the post-request behaviour off `pair`'s own flags. `--wait 0`
 /// is the documented escape back to the pre-P2 detached shape, for anything
 /// scripted that cannot sit on a human.
-fn pair_finish_from(inv: &Invocation) -> Result<PairFinish, String> {
+pub(crate) fn pair_finish_from(inv: &Invocation) -> Result<PairFinish, String> {
     let wait_secs = match inv.flags.get("wait") {
         Some(raw) => raw.trim().parse::<u64>().map_err(|_| format!("--wait takes whole seconds (0 to park and return), not `{raw}`"))?,
         None => DEFAULT_PAIR_WAIT_SECS,
@@ -2113,10 +2116,13 @@ fn outbound_gate_from(finish: &PairFinish) -> CodeGate {
 /// never persists a grant on a parked entry (the User's decision: the grant
 /// stays attached to a live human at commit time), and accepting the pair
 /// silently would drop the flag, the same silent no-op `grant_note` exists
-/// to prevent one step later (review finding). Checked by the two REQUEST
-/// arms only: the RESUME leg keeps the combination legal, because its
-/// `--wait 0` still polls once and can commit.
-fn refuse_detached_grant(cmd: &str, finish: &PairFinish) -> Option<Outcome> {
+/// to prevent one step later (review finding). Checked by the REQUEST arms
+/// only — the two here, plus `crate::mesh`'s converge, which asks this same
+/// rule about the grant its declaration supplies and replaces only the
+/// wording (no `--allow` was typed there). The RESUME leg keeps the
+/// combination legal, because its `--wait 0` still polls once and can
+/// commit.
+pub(crate) fn refuse_detached_grant(cmd: &str, finish: &PairFinish) -> Option<Outcome> {
     (finish.wait_secs == 0 && finish.grant.is_some()).then(|| {
         Outcome::usage(
             cmd,

@@ -1,6 +1,8 @@
-//! `aoide mesh` (task #135 P4): compare every declared `[mesh.<name>]`
-//! (`aoide_storage::config::Mesh`) against the live peer registry
-//! (`aoide_storage::peer_store::load_peers`) and report where they diverge.
+//! `aoide mesh` (task #135 P4) and `aoide mesh pair` (P5): compare every
+//! declared `[mesh.<name>]` (`aoide_storage::config::Mesh`) against the live
+//! peer registry (`aoide_storage::peer_store::load_peers`), report where
+//! they diverge — and, on the converge, close that divergence by running
+//! the ordinary pairing ceremony over it.
 //!
 //! **Declaration vs. registry — intent vs. state.** `config.toml`'s
 //! `[mesh.*]` is INTENT: the operator's own roster of who SHOULD be paired,
@@ -38,14 +40,15 @@
 //! of health per peer.
 //!
 //! **`allows` divergence is deliberately NOT a drift class.** A mesh's
-//! `grant` DECLARES a capability set (`aoide_storage::config::Mesh::grant`'s
-//! own doc) — nothing yet reads it to actually grant anything at
-//! first-verify, and this module does not wait on that being decided: a
-//! human may freely narrow or widen a live peer's `allows` via `peer
-//! allow`, and comparing it against a mesh's `grant` would turn an
-//! intentional, one-off admin action into permanent reported drift
-//! regardless of whether `grant` ever becomes live. This module has no
-//! standing to second-guess that decision on every subsequent `mesh` call.
+//! `grant` is a default for the moment a pair is MINTED, never a continuous
+//! invariant over it: [`handle_mesh_pair`] hands it to the ceremony, and
+//! `peer_store::upsert_paired_peer` stamps a capability set only on a FIRST
+//! verification, leaving an already-verified peer's `allows` exactly as it
+//! was. A human then narrows or widens that set deliberately, one peer at a
+//! time, with `peer allow`. Comparing the result back against the
+//! declaration would report every one of those decisions as permanent drift
+//! and invite the operator to "fix" his own revocation — so the comparison
+//! is not made.
 //!
 //! **`paired-but-not-declared` is reported, never accused.** A verified
 //! peer named in no mesh lands in [`MeshReport::undeclared`] — its own
@@ -69,12 +72,37 @@
 //! `data.report` — there is nothing to compare), the same shape `aoide
 //! config` itself already uses for the same failure.
 //!
-//! P5 (`mesh pair`, not yet built — out of scope here) will consume this
-//! same [`drift`] to decide what to converge; this module stops at
-//! reporting.
+//! **`mesh pair` is the converge, and it consumes exactly the [`drift`]
+//! above.** There is no second comparison anywhere in the tree: [`plan`]
+//! reads [`MeshSection::rows`] and selects `missing` + `unverified`, in
+//! declared-name order; `via-mismatch` comes back `skipped`, naming `aoide
+//! pair <name>` as the fix. That skip is a ruling, not an omission — a
+//! converge NEVER modifies an existing verified peer, because re-pairing
+//! rotates key material and because writing `via` outside a ceremony commit
+//! would make this a second writer of a field
+//! `peer_store::set_peer_via` reserves to that commit. It also makes a
+//! converge idempotent by construction: run it twice and the second run is
+//! all-`skipped`.
+//!
+//! Each selected peer goes through `commands::run_pair_request` and nothing
+//! else — the ordinary two-POST ceremony, the ordinary park, the ordinary
+//! blocking wait. **Zero ceremony logic lives here**; a duplicated poll loop
+//! is the design error the `poll_outbound_once`/`commit_outbound` split
+//! exists to prevent. What a converge adds over typing `aoide pair` N times
+//! is the selection, one pre-flight confirm for the whole run, the mesh's
+//! declared `grant`, and a report in one vocabulary — completed / parked /
+//! UNREACHABLE / skipped ([`ConvergeOutcome`]).
+//!
+//! **`sameOperator` is declared and not acted on.** Whether a converge may
+//! ever satisfy the far side's typed code on an operator's behalf is
+//! undecided (`docs/architecture/PAIRING.md`'s "Mesh declaration" section),
+//! so a mesh declaring it converges byte-identically to one that does not:
+//! every peer paired with both codes typed. The report carries one note
+//! saying the flag was seen and not acted on — a note, never a row, never a
+//! status, never a refusal.
 
 use aoide_protocol::output::Outcome;
-use aoide_protocol::registry::{cmd, Registry};
+use aoide_protocol::registry::{arg, cmd, flag, Registry};
 use aoide_protocol::Invocation;
 use aoide_storage::config::Mesh;
 use aoide_storage::peer_store::Peer;
@@ -279,9 +307,494 @@ fn handle_mesh(_inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, text).with_data(json!({ "report": report }))
 }
 
-/// `mesh`, appended newest (Registry discipline, `pkgs/aoide/crates/
-/// AGENTS.md`) into `cli`'s `commands::all()` — LAST, after every other
-/// `register*` call.
+// ────────────────────────────────────────────────────────────────────────
+// `mesh pair` — the converge (task #135 P5)
+// ────────────────────────────────────────────────────────────────────────
+
+/// What a converge does with one declared peer. Decided from [`drift`]'s
+/// own classification and nothing else — a converge runs the SAME
+/// comparison the read side does, never a second one.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PlannedAction {
+    /// [`DriftClass::Missing`] or [`DriftClass::Unverified`] — run the
+    /// pairing ceremony through `hop`, the declared `ssh://` marker.
+    Pair { hop: String },
+    /// Reported, never attempted. `reason` is what the converge report
+    /// carries and names the command that DOES fix it.
+    Skip { reason: String },
+}
+
+/// One declared peer and what the converge will do with it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PlannedPeer {
+    pub peer: String,
+    pub action: PlannedAction,
+}
+
+/// What a converge over one declared mesh will attempt, and what it will
+/// not. Pure, and the whole of the selection ruling:
+///
+/// - Only [`MeshSection::rows`] are considered, so a peer that already
+///   matches is never touched and the local box (dropped inside [`drift`],
+///   never here) is invisible.
+/// - `missing` and `unverified` are paired. An `unverified` record is a
+///   `peer add` row the ceremony never confirmed; `upsert_paired_peer`
+///   updates it in place.
+/// - **`via-mismatch` is skipped, always.** A converge NEVER modifies an
+///   existing verified peer: re-pairing rotates key material,
+///   `commands::confirm_repair_if_verified` already gates that behind a
+///   human y/N, and writing `via` outside a ceremony commit would make this
+///   a second writer of a field `peer_store::set_peer_via` reserves to the
+///   ceremony. The fix is a human re-pair (`aoide pair <name>`), started
+///   from whichever box holds the wrong record — and it is that skip which
+///   makes a converge idempotent by construction: run it twice and the
+///   second run is all-`skipped`.
+///
+/// Order is [`MeshSection::rows`]' own, which is `Mesh::peers`' `BTreeMap`
+/// order — lexicographic by declared name, so the same declaration always
+/// converges in the same sequence.
+pub fn plan(section: &MeshSection, mesh: &Mesh) -> Vec<PlannedPeer> {
+    section
+        .rows
+        .iter()
+        .map(|row| {
+            let action = match &row.class {
+                DriftClass::Missing | DriftClass::Unverified => match mesh.peers.get(&row.peer) {
+                    Some(hop) => PlannedAction::Pair { hop: hop.clone() },
+                    // Unreachable by construction — `drift` builds every row
+                    // out of this same map — so this arm exists to keep the
+                    // match total rather than to guard anything.
+                    None => PlannedAction::Skip { reason: format!("no hop declared for `{}`", row.peer) },
+                },
+                DriftClass::ViaMismatch { .. } => {
+                    PlannedAction::Skip { reason: format!("via-mismatch; fix with `aoide pair {}`", row.peer) }
+                }
+            };
+            PlannedPeer { peer: row.peer.clone(), action }
+        })
+        .collect()
+}
+
+/// How one selected peer's converge attempt came out, in the four words
+/// this report is allowed (the pairing tombstone slice's locked vocabulary
+/// — completed / parked / UNREACHABLE / skipped; a fifth word is a spec
+/// change, not an implementation detail).
+///
+/// [`Unreachable`](ConvergeOutcome::Unreachable) carries NO id, structurally:
+/// `pairing::park_outbound` runs only after BOTH ceremony POSTs succeed, so
+/// a request to an offline box parks nothing at all and there is no entry a
+/// later `aoide pair <id>` could resume. A report that handed one back would
+/// be inviting the operator to resume something that does not exist.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+#[serde(tag = "outcome", rename_all = "kebab-case")]
+pub enum ConvergeOutcome {
+    /// The far operator typed the reply code and the peer record is
+    /// verified — `commit_outbound`'s own success.
+    Completed,
+    /// The request is parked and resumable under `id`: `--wait 0`, a wait
+    /// that ran out, an approval with no terminal to type the reply code
+    /// into, or a declined confirm. `detail` is the ceremony's own message
+    /// and rides the human line beside the resume: the id alone cannot say
+    /// whether THIS run parked it or an older entry survived a request that
+    /// never landed ([`parked_id_for`]), and that difference is the whole
+    /// news when a box has gone offline.
+    Parked { id: String, detail: String },
+    /// The ceremony left nothing parked and nothing committed. `detail` is
+    /// the ceremony's own message — the human line shows THIS half, since
+    /// here it is the only half worth acting on.
+    Unreachable { detail: String },
+    /// Never attempted. See [`plan`].
+    Skipped { reason: String },
+}
+
+/// One peer's converge result. `#[serde(flatten)]` for the same reason
+/// [`MeshRow`] uses it — one flat `{"peer": …, "outcome": …}` object per
+/// row, never a nested tag.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ConvergeRow {
+    pub peer: String,
+    #[serde(flatten)]
+    pub outcome: ConvergeOutcome,
+}
+
+/// One converge, whole. What [`handle_mesh_pair`] renders and what `--json`
+/// serializes under `data.report`.
+#[derive(Debug, Clone, PartialEq, Serialize, Default)]
+pub struct ConvergeReport {
+    pub mesh: String,
+    pub rows: Vec<ConvergeRow>,
+    /// Present only when the mesh declares `sameOperator = true`. Its own
+    /// field, deliberately outside [`rows`](ConvergeReport::rows): the flag
+    /// changes no peer's status and no count, so folding it into a per-peer
+    /// result would misreport what happened.
+    #[serde(rename = "sameOperatorNote", skip_serializing_if = "Option::is_none")]
+    pub same_operator_note: Option<String>,
+}
+
+/// What a declared `sameOperator = true` gets: a sentence, and nothing
+/// else. Whether a converge may ever act on that claim — satisfying the far
+/// side's typed code on an operator's behalf — is undecided
+/// (`docs/architecture/PAIRING.md`'s "Mesh declaration" section), so the
+/// converge runs the flag's `false` path exactly: every peer paired with
+/// both codes typed, by two people or by one person at two screens. The
+/// note says so rather than leaving the operator to wonder whether a
+/// declared flag quietly did something.
+const SAME_OPERATOR_NOTE: &str = "declares sameOperator = true, which is not yet ruled: a converge cannot act on it. \
+                                  Peers were paired with both codes typed, as normal.";
+
+/// Assemble one converge's report. Pure, so the `sameOperator` ruling above
+/// is a unit test over in-memory values: the note's presence is the ONLY
+/// thing `same_operator` changes about a report.
+fn converge_report(mesh_name: &str, mesh: &Mesh, rows: Vec<ConvergeRow>) -> ConvergeReport {
+    ConvergeReport {
+        mesh: mesh_name.to_string(),
+        rows,
+        same_operator_note: mesh.same_operator.then(|| format!("mesh.{mesh_name} {SAME_OPERATOR_NOTE}")),
+    }
+}
+
+/// Fold one peer's ceremony envelope into the locked vocabulary. Pure: both
+/// facts it decides on are handed in — `out` is whatever
+/// `commands::run_pair_request` returned, and `parked_id` is what
+/// `pairing::list_outbound` says about that peer AFTERWARD (the only way
+/// this module ever reads parked state, so a new optional field on a parked
+/// entry stays invisible to it).
+///
+/// Keyed on those two facts and nothing else — never on a `data.reason`
+/// string, which would make the vocabulary a hostage to every future
+/// wording change inside the ceremony:
+///
+/// - `confirmed: true` on an Ok envelope is `commit_outbound`'s own success
+///   shape, and the only thing that means a peer record was written.
+/// - Otherwise, an entry parked under this peer's name is exactly what
+///   "resume it later" needs, whatever the envelope's status was — a
+///   mistyped reply code leaves the request parked and is reported as such,
+///   not as an unreachable box.
+/// - Nothing committed and nothing parked is [`ConvergeOutcome::Unreachable`],
+///   which by construction cannot carry an id.
+pub fn classify(out: &Outcome, parked_id: Option<String>) -> ConvergeOutcome {
+    let confirmed = out
+        .data
+        .as_ref()
+        .and_then(|d| d.get("confirmed"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    if out.status == aoide_protocol::output::Status::Ok && confirmed {
+        return ConvergeOutcome::Completed;
+    }
+    match parked_id {
+        Some(id) => ConvergeOutcome::Parked { id, detail: out.message.clone() },
+        None => ConvergeOutcome::Unreachable { detail: out.message.clone() },
+    }
+}
+
+/// Which declared mesh a converge runs over. A bare `mesh pair` with
+/// exactly one declared mesh is unambiguous and takes it; anything else
+/// names what it found rather than guessing.
+fn resolve_section<'a>(cmd: &str, report: &'a MeshReport, arg: Option<&str>) -> Result<&'a MeshSection, Outcome> {
+    let declared: Vec<&str> = report.sections.iter().map(|s| s.name.as_str()).collect();
+    match arg {
+        Some(name) => report.sections.iter().find(|s| s.name == name).ok_or_else(|| {
+            Outcome::usage(
+                cmd,
+                format!(
+                    "no `[mesh.{name}]` in config.toml — declared: {}",
+                    if declared.is_empty() { "(none)".to_string() } else { declared.join(", ") }
+                ),
+            )
+            .with_data(json!({ "reason": "unknown-mesh", "mesh": name, "declared": declared }))
+        }),
+        None if declared.is_empty() => Err(Outcome::error(
+            cmd,
+            "no mesh declared — add a `[mesh.<name>]` section to config.toml, then `aoide mesh` to see the drift this would converge",
+        )
+        .with_data(json!({ "reason": "no-mesh-declared" }))),
+        None if declared.len() == 1 => Ok(&report.sections[0]),
+        None => Err(Outcome::usage(
+            cmd,
+            format!("more than one mesh is declared — name the one to converge: {}", declared.join(", ")),
+        )
+        .with_data(json!({ "reason": "ambiguous-mesh", "declared": declared }))),
+    }
+}
+
+/// The ceremony's post-request behaviour for a converge: `pair`'s OWN
+/// `--wait`/`--yes` parse ([`crate::commands::pair_finish_from`] — one
+/// parser and one taught error for a flag both commands spell the same),
+/// with the grant taken from the MESH rather than from an `--allow` flag
+/// `mesh pair` deliberately does not have. A declared grant is what a first
+/// verification stamps; `None` (the mesh declares no override) falls
+/// through to `commands::resolve_grant`, which reads `[pairing]
+/// defaultGrant`. Never `Some(vec![])` for an absent declaration — the
+/// empty list is the distinct, real "grant nothing" intent and must stay
+/// distinguishable from "declared no override".
+fn converge_finish(inv: &Invocation, mesh: &Mesh) -> Result<crate::commands::PairFinish, String> {
+    let mut finish = crate::commands::pair_finish_from(inv)?;
+    finish.grant = mesh.grant.clone();
+    // `--yes` here buys the ONE pre-flight confirm below, never a code gate.
+    // `commands::outbound_gate_from` reads `skip_confirm` ahead of the tty
+    // test, so carrying it through would resolve every leg to
+    // `CodeGate::Unavailable` and park the whole converge without committing
+    // anything — N ids to type by hand, which is what this command exists to
+    // replace. The converge replaces the N requests, not the N codes.
+    finish.skip_confirm = false;
+    Ok(finish)
+}
+
+/// How many of a plan's entries would actually send a request. Everything
+/// that turns on "does this run do anything at all" — the pre-flight, the
+/// detached-grant refusal — asks this one function, so the two can never
+/// disagree about whether a converge is a no-op.
+fn pairs_planned(plan: &[PlannedPeer]) -> usize {
+    plan.iter().filter(|p| matches!(p.action, PlannedAction::Pair { .. })).count()
+}
+
+/// The whole converge, laid out for the one pre-flight confirm: which
+/// peers, in what order, through which hops, at what grant, and how long
+/// each will wait. Pure — the prompt is rendered here and only READ by the
+/// confirm below.
+fn render_preflight(mesh_name: &str, mesh: &Mesh, plan: &[PlannedPeer], wait_secs: u64) -> String {
+    let mut lines = vec![format!("converge mesh.{mesh_name}:")];
+    for planned in plan {
+        if let PlannedAction::Pair { hop } = &planned.action {
+            lines.push(format!("  pair {} via {hop}", planned.peer));
+        }
+    }
+    for planned in plan {
+        if let PlannedAction::Skip { reason } = &planned.action {
+            lines.push(format!("  skip {} ({reason})", planned.peer));
+        }
+    }
+    lines.push(match &mesh.grant {
+        Some(g) if g.is_empty() => format!("grant: nothing (mesh.{mesh_name} declares an empty grant)"),
+        Some(g) => format!("grant: {} (declared by mesh.{mesh_name})", g.join(", ")),
+        None => "grant: config.toml's [pairing] defaultGrant".to_string(),
+    });
+    lines.push(match wait_secs {
+        0 => "each request is parked and returns immediately (--wait 0)".to_string(),
+        n => format!("each far operator types the pairing code and reads a reply code back; up to {n}s per peer"),
+    });
+    lines.join("\n")
+}
+
+/// ONE confirmation for the whole converge, before the loop (never one per
+/// peer — N prompts for a single decision is friction, not safety).
+/// `--yes` skips it exactly as it skips `pair`'s own sweep proceed-prompt:
+/// nothing is bypassed by that, because every far operator still types a
+/// code, and the pairing codes remain the gate that actually secures each
+/// pair. `Err` is the finished [`Outcome`] to return — a decline is an Ok
+/// "nothing sent", not a failure.
+fn confirm_preflight(
+    cmd: &str,
+    inv: &Invocation,
+    mesh_name: &str,
+    mesh: &Mesh,
+    plan: &[PlannedPeer],
+    wait_secs: u64,
+) -> Result<(), Outcome> {
+    let to_pair = pairs_planned(plan);
+    if to_pair == 0 || inv.flag_present("yes") {
+        return Ok(());
+    }
+    let listing = render_preflight(mesh_name, mesh, plan, wait_secs);
+    if !aoide_protocol::pick::interactive(inv.door) {
+        return Err(Outcome::error(
+            cmd,
+            format!("{listing}\n— no terminal to confirm this on; re-run with --yes to proceed"),
+        )
+        .with_data(json!({ "reason": "no-preflight-confirm", "mesh": mesh_name, "toPair": to_pair })));
+    }
+    eprintln!("{listing}");
+    match aoide_protocol::pick::confirm(&format!("proceed — pair {to_pair} peer(s) in mesh.{mesh_name}?")) {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(Outcome::ok(cmd, "not confirmed — nothing sent")
+            .with_data(json!({ "confirmed": false, "mesh": mesh_name }))),
+        Err(e) => Err(Outcome::error(cmd, e)),
+    }
+}
+
+/// What `pairing::list_outbound` holds for `peer` at this moment — the id of
+/// the entry a later `aoide pair <id>` would resume, or `None` when nothing
+/// is parked under that name. The ONE way this module reads parked state:
+/// never the file, never a second index.
+///
+/// It answers about the NAME, not about this run: `park_outbound` dedups by
+/// pubkey, so an entry a previous converge left behind survives a request
+/// that never reached the box, and this returns that older id. The row is
+/// still true — that id really is resumable — but it is not evidence this
+/// run made progress, which is why [`render_converge_outcome`] prints a
+/// parked row's `detail` beside its id rather than the id alone.
+fn parked_id_for(peer: &str) -> Option<String> {
+    let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
+    aoide_storage::pairing::list_outbound(now_epoch).into_iter().find(|e| e.name == peer).map(|e| e.id)
+}
+
+/// Run the ceremony for one selected peer, through its declared hop. Every
+/// line of ceremony logic lives in `commands::run_pair_request` — this
+/// composes its arguments and nothing more. A duplicated poll loop is the
+/// design error this whole split exists to prevent.
+///
+/// The dial url's HOST is irrelevant and deliberately loopback:
+/// `commands::resolve_dial_url` discards a logical url's authority whenever
+/// a `via` is set, rewriting the dial to the tunnel's own local end. So
+/// `http://127.0.0.1:<default_a2a_port()>/` is both the correct logical url
+/// and exactly the record shape a paired peer already carries.
+fn converge_one(cmd: &str, peer: &str, hop: &str, finish: &crate::commands::PairFinish) -> ConvergeOutcome {
+    let via = match aoide_storage::tunnel::parse_via(hop) {
+        Ok(v) => v,
+        // Unreachable through `config::load` (`validate_mesh` runs the same
+        // parser), so this is the total-match arm, not a second validation.
+        Err(e) => return ConvergeOutcome::Skipped { reason: format!("declared hop `{hop}` does not parse: {e}") },
+    };
+    let dial_url = format!("http://127.0.0.1:{}/", crate::commands::default_a2a_port());
+    let self_url = crate::commands::default_self_url();
+    let self_via = crate::commands::default_self_via(&via.host);
+    let out = crate::commands::run_pair_request(
+        cmd,
+        &dial_url,
+        peer,
+        &self_url,
+        self_via.as_deref(),
+        Some(&via),
+        Some(hop.to_string()),
+        finish,
+    );
+    classify(&out, parked_id_for(peer))
+}
+
+/// The human-text rendering `aoide mesh pair`'s message carries — `--json`
+/// serializes the same [`ConvergeReport`] under `data.report`, detail
+/// included for every row.
+fn render_converge(report: &ConvergeReport) -> String {
+    let mut lines = Vec::new();
+    if report.rows.is_empty() {
+        lines.push(format!("mesh.{} — every declared peer is already paired at its declared hop", report.mesh));
+    } else {
+        let width = report.rows.iter().map(|r| r.peer.chars().count()).max().unwrap_or(0);
+        for row in &report.rows {
+            lines.push(format!("  {:width$} — {}", row.peer, render_converge_outcome(&row.outcome)));
+        }
+    }
+    if let Some(note) = &report.same_operator_note {
+        lines.push(String::new());
+        lines.push(format!("  {note}"));
+    }
+    lines.join("\n")
+}
+
+/// One row's outcome word plus the half of its detail that is actionable —
+/// the resume for a parked request, the failure for an unreachable one, the
+/// fix for a skip. The other half is never lost: `--json` carries every
+/// field of [`ConvergeOutcome`] verbatim.
+fn render_converge_outcome(outcome: &ConvergeOutcome) -> String {
+    match outcome {
+        ConvergeOutcome::Completed => "completed   (far operator typed the reply code)".to_string(),
+        ConvergeOutcome::Parked { id, detail } => {
+            format!("parked      (resume with `aoide pair {id}` — {detail})")
+        }
+        ConvergeOutcome::Unreachable { detail } => format!("UNREACHABLE ({detail})"),
+        ConvergeOutcome::Skipped { reason } => format!("skipped     ({reason})"),
+    }
+}
+
+/// `aoide mesh pair [<mesh>] [--wait N] [--yes] [--json]` — make a declared
+/// mesh true, one ordinary pairwise ceremony at a time. See the module doc.
+fn handle_mesh_pair(inv: &Invocation) -> Outcome {
+    let cmd = "mesh.pair";
+    const USAGE: &str = "usage: aoide mesh pair [<mesh>] [--wait SECS] [--yes] [--json] — pairs every declared peer this box has no verified record of; the mesh may be omitted when exactly one is declared";
+    if inv.args.len() > 1 {
+        return Outcome::usage(cmd, USAGE);
+    }
+    let loaded = match aoide_storage::config::load() {
+        Ok(l) => l,
+        Err(e) => {
+            return Outcome::error(cmd, e.to_string())
+                .with_data(json!({ "reason": "config-unreadable", "path": e.path().to_string_lossy() }));
+        }
+    };
+    let peers = aoide_storage::peer_store::load_peers();
+    let local_name = aoide_storage::display::local_host_name();
+    let report = drift(&loaded.config.mesh, &peers, &local_name);
+
+    let arg = inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty());
+    let section = match resolve_section(cmd, &report, arg) {
+        Ok(s) => s,
+        Err(out) => return out,
+    };
+    let Some(mesh) = loaded.config.mesh.get(&section.name) else {
+        // `drift` builds a section per declared mesh, keyed by that same
+        // map — the total-match arm, not a guard.
+        return Outcome::error(cmd, format!("mesh.{} vanished between the read and the converge", section.name));
+    };
+
+    let plan = plan(section, mesh);
+    let finish = match converge_finish(inv, mesh) {
+        Ok(f) => f,
+        Err(e) => return Outcome::usage(cmd, format!("{USAGE} — {e}")),
+    };
+    // The same refusal `pair --allow --wait 0` already gives, by the SAME
+    // rule — `commands::refuse_detached_grant` is asked, so if `pair` ever
+    // changes when a detached grant is refused this follows without a
+    // second copy of the condition. Only the WORDING is replaced: that
+    // message names `--allow`, and here the grant came from the
+    // declaration, not from a flag anybody typed.
+    //
+    // Asked only when something would actually be sent, the same condition
+    // the pre-flight uses. A converged mesh plans no request, so there is no
+    // grant to detach and nothing to refuse — an all-`skipped` run stays Ok
+    // whatever flags it carries, which is what makes the second run over a
+    // converged mesh a usable scripted check.
+    if pairs_planned(&plan) > 0 && crate::commands::refuse_detached_grant(cmd, &finish).is_some() {
+        return Outcome::usage(
+            cmd,
+            format!(
+                "mesh.{} declares a grant, and `--wait 0` parks every request before anything commits — \
+                 a grant is never persisted on a parked entry, so this one would be silently dropped. \
+                 Drop `--wait 0` so each pair finishes while its grant is still in hand.",
+                section.name
+            ),
+        )
+        .with_data(json!({ "reason": "detached-grant", "mesh": section.name }));
+    }
+    if let Err(out) = confirm_preflight(cmd, inv, &section.name, mesh, &plan, finish.wait_secs) {
+        return out;
+    }
+
+    let mut rows = Vec::with_capacity(plan.len());
+    for planned in &plan {
+        let outcome = match &planned.action {
+            PlannedAction::Skip { reason } => ConvergeOutcome::Skipped { reason: reason.clone() },
+            PlannedAction::Pair { hop } => converge_one(cmd, &planned.peer, hop, &finish),
+        };
+        rows.push(ConvergeRow { peer: planned.peer.clone(), outcome });
+    }
+
+    let completed = rows.iter().any(|r| r.outcome == ConvergeOutcome::Completed);
+    let converged = converge_report(&section.name, mesh, rows);
+    let text = render_converge(&converged);
+    let out = Outcome::ok(cmd, text).with_data(json!({ "report": converged }));
+    if completed {
+        out.changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
+    } else {
+        out
+    }
+}
+
+/// `mesh` then `mesh pair`, appended newest (Registry discipline,
+/// `pkgs/aoide/crates/AGENTS.md`) into `cli`'s `commands::all()` — LAST,
+/// after every other `register*` call.
+///
+/// **Neither is door-gated, and `mesh pair` is not gated for the same
+/// reason `pair` is not.** Over any door but the CLI,
+/// `aoide_protocol::pick::interactive` is false, so both legs' `CodeGate`
+/// resolves to `Unavailable` (`commands::approve_inbound_leg`,
+/// `commands::outbound_gate_from`): a remote caller can START requests and
+/// can never COMMIT one. A converge is a loop over that same ceremony and
+/// inherits that answer whole, so it needs no gate of its own — the
+/// convention already answers. This says nothing about whether a converge
+/// that could satisfy a far side's code mechanically would need one; no
+/// such path exists, and if one is ever ruled in it brings its own gate and
+/// its own reason.
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["mesh"],
@@ -292,6 +805,19 @@ pub fn register(r: &mut Registry) {
         implemented: true,
         handler: handle_mesh,
         examples: ["mesh", "mesh --json"],
+    ));
+    r.insert(cmd!(
+        path: ["mesh", "pair"],
+        summary: "Converge a declared [mesh.<name>]: run the ordinary pairing ceremony against every declared peer this box has no verified record of (missing or unverified), in declared-name order, through each one's declared ssh hop, stamping the mesh's own grant. A verified peer is NEVER modified — a via-mismatch is reported as skipped and fixed by a human re-pair — so a second run is all-skipped. One pre-flight confirm for the whole converge (--yes skips it); every far operator still types a pairing code and reads a reply code back.",
+        args: [arg!("mesh", "string", false, "Which declared mesh to converge. Omitted: the one declared mesh, when exactly one is declared.")],
+        flags: [
+            flag!("wait", "int", "Seconds to block per peer for the far operator (default 600). --wait 0 parks every request and returns immediately, to be finished later with `aoide pair <id>` or `aoide pair watch`. Refused when the mesh declares a grant and there is anything to pair: a parked entry carries no grant, so the declared one would be silently dropped."),
+            flag!("yes", "bool", "Skip the pre-flight confirm. Never a bypass of the pairing codes: each peer's commit still needs a typed code on both sides."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: handle_mesh_pair,
+        examples: ["mesh pair", "mesh pair home", "mesh pair home --wait 0", "mesh pair home --yes --json"],
     ));
 }
 
@@ -557,5 +1083,428 @@ mod tests {
         let data = out.data.as_ref().expect("error envelope carries data");
         assert_eq!(data.get("reason").and_then(|v| v.as_str()), Some("config-unreadable"), "{data:?}");
         assert!(data.get("report").is_none(), "{data:?}");
+    }
+
+    // ── mesh pair: selection ────────────────────────────────────────────────
+
+    /// A mesh whose four declared peers cover every drift class plus this
+    /// box itself — one fixture the selection rulings are all read off.
+    fn converge_fixture() -> (BTreeMap<String, Mesh>, Vec<Peer>) {
+        let mut m = mesh(&[
+            ("this-box", "ssh://khoa@self"),
+            ("sakaki", "ssh://khoa@h1"),
+            ("chiyo", "ssh://khoa@h2"),
+            ("osaka", "ssh://khoa@h3"),
+            ("yuzu", "ssh://khoa@h4"),
+        ]);
+        m.grant = None;
+        let peers = vec![
+            // sakaki: no record at all -> missing
+            peer("chiyo", false, None),                    // unverified
+            peer("osaka", true, Some("ssh://khoa@h3")),     // matches -> no row
+            peer("yuzu", true, Some("ssh://khoa@wrong")),   // via-mismatch
+        ];
+        (BTreeMap::from([("home".to_string(), m)]), peers)
+    }
+
+    #[test]
+    fn a_converge_selects_exactly_the_missing_and_unverified_peers_in_declared_order() {
+        let (meshes, peers) = converge_fixture();
+        let report = drift(&meshes, &peers, "this-box");
+        let plan = plan(&report.sections[0], &meshes["home"]);
+        let paired: Vec<&str> = plan
+            .iter()
+            .filter(|p| matches!(p.action, PlannedAction::Pair { .. }))
+            .map(|p| p.peer.as_str())
+            .collect();
+        // chiyo (unverified) before sakaki (missing) — lexicographic by
+        // declared name, never by drift class.
+        assert_eq!(paired, vec!["chiyo", "sakaki"]);
+    }
+
+    #[test]
+    fn a_converge_never_touches_this_box_or_a_peer_that_already_matches() {
+        let (meshes, peers) = converge_fixture();
+        let report = drift(&meshes, &peers, "this-box");
+        let plan = plan(&report.sections[0], &meshes["home"]);
+        let named: Vec<&str> = plan.iter().map(|p| p.peer.as_str()).collect();
+        assert!(!named.contains(&"this-box"), "the local box is invisible, not a skipped row: {named:?}");
+        assert!(!named.contains(&"osaka"), "an already-matching peer is not a row at all: {named:?}");
+    }
+
+    #[test]
+    fn a_via_mismatch_is_skipped_and_names_the_human_re_pair_as_the_fix() {
+        let (meshes, peers) = converge_fixture();
+        let report = drift(&meshes, &peers, "this-box");
+        let plan = plan(&report.sections[0], &meshes["home"]);
+        let yuzu = plan.iter().find(|p| p.peer == "yuzu").expect("yuzu is planned");
+        match &yuzu.action {
+            PlannedAction::Skip { reason } => assert_eq!(reason, "via-mismatch; fix with `aoide pair yuzu`"),
+            other => panic!("a verified peer is never re-paired by a converge: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_second_converge_over_a_converged_mesh_is_all_skipped() {
+        // §2.2's payoff, stated as a test: once the missing/unverified peers
+        // are paired at their declared hops, the only rows left are the
+        // via-mismatches, and every one of them is a skip.
+        let (meshes, _) = converge_fixture();
+        let peers = vec![
+            peer("sakaki", true, Some("ssh://khoa@h1")),
+            peer("chiyo", true, Some("ssh://khoa@h2")),
+            peer("osaka", true, Some("ssh://khoa@h3")),
+            peer("yuzu", true, Some("ssh://khoa@wrong")),
+        ];
+        let report = drift(&meshes, &peers, "this-box");
+        let plan = plan(&report.sections[0], &meshes["home"]);
+        assert!(
+            plan.iter().all(|p| matches!(p.action, PlannedAction::Skip { .. })),
+            "a re-run converges nothing: {plan:?}"
+        );
+    }
+
+    // ── mesh pair: the outcome fold ─────────────────────────────────────────
+
+    #[test]
+    fn a_committed_ceremony_folds_to_completed() {
+        let out = Outcome::ok("pair", "paired with `sakaki` — verified, granted read")
+            .with_data(json!({ "confirmed": true, "peer": "sakaki" }));
+        assert_eq!(classify(&out, None), ConvergeOutcome::Completed);
+    }
+
+    #[test]
+    fn a_ceremony_that_left_an_entry_parked_folds_to_parked_with_its_resumable_id() {
+        let out = Outcome::ok("pair", "no answer from `osaka` within 600s")
+            .with_data(json!({ "reason": "wait-timeout", "id": "4f2a91bc" }));
+        assert_eq!(
+            classify(&out, Some("4f2a91bc".to_string())),
+            ConvergeOutcome::Parked { id: "4f2a91bc".into(), detail: "no answer from `osaka` within 600s".into() }
+        );
+    }
+
+    #[test]
+    fn a_mistyped_reply_code_is_parked_not_unreachable_because_the_entry_survives() {
+        // An Error envelope whose entry is still parked is resumable, and
+        // the fold says so — it keys on what the parked store holds, never
+        // on the envelope's `data.reason` wording.
+        let out = Outcome::error("pair", "reply-code mismatch — try 1 of 3")
+            .with_data(json!({ "reason": "code-mismatch", "id": "4f2a91bc", "tries": 1 }));
+        assert!(matches!(classify(&out, Some("4f2a91bc".to_string())), ConvergeOutcome::Parked { .. }));
+    }
+
+    #[test]
+    fn an_offline_box_folds_to_unreachable_and_carries_no_resumable_id() {
+        // `park_outbound` runs only after both ceremony POSTs succeed, so a
+        // request to an offline box parks nothing — the variant has no id
+        // field at all, so no report can imply a resume that would fail.
+        let out = Outcome::error("pair", "sending the pairing request to http://127.0.0.1:8710/: connection refused")
+            .with_data(json!({ "reason": "fetch-failed", "url": "http://127.0.0.1:8710/" }));
+        let outcome = classify(&out, None);
+        assert!(matches!(outcome, ConvergeOutcome::Unreachable { .. }), "{outcome:?}");
+        let json = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(json.get("outcome").and_then(|v| v.as_str()), Some("unreachable"));
+        assert!(json.get("id").is_none(), "UNREACHABLE never carries a resumable id: {json}");
+    }
+
+    #[test]
+    fn an_id_on_an_envelope_the_ceremony_never_parked_is_still_unreachable() {
+        // A reveal that fails carries the APPROVER's id, but `park_outbound`
+        // has not run yet — nothing on this side is resumable, and the fold
+        // asks the parked store rather than trusting the envelope's `id`.
+        let out = Outcome::error("pair", "revealing the nonce to http://127.0.0.1:8710/: HTTP 500")
+            .with_data(json!({ "reason": "reveal-http-error", "id": "4f2a91bc" }));
+        assert!(matches!(classify(&out, None), ConvergeOutcome::Unreachable { .. }));
+    }
+
+    // ── mesh pair: sameOperator is a note and nothing else ──────────────────
+
+    fn one_row() -> Vec<ConvergeRow> {
+        vec![ConvergeRow { peer: "sakaki".into(), outcome: ConvergeOutcome::Completed }]
+    }
+
+    #[test]
+    fn same_operator_true_adds_a_note_and_changes_no_row_and_no_count() {
+        let plain = mesh(&[("sakaki", "ssh://khoa@h")]);
+        let mut claimed = plain.clone();
+        claimed.same_operator = true;
+        let a = converge_report("home", &plain, one_row());
+        let b = converge_report("home", &claimed, one_row());
+        assert_eq!(a.rows, b.rows, "the flag changes no per-peer result");
+        assert_eq!(a.rows.len(), b.rows.len());
+        assert!(a.same_operator_note.is_none());
+        let note = b.same_operator_note.as_deref().expect("a declared sameOperator is noted");
+        assert!(note.starts_with("mesh.home declares sameOperator = true"), "{note}");
+        assert!(note.contains("not yet ruled"), "{note}");
+        assert!(note.contains("both codes typed"), "{note}");
+    }
+
+    #[test]
+    fn the_same_operator_note_is_its_own_json_field_never_a_per_peer_result() {
+        let mut claimed = mesh(&[("sakaki", "ssh://khoa@h")]);
+        claimed.same_operator = true;
+        let json = serde_json::to_value(converge_report("home", &claimed, one_row())).unwrap();
+        assert!(json.get("sameOperatorNote").is_some(), "{json}");
+        let row = &json["rows"][0];
+        assert_eq!(row.get("outcome").and_then(|v| v.as_str()), Some("completed"));
+        assert!(row.get("sameOperatorNote").is_none(), "never folded into a row: {row}");
+    }
+
+    #[test]
+    fn same_operator_true_selects_exactly_what_same_operator_false_selects() {
+        let (mut meshes, peers) = converge_fixture();
+        let report_false = drift(&meshes, &peers, "this-box");
+        let plan_false = plan(&report_false.sections[0], &meshes["home"]);
+        meshes.get_mut("home").unwrap().same_operator = true;
+        let report_true = drift(&meshes, &peers, "this-box");
+        let plan_true = plan(&report_true.sections[0], &meshes["home"]);
+        assert_eq!(plan_false, plan_true, "the converge runs the flag's `false` path either way");
+    }
+
+    #[test]
+    fn the_rendered_report_carries_the_note_below_the_rows_never_as_one() {
+        let mut claimed = mesh(&[("sakaki", "ssh://khoa@h")]);
+        claimed.same_operator = true;
+        let text = render_converge(&converge_report("home", &claimed, one_row()));
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(lines[0].contains("sakaki") && lines[0].contains("completed"), "{text}");
+        assert!(lines.last().unwrap().contains("sameOperator = true"), "{text}");
+        assert_eq!(lines.iter().filter(|l| l.contains("sakaki")).count(), 1, "the note is not a row: {text}");
+    }
+
+    // ── mesh pair: the declared grant reaches the ceremony ──────────────────
+
+    #[test]
+    fn a_declared_grant_reaches_pair_finish_and_an_absent_one_is_none_never_empty() {
+        let inv = cli_inv(&["mesh", "pair"]);
+        let none = converge_finish(&inv, &mesh(&[])).expect("no flags, no parse failure");
+        assert_eq!(none.grant, None, "an absent declaration falls through to resolve_grant, never to []");
+
+        let mut declared = mesh(&[]);
+        declared.grant = Some(vec!["read".to_string(), "spawn".to_string()]);
+        let some = converge_finish(&inv, &declared).expect("no flags, no parse failure");
+        assert_eq!(some.grant, Some(vec!["read".to_string(), "spawn".to_string()]));
+        assert_ne!(none.grant, some.grant, "a mesh that declares a grant stamps a different one");
+
+        let mut empty = mesh(&[]);
+        empty.grant = Some(Vec::new());
+        let nothing = converge_finish(&inv, &empty).expect("no flags, no parse failure");
+        assert_eq!(nothing.grant, Some(Vec::new()), "`grant = []` is the real `grant nothing` intent");
+        assert_ne!(nothing.grant, none.grant);
+    }
+
+    #[test]
+    fn yes_buys_the_preflight_and_never_reaches_the_code_gate() {
+        // `commands::outbound_gate_from` reads `skip_confirm` BEFORE it
+        // tests for a tty, so a `--yes` carried into the finish would
+        // resolve every leg to `CodeGate::Unavailable` — the whole converge
+        // parks, nothing commits, and the operator types N ids by hand.
+        // `--yes` buys exactly one thing here: the pre-flight, which
+        // `the_preflight_is_refused_off_a_tty_without_yes_and_skipped_with_it`
+        // pins separately off the invocation.
+        let mut inv = cli_inv(&["mesh", "pair"]);
+        inv.flags.insert("yes".to_string(), "true".to_string());
+        let finish = converge_finish(&inv, &mesh(&[])).expect("--yes parses");
+        assert!(!finish.skip_confirm, "--yes must not reach the ceremony's own gate: {finish:?}");
+        assert!(inv.flag_present("yes"), "and it must still be readable for the pre-flight");
+    }
+
+    // ── mesh pair: which mesh, and the pre-flight ───────────────────────────
+
+    #[test]
+    fn a_bare_converge_takes_the_one_declared_mesh_and_names_them_when_there_are_several() {
+        let one = drift(&BTreeMap::from([("home".to_string(), mesh(&[]))]), &[], "this-box");
+        assert_eq!(resolve_section("mesh.pair", &one, None).unwrap().name, "home");
+
+        let two = drift(
+            &BTreeMap::from([("home".to_string(), mesh(&[])), ("lab".to_string(), mesh(&[]))]),
+            &[],
+            "this-box",
+        );
+        let err = resolve_section("mesh.pair", &two, None).unwrap_err();
+        assert_eq!(err.status, aoide_protocol::output::Status::Usage, "{err:?}");
+        assert!(err.message.contains("home, lab"), "{}", err.message);
+
+        let none = drift(&BTreeMap::new(), &[], "this-box");
+        let err = resolve_section("mesh.pair", &none, None).unwrap_err();
+        assert_eq!(err.data.unwrap().get("reason").and_then(|v| v.as_str()), Some("no-mesh-declared"));
+    }
+
+    #[test]
+    fn naming_a_mesh_that_is_not_declared_lists_the_ones_that_are() {
+        let one = drift(&BTreeMap::from([("home".to_string(), mesh(&[]))]), &[], "this-box");
+        let err = resolve_section("mesh.pair", &one, Some("lab")).unwrap_err();
+        assert!(err.message.contains("no `[mesh.lab]`"), "{}", err.message);
+        assert!(err.message.contains("declared: home"), "{}", err.message);
+    }
+
+    #[test]
+    fn the_preflight_lists_every_peer_its_hop_the_grant_and_the_wait() {
+        let (meshes, peers) = converge_fixture();
+        let mut m = meshes["home"].clone();
+        m.grant = Some(vec!["read".to_string()]);
+        let report = drift(&meshes, &peers, "this-box");
+        let plan = plan(&report.sections[0], &m);
+        let text = render_preflight("home", &m, &plan, 600);
+        assert!(text.contains("pair chiyo via ssh://khoa@h2"), "{text}");
+        assert!(text.contains("pair sakaki via ssh://khoa@h1"), "{text}");
+        assert!(text.contains("skip yuzu"), "{text}");
+        assert!(text.contains("grant: read (declared by mesh.home)"), "{text}");
+        assert!(text.contains("600s per peer"), "{text}");
+    }
+
+    #[test]
+    fn the_preflight_is_refused_off_a_tty_without_yes_and_skipped_with_it() {
+        let (meshes, peers) = converge_fixture();
+        let m = &meshes["home"];
+        let report = drift(&meshes, &peers, "this-box");
+        let plan = plan(&report.sections[0], m);
+
+        let mut inv = cli_inv(&["mesh", "pair"]);
+        inv.door = Door::A2a; // never interactive
+        let err = confirm_preflight("mesh.pair", &inv, "home", m, &plan, 600).unwrap_err();
+        assert!(err.message.contains("re-run with --yes"), "{}", err.message);
+        assert_eq!(err.data.unwrap().get("reason").and_then(|v| v.as_str()), Some("no-preflight-confirm"));
+
+        inv.flags.insert("yes".to_string(), "true".to_string());
+        assert!(confirm_preflight("mesh.pair", &inv, "home", m, &plan, 600).is_ok());
+    }
+
+    #[test]
+    fn a_converge_with_nothing_to_pair_needs_no_confirmation_at_all() {
+        // All-`skipped` (the idempotent second run) sends nothing, so there
+        // is nothing to confirm — it must not refuse off a non-tty door.
+        let (meshes, _) = converge_fixture();
+        let peers = vec![peer("yuzu", true, Some("ssh://khoa@wrong"))];
+        let report = drift(&meshes, &peers, "this-box");
+        let plan: Vec<PlannedPeer> = plan(&report.sections[0], &meshes["home"])
+            .into_iter()
+            .filter(|p| matches!(p.action, PlannedAction::Skip { .. }))
+            .collect();
+        let mut inv = cli_inv(&["mesh", "pair"]);
+        inv.door = Door::A2a;
+        assert!(confirm_preflight("mesh.pair", &inv, "home", &meshes["home"], &plan, 600).is_ok());
+    }
+
+    // ── mesh pair: handler wiring ───────────────────────────────────────────
+
+    #[test]
+    fn handle_mesh_pair_with_no_mesh_declared_refuses_and_pairs_nothing() {
+        let out = with_config_root("pair-nomesh", |_dir| handle_mesh_pair(&cli_inv(&["mesh", "pair"])));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+        let data = out.data.as_ref().expect("error envelope carries data");
+        assert_eq!(data.get("reason").and_then(|v| v.as_str()), Some("no-mesh-declared"), "{data:?}");
+    }
+
+    #[test]
+    fn handle_mesh_pair_is_error_when_config_fails_to_load() {
+        let out = with_config_root("pair-badconfig", |dir| {
+            std::fs::write(dir.join("config.toml"), "[mesh.home]\ngrant = [\"root\"]\n").unwrap();
+            handle_mesh_pair(&cli_inv(&["mesh", "pair"]))
+        });
+        assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
+        let data = out.data.as_ref().expect("error envelope carries data");
+        assert_eq!(data.get("reason").and_then(|v| v.as_str()), Some("config-unreadable"), "{data:?}");
+    }
+
+    #[test]
+    fn handle_mesh_pair_over_an_all_skipped_mesh_dials_nothing_and_reports_every_skip() {
+        // A declaration whose only drift is a via-mismatch: the converge
+        // sends nothing (no tunnel, no POST, no confirm) and comes back with
+        // one `skipped` row — the idempotent second run, end to end.
+        let out = with_config_root("pair-skipped", |dir| {
+            std::fs::write(
+                dir.join("config.toml"),
+                "[mesh.home.peers]\nyuzu = \"ssh://khoa@h4\"\n",
+            )
+            .unwrap();
+            std::fs::create_dir_all(dir).unwrap();
+            let peers = vec![peer("yuzu", true, Some("ssh://khoa@wrong"))];
+            aoide_storage::peer_store::save_peers(&peers).unwrap();
+            handle_mesh_pair(&cli_inv(&["mesh", "pair"]))
+        });
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+        assert!(out.changed.is_empty(), "nothing was written: {out:?}");
+        assert!(out.message.contains("yuzu") && out.message.contains("skipped"), "{}", out.message);
+        let report = out.data.as_ref().and_then(|d| d.get("report")).expect("ok envelope carries a report");
+        assert_eq!(report["rows"].as_array().map(Vec::len), Some(1), "{report}");
+        assert_eq!(report["rows"][0]["outcome"].as_str(), Some("skipped"), "{report}");
+    }
+
+    #[test]
+    fn handle_mesh_pair_refuses_wait_zero_when_the_mesh_declares_a_grant() {
+        // The same rule `pair --allow --wait 0` already holds: a parked
+        // entry never carries a grant, so a declared one would be silently
+        // dropped on the resume. Refused up front, nothing sent.
+        let out = with_config_root("pair-detached-grant", |dir| {
+            std::fs::write(
+                dir.join("config.toml"),
+                "[mesh.home]\ngrant = [\"read\"]\n\n[mesh.home.peers]\nsakaki = \"ssh://khoa@h1\"\n",
+            )
+            .unwrap();
+            let mut inv = cli_inv(&["mesh", "pair"]);
+            inv.flags.insert("wait".to_string(), "0".to_string());
+            inv.flags.insert("yes".to_string(), "true".to_string());
+            handle_mesh_pair(&inv)
+        });
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
+        assert!(out.message.contains("mesh.home declares a grant"), "{}", out.message);
+        assert!(out.message.contains("never persisted on a parked entry"), "{}", out.message);
+        assert!(!out.message.contains("retype --allow"), "no flag was typed here: {}", out.message);
+        let data = out.data.as_ref().expect("usage envelope carries data");
+        assert_eq!(data.get("reason").and_then(|v| v.as_str()), Some("detached-grant"), "{data:?}");
+    }
+
+    #[test]
+    fn wait_zero_over_a_converged_mesh_is_ok_even_when_a_grant_is_declared() {
+        // The refusal above is about a grant that would be DROPPED, and a
+        // converged mesh sends nothing to drop it from. Refusing here would
+        // make `mesh pair --wait 0 --json` — the scripted drift check — fail
+        // forever on any mesh that declares a grant, contradicting the
+        // all-skipped second run the command promises.
+        let out = with_config_root("pair-converged-grant", |dir| {
+            std::fs::write(
+                dir.join("config.toml"),
+                "[mesh.home]\ngrant = [\"read\"]\n\n[mesh.home.peers]\nyuzu = \"ssh://khoa@h4\"\n",
+            )
+            .unwrap();
+            let peers = vec![peer("yuzu", true, Some("ssh://khoa@wrong"))];
+            aoide_storage::peer_store::save_peers(&peers).unwrap();
+            let mut inv = cli_inv(&["mesh", "pair"]);
+            inv.flags.insert("wait".to_string(), "0".to_string());
+            handle_mesh_pair(&inv)
+        });
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+        assert!(out.changed.is_empty(), "nothing was written: {out:?}");
+        let report = out.data.as_ref().and_then(|d| d.get("report")).expect("ok envelope carries a report");
+        assert_eq!(report["rows"][0]["outcome"].as_str(), Some("skipped"), "{report}");
+    }
+
+    #[test]
+    fn parked_id_for_answers_about_the_name_not_about_this_run() {
+        // `park_outbound` dedups by pubkey, so an entry an earlier converge
+        // left behind outlives a request that never reached the box. The id
+        // it returns is genuinely resumable — it is simply not proof that
+        // THIS run made progress, which is why a parked row prints its
+        // detail beside the id.
+        with_config_root("parked-id", |_dir| {
+            assert_eq!(parked_id_for("sakaki"), None, "nothing parked yet");
+            aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
+                id: "abc123".to_string(),
+                url: "http://127.0.0.1:8710/".to_string(),
+                name: "sakaki".to_string(),
+                pubkey_hex: "aa".repeat(32),
+                requester_nonce_hex: "bb".repeat(16),
+                approver_nonce_hex: "cc".repeat(16),
+                requested_at: "2026-09-03T00:00:00Z".to_string(),
+                expires_at: "2099-01-01T00:00:00Z".to_string(),
+                state: aoide_storage::pairing::OutboundState::AwaitingApproval,
+                tries: 0,
+                via: Some("ssh://khoa@h1".to_string()),
+            })
+            .expect("parking writes to the scratch root");
+            assert_eq!(parked_id_for("sakaki").as_deref(), Some("abc123"));
+            assert_eq!(parked_id_for("osaka"), None, "another name is not this one's entry");
+        });
     }
 }

@@ -228,6 +228,12 @@ mod tests {
         // comparing every declared `[mesh.<name>]` in config.toml against
         // the live peer registry (`aoide_client::mesh`); writes neither
         // side. Net: 79 + 1 = 80.
+        //
+        // Task #135 P5 adds `mesh.pair` (+1) — the converge: the same
+        // `mesh::drift` selects the declared peers with no verified record
+        // (missing/unverified) and drives `commands::run_pair_request` over
+        // each, one ordinary pairwise ceremony apiece. A verified peer is
+        // never modified, so a second run is all-skipped. Net: 80 + 1 = 81.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -256,6 +262,7 @@ mod tests {
             "melete.graph",
             "melete.status",
             "mesh",
+            "mesh.pair",
             "onboard",
             "pair",
             "pair.reject",

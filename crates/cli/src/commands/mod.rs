@@ -40,9 +40,12 @@ use crate::registry::Registry;
 /// P3' each collapsed it further, ending in ONE smart command: bare `pair`
 /// resolves/approves/starts, `pair reject`, `pair watch`; see
 /// `docs/architecture/PAIRING.md`), config + config set (task #135 P-C —
-/// the portable runtime config file, `$AOIDE_ROOT/config.toml`), mesh (task
-/// #135 P4 — compares every declared `[mesh.<name>]` against the live peer
-/// registry and reports drift; never writes either side).
+/// the portable runtime config file, `$AOIDE_ROOT/config.toml`), mesh +
+/// mesh pair (task #135 P4/P5 — the read compares every declared
+/// `[mesh.<name>]` against the live peer registry and reports drift without
+/// writing either side; the converge closes that drift by running the
+/// ordinary `pair` ceremony against every declared peer with no verified
+/// record, and never touches a verified one).
 ///
 /// P-A5 (binary-split workstream) removed the register lines for the
 /// graphical bundle — rice/draft/mode/cover/livery/rice-late-stubs/
@@ -82,7 +85,7 @@ pub fn all() -> Registry {
     aoide_conduct::commands::peer_list::register(&mut r); // peer list — the one-glance mesh roster over the roster core's probe (formerly who's) + one discovery sweep (task #120 P2, appended newest)
     aoide_client::commands::register_pair(&mut r); // pair + pair reject/watch — the pairing ceremony's whole CLI face, one smart command (task #135 P3', superseding the peer pair family — hard cutover)
     aoide_storage::commands::register_config(&mut r); // config, config set — the portable runtime config file (task #135 P-C, appended newest)
-    aoide_client::mesh::register(&mut r); // mesh — declared-mesh-vs-live-registry drift report (task #135 P4, appended newest)
+    aoide_client::mesh::register(&mut r); // mesh + mesh pair — the declared-mesh-vs-live-registry drift report and the converge that closes it (task #135 P4/P5, appended newest)
 
     r
 }

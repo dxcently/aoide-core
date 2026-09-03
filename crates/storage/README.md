@@ -104,8 +104,9 @@ by decision — no embedded database yet
   table `&'static str` can enumerate, so `config set` structurally cannot
   reach into it (`SetRefusal::UnknownKey` for any `mesh.*` key, same as a
   typo). Writing a mesh is a text edit to `config.toml` — reading what it
-  implies about the live peer registry is `aoide mesh`
-  (`aoide_client::mesh`), not this crate.
+  implies about the live peer registry is `aoide mesh`, and acting on it
+  (pairing the declared peers, stamping the declared `grant`) is `aoide mesh
+  pair`; both live in `aoide_client::mesh`, never this crate.
 - `session` — pure session/hook upsert operations.
 - `peer_store` — the peer-federation registry + pull cache (CONTRACTS.md §7).
   `Peer` carries two independent, opposite-direction credential fields:

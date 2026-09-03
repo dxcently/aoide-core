@@ -486,14 +486,14 @@
     mesh-shaped column to go stale against the declaration it would be
     shadowing.
   - **`allows` divergence is not a drift class.** `mesh.<name>.grant` is
-    declared, validated, stored, and shown back only — what, if anything,
-    ever reads it to set a peer's capability set is not yet decided
-    (`config::Mesh::grant`'s doc, `docs/architecture/PAIRING.md`'s "Mesh
-    declaration" section). Even if that lands, the natural place is
-    first-verify only: a human narrowing or widening `allows` afterward
-    via `peer allow` is a decision this comparison would have no standing
-    to re-flag on every subsequent call. Do not add a fourth class that
-    compares `grant` against live `allows`.
+    stamped at FIRST verification and only there: `mesh pair` hands it to
+    the ceremony as `PairFinish::grant`, and `peer_store::
+    upsert_paired_peer` leaves an already-verified peer's set exactly as it
+    was. So the declaration is a default for the moment a pair is minted,
+    never a continuous invariant over it — a human narrowing or widening
+    `allows` afterward via `peer allow` is a deliberate decision this
+    comparison has no standing to re-flag on every subsequent call. Do not
+    add a fourth class that compares `grant` against live `allows`.
   - **`undeclared` (paired, named in no mesh) is reported, never accused.**
     It is its own field on `MeshReport`, outside every drift count, and
     its rendering never suggests an action. Plenty of legitimate peers are
@@ -509,6 +509,53 @@
     commonly a loopback address, so it silently dials THIS box's own
     loopback. Severity is derived at render time (`recorded.is_none()`),
     never stored as a second field redundant with `recorded`.
+- **`mesh pair` NEVER modifies an existing verified peer (task #135 P5).**
+  `plan` selects `missing` and `unverified` and nothing else; a
+  `via-mismatch` comes back `skipped`, naming `aoide pair <name>` as the
+  fix. Three reasons, and none of them has weakened: re-pairing rotates key
+  material (`docs/architecture/PAIRING.md`: never silently),
+  `commands::confirm_repair_if_verified` already gates that behind a human
+  y/N, and writing `via` outside a ceremony commit would make this module a
+  second writer of a field `peer_store::set_peer_via` reserves to that
+  commit. The payoff is idempotence by construction — a second run is
+  all-`skipped` — and a test pins it. Do not widen the selection to "repair
+  what drifted".
+  - **Zero ceremony logic lives in `mesh.rs`.** Every selected peer goes
+    through `commands::run_pair_request`, which already posts request +
+    reveal, parks, and (on a nonzero wait) polls and commits. A second poll
+    loop, a second commit path, or a hand-rolled request here is the exact
+    design error the `poll_outbound_once`/`commit_outbound` split exists to
+    prevent.
+  - **The outcome vocabulary is four words** — completed / parked /
+    UNREACHABLE / skipped — and a fifth is a spec change, not an
+    implementation detail. `classify` decides between them on two facts
+    handed in (the ceremony's envelope, and what `pairing::list_outbound`
+    holds for that peer afterward), never on a `data.reason` string, which
+    would hostage the vocabulary to the ceremony's wording. `Unreachable`
+    has no id FIELD, so no report can ever invite a resume of something
+    that was never parked.
+  - **Parked state is read only through `pairing::list_inbound`/
+    `list_outbound`**, never by touching the file. A new optional field on
+    a parked entry must stay invisible to this module.
+  - **`sameOperator` is declared and not acted on.** Whether a converge may
+    ever satisfy the far side's typed code on an operator's behalf is
+    undecided. A mesh declaring it converges byte-identically to one that
+    does not, and the report carries ONE note saying the flag was seen and
+    not acted on — a note, never a row, never a status, never a refusal,
+    and in `--json` its own field outside `rows`. Do not make it change a
+    selection, a count, or a gate before it is ruled.
+  - **`mesh pair` carries no door gate, for the same reason `pair` carries
+    none.** Off any door but the CLI, `pick::interactive` is false and both
+    legs' `CodeGate` resolves to `Unavailable`, so a remote caller can start
+    requests and can never commit one. A converge inherits that whole; a
+    gate here would be a new guard where the convention already answers.
+  - **`mesh pair` adds no audit call of its own.** Auditing is per-dispatch
+    (`cli/src/dispatch.rs`), not per-ceremony — the record commits make no
+    `audit` call, and `aoide-client` makes none outside `adapter.rs`. So a
+    converge over five peers writes ONE line named `mesh.pair` where five
+    `aoide pair` runs write five. That coarsening is deliberate: a converge
+    audit line belongs to the pairing-audit-sweep slice (design record §7,
+    T4), which owns the three ceremony audit sites, not to this command.
 
 ## Extension points
 

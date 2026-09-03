@@ -274,24 +274,49 @@ never the inbound/serve half (that's `aoide-server`).
   (`origin_for_inject`, CONTRACTS.md §6) — a signed caller is a remote peer
   by construction and never rides Loopback's trust, so tunneled delivery is
   safe against a real, non-autogate peer, not merely possible.
-- `mesh` (task #135 P4) — `aoide mesh`: compares every declared
-  `[mesh.<name>]` (`aoide_storage::config::Mesh`, validated but not a
-  `config set`-reachable key — see `crates/storage/AGENTS.md`'s extension
-  points) against the live peer registry (`aoide_storage::peer_store::
-  load_peers`) and reports where they diverge. Own module, own `register`
-  (the `mcp_client::register_melete` precedent — a self-contained file, own
-  handler, own tests, appended last into `commands::all()`). The compare
-  itself, `drift`, is pure — no I/O, no clock, no env — so every ruling
-  (which class a mismatch falls into, that `allows` divergence is never one
-  of them, that an undeclared peer is reported, not accused) is a plain
-  unit test; `handle_mesh` is the only impure edge, resolving
-  `config::load()`/`peer_store::load_peers()`/`display::local_host_name()`
-  and handing the results in. Writes nothing — this is a report over two
-  read-only sources, never a third place either could drift from. Drift is
-  never itself a command failure: every class is surfaced in the message
-  and `data.report`, whatever it finds. The one exception is the read — a
-  config that fails to load returns `Outcome::error` (`data.reason`, no
-  `data.report`), same as any other command whose config read fails.
+- `mesh` (task #135 P4/P5) — `aoide mesh` and `aoide mesh pair`, the read
+  and the converge over a declared `[mesh.<name>]`
+  (`aoide_storage::config::Mesh`, validated but not a `config
+  set`-reachable key — see `crates/storage/AGENTS.md`'s extension points).
+  Own module, own `register` (the `mcp_client::register_melete` precedent —
+  a self-contained file, own handler, own tests, appended last into
+  `commands::all()`).
+
+  **The read.** `aoide mesh` compares the declaration against the live peer
+  registry (`aoide_storage::peer_store::load_peers`) and reports where they
+  diverge. The compare itself, `drift`, is pure — no I/O, no clock, no env
+  — so every ruling (which class a mismatch falls into, that `allows`
+  divergence is never one of them, that an undeclared peer is reported, not
+  accused) is a plain unit test; `handle_mesh` is the only impure edge,
+  resolving `config::load()`/`peer_store::load_peers()`/`display::
+  local_host_name()` and handing the results in. Writes nothing — a report
+  over two read-only sources, never a third place either could drift from.
+  Drift is never itself a command failure: every class is surfaced in the
+  message and `data.report`, whatever it finds. The one exception is the
+  read — a config that fails to load returns `Outcome::error`
+  (`data.reason`, no `data.report`), same as any other command whose config
+  read fails.
+
+  **The converge.** `aoide mesh pair [<mesh>]` runs that SAME `drift` — no
+  second comparison exists anywhere in the tree — and `plan` selects the
+  `missing` and `unverified` rows, in declared-name order. Each goes
+  through `commands::run_pair_request` and nothing else: the ordinary
+  two-POST ceremony, the ordinary park, the ordinary blocking wait, dialed
+  at `http://127.0.0.1:<default_a2a_port()>/` through the declared hop
+  (`resolve_dial_url` discards a logical url's host whenever a `via` is
+  set, so the loopback url is both correct and the record shape a paired
+  peer already carries). Zero ceremony logic lives in this module. A
+  `via-mismatch` comes back `skipped` — a converge NEVER modifies an
+  existing verified peer — which is what makes a second run all-`skipped`.
+  What the converge adds over N typed `aoide pair`s is the selection, ONE
+  pre-flight confirm for the whole run (`--yes` skips it, exactly as it
+  skips `pair`'s sweep proceed-prompt; the far operators still type codes),
+  the mesh's declared `grant` handed through as `PairFinish::grant`, and
+  one report in one vocabulary: completed / parked / UNREACHABLE / skipped.
+  `classify` folds each peer's envelope plus what `pairing::list_outbound`
+  says about it afterward — never a `data.reason` string — so `UNREACHABLE`
+  is exactly "nothing committed and nothing parked" and structurally
+  carries no resumable id.
 - `commands` — this crate's CLI commands:
   `peer add/remove/pull/status/hub/allow/spawn/discover`,
   `aoide pair` + `pair.reject`/`pair.watch` (P-P2, P-PV2, task #135 P3',
