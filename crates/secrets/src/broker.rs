@@ -247,7 +247,7 @@
 //! axis — and the three policy axes stay distinct: `remote` (may this
 //! secret be served through a NON-LOCAL entry point), `automation` (may a
 //! listed consumer skip TOTP), `allowRemoteOrigin` (may a session a REMOTE
-//! PEER created resolve this secret locally).
+//! NODE created resolve this secret locally).
 //!
 //! **`requireTotp` is wired live (P-V3).** [`resolve_gate`] rejects it
 //! outright ONLY when no `secrets enroll` has ever run on this host
