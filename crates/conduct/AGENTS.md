@@ -873,6 +873,21 @@
   absent `from` explicit-empty rather than let it fall through to their own
   process's ambient `AOIDE_SESSION_ID`), not the gate's own identity
   resolution.
+- **`build_graph`'s `conductable` node field is DERIVED at read time
+  (`doc.rs::is_conductable_now`), never the stored flag echoed verbatim.**
+  The STORED `SessionRecord.conductable` is a permanent fact about a
+  session's NATURE — it IS a conducted PTY wrap — and `window.rs`/`reap.rs`
+  classification (`is_agent_kind`, the lineage checks) keeps reading that
+  field directly; a session does not stop being a conducted wrap just
+  because its socket briefly vanished, so don't migrate or clear the stored
+  field to "fix" a stale report. But `shellbridge.service` owns
+  `$XDG_RUNTIME_DIR/aoide` with `RuntimeDirectoryPreserve=no`, so a rebuild
+  deletes a live session's socket file without ever touching the record —
+  every caller-facing report of conductability (`graph`'s JSON/tree,
+  `resolve_graph_document`'s federation wire response) additionally
+  requires the socket to still exist on disk, or the graph claims a session
+  is reachable when nothing can reach it. A missing or empty socket path is
+  not-conductable, the same shape `send.rs`'s own gate already filters for.
 
 ## Extension points
 

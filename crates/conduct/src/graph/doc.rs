@@ -15,6 +15,29 @@ use serde_json::Map;
 use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 
+/// Is `s` conductable RIGHT NOW, for a caller asking "can I reach this
+/// session" — the value `build_graph` (and `resolve_graph_document`'s
+/// federation wire response, which wraps it verbatim) reports. The STORED
+/// `conductable` flag is a permanent fact about the session's NATURE (it IS a
+/// conducted PTY wrap) and is never touched here: `window.rs`/`reap.rs`
+/// classification (`is_agent_kind`, the lineage checks) keeps reading
+/// `s.conductable` directly, because a session does not stop being a
+/// conducted wrap just because its socket briefly vanished. But
+/// `shellbridge.service` owns `$XDG_RUNTIME_DIR/aoide` with
+/// `RuntimeDirectoryPreserve=no`, so a rebuild deletes a live session's
+/// socket file out from under it without ever touching the record — a REPORT
+/// of conductability additionally needs the socket to still exist on disk, or
+/// the graph tells a caller it can reach a session nothing can actually reach.
+/// A missing or empty socket path is not-conductable, the same shape
+/// `send.rs`'s own gate already filters for.
+fn is_conductable_now(s: &SessionRecord) -> bool {
+    s.conductable == Some(true)
+        && s.socket
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .is_some_and(|p| std::path::Path::new(p).exists())
+}
+
 /// Build the fully resolved graph document (`graph.json` v0 shape). A session
 /// with a resolved parent carries only its `spawned` edge; root sessions carry
 /// an `anchors` edge to their longest-prefix project (or none, unanchored).
@@ -51,8 +74,11 @@ pub fn build_graph(
         // Conductor-channel fields ride onto the node only when present, so a
         // legacy/observe-only session stays byte-for-byte as before and the
         // conductor can distinguish conductable nodes + label by title.
-        if let Some(c) = s.conductable {
-            node["conductable"] = json!(c);
+        // `conductable` rides the DERIVED value (see `is_conductable_now`),
+        // not `s.conductable` verbatim — presence still gates on the stored
+        // field alone, so a legacy record stays byte-for-byte absent.
+        if s.conductable.is_some() {
+            node["conductable"] = json!(is_conductable_now(s));
         }
         if let Some(sock) = &s.socket {
             node["socket"] = json!(sock);
@@ -932,6 +958,83 @@ mod tests {
         let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
         assert_eq!(node_a["needsSudo"], json!(true));
         assert!(node_b.get("needsSudo").is_none());
+    }
+    #[test]
+    fn graph_reports_conductable_only_when_the_socket_still_exists_on_disk() {
+        // The read-time fix (`is_conductable_now`): `conductable` is the
+        // stored flag AND the socket path existing on disk, never the stored
+        // flag echoed verbatim. `shellbridge.service` owns
+        // `$XDG_RUNTIME_DIR/aoide` with `RuntimeDirectoryPreserve=no`, so a
+        // rebuild deletes a live session's socket file without ever touching
+        // the stored record — this is the regression that let `aoide graph
+        // --json` report a dead session conductable forever.
+        let dir = unique_stage("doc-conductable");
+        let sock = dir.join("session-a.sock");
+        std::fs::write(&sock, b"").unwrap();
+
+        let rec = SessionRecord {
+            session_id: "a".into(),
+            window_address: "0xaaa".into(),
+            conductable: Some(true),
+            socket: Some(sock.to_string_lossy().into_owned()),
+            ..Default::default()
+        };
+        let doc = build_graph(&[], &[rec.clone()], &[]);
+        let node = doc["nodes"].as_array().unwrap().iter().find(|n| n["id"] == "session:a").unwrap();
+        assert_eq!(node["conductable"], json!(true), "an existing socket reports conductable");
+
+        // The socket vanishes (a rebuild deleting the runtime dir) — the
+        // ORIGINAL record is never touched; only the REPORTED value changes.
+        std::fs::remove_file(&sock).unwrap();
+        let doc2 = build_graph(&[], &[rec.clone()], &[]);
+        let node2 = doc2["nodes"].as_array().unwrap().iter().find(|n| n["id"] == "session:a").unwrap();
+        assert_eq!(node2["conductable"], json!(false), "a removed socket reports NOT conductable");
+        assert_eq!(rec.conductable, Some(true), "the stored field is never modified by a read");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+    #[test]
+    fn graph_reports_not_conductable_with_no_socket_path() {
+        // A record with `conductable: Some(true)` but no socket at all — or
+        // an empty one — is not-conductable, the same shape `send.rs`'s own
+        // gate already filters for
+        // (`rec.socket.clone().filter(|s| !s.is_empty())`).
+        let no_socket = SessionRecord {
+            session_id: "a".into(),
+            window_address: "0xaaa".into(),
+            conductable: Some(true),
+            socket: None,
+            ..Default::default()
+        };
+        let empty_socket = SessionRecord {
+            session_id: "b".into(),
+            window_address: "0xbbb".into(),
+            conductable: Some(true),
+            socket: Some(String::new()),
+            ..Default::default()
+        };
+        let doc = build_graph(&[], &[no_socket, empty_socket], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node_a = nodes.iter().find(|n| n["id"] == "session:a").unwrap();
+        let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
+        assert_eq!(node_a["conductable"], json!(false));
+        assert_eq!(node_b["conductable"], json!(false));
+    }
+    #[test]
+    fn conducted_pty_host_classification_is_unaffected_by_a_missing_socket() {
+        // The regression this derivation must never cause: a REPORT going
+        // false when the socket vanishes must never leak into internal
+        // classification, which keeps reading the STORED field directly.
+        // `is_agent_kind` (reap.rs) never counts a conducted PTY host as an
+        // agent-duplicate candidate — true whether or not its socket exists.
+        let rec = SessionRecord {
+            session_id: "a".into(),
+            window_address: "0xaaa".into(),
+            conductable: Some(true),
+            socket: Some("/nonexistent/session-a.sock".into()),
+            ..Default::default()
+        };
+        assert!(!crate::reap::is_agent_kind(&rec));
     }
     #[test]
     fn build_graph_folds_a_fresh_node_as_a_root_node_with_nested_children() {
