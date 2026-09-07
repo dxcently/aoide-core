@@ -578,8 +578,8 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   read. `shellbridge::serve`'s accept loop (and `aoide-server`'s own
   `accept_loop`, over `aoide_secrets::peercred` — already `pub`, already a
   dependency, so no widening needed there) now refuses any connection whose
-  node uid doesn't match the process's own euid, fail-closed on an
-  unidentified node exactly like the secrets broker's `admin_gate`
+  peer uid doesn't match the process's own euid, fail-closed on an
+  unidentified peer exactly like the secrets broker's `admin_gate`
   precedent (`shellbridge::cross_uid_gate`/`daemon::cross_uid_gate`, pure
   and unit-tested without a real different-uid connection). **This is a
   CROSS-uid floor only** — under OQ1-A every legitimate connector on both
@@ -602,7 +602,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   the daemon's/`a2a serve`'s own ancestry, not the original caller's; in
   production that ancestry never resolves a live sealed session, so this
   already fails closed to `pending` by construction, not because either fix
-  re-derives the real caller's identity — threading the connecting node's
+  re-derives the real caller's identity — threading the connecting peer's
   pid into the gate itself would touch `send.rs`, out of this phase's scope
   fence.
 - **`session` (bare) — the ROSTER (session-surface redesign, command-defrag

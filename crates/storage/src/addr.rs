@@ -111,7 +111,7 @@ pub struct LocalCandidate<'a> {
 
 impl<'a> LocalCandidate<'a> {
     /// Build a candidate from a live `SessionRecord` plus its caller-derived
-    /// `role` — the ergonomic function Object() { [native code] } C2/C3 are expected to map their
+    /// `role` — the ergonomic constructor C2/C3 are expected to map their
     /// session slice through (mirrors `display::session_label`'s own
     /// `(rec, host, role)` argument shape). A caller that wants a "done"
     /// session excluded from resolution filters it out of the slice before

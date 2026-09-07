@@ -167,11 +167,11 @@ pub enum ParkOutcome {
 /// `peer_uid` (task #73) is the ORIGINAL requesting connection's
 /// kernel-truth `SO_PEERCRED` uid, stamped ONCE at park time
 /// (`ParkRegistry::park_if_room`'s own caller, `broker::handle_resolve`) —
-/// `None` when that connection's node cred could not be read
+/// `None` when that connection's peer cred could not be read
 /// (`peercred::peer_cred`'s own "unidentified, never a panic" contract).
 /// This is the one fact `broker::handle_dismiss`'s authorization check
 /// (#73) is keyed on: an ordinary caller may only dismiss an ask whose
-/// STAMPED `peer_uid` matches its OWN connection's node uid, never a
+/// STAMPED `peer_uid` matches its OWN connection's peer uid, never a
 /// self-asserted claim.
 pub struct ParkedAsk {
     pub secret: String,
@@ -481,9 +481,9 @@ mod tests {
         assert!(id.len() > "-1".len(), "the nonce half must be non-empty: {id:?}");
         let list = reg.list();
         assert_eq!(list.len(), 1);
-        // `park` (unbounded, no node info) always stamps `None` — only
+        // `park` (unbounded, no peer info) always stamps `None` — only
         // `park_if_room`'s real production caller (`broker::handle_resolve`)
-        // ever supplies a node uid.
+        // ever supplies a peer uid.
         assert_eq!(list[0], (id, "db-prod".to_string(), "m".to_string(), 1_700_000_000, None, None, AskOrigin::default()));
     }
 
@@ -553,7 +553,7 @@ mod tests {
     // ── peer_uid (task #73) ─────────────────────────────────────────────
 
     #[test]
-    fn park_if_room_stamps_the_given_node_uid_and_peek_returns_it() {
+    fn park_if_room_stamps_the_given_peer_uid_and_peek_returns_it() {
         let reg = ParkRegistry::new();
         let (id, _rx) = reg.park_if_room("t", "m", 1, usize::MAX, Some(4242), None, AskOrigin::default()).unwrap();
         assert_eq!(reg.peek(&id), Some(("t".to_string(), "m".to_string(), Some(4242))));
@@ -576,7 +576,7 @@ mod tests {
     }
 
     #[test]
-    fn park_if_room_with_no_node_uid_stamps_none() {
+    fn park_if_room_with_no_peer_uid_stamps_none() {
         let reg = ParkRegistry::new();
         let (id, _rx) = reg.park_if_room("t", "m", 1, usize::MAX, None, None, AskOrigin::default()).unwrap();
         assert_eq!(reg.peek(&id), Some(("t".to_string(), "m".to_string(), None)));

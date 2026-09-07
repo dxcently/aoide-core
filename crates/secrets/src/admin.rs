@@ -13,7 +13,7 @@
 //! — so the SAME function serves two entirely different callers with two
 //! entirely different gates: `commands.rs`'s direct-write fallback (reached
 //! only after `require_cli` + `require_admin_identity` already passed) and
-//! `broker::handle_admin` (reached only after its own node-uid-is-the-
+//! `broker::handle_admin` (reached only after its own peer-uid-is-the-
 //! broker's-own-euid gate already passed, `broker.rs`'s module doc). This
 //! module makes NO admin-identity decision of its own — the euid guard
 //! belongs entirely to whichever caller is invoking it, matching the

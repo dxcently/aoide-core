@@ -391,7 +391,7 @@ impl App {
         }
     }
 
-    /// Test-only function Object() { [native code] }: an App seeded from in-memory data, no disk. Lets
+    /// Test-only constructor: an App seeded from in-memory data, no disk. Lets
     /// the panel unit tests exercise pure rendering without a stage tree.
     #[cfg(test)]
     pub fn for_test(
@@ -406,7 +406,7 @@ impl App {
         app
     }
 
-    /// Test-only function Object() { [native code] }: like [`App::for_test`] but also wires a real
+    /// Test-only constructor: like [`App::for_test`] but also wires a real
     /// `DispatchFn` — the ROSTER throttle tests need to observe actual
     /// dispatch calls (a counting `fn`), not just render/select/navigate.
     #[cfg(test)]

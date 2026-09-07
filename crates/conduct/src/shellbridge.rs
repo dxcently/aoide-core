@@ -789,12 +789,12 @@ pub fn send_line(line: &str) -> std::io::Result<()> {
 /// and unit-tested without a real different-uid connection (same shape
 /// `aoide_secrets::broker::admin_gate` already holds: a plain `Option<u32>`
 /// in, an `Option<String>` refusal reason out). `None` (admitted) only when
-/// the node's kernel-attested uid equals `my_euid` — this process's OWN
+/// the peer's kernel-attested uid equals `my_euid` — this process's OWN
 /// euid, since shellbridge always runs as the operator's own uid, the SAME
 /// uid every legitimate connector already runs as (the QML herald/bar
 /// widgets, `aoide herald push` off dunst's script hook, `session permit`
 /// raising its own summons — every one of them same-uid, none of them a
-/// DIFFERENT uid). An unidentified node (`SO_PEERCRED` read failed) is
+/// DIFFERENT uid). An unidentified peer (`SO_PEERCRED` read failed) is
 /// refused the same fail-closed way a mismatched uid is, never treated as
 /// benign.
 ///
@@ -805,15 +805,15 @@ pub fn send_line(line: &str) -> std::io::Result<()> {
 /// `{"cmd":"heraldverdict",...}` is an OQ1-A-INHERENT residual this floor
 /// does not close — see `CONTRACTS.md`'s identity section for the honest
 /// statement of what remains open on the verdict door specifically.
-fn cross_uid_gate(node: Option<crate::graph::identity::PeerCred>, my_euid: u32) -> Option<String> {
-    match node {
+fn cross_uid_gate(peer: Option<crate::graph::identity::PeerCred>, my_euid: u32) -> Option<String> {
+    match peer {
         Some(p) if p.uid == my_euid => None,
         Some(p) => Some(format!(
-            "shellbridge connection refused: node uid {} does not match this process's own uid {my_euid}",
+            "shellbridge connection refused: peer uid {} does not match this process's own uid {my_euid}",
             p.uid
         )),
         None => Some(
-            "shellbridge connection refused: node uid could not be determined (SO_PEERCRED read failed)"
+            "shellbridge connection refused: peer uid could not be determined (SO_PEERCRED read failed)"
                 .to_string(),
         ),
     }
@@ -826,8 +826,8 @@ fn serve(listener: &UnixListener) {
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                let node = crate::graph::identity::peer_cred(&stream);
-                if let Some(reason) = cross_uid_gate(node, my_euid) {
+                let peer = crate::graph::identity::peer_cred(&stream);
+                if let Some(reason) = cross_uid_gate(peer, my_euid) {
                     let _ = daemon::audit(
                         &daemon::default_audit_log(),
                         daemon::Door::Daemon,
@@ -1000,14 +1000,14 @@ mod tests {
     }
 
     #[test]
-    fn cross_uid_gate_refuses_an_unidentified_node() {
+    fn cross_uid_gate_refuses_an_unidentified_peer() {
         // Fail-closed, never a benign default — the same posture
         // `admin_gate` holds for a `SO_PEERCRED` read that failed.
         assert!(cross_uid_gate(None, 1000).is_some());
     }
 
     /// End-to-end against a REAL socketpair (mirrors `identity.rs`'s own
-    /// `node_cred_on_a_scratch_socketpair_matches_this_processs_own_identity`):
+    /// `peer_cred_on_a_scratch_socketpair_matches_this_processs_own_identity`):
     /// a connection entirely local to this process reports THIS process's
     /// own euid, which `cross_uid_gate` then admits — proving the floor
     /// does not refuse the legitimate same-uid caller (the desktop QML, the
@@ -1016,9 +1016,9 @@ mod tests {
     #[test]
     fn a_real_same_process_socketpair_is_admitted() {
         let (a, _b) = std::os::unix::net::UnixStream::pair().expect("socketpair");
-        let node = crate::graph::identity::peer_cred(&a);
+        let peer = crate::graph::identity::peer_cred(&a);
         let my_euid = unsafe { libc::geteuid() };
-        assert_eq!(cross_uid_gate(node, my_euid), None);
+        assert_eq!(cross_uid_gate(peer, my_euid), None);
     }
 
     #[test]

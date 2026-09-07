@@ -98,7 +98,7 @@ pub struct Advertisement {
     pub user: String,
 }
 
-/// Build this instance's own advertisement — the ONE function Object() { [native code] }, so `v`
+/// Build this instance's own advertisement — the ONE constructor, so `v`
 /// can never drift from [`VERSION`] at a call site.
 pub fn build(name: &str, host: &str, user: &str) -> Advertisement {
     Advertisement {

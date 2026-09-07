@@ -682,7 +682,7 @@ pub fn put(socket_path: &Path, secret: &str, value: &str, overwrite: bool) -> Re
 /// direct-write path on ([`NoSocket`](AdminError::NoSocket)). Every other
 /// failure — a different connect error, a write/read failure, an
 /// unparseable reply, or the broker's own `{"ok":false}` domain denial
-/// (a bad admin-identity node uid, "no policy for secret x", a poisoned
+/// (a bad admin-identity peer uid, "no policy for secret x", a poisoned
 /// `policy.json`) — is [`Other`](AdminError::Other) and MUST be reported,
 /// never silently downgraded to a direct write: a live-but-sick daemon (a
 /// permission error, a saturated backlog `connect_bounded` gave up
@@ -1610,7 +1610,7 @@ mod tests {
         assert_eq!(ask.consumer, "m");
         // #73: a REAL socket connection's SO_PEERCRED is this same test
         // process's own euid (the resolving thread and this thread are one
-        // process) — proves the node uid survives the full accept ->
+        // process) — proves the peer uid survives the full accept ->
         // park -> pending round trip, not just the in-process unit tests.
         assert_eq!(ask.peer_uid, Some(unsafe { libc::geteuid() }));
 

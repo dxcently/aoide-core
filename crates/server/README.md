@@ -143,8 +143,8 @@ the inbound half of the two-door contract (the outbound half is
 - **The dispatch socket's own accept gets a cross-uid floor, and two
   attribution leaks close (LANE IDENTITY P-ID3).** `daemon::accept_loop`
   reads `aoide_secrets::peercred::peer_cred` on every accepted connection
-  and refuses one whose node uid doesn't match this daemon's own euid,
-  fail-closed on an unidentified node — the same `admin_gate` shape the
+  and refuses one whose peer uid doesn't match this daemon's own euid,
+  fail-closed on an unidentified peer — the same `admin_gate` shape the
   secrets broker already holds, restated here for this THIRD socket
   (`daemon::cross_uid_gate`, `shellbridge::cross_uid_gate` in
   `aoide-conduct`). Cross-uid only: every legitimate connector already

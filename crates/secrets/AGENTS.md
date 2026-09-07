@@ -112,11 +112,11 @@
   threads the same value into every op that connection sends — never
   re-read per line. A read failure is an UNIDENTIFIED connection (`None`),
   never a panic, never a fabricated uid. `park::ParkedAsk::peer_uid` stamps
-  the parking connection's node uid at park time (shown additively in
+  the parking connection's peer uid at park time (shown additively in
   `pending`'s `peerUid`); `broker::handle_dismiss` is the one place this
   fact gates a decision (`dismiss_authorized`, pure and unit-tested): an
   ordinary caller may only dismiss an ask whose stamped `peer_uid` matches
-  its OWN connection's node uid, or the broker's own effective uid
+  its OWN connection's peer uid, or the broker's own effective uid
   (`home::effective_uid()`) may always dismiss any ask. **Fail closed on
   any missing kernel fact** — an unidentified dismisser is NEVER
   authorized, even against an ask whose own `peer_uid` is also
@@ -124,7 +124,7 @@
   `approve` is UNCHANGED — it stays open to any local caller, gated by the
   TOTP code alone, never by identity. Every `audit_resolve`/`audit_park`/
   `audit_approve`/`audit_dismiss`/`audit_put` call now also carries the
-  acting connection's node uid, alongside (never replacing) the
+  acting connection's peer uid, alongside (never replacing) the
   self-asserted name it already carried. Don't read this as closing the
   `consumer`-self-assertion gap the ruling above and `CONTRACTS.md`'s
   honesty note describe — that gap is authenticated CONSUMER identity,
@@ -134,7 +134,7 @@
   `automation.consumers`/policy `consumers[]` matching as if it were an
   authenticated consumer name — it isn't one.
 - **The broker socket is the single writer for every admin CRUD mutation
-  when a daemon is listening (task #79, built on #73's node-cred gate) —
+  when a daemon is listening (task #79, built on #73's peer-cred gate) —
   direct-write-to-`policy.json` survives ONLY as the no-daemon fallback.**
   `crate::admin` is the ONE module holding every command's actual
   read-modify-write logic (`add`/`rm`/`grant`/`revoke`/`set_totp`/
@@ -152,7 +152,7 @@
   nothing listening). **Every other socket error is `AdminError::Other`
   and is reported outright, NEVER silently downgraded into the fallback**
   — this includes the broker's own authoritative `{"ok":false}` denial (a
-  bad admin-identity node uid, "no policy for secret x", a poisoned
+  bad admin-identity peer uid, "no policy for secret x", a poisoned
   `policy.json`): a live-but-sick daemon, or a daemon that correctly
   refused the request, must never be bypassed into a direct write racing
   underneath it. Don't add a command whose direct-write fallback re-derives
@@ -160,10 +160,10 @@
   point of this split is that ONE function's behavior is what BOTH paths
   give a caller, never two implementations that could drift.
   `broker::admin_gate` is the socket-side identity gate: an `{op:"admin"}`
-  request is accepted ONLY when the CONNECTING node's own uid is the
+  request is accepted ONLY when the CONNECTING peer's own uid is the
   broker's own effective uid — reusing `home::admin_identity_error`'s exact
   wording (root's "plain `sudo` runs as root" clause included) by treating
-  the node's uid as that function's "process euid" argument and the
+  the peer's uid as that function's "process euid" argument and the
   broker's own euid as its "home owner" argument, so a refusal here teaches
   the IDENTICAL fix the direct path already teaches, never a second
   wording for the same underlying check aimed at two different processes.
@@ -734,7 +734,7 @@
   every `policy.json`/backend-store read-modify-write this crate makes.**
   `commands.rs`'s own handlers (`admin_dispatch`) send an
   `{"op":"admin","command":...}` request over the socket FIRST; `broker::
-  handle_admin` node-cred-gates it (`admin_gate`, ONLY the broker's own
+  handle_admin` peer-cred-gates it (`admin_gate`, ONLY the broker's own
   effective uid — root and an unidentified connection both refused, the
   identical taught error `home::admin_identity_error` already gives on the
   direct path, since this reuses that exact function rather than a second

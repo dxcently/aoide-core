@@ -1,7 +1,7 @@
 //! LANE IDENTITY P-ID2 (`docs/architecture/CONTRACTS.md`'s identity
 //! section; plan file "LANE IDENTITY (#63)"'s thesis) — the kernel-truth
 //! primitives the send gate and the per-session control socket both build
-//! on: `SO_PEERCRED` for a connecting `UnixStream` node, and
+//! on: `SO_PEERCRED` for a connecting `UnixStream` peer, and
 //! [`attested_sender`], the pure decision function that walks a pid's real
 //! `/proc` ancestry to find the (verified) sealed session it is running
 //! under.
@@ -30,7 +30,7 @@ use super::model::SessionRecord;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixStream;
 
-/// Kernel-truth identity of a connected `UnixStream`'s node, from
+/// Kernel-truth identity of a connected `UnixStream`'s peer, from
 /// `SO_PEERCRED` — mirrors `aoide_secrets::peercred::PeerCred` exactly
 /// (task brief: a small local reimplementation is fine here, `libc`
 /// already this crate's dependency for the PTY/signal code in
@@ -447,7 +447,7 @@ mod tests {
     /// own test of the same shape, proving the local reimplementation here
     /// behaves identically).
     #[test]
-    fn node_cred_on_a_scratch_socketpair_matches_this_processs_own_identity() {
+    fn peer_cred_on_a_scratch_socketpair_matches_this_processs_own_identity() {
         let (a, b) = UnixStream::pair().expect("socketpair");
         let cred_a = peer_cred(&a).expect("SO_PEERCRED must be readable on a live socketpair");
         let cred_b = peer_cred(&b).expect("SO_PEERCRED must be readable on a live socketpair");

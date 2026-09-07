@@ -71,7 +71,7 @@
 //! line sent with no trailing newline can no longer grow this connection's
 //! own buffer past [`MAX_REQUEST_LINE_BYTES`] while the client keeps
 //! streaming it — the connection is dropped (with one error reply, when a
-//! node is still there to receive it) the instant the cap is crossed, never
+//! peer is still there to receive it) the instant the cap is crossed, never
 //! only after EOF or a newline finally shows up.
 //!
 //! ## The events feed (P-D2)
@@ -683,7 +683,7 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()
 }
 
 /// How [`read_capped_line`] failed — the two cases [`handle_conn`]'s caller
-/// tells apart, since only one of them still has a node worth replying to.
+/// tells apart, since only one of them still has a peer worth replying to.
 enum LineReadError {
     /// A real I/O read error (`fill_buf` itself failed) — no reply is
     /// attempted. Invalid UTF-8 is a SEPARATE case this variant does not
@@ -781,7 +781,7 @@ fn read_capped_line(reader: &mut BufReader<UnixStream>, cap: usize) -> Result<Op
 /// with no `--yes`/autogate ALREADY fails closed to `pending` today — not
 /// because anything here re-derives the connecting client's real identity
 /// (it doesn't), but because the daemon's own ancestry is architecturally
-/// incapable of impersonating one. Threading the connecting node's real
+/// incapable of impersonating one. Threading the connecting peer's real
 /// pid into the gate so a dispatched `send` resolves the ACTUAL caller
 /// (rather than merely failing closed) would touch `send.rs`'s gate
 /// itself — out of this phase's scope fence; see `CONTRACTS.md`'s identity
@@ -852,10 +852,10 @@ pub fn serve_daemon(
 /// `aoide_secrets::broker::admin_gate` and `aoide_conduct::shellbridge::
 /// cross_uid_gate` exactly — the SAME decision restated at this third
 /// socket, not a fourth wording for it). `None` (admitted) only when the
-/// node's kernel-attested uid equals `my_euid` — this daemon's OWN euid,
+/// peer's kernel-attested uid equals `my_euid` — this daemon's OWN euid,
 /// since every legitimate connector (the CLI's `daemon_dispatch` proxy, a
 /// hook's `session hook`, the conductor) already runs as the SAME uid this
-/// process does. An unidentified node (`SO_PEERCRED` read failed) is
+/// process does. An unidentified peer (`SO_PEERCRED` read failed) is
 /// refused the same fail-closed way a mismatched uid is.
 ///
 /// **This closes a CROSS-uid gap only.** It does not, and was never meant
@@ -863,15 +863,15 @@ pub fn serve_daemon(
 /// — see [`invocation_from_dispatch_request`]'s own doc for the SEPARATE
 /// attribution fix (G8's other half) and `CONTRACTS.md`'s identity section
 /// for the honest accounting of what remains open.
-fn cross_uid_gate(node: Option<aoide_secrets::peercred::PeerCred>, my_euid: u32) -> Option<String> {
-    match node {
+fn cross_uid_gate(peer: Option<aoide_secrets::peercred::PeerCred>, my_euid: u32) -> Option<String> {
+    match peer {
         Some(p) if p.uid == my_euid => None,
         Some(p) => Some(format!(
-            "aoided dispatch connection refused: node uid {} does not match this daemon's own uid {my_euid}",
+            "aoided dispatch connection refused: peer uid {} does not match this daemon's own uid {my_euid}",
             p.uid
         )),
         None => Some(
-            "aoided dispatch connection refused: node uid could not be determined (SO_PEERCRED read failed)"
+            "aoided dispatch connection refused: peer uid could not be determined (SO_PEERCRED read failed)"
                 .to_string(),
         ),
     }
@@ -889,8 +889,8 @@ fn accept_loop(
     for conn in listener.incoming() {
         match conn {
             Ok(stream) => {
-                let node = aoide_secrets::peercred::peer_cred(&stream);
-                if let Some(reason) = cross_uid_gate(node, my_euid) {
+                let peer = aoide_secrets::peercred::peer_cred(&stream);
+                if let Some(reason) = cross_uid_gate(peer, my_euid) {
                     let _ = audit(
                         &aoide_protocol::default_audit_log(),
                         Door::Daemon,
@@ -957,7 +957,7 @@ fn handle_conn(
                 );
                 return; // Oversized line → error, drop connection (module doc).
             }
-            Err(LineReadError::Io) => return, // Read error/invalid UTF-8: no node left to usefully reply to.
+            Err(LineReadError::Io) => return, // Read error/invalid UTF-8: no peer left to usefully reply to.
         };
         let Ok(line) = String::from_utf8(line_bytes) else {
             return; // Invalid UTF-8 — mirrors `read_line`'s own Err(_) => return path.
@@ -1319,7 +1319,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_uid_gate_refuses_an_unidentified_node() {
+    fn cross_uid_gate_refuses_an_unidentified_peer() {
         // Fail-closed, never a benign default — the same posture
         // `aoide_secrets::broker::admin_gate` holds for a `SO_PEERCRED` read
         // that failed.
@@ -1335,9 +1335,9 @@ mod tests {
     #[test]
     fn a_real_same_process_socketpair_is_admitted() {
         let (a, _b) = UnixStream::pair().expect("socketpair");
-        let node = aoide_secrets::peercred::peer_cred(&a);
+        let peer = aoide_secrets::peercred::peer_cred(&a);
         let my_euid = unsafe { libc::geteuid() };
-        assert_eq!(cross_uid_gate(node, my_euid), None);
+        assert_eq!(cross_uid_gate(peer, my_euid), None);
     }
 
     // ── invocation_from_dispatch_request (LANE IDENTITY P-ID3, G8) ──────
