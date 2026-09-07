@@ -446,9 +446,10 @@ by decision — no embedded database yet
   sha256 `msgid` over the signed bytes — MAIL.md's "The envelope" is the
   formula). Every write funnels through one `with_lock` choke point —
   under `fs::try_stage_lock`, migrate a legacy `inbox.json` if not yet
-  done, truncate any torn tail, append, fsync, then append `seen.jsonl` —
-  so a crash between the two appends is re-accepted next time, never
-  lost. `mail::file_receipt` is the shared seam both `conduct`'s
+  done (skipping any row whose `msgid` is already in `seen.jsonl`, so a
+  retry after a crash mid-migration never re-files one), truncate any torn
+  tail, append, fsync, then append `seen.jsonl` — so a crash between the
+  two appends is re-accepted next time, never lost. `mail::file_receipt` is the shared seam both `conduct`'s
   `deliver_local` and the A2A door's `spawn_inject_prompt` file a
   delivered message through; `mail::file_letter` is `mail send`'s own
   engine. Keep-all: `mail rm --older-than` is the only pruning, and it

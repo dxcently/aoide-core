@@ -34,7 +34,13 @@ other crate in this workspace sits above.
   value); `append_audit` structurally forbids `untrusted_data` on that one
   class, stripping it (with an `eprintln!`, never a panic — an audit call
   must never take its caller down) rather than trusting every call site to
-  never set it.
+  never set it. `append_audit` also clamps `AuditRecord.message` to 512
+  bytes on a UTF-8 boundary, appending a truncation marker when it clamps:
+  the log records that an operation happened, not what it printed, so a
+  command whose outcome message is also its rendered output (`aoide mail
+  show`'s whole letter) never leaves a second, unbounded copy sitting in
+  the log. Only the stored copy is bounded — the `Outcome` itself, and
+  every door's human/JSON rendering of it, is untouched.
 - `door` — the hand-rolled parse → dispatch → render run loop (`run`),
   parameterized by a `special` hook so each binary's one-shot exceptions
   (`mcp serve --stdio`, `a2a serve`, `conductor`, `guide`/`schema` raw

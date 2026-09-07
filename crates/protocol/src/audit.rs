@@ -119,6 +119,39 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// The audit log records that an operation happened, not what it printed.
+/// A command's `Outcome` message is both its human output and (via
+/// `dispatch.rs`'s generic per-dispatch audit call) its audit payload, so a
+/// command that renders content as its message — `aoide mail show`'s whole
+/// letter, `mail read`'s every printed entry — would otherwise leave an
+/// unbounded second copy sitting in `~/.aoide/log`, one the mailbase's own
+/// `mail rm --older-than` can never reach. [`append_audit`] clamps to this
+/// bound instead of trusting every future message-bearing command to stay
+/// short on its own.
+const STORED_MESSAGE_MAX_BYTES: usize = 512;
+
+/// Appended once a stored message is cut short — never counted against
+/// [`STORED_MESSAGE_MAX_BYTES`] itself, so a maximally clamped message is
+/// that many content bytes plus this marker, not fewer.
+const STORED_MESSAGE_TRUNCATION_MARKER: &str = " … (truncated)";
+
+/// `Some(clamped)` when `msg` is over [`STORED_MESSAGE_MAX_BYTES`]; `None`
+/// when it already fits and nothing about it changes. Cuts on the last
+/// UTF-8 character boundary at or before the bound — never mid-codepoint —
+/// so the result is always valid `str` before the marker is appended.
+fn clamp_stored_message(msg: &str) -> Option<String> {
+    if msg.len() <= STORED_MESSAGE_MAX_BYTES {
+        return None;
+    }
+    let mut cut = STORED_MESSAGE_MAX_BYTES;
+    while cut > 0 && !msg.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    let mut clamped = msg[..cut].to_string();
+    clamped.push_str(STORED_MESSAGE_TRUNCATION_MARKER);
+    Some(clamped)
+}
+
 /// Append one JSON-lines record to the single audit log (real code path).
 /// Creates the parent directory and the file if absent; idempotent per-call.
 ///
@@ -135,15 +168,28 @@ pub fn now_secs() -> u64 {
 /// at every call site in this workspace (a logging failure must never take
 /// the caller down with it); this guard keeps that posture rather than
 /// trading a data-shape mistake for a crashed process.
+///
+/// **`message` is clamped to [`STORED_MESSAGE_MAX_BYTES`]** the same way,
+/// and for the same reason: the bound belongs here, once, so every door and
+/// every future caller inherits it rather than each remembering to clamp
+/// its own outcome message before logging it. Only the STORED copy is
+/// bounded — the caller's own `Outcome` is never touched, so human and
+/// JSON output keep printing in full.
 pub fn append_audit(log_path: &Path, record: &AuditRecord) -> std::io::Result<()> {
+    let strip_secret = record.class == EventClass::Secret && record.untrusted_data.is_some();
+    let clamped_message = clamp_stored_message(&record.message);
+
     let owned;
-    let record: &AuditRecord = if record.class == EventClass::Secret && record.untrusted_data.is_some() {
-        eprintln!(
-            "[aoide/protocol] BUG: an EventClass::Secret audit record carried untrusted_data — stripping it before writing (command: {})",
-            record.command
-        );
+    let record: &AuditRecord = if strip_secret || clamped_message.is_some() {
+        if strip_secret {
+            eprintln!(
+                "[aoide/protocol] BUG: an EventClass::Secret audit record carried untrusted_data — stripping it before writing (command: {})",
+                record.command
+            );
+        }
         owned = AuditRecord {
-            untrusted_data: None,
+            message: clamped_message.unwrap_or_else(|| record.message.clone()),
+            untrusted_data: if strip_secret { None } else { record.untrusted_data.clone() },
             ..record.clone()
         };
         &owned
@@ -264,6 +310,69 @@ mod tests {
         append_audit(&log, &record).unwrap();
         let lines = read_lines(&log);
         assert_eq!(lines[0]["untrusted_data"], "some app title");
+        std::fs::remove_dir_all(log.parent().unwrap()).ok();
+    }
+
+    fn record_with_message(message: String) -> AuditRecord {
+        AuditRecord {
+            ts: now_secs(),
+            door: Door::Cli,
+            class: EventClass::Audit,
+            command: "mail.show".to_string(),
+            status: "ok".to_string(),
+            message,
+            untrusted_data: None,
+        }
+    }
+
+    /// A message at or under the bound is stored byte-for-byte — no marker,
+    /// no truncation, the common case for nearly every command.
+    #[test]
+    fn a_message_within_the_bound_is_stored_verbatim_with_no_marker() {
+        let log = tmp_log("short");
+        let record = record_with_message("mark: cursor marked through seq 3".to_string());
+        append_audit(&log, &record).unwrap();
+        let lines = read_lines(&log);
+        assert_eq!(lines[0]["message"], "mark: cursor marked through seq 3");
+        std::fs::remove_dir_all(log.parent().unwrap()).ok();
+    }
+
+    /// A message over the bound is cut to exactly `STORED_MESSAGE_MAX_BYTES`
+    /// content bytes and carries the marker — this is the leak `mail show`
+    /// exposed: an outcome message that IS the rendered letter now leaves
+    /// only a bounded trace in the log, never the whole text.
+    #[test]
+    fn a_message_over_the_bound_is_clamped_and_carries_the_truncation_marker() {
+        let log = tmp_log("long");
+        let record = record_with_message("a".repeat(600));
+        append_audit(&log, &record).unwrap();
+        let lines = read_lines(&log);
+        let stored = lines[0]["message"].as_str().unwrap().to_string();
+        assert_eq!(stored.len(), STORED_MESSAGE_MAX_BYTES + STORED_MESSAGE_TRUNCATION_MARKER.len());
+        assert!(stored.starts_with(&"a".repeat(STORED_MESSAGE_MAX_BYTES)));
+        assert!(stored.ends_with(STORED_MESSAGE_TRUNCATION_MARKER));
+        std::fs::remove_dir_all(log.parent().unwrap()).ok();
+    }
+
+    /// A message whose byte 512 falls inside a multi-byte character clamps
+    /// on the boundary BELOW it, never mid-codepoint, and the record still
+    /// round-trips as valid JSON — the whole point of cutting on a boundary
+    /// rather than a raw byte offset.
+    #[test]
+    fn clamping_a_split_codepoint_lands_on_the_boundary_below_it_and_still_parses() {
+        let log = tmp_log("boundary");
+        let mut message = "a".repeat(511);
+        message.push('€'); // 3-byte UTF-8 char starting at byte 511: occupies 511..514
+        message.push_str(&"b".repeat(100));
+        assert!(!message.is_char_boundary(STORED_MESSAGE_MAX_BYTES), "the fixture must actually straddle byte 512");
+        let record = record_with_message(message);
+        append_audit(&log, &record).unwrap();
+
+        let raw = std::fs::read_to_string(&log).unwrap();
+        let parsed: serde_json::Value =
+            serde_json::from_str(raw.lines().next().unwrap()).expect("clamped record still parses as JSON");
+        let stored = parsed["message"].as_str().unwrap();
+        assert_eq!(stored, format!("{}{}", "a".repeat(511), STORED_MESSAGE_TRUNCATION_MARKER));
         std::fs::remove_dir_all(log.parent().unwrap()).ok();
     }
 }

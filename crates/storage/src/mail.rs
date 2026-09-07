@@ -81,7 +81,7 @@ use crate::stage::{load_stage, write_stage};
 use crate::time::{now_iso_utc, parse_iso_utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Write as _;
 use std::path::PathBuf;
 
@@ -347,6 +347,13 @@ fn ensure_mail_dir() -> Result<(), String> {
 /// not carried (ruling 8: every migrated entry is unread once); `context`
 /// is dropped too (ruling 7) — [`LegacyInboxEntry`] never declares either
 /// field, so there is nothing to carry even by accident.
+///
+/// A crash between appending row N and the rename below leaves `inbox.json`
+/// in place, so a retry re-enters this same loop over the same rows —
+/// [`seal`] is deterministic, so a row already filed recomputes the exact
+/// same `msgid`. Reading `seen.jsonl` into a set ONCE before the loop and
+/// skipping a row already in it is what makes that retry file each legacy
+/// row exactly once instead of duplicating rows `1..N`.
 fn migrate_if_needed() -> Result<(), String> {
     let old_path = legacy_inbox_path();
     let raw = match std::fs::read_to_string(&old_path) {
@@ -359,6 +366,7 @@ fn migrate_if_needed() -> Result<(), String> {
 
     let node = display::local_host_name();
     let (kp, _) = identity::load_or_mint().map_err(|e| e.to_string())?;
+    let already_seen = read_seen_msgids_unlocked()?;
 
     for row in &legacy.entries {
         let header = Header {
@@ -370,6 +378,9 @@ fn migrate_if_needed() -> Result<(), String> {
             origin_mesh: String::new(),
         };
         let (sig, msgid) = seal(&header, &row.text, &kp);
+        if already_seen.contains(&msgid) {
+            continue;
+        }
         let envelope = Envelope { header, text: row.text.clone(), sig, msgid: msgid.clone() };
         let entry = Entry {
             seq: next_seq()?,
@@ -408,6 +419,21 @@ fn read_entries_unlocked() -> Result<Vec<Entry>, String> {
         Err(e) => return Err(format!("{}: {e}", path.display())),
     };
     Ok(raw.lines().filter_map(|l| serde_json::from_str::<Entry>(l).ok()).collect())
+}
+
+/// Tolerant whole-file read of `seen.jsonl`'s `msgid` column into a set —
+/// same skip-malformed-lines contract as [`read_entries_unlocked`]. Raw —
+/// assumes the caller already holds the lock. [`migrate_if_needed`] reads
+/// this ONCE before its row loop, not per row, so retrying after a crash
+/// mid-migration stays one lookup per row rather than one file read.
+fn read_seen_msgids_unlocked() -> Result<HashSet<String>, String> {
+    let path = seen_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    Ok(raw.lines().filter_map(|l| serde_json::from_str::<SeenEntry>(l).ok()).map(|s| s.msgid).collect())
 }
 
 /// `last line's seq + 1`, read under the lock (MAIL.md "Store"). Raw —
@@ -959,6 +985,71 @@ mod tests {
         assert_eq!(all[1].envelope.header.from.name, "");
 
         assert!(!legacy_inbox_path().exists(), "the old file is renamed away");
+        assert!(state_dir().join("inbox.json.migrated").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_migration_interrupted_after_some_rows_files_each_legacy_row_exactly_once_on_retry() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("migration-retry");
+
+        let legacy = serde_json::json!({
+            "entries": [
+                { "from": "alice", "target": "sess-1", "text": "first", "receivedAt": "2026-08-21T00:00:00Z" },
+                { "from": "bob", "target": "sess-2", "text": "second", "receivedAt": "2026-08-21T00:01:00Z" }
+            ]
+        });
+        std::fs::create_dir_all(state_dir()).unwrap();
+        std::fs::write(legacy_inbox_path(), serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        // Simulate a crash after row 1 was filed but before the rename:
+        // hand-build exactly the entry a first partial attempt would have
+        // produced for row 1, and seed base.jsonl/seen.jsonl with it
+        // directly. inbox.json stays present, as it would after a real
+        // crash — nothing here goes through `migrate_if_needed`.
+        std::fs::create_dir_all(mail_dir()).unwrap();
+        let node = display::local_host_name();
+        let (kp, _) = identity::load_or_mint().unwrap();
+        let row1_header = Header {
+            version: ENVELOPE_VERSION.to_string(),
+            from: Address { node: node.clone(), name: "alice".to_string() },
+            to: Address { node: node.clone(), name: "sess-1".to_string() },
+            kind: ENTRY_TYPE_RECEIPT.to_string(),
+            minted_at: "2026-08-21T00:00:00Z".to_string(),
+            origin_mesh: String::new(),
+        };
+        let (sig, row1_msgid) = seal(&row1_header, "first", &kp);
+        let row1_entry = Entry {
+            seq: 1,
+            received_at: "2026-08-21T00:00:00Z".to_string(),
+            kind: ENTRY_TYPE_RECEIPT.to_string(),
+            via: "self".to_string(),
+            envelope: Envelope { header: row1_header, text: "first".to_string(), sig, msgid: row1_msgid.clone() },
+        };
+        std::fs::write(base_path(), format!("{}\n", serde_json::to_string(&row1_entry).unwrap())).unwrap();
+        std::fs::write(
+            seen_path(),
+            format!(
+                "{}\n",
+                serde_json::to_string(&SeenEntry {
+                    msgid: row1_msgid.clone(),
+                    received_at: "2026-08-21T00:00:00Z".to_string()
+                })
+                .unwrap()
+            ),
+        )
+        .unwrap();
+
+        // Retry: inbox.json is still present, exactly as after a crash.
+        let all = read_base().unwrap();
+        assert_eq!(all.len(), 2, "row 1 must not be duplicated, row 2 must be filed");
+        assert_eq!(all[0].envelope.msgid, row1_msgid, "the pre-seeded row 1 is untouched");
+        assert_eq!(all[1].envelope.header.from.name, "bob");
+        assert_eq!(all[1].envelope.text, "second");
+
+        assert!(!legacy_inbox_path().exists(), "the retry still completes the rename");
         assert!(state_dir().join("inbox.json.migrated").exists());
 
         let _ = std::fs::remove_dir_all(&dir);
