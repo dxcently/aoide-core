@@ -54,8 +54,9 @@ discover [--secs N]`/`node advertise on|off`, P-P6 + task #120, the LAN
 discovery advertisement's read-only sweep (`pair`'s own hostname arm
 is the sugar-over-the-ceremony half, P-PV2), and this instance's
 own advertise switch), presence, the
-daemon, its own event bus (`events tail`), usage, hooks, the message
-inbox, the secrets broker, this instance's own `identity` (P-P1 of the
+daemon, its own event bus (`events tail`), usage, hooks, mail (the
+addressed, signed, append-only mailbase), the secrets broker, this
+instance's own `identity` (P-P1 of the
 pairing workstream, `docs/architecture/PAIRING.md`)).
 Never depends on
 `aoide-song`/`aoide-screen` — painting is `lyra`'s bundle, assembled the

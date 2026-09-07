@@ -239,6 +239,13 @@ mod tests {
         // renames all ten `peer.*` paths to `node.*` in place — hard
         // cutover, no aliases, same shape `node.invite`'s own retirement
         // set. Net: 81 (unchanged).
+        //
+        // Messaging plan P-M1 (docs/architecture/MAIL.md) retires
+        // `inbox.clear`/`inbox.list`/`inbox.read` (-3) and adds the
+        // addressed, signed, append-only mailbase's six commands: bare
+        // `mail`, `mail.mark`, `mail.read`, `mail.rm`, `mail.send`,
+        // `mail.show` (+6) — same alphabetical slot the retired `inbox.*`
+        // trio held, between `identity` and `make`. Net: 81 - 3 + 6 = 84.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -258,9 +265,12 @@ mod tests {
             "guide",
             "hooks.install",
             "identity",
-            "inbox.clear",
-            "inbox.list",
-            "inbox.read",
+            "mail",
+            "mail.mark",
+            "mail.read",
+            "mail.rm",
+            "mail.send",
+            "mail.show",
             "make",
             "mcp.serve",
             "melete.call",

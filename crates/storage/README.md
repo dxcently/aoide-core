@@ -212,7 +212,7 @@ by decision — no embedded database yet
   `aoide-secrets::park::park_if_room` holds); `park_outbound`
   is uncapped (operator-created, one per `aoide pair` call). Every
   mutator of either park file runs its whole load-modify-write under
-  `fs::with_stage_lock` — the same flock `inbox::receive` reuses for a
+  `fs::with_stage_lock` — the same flock `mail`'s writer resolves for a
   `state/` file — so the `a2a serve` process and a concurrent CLI never
   race each other's read-modify-write on
   `state/node-pairing-{inbound,outbound}.json`. One live parked request
@@ -439,16 +439,20 @@ by decision — no embedded database yet
   a tested library function only; `send --to`'s live call site still
   calls plain `resolve` (the same "land the function, wire a caller later"
   order this module's own tier-5 `node/<rest>` grammar went through).
-- `inbox` — the durable per-host message store (messaging plan P-C6,
-  `state/inbox.json`, CONTRACTS.md §4): every message that lands in a local
-  session, filed by `conduct`'s `deliver_local` success path — the ONE
-  writer that covers a direct `send`, a `--to` local resolve, a
-  `pending approve` re-drive, AND the A2A server's `do_inject` (which
-  reaches `deliver_local` through the same `session_send` door). Capped at
-  200, oldest-drop, atomic writes (`herald::LEDGER_CAP`'s fold-and-cap
-  precedent). `context` is an opaque `serde_json::Value` passthrough
-  reserved for a future Mneme (memory-manager) integration — v0 never reads
-  it.
+- `mail` — the addressed, signed, append-only mailbase (messaging plan
+  P-M1, `docs/architecture/MAIL.md`, CONTRACTS.md §4's `state/mail/`
+  subsection): `base.jsonl`/`cursors.json`/`seen.jsonl` under
+  `state/mail/`, one entry per envelope (header, text, ed25519 `sig`,
+  sha256 `msgid` over the signed bytes — MAIL.md's "The envelope" is the
+  formula). Every write funnels through one `with_lock` choke point —
+  under `fs::try_stage_lock`, migrate a legacy `inbox.json` if not yet
+  done, truncate any torn tail, append, fsync, then append `seen.jsonl` —
+  so a crash between the two appends is re-accepted next time, never
+  lost. `mail::file_receipt` is the shared seam both `conduct`'s
+  `deliver_local` and the A2A door's `spawn_inject_prompt` file a
+  delivered message through; `mail::file_letter` is `mail send`'s own
+  engine. Keep-all: `mail rm --older-than` is the only pruning, and it
+  never touches `seen.jsonl`.
 - `identity` — this instance's lazily-minted ed25519 keypair (pairing
   workstream P-P1, `docs/architecture/PAIRING.md`, CONTRACTS.md §4's
   `state/identity/` subsection): `state/identity/ed25519.key` (the raw
@@ -561,7 +565,7 @@ by decision — no embedded database yet
   construction, since this module cannot write a node record even if a
   caller wanted it to.
 - `commands` — this crate's CLI commands: `usage` (local token/cost rollup),
-  `inbox list|read|clear` (the store above's CLI surface), `identity`
+  `mail send|read|show|mark|rm` (the store above's CLI surface), `identity`
   (the module above's CLI surface), and `config`/`config set` (the config
   module's — `config` prints the effective values, the path they resolved
   from, and whether it is managed or unmanaged; `config set` is the one

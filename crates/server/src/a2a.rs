@@ -845,20 +845,20 @@ fn submitted_task(session_id: &str) -> Value {
 /// synchronous JSON-RPC caller gets an honest immediate response;
 /// `tasks/get`/the SSE stream reflect the real session state once/if a
 /// human approves and delivers it.
-/// **Messaging plan P-C6, `state/inbox.json`**: this function files NO inbox
-/// entry of its own. It builds a `send --id` [`Invocation`] and calls
-/// [`session_send`] just like `send` itself does — and since this
+/// **Messaging plan P-M1, `state/mail/base.jsonl`**: this function files NO
+/// mailbase entry of its own. It builds a `send --id` [`Invocation`] and
+/// calls [`session_send`] just like `send` itself does — and since this
 /// invocation never carries a `--to` flag, `session_send` can only ever
 /// reach its LOCAL branch (`deliver_local`), which is one of the two places
 /// a delivered message gets filed (`aoide_conduct::graph::send::deliver_local`
-/// — see `aoide_storage::inbox`'s module doc, and [`spawn_inject_prompt`]
+/// — see `aoide_storage::mail`'s module doc, and [`spawn_inject_prompt`]
 /// for the OTHER site: a brand-new spawned session's first turn, which
 /// cannot go through `deliver_local` at all — this function only ever
 /// injects into an ALREADY-REGISTERED session). So a remote node's message
-/// into an existing session lands in the inbox through the exact same call
-/// `do_inject` already makes below; adding a second append here would
+/// into an existing session lands in the mailbase through the exact same
+/// call `do_inject` already makes below; adding a second append here would
 /// double-file every A2A-delivered message. See
-/// `a_successfully_delivered_message_send_files_into_the_inbox` below for
+/// `a_successfully_delivered_message_send_files_into_the_mailbase` below for
 /// the end-to-end proof.
 fn do_inject(
     session_id: &str,
@@ -942,15 +942,15 @@ fn do_inject(
 /// registry here would just trade the socket race for a registration race,
 /// so this stays on the raw socket path it already computed.
 ///
-/// **Messaging plan P-C6, `state/inbox.json`**: because of the above, this
-/// is the SECOND (and last) inbox-filing site in the tree, alongside
-/// `deliver_local`'s (see `aoide_storage::inbox`'s module doc) — a spawned
+/// **Messaging plan P-M1, `state/mail/base.jsonl`**: because of the above,
+/// this is the SECOND (and last) mailbase-filing site in the tree, alongside
+/// `deliver_local`'s (see `aoide_storage::mail`'s module doc) — a spawned
 /// session's first turn can never reach `deliver_local`, so it has to file
 /// itself. `from` is empty: the a2a door has no caller identity to offer
 /// today (#51's scope), same reasoning [`do_inject`]'s callers rely on.
 /// Best-effort, same tolerance as the rest of this function — a write error
 /// above is already swallowed (the retry loop only confirms a bound socket,
-/// never delivery), so a failed inbox write is no less tolerated.
+/// never delivery), so a failed mailbase write is no less tolerated.
 fn spawn_inject_prompt(id: &str, prompt: &str) {
     if prompt.is_empty() {
         return;
@@ -962,7 +962,7 @@ fn spawn_inject_prompt(id: &str, prompt: &str) {
             if let Ok(mut s) = UnixStream::connect(&socket) {
                 let _ = s.write_all(payload.as_bytes());
                 let _ = s.flush();
-                let _ = aoide_storage::inbox::receive("", id, prompt, None);
+                let _ = aoide_storage::mail::file_receipt("", id, prompt);
                 return;
             }
         }
@@ -4686,7 +4686,7 @@ mod tests {
     // WHICH rung resolved the caller) covers token-rung-admitted /
     // addr-rung-refused, both directly against fixtures — never through
     // `message_send`/`do_spawn`, which would actually launch a process (see
-    // `spawn_inject_prompts_success_branch_files_the_opening_turn_into_the_inbox`'s
+    // `spawn_inject_prompts_success_branch_files_the_opening_turn_into_the_mailbase`'s
     // own doc comment on why no test in this file drives `do_spawn`'s real
     // OS-level spawn). The integration tests below drive `message_send`
     // itself for the REFUSAL branches, which never reach `do_spawn` at all.
@@ -5324,7 +5324,7 @@ mod tests {
     /// NodeRung::Signature))`) — really admits it. This file's own
     /// established discipline (see the doc comment atop the "Spawn gate
     /// table" section above, and `spawn_inject_prompts_success_branch_
-    /// files_the_opening_turn_into_the_inbox`'s) is that NO test here drives
+    /// files_the_opening_turn_into_the_mailbase`'s) is that NO test here drives
     /// `do_spawn`'s real process spawn, because `std::env::current_exe()`
     /// inside a `cargo test` binary is the TEST binary, not a real `aoide`
     /// — calling `message_send`'s Spawn arm all the way through on the
@@ -6003,15 +6003,15 @@ mod tests {
     }
 
     #[test]
-    fn a_successfully_delivered_message_send_files_into_the_inbox() {
-        // Messaging plan P-C6: `do_inject` files no entry of its own (see its
+    fn a_successfully_delivered_message_send_files_into_the_mailbase() {
+        // Messaging plan P-M1: `do_inject` files no entry of its own (see its
         // doc comment) — this proves the SHARED seam actually fires for an
         // A2A-delivered message, end to end through `message_send`.
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
-            "aoide-a2a-inbox-{}-{}",
+            "aoide-a2a-mail-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
@@ -6023,7 +6023,7 @@ mod tests {
         std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
         std::env::remove_var("AOIDE_SESSION_ID");
 
-        let id = "inbox-a2a-target";
+        let id = "mail-a2a-target";
         let socket = aoide_conduct::graph::conduct_socket_path(id);
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
@@ -6050,14 +6050,14 @@ mod tests {
         let _ = acc.join().unwrap();
         assert!(result.is_ok(), "{:?}", result.err());
 
-        let file = aoide_storage::inbox::load().unwrap();
-        assert_eq!(file.entries.len(), 1, "one delivered A2A message, one inbox entry — not two");
-        assert_eq!(file.entries[0].target, id);
-        assert_eq!(file.entries[0].text, "hello from a node");
+        let entries = aoide_storage::mail::read_base().unwrap();
+        assert_eq!(entries.len(), 1, "one delivered A2A message, one mailbase entry — not two");
+        assert_eq!(entries[0].envelope.header.to.name, id);
+        assert_eq!(entries[0].envelope.text, "hello from a node");
         // The a2a door has no caller identity to offer today (#51's scope) —
         // `do_inject`'s Invocation never sets `--from`, and this test process
         // has no AOIDE_SESSION_ID either, so the honest attribution is empty.
-        assert_eq!(file.entries[0].from, "");
+        assert_eq!(entries[0].envelope.header.from.name, "");
 
         let _ = std::fs::remove_dir_all(&root);
         match saved_stage {
@@ -6071,11 +6071,11 @@ mod tests {
     }
 
     #[test]
-    fn spawn_inject_prompts_success_branch_files_the_opening_turn_into_the_inbox() {
-        // Messaging plan P-C6, the bounce-fix hole: `message/send` with NO
+    fn spawn_inject_prompts_success_branch_files_the_opening_turn_into_the_mailbase() {
+        // Messaging plan P-M1, the bounce-fix hole: `message/send` with NO
         // contextId (or `spawn_asked`) resolves to `SendAction::Spawn` and
         // `do_spawn` — a brand-new session's FIRST turn is typed by
-        // `spawn_inject_prompt`, the SECOND (and last) inbox-filing site
+        // `spawn_inject_prompt`, the SECOND (and last) mailbase-filing site
         // alongside `deliver_local`'s (see its own doc comment for why it
         // can't reach `deliver_local`).
         //
@@ -6089,7 +6089,7 @@ mod tests {
         // and time out this test's 3s retry budget for nothing. No test in
         // this file exercises `do_spawn`'s OS-level spawn for that reason
         // (there is no `AOIDE_A2A_BIN`-style override seam for it) —
-        // `spawn_inject_prompt` is the exact function the new inbox-filing
+        // `spawn_inject_prompt` is the exact function the mailbase-filing
         // code lives in, and driving it directly against a stand-in
         // listener is the same boundary `aoide_conduct::graph::conduct`'s
         // own PTY-injection test already uses for the underlying
@@ -6123,12 +6123,11 @@ mod tests {
         let got = acc.join().unwrap();
         assert_eq!(String::from_utf8(got).unwrap(), "hello new session\n", "--submit's newline, same as do_spawn's payload");
 
-        let file = aoide_storage::inbox::load().unwrap();
-        assert_eq!(file.entries.len(), 1, "the spawned session's opening turn is filed exactly once");
-        assert_eq!(file.entries[0].target, id);
-        assert_eq!(file.entries[0].text, "hello new session");
-        assert_eq!(file.entries[0].from, "", "no caller identity to offer — #51's scope");
-        assert!(!file.entries[0].read);
+        let entries = aoide_storage::mail::read_base().unwrap();
+        assert_eq!(entries.len(), 1, "the spawned session's opening turn is filed exactly once");
+        assert_eq!(entries[0].envelope.header.to.name, id);
+        assert_eq!(entries[0].envelope.text, "hello new session");
+        assert_eq!(entries[0].envelope.header.from.name, "", "no caller identity to offer — #51's scope");
 
         let _ = std::fs::remove_dir_all(&root);
         match saved_state {
@@ -6144,8 +6143,8 @@ mod tests {
     #[test]
     fn spawn_inject_prompt_on_an_empty_prompt_files_nothing() {
         // The existing early return (`if prompt.is_empty() { return; }`) —
-        // an empty prompt never connects at all, so it must not file an
-        // inbox entry either.
+        // an empty prompt never connects at all, so it must not file a
+        // mailbase entry either.
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let root = std::env::temp_dir().join(format!(
@@ -6157,7 +6156,7 @@ mod tests {
         std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
 
         spawn_inject_prompt("whatever-id", "");
-        assert!(aoide_storage::inbox::load().unwrap().entries.is_empty());
+        assert!(aoide_storage::mail::read_base().unwrap().is_empty());
 
         let _ = std::fs::remove_dir_all(&root);
         match saved_state {

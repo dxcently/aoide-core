@@ -350,8 +350,8 @@
   load-modify-write of either park file (`park_inbound`/`take_inbound`/
   `reveal_inbound`/`mark_inbound_approved`/`record_inbound_code_try`/
   `list_inbound` and the outbound five) runs under
-  `crate::fs::with_stage_lock` — the same flock `inbox::receive` already
-  reuses for a `state/` file — so the resident `a2a serve` process and a
+  `crate::fs::with_stage_lock` — the same flock `mail`'s writer already
+  resolves for a `state/` file — so the resident `a2a serve` process and a
   concurrent CLI invocation can never silently drop each other's
   `approved` flag or `tries` increment (#119 review finding 4). A new
   mutator here wraps its whole load-modify-write in `with_stage_lock` the
@@ -565,8 +565,8 @@
   validates the declaration.
   Updates CONTRACTS.md §4's `config.toml` subsection in the same commit,
   same as a settable section.
-- **A new CLI command** (this crate has four groups today, `usage`, `inbox
-  list|read|clear`, `identity`, and `config`/`config set`) adds a
+- **A new CLI command** (this crate has four groups today, `usage`, `mail
+  send|read|show|mark|rm`, `identity`, and `config`/`config set`) adds a
   `cmd!`/`register` entry in `commands.rs`, wired into the owning app
   crate's `commands::all()`. The
   pairing ceremony's own CLI commands (`aoide pair`/`pair reject`/`pair

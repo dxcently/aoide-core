@@ -27,8 +27,7 @@ use crate::registry::Registry;
 /// soundcheck (the mechanical-integrity command's WORKING-tree half,
 /// `aoide-upkeep`; report-only, forever — see its own module doc for the
 /// finding format and why the COMMITTED-tree half lives in `nix flake
-/// check` instead), inbox list/read/clear (the
-/// durable per-host message store, messaging workstream C6), secrets
+/// check` instead), secrets
 /// serve/exec/add/rm/grant/revoke (Workstream SECRETS's
 /// broker daemon + client + admin CLI surface, P-V2), events tail
 /// (the aoided event bus's own terminal-reachable follow
@@ -45,7 +44,9 @@ use crate::registry::Registry;
 /// `[mesh.<name>]` against the live node registry and reports drift without
 /// writing either side; the converge closes that drift by running the
 /// ordinary `pair` ceremony against every declared node with no verified
-/// record, and never touches a verified one).
+/// record, and never touches a verified one), mail send/read/show/mark/rm
+/// (the addressed, signed, append-only mailbase — the durable per-host
+/// message store, messaging plan P-M1, `docs/architecture/MAIL.md`).
 ///
 /// P-A5 (binary-split workstream) removed the register lines for the
 /// graphical bundle — rice/draft/mode/cover/livery/rice-late-stubs/
@@ -76,7 +77,6 @@ pub fn all() -> Registry {
     aoide_storage::commands::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
     aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer command
     aoide_upkeep::commands::register(&mut r); // soundcheck — mechanical-integrity WORKING-tree sweep, report-only
-    aoide_storage::commands::register_inbox(&mut r); // inbox list/read/clear — durable per-host message store (messaging workstream C6, appended newest)
     aoide_secrets::commands::register(&mut r); // secrets serve/exec/add/rm/grant/revoke — the secrets broker (Workstream SECRETS P-V2, appended newest)
     aoide_server::commands::register_events(&mut r); // events tail — aoided's own feed follow command (P-D3, appended newest)
     aoide_storage::commands::register_identity(&mut r); // identity — this instance's ed25519 identity show command (pairing workstream P-P1, appended newest)
@@ -86,6 +86,7 @@ pub fn all() -> Registry {
     aoide_client::commands::register_pair(&mut r); // pair + pair reject/watch — the pairing ceremony's whole CLI face, one smart command (task #135 P3', superseding the node pair family — hard cutover)
     aoide_storage::commands::register_config(&mut r); // config, config set — the portable runtime config file (task #135 P-C, appended newest)
     aoide_client::mesh::register(&mut r); // mesh + mesh pair — the declared-mesh-vs-live-registry drift report and the converge that closes it (task #135 P4/P5, appended newest)
+    aoide_storage::commands::register_mail(&mut r); // mail send/read/show/mark/rm — the addressed, signed, append-only mailbase (messaging plan P-M1, docs/architecture/MAIL.md, appended newest, supersedes register_inbox)
 
     r
 }

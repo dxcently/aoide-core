@@ -745,19 +745,19 @@
   network seams (`PullFn`, `SweepFn`) stay injected so its tests never
   open a socket. Row/mark grammar and `--json` shape are CONTRACTS.md
   §7-pinned — a rendering change is a contract edit first.
-- **`send::deliver_local`'s success path is ONE of exactly TWO inbox-filing
+- **`send::deliver_local`'s success path is ONE of exactly TWO mailbase-filing
   calls in the whole tree — never a third.** Every consumer that delivers
   into an ALREADY-REGISTERED session's socket (`send --id`, `--to`
   resolving local, `pending approve`'s re-drive, `aoide-server`'s A2A
   `do_inject`) reaches it through `session_send`; do NOT add a second
-  `aoide_storage::inbox::receive` call for any of those — `do_inject` in
+  `aoide_storage::mail::file_receipt` call for any of those — `do_inject` in
   particular reaches this exact function too, so a call there would
   double-file every A2A message delivered into an existing session. The
   OTHER filing call lives OUTSIDE this crate, in `aoide-server`'s
   `spawn_inject_prompt` (`a2a.rs`) — a brand-new A2A-spawned session's first
   turn is typed before that session has a `SessionRecord` at all, so it
   can never reach `deliver_local`/`session_send` and has to file itself
-  (see `aoide_storage::inbox`'s module doc for the full two-writer
+  (see `aoide_storage::mail`'s module doc for the full two-writer
   reasoning).
 - **`graph/spawn.rs`'s `build_conduct_args` is the ONE place the `aoide
   conduct -- <agent cmd>` argv gets built (P-D7).** Both `spawn`

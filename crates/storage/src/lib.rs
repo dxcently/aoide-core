@@ -30,9 +30,11 @@
 //! (`node_store::Node.hub`): a hub-designated node as one last,
 //! least-specific candidate only when `resolve` finds nothing at all.
 //!
-//! `inbox` (messaging plan, P-C6) is the newest: the durable per-host
-//! message store (`state/inbox.json`) both delivery seams file into — see
-//! its own module doc for the one-writer-covers-both-seams reasoning.
+//! `mail` (messaging plan, P-M1, `docs/architecture/MAIL.md`) is the newest:
+//! the addressed, signed, append-only mailbase (`state/mail/`) that absorbs
+//! the old per-host receipt log both delivery seams file into — see its own
+//! module doc for the envelope/header/msgid formula and the one-writer-
+//! covers-both-seams reasoning it inherits.
 //!
 //! `identity` (pairing workstream, P-P1, `docs/architecture/PAIRING.md`) is
 //! this instance's lazily-minted ed25519 keypair (`state/identity/`) — the
@@ -113,8 +115,8 @@ pub mod edits;
 pub mod fs;
 pub mod git;
 pub mod identity;
-pub mod inbox;
 pub mod ledger;
+pub mod mail;
 pub mod manifest;
 pub mod mode;
 pub mod pairing;

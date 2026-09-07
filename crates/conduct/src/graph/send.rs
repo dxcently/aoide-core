@@ -807,35 +807,39 @@ fn deliver_local_with(
         }
     }
 
-    // File this delivered message into the durable per-host inbox
-    // (messaging plan P-C6, `state/inbox.json`) — this is the ONE seam that
-    // covers every route a message takes to land here: a direct `--id`
-    // send, a `--to <local target>` (re-drives this exact function), a
-    // `pending approve` re-drive, AND the A2A server's `do_inject`
-    // (`crates/server/src/a2a.rs`) — `do_inject` builds a `send --id`
-    // invocation and calls `session_send` too, which for a same-box
-    // `contextId` can only ever reach THIS branch (it never sets `--to`).
-    // See `aoide_storage::inbox`'s module doc for the full reasoning and
-    // why `do_inject` does not file a second entry of its own.
+    // File this delivered message into the mailbase as a receipt (messaging
+    // plan P-M1, `docs/architecture/MAIL.md`, `state/mail/base.jsonl`) —
+    // this is the ONE seam that covers every route a message takes to land
+    // here: a direct `--id` send, a `--to <local target>` (re-drives this
+    // exact function), a `pending approve` re-drive, AND the A2A server's
+    // `do_inject` (`crates/server/src/a2a.rs`) — `do_inject` builds a
+    // `send --id` invocation and calls `session_send` too, which for a
+    // same-box `contextId` can only ever reach THIS branch (it never sets
+    // `--to`). See `aoide_storage::mail`'s module doc for the full
+    // reasoning and why `do_inject` does not file a second entry of its
+    // own.
     //
     // `from` is `attributed_sender` — the SAME resolved sender the audit
     // line and the provenance prefix above already computed, empty string
-    // for an anonymous/unresolved sender (never `None` — the inbox's `from`
-    // is a plain `String`, not optional). `text` is the ORIGINAL message,
-    // not `payload` (which carries the provenance prefix and/or submit
-    // keystroke actually written to the socket).
+    // for an anonymous/unresolved sender (`file_receipt`'s `from` is a
+    // plain `&str`, not optional). `text` is the ORIGINAL message, not
+    // `payload` (which carries the provenance prefix and/or submit
+    // keystroke actually written to the socket). `to_name` is `id`: a
+    // receipt's `to` is the session it was delivered to, not a mailbox
+    // name a human reads by — MAIL.md's ruling that context is dropped,
+    // not carried (a receipt is filed and forgotten, never read back by
+    // `mail read`).
     //
-    // Best-effort by design: an inbox write failing must never turn an
+    // Best-effort by design: a mailbase write failing must never turn an
     // ALREADY-DELIVERED message into a reported failure — any error is
     // folded into `changed` below, the returned status stays `Ok`.
-    let inbox_note = match aoide_storage::inbox::receive(
+    let mail_note = match aoide_storage::mail::file_receipt(
         attributed_sender.as_deref().unwrap_or(""),
         &id,
         &text,
-        None,
     ) {
         Ok(()) => None,
-        Err(e) => Some(format!("(inbox filing failed: {e})")),
+        Err(e) => Some(format!("(mail filing failed: {e})")),
     };
 
     // Auto-rename the node to a one-line form of the delivered task — unless
@@ -848,7 +852,7 @@ fn deliver_local_with(
     };
     let total_bytes = payload.len() + if submit { submit_key.len() } else { 0 };
     let mut changed = vec![format!("injected {total_bytes} byte(s) into {id}")];
-    if let Some(note) = inbox_note {
+    if let Some(note) = mail_note {
         changed.push(note);
     }
     if renamed {
@@ -916,7 +920,7 @@ fn session_send_to(inv: &Invocation, target: &str) -> Outcome {
     // for an otherwise-`NotFound` query. `who.rs`'s own `apply_filter` is a
     // LISTING/display filter, not a route, and deliberately keeps the plain
     // `addr::resolve` — the design doc names exactly two hub-preference
-    // consumers (this `--to` resolution and the messaging inbox relay),
+    // consumers (this `--to` resolution and the mail relay),
     // neither of which is `who`'s display semantics.
     let hub = nodes.iter().find(|p| p.hub).map(|p| p.name.as_str());
 
@@ -2329,11 +2333,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
-    fn a_delivered_local_send_is_filed_into_the_inbox() {
-        // Messaging plan P-C6: `deliver_local`'s success path is the one
-        // seam that files a delivered message into `state/inbox.json` — see
-        // `aoide_storage::inbox`'s module doc for why the A2A door's
-        // `do_inject` does not need (and must not add) a second append.
+    fn a_delivered_local_send_is_filed_into_the_mailbase() {
+        // Messaging plan P-M1: `deliver_local`'s success path is the one
+        // seam that files a delivered message into `state/mail/base.jsonl`
+        // as a receipt — see `aoide_storage::mail`'s module doc for why the
+        // A2A door's `do_inject` does not need (and must not add) a second
+        // append.
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -2344,7 +2349,7 @@ mod tests {
             "AOIDE_SESSION_ID",
         ]);
 
-        let root = unique_stage("send-inbox");
+        let root = unique_stage("send-mail");
         let stage = root.join("stage");
         let state = root.join("state");
         std::fs::create_dir_all(&stage).unwrap();
@@ -2355,7 +2360,7 @@ mod tests {
         std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
         std::env::set_var("AOIDE_SESSION_ID", "orchestrator-1");
 
-        let id = "send-inbox-target";
+        let id = "send-mail-target";
         let socket = conduct_socket_path(id);
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
@@ -2382,21 +2387,20 @@ mod tests {
         let _ = acc.join().unwrap();
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
 
-        let file = aoide_storage::inbox::load().unwrap();
-        assert_eq!(file.entries.len(), 1, "one delivered message, one inbox entry");
-        let e = &file.entries[0];
-        assert_eq!(e.from, "orchestrator-1");
-        assert_eq!(e.target, id);
-        assert_eq!(e.text, "do the thing", "the RAW text, not the prefixed wire payload");
-        assert!(!e.read);
-        assert!(e.context.is_none());
+        let entries = aoide_storage::mail::read_base().unwrap();
+        assert_eq!(entries.len(), 1, "one delivered message, one mailbase entry");
+        let e = &entries[0];
+        assert_eq!(e.kind, aoide_storage::mail::ENTRY_TYPE_RECEIPT);
+        assert_eq!(e.envelope.header.from.name, "orchestrator-1");
+        assert_eq!(e.envelope.header.to.name, id);
+        assert_eq!(e.envelope.text, "do the thing", "the RAW text, not the prefixed wire payload");
 
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
-    fn a_send_left_pending_is_not_filed_into_the_inbox_until_approved() {
+    fn a_send_left_pending_is_not_filed_into_the_mailbase_until_approved() {
         // Only a SUCCESSFUL delivery files — a held-pending send must not
-        // appear in the inbox at all yet.
+        // appear in the mailbase at all yet.
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -2407,7 +2411,7 @@ mod tests {
             "AOIDE_SESSION_ID",
         ]);
 
-        let root = unique_stage("send-inbox-pending");
+        let root = unique_stage("send-mail-pending");
         let stage = root.join("stage");
         let state = root.join("state");
         std::fs::create_dir_all(&stage).unwrap();
@@ -2418,7 +2422,7 @@ mod tests {
         std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
         std::env::remove_var("AOIDE_SESSION_ID");
 
-        let id = "send-inbox-pending-target";
+        let id = "send-mail-pending-target";
         let socket = conduct_socket_path(id);
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let _listener = UnixListener::bind(&socket).unwrap();
@@ -2438,8 +2442,8 @@ mod tests {
         let out = session_send(&send_invocation(&["do", "the", "thing"], &[("id", id)]));
         assert_eq!(out.data.as_ref().unwrap()["state"], "pending");
 
-        let file = aoide_storage::inbox::load().unwrap();
-        assert!(file.entries.is_empty(), "a pending (undelivered) send never reaches the inbox");
+        let entries = aoide_storage::mail::read_base().unwrap();
+        assert!(entries.is_empty(), "a pending (undelivered) send never reaches the mailbase");
 
         let _ = std::fs::remove_dir_all(&root);
     }

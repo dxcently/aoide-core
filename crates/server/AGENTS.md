@@ -320,7 +320,7 @@
   crate is verify-only, consistent with "inbound/serve only" above. No
   test in this file drives `do_spawn`'s real OS-level process spawn (an
   established precedent, `spawn_inject_prompts_success_branch_
-  files_the_opening_turn_into_the_inbox`'s own doc comment) — the gate
+  files_the_opening_turn_into_the_mailbase`'s own doc comment) — the gate
   itself is proven via the pure `node_may_spawn`/`spawn_admitted`/
   `spawn_refusal` predicates, `verify_signed_request`'s own dedicated test
   section, and `message_send`'s REFUSAL branches only. **P-P5b's own

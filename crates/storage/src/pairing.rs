@@ -101,8 +101,8 @@
 //! ParkRegistry::park_if_room` already holds. **Cross-process (#119 review
 //! finding 4), every load-modify-write of EITHER park file additionally
 //! runs under [`crate::fs::with_stage_lock`]** — the same flock
-//! `state/inbox.json`'s writers already reuse for a `state/` file
-//! (`inbox::receive`'s doc: "one process-wide lock file is enough … a
+//! `state/mail/base.jsonl`'s writer already reuses for a `state/` file
+//! (`mail`'s own doc: "one process-wide lock file is enough … a
 //! second lock file would be a new abstraction for zero added
 //! correctness"): the resident `a2a serve` process and a concurrent CLI
 //! invocation (`pair`/`pair reject`, a poll release) mutate the

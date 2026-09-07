@@ -38,7 +38,7 @@ use std::io::Write;
 /// touching (`with_stage_lock`'s own doc: it always locks `stage_dir()`,
 /// even for a `conducting_stage_dir`-domain caller) — a live incident
 /// during this lane's own development proved that a `state_dir()`-only
-/// test (`inbox` command tests, overriding only `$AOIDE_STATE_DIR`) still
+/// test (a command's own tests, overriding only `$AOIDE_STATE_DIR`) still
 /// reaches `stage_dir()`'s fallback through `with_stage_lock`, and would
 /// have silently driven a real migration against the operator's actual
 /// `$HOME` the first time such a test ran unguarded. `conducting_stage_dir`
@@ -269,8 +269,8 @@ pub fn state_dir() -> std::path::PathBuf {
 /// The CONDUCTING stage directory: `$AOIDE_ROOT/state/stage/` (default
 /// `~/.aoide/state/stage/`) — sessions.json,
 /// hooks.json, projects.json, graph.json, pending.json, herald.json (the
-/// broker-owned roster [`crate::inbox`]'s doc calls the "L4 dual-writer
-/// surface", mirrored by `server/src/daemon.rs::stage_roster`). Split from
+/// broker-owned roster this tree calls the "L4 dual-writer surface"
+/// (`conduct/README.md`), mirrored by `server/src/daemon.rs::stage_roster`). Split from
 /// [`stage_dir`] (2026-08-27, command-defrag lane S1): those six files are
 /// core orchestration state the `aoide`/`aoided` binaries alone read and
 /// write, never rice/paint — `song/` is lyra's tree
@@ -802,8 +802,10 @@ pub fn secure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
 /// callers (command-defrag S1).** `sessions.json`/`hooks.json`/`projects.json`/
 /// `graph.json`/`pending.json`/`herald.json` moved to `state/stage/`, but every
 /// mutator of them still calls this exact function unchanged — the SAME
-/// precedent [`crate::inbox::receive`] already set for `state/inbox.json`
-/// ("one process-wide lock file is enough … a second lock file would be a new
+/// precedent `state/mail/base.jsonl`'s writer sets for a `state/` file today
+/// (its own [`try_stage_lock`], the fail-closed sibling defined just below,
+/// still resolves this SAME `.stage.lock` rather than inventing its own —
+/// "one process-wide lock file is enough … a second lock file would be a new
 /// abstraction for zero added correctness"). A second `.stage.lock` under
 /// `state/stage/` would serialise the six core files against each other
 /// without serialising them against `stage_dir()`'s own rice writers sharing
@@ -831,6 +833,33 @@ pub fn with_stage_lock<T>(f: impl FnOnce() -> T) -> T {
         }
     }
     out
+}
+
+/// Fail-closed sibling of [`with_stage_lock`]: mail's base-log append (MAIL.md,
+/// "Store") must never let two writers interleave two entries, so a lock that
+/// can't be taken has to reject the write rather than run it anyway. Blocks on
+/// `LOCK_EX` (a concurrent opener waits, per the architect's ruling that a second
+/// writer queues rather than races) — it only returns `Err` when the lock file
+/// itself can't be opened or created, not when another writer briefly holds it.
+pub fn try_stage_lock<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    use std::os::unix::io::AsRawFd;
+    let dir = stage_dir();
+    let _ = std::fs::create_dir_all(&dir);
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(dir.join(".stage.lock"))
+        .map_err(|e| format!("cannot open stage lock: {e}"))?;
+    let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
+    if rc != 0 {
+        return Err(format!("cannot lock stage dir: {}", std::io::Error::last_os_error()));
+    }
+    let out = f();
+    unsafe {
+        libc::flock(lock.as_raw_fd(), libc::LOCK_UN);
+    }
+    Ok(out)
 }
 
 /// Does `/proc/<pid>` still exist? (the liveness probe [`sweep_stale_temps`] uses

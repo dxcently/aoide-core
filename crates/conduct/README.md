@@ -90,15 +90,16 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   consumer of the hub preference in this crate; `who.rs`'s own listing
   filter deliberately keeps the plain, hub-blind `addr::resolve`. `send::deliver_local`'s success path is ONE
   of exactly TWO seams that file a delivered message into
-  `aoide_storage::inbox` (messaging plan P-C6, `state/inbox.json`) — every
-  route that lands a message into an ALREADY-REGISTERED session (direct
-  `--id`, `--to` local, `pending approve`'s re-drive, AND `aoide-server`'s
-  A2A `do_inject`, which reaches this same function through `session_send`)
-  is covered by that one call. The OTHER seam lives in `aoide-server`
-  itself (`spawn_inject_prompt`, `a2a.rs`): a brand-new A2A-spawned
-  session's first turn is typed before that session has a `SessionRecord`
-  at all, so it can't reach `deliver_local` and files itself instead — see
-  `aoide_storage::inbox`'s module doc for the full two-writer reasoning.
+  `aoide_storage::mail` as a receipt (messaging plan P-M1,
+  `state/mail/base.jsonl`) — every route that lands a message into an
+  ALREADY-REGISTERED session (direct `--id`, `--to` local, `pending
+  approve`'s re-drive, AND `aoide-server`'s A2A `do_inject`, which reaches
+  this same function through `session_send`) is covered by that one call
+  (`mail::file_receipt`). The OTHER seam lives in `aoide-server` itself
+  (`spawn_inject_prompt`, `a2a.rs`): a brand-new A2A-spawned session's
+  first turn is typed before that session has a `SessionRecord` at all,
+  so it can't reach `deliver_local` and files itself instead — see
+  `aoide_storage::mail`'s module doc for the full two-writer reasoning.
 - **`send.rs::write_delivery`** is the one place a delivered payload actually
   reaches a target's control socket (task #124): the text write, then — on
   `--submit` — a SEPARATE, later write of the target's own submit keystroke,

@@ -634,12 +634,12 @@ mod tests {
     }
 
     #[test]
-    fn approving_a_pending_entry_files_it_into_the_inbox_via_the_shared_delivery_seam() {
-        // Messaging plan P-C6: the inbox append lives ONLY in `deliver_local`
-        // (send.rs) — `pending_approve`'s re-drive goes through the SAME
-        // `session_send` door, so a previously-held entry lands in the
-        // inbox naturally the moment it is actually delivered, never at
-        // queue time.
+    fn approving_a_pending_entry_files_it_into_the_mailbase_via_the_shared_delivery_seam() {
+        // Messaging plan P-M1: the mailbase append lives ONLY in
+        // `deliver_local` (send.rs) — `pending_approve`'s re-drive goes
+        // through the SAME `session_send` door, so a previously-held entry
+        // lands in the mailbase naturally the moment it is actually
+        // delivered, never at queue time.
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -649,11 +649,11 @@ mod tests {
             "AOIDE_CONDUCT_AUTOGATE",
             "AOIDE_SESSION_ID",
         ]);
-        let root = setup("pnd-inbox");
+        let root = setup("pnd-mail");
         let state = root.join("state");
         std::env::set_var("AOIDE_STATE_DIR", &state);
 
-        let id = "inbox-approve-target";
+        let id = "mail-approve-target";
         let socket = conduct_socket_path(id);
         std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
         let listener = UnixListener::bind(&socket).unwrap();
@@ -672,13 +672,13 @@ mod tests {
         std::fs::write(
             pending_path(),
             format!(
-                r#"{{"schemaVersion":"0","pending":[{{"sessionId":"{id}","text":"hello inbox","submit":true,"queuedAt":"2026-08-13T14:01:10Z","from":"queuer-a"}}]}}"#
+                r#"{{"schemaVersion":"0","pending":[{{"sessionId":"{id}","text":"hello mail","submit":true,"queuedAt":"2026-08-13T14:01:10Z","from":"queuer-a"}}]}}"#
             ),
         )
         .unwrap();
 
-        // Nothing in the inbox yet — the entry is only PENDING.
-        assert!(aoide_storage::inbox::load().unwrap().entries.is_empty());
+        // Nothing in the mailbase yet — the entry is only PENDING.
+        assert!(aoide_storage::mail::read_base().unwrap().is_empty());
 
         let acc = std::thread::spawn(move || {
             let (mut conn, _) = listener.accept().unwrap();
@@ -691,11 +691,11 @@ mod tests {
         let _ = acc.join().unwrap();
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
 
-        let file = aoide_storage::inbox::load().unwrap();
-        assert_eq!(file.entries.len(), 1, "approval's re-drive filed the message");
-        assert_eq!(file.entries[0].from, "queuer-a", "the ORIGINAL queuer, not the approver");
-        assert_eq!(file.entries[0].target, id);
-        assert_eq!(file.entries[0].text, "hello inbox");
+        let entries = aoide_storage::mail::read_base().unwrap();
+        assert_eq!(entries.len(), 1, "approval's re-drive filed the message");
+        assert_eq!(entries[0].envelope.header.from.name, "queuer-a", "the ORIGINAL queuer, not the approver");
+        assert_eq!(entries[0].envelope.header.to.name, id);
+        assert_eq!(entries[0].envelope.text, "hello mail");
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -57,6 +57,33 @@ impl Drop for EnvSaver {
     }
 }
 
+/// Point `AOIDE_ROOT` at a fresh, isolated temp directory for the returned
+/// guard's lifetime, and clear `AOIDE_STATE_DIR`/`AOIDE_STAGE_DIR` so
+/// neither can leave a stale absolute override pointing somewhere else —
+/// restored on drop via [`EnvSaver`]. `aoide-storage`'s own `env_lock()`
+/// floors nothing (unlike `aoide-conduct`'s and `aoide-server`'s own), so a
+/// storage test that sets only `AOIDE_STATE_DIR` still resolves
+/// `stage_dir()` — and so `try_stage_lock`'s `.stage.lock` — against the
+/// REAL, unset root; that gap is exactly how a fixture once wrote real rows
+/// into the live inbox. Pointing `AOIDE_ROOT` itself moves both
+/// `state_dir()` and `stage_dir()` off the real root at once. Every
+/// `aoide-storage` test that touches `mail` must use this, never
+/// `AOIDE_STATE_DIR` alone.
+///
+/// Caller must already hold [`env_lock`] (the same convention every other
+/// env-touching test here follows — acquired once, at the top of the test,
+/// before constructing any guard). Owns the environment only, not the
+/// directory: the caller still removes it at the end of the test, the same
+/// way every `unique_tmp` caller already does.
+pub fn isolated_mail_root(tag: &str) -> (EnvSaver, PathBuf) {
+    let env = EnvSaver::capture(&["AOIDE_ROOT", "AOIDE_STATE_DIR", "AOIDE_STAGE_DIR"]);
+    let root = unique_tmp(tag);
+    std::env::set_var("AOIDE_ROOT", &root);
+    std::env::remove_var("AOIDE_STATE_DIR");
+    std::env::remove_var("AOIDE_STAGE_DIR");
+    (env, root)
+}
+
 pub const VALID_NOTES: &str = r##"{ "schemaVersion":"0",
     "palette": {"bg":"#0b1021","fg":"#c8d3f5","accent":"#82aaff","urgent":"#ff757f"} }"##;
 
