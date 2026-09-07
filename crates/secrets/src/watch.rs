@@ -566,7 +566,7 @@ fn format_reason_line(reason: &Option<String>) -> Option<String> {
 /// an entirely unidentified origin (every field `None`, `park::AskOrigin`'s
 /// own doc on when that happens) renders NOTHING at all, never a bare
 /// "from:" with nothing after it. `username` falls back to the literal
-/// `unidentified` when a `comm`/`pid`/`hostname` piece IS known but the peer
+/// `unidentified` when a `comm`/`pid`/`hostname` piece IS known but the node
 /// itself wasn't (should not happen in practice — `peercred::peer_cred`
 /// either resolves the whole `PeerCred` or none of it — kept anyway so this
 /// function never assumes that invariant from outside). This is the ONE
@@ -1562,7 +1562,7 @@ mod tests {
 
     #[test]
     fn format_origin_line_degrades_to_unidentified_when_only_the_hostname_is_known() {
-        // A totally unidentified peer (`peercred::peer_cred` itself failed)
+        // A totally unidentified node (`peercred::peer_cred` itself failed)
         // still yields a hostname (`capture_origin`'s own doc, broker.rs) —
         // this proves the degraded rendering never produces a bare "from:"
         // with nothing after the label.

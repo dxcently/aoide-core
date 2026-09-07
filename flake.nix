@@ -118,7 +118,7 @@
               # `aoide <cmd> --json | jq …`.
               jq
               # Core runtime shell-outs (crates/client, storage, secrets):
-              curl # client peer pulls / A2A dials
+              curl # client node pulls / A2A dials
               git # storage::git derivation capture
               qrencode # secrets enroll — otpauth QR render
               age # secrets age backend — without it the crate's age-gated tests self-skip

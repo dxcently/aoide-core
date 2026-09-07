@@ -5,7 +5,7 @@
 //!
 //! Prototyped under the name "carry" (task #96, `state/carry.json`); this is
 //! the shipped rename (command-defrag lane U1, 2026-08-27) — same shape and
-//! discipline as before, and the same discipline `peer_store.rs` set: a
+//! discipline as before, and the same discipline `node_store.rs` set: a
 //! `schemaVersion` container, tolerate-missing/corrupt-as-empty on read,
 //! `fs::atomic_write` on write, pure list mutations for the CRUD so it's
 //! unit-testable off disk. [`load_undying`] additionally folds in a one-shot
@@ -43,7 +43,7 @@ pub struct UndyingRegistry {
 }
 
 /// The undying file path: `state/undying.json` — the same gitignored
-/// root-runtime `state/` dir `peers.json`/`usage.json` live in
+/// root-runtime `state/` dir `nodes.json`/`usage.json` live in
 /// (CONTRACTS.md), NOT inside either stage tree (`state/stage/` or
 /// `song/stage/`): an undying mark is durable operator state, never staged
 /// rehearsal/registry state.
@@ -96,7 +96,7 @@ fn migrate_carry_to_undying() {
 }
 
 /// Read the undying set, tolerating a missing/corrupt/wrong-shape file as
-/// empty — never an error, the same discipline `peer_store::load_peers`
+/// empty — never an error, the same discipline `node_store::load_nodes`
 /// holds. A mark set on an id that never produced a ledger line is inert,
 /// not an error condition, so an unreadable file is simply "nothing
 /// undying." Migrates a legacy `carry.json` in first, if one is found (see
@@ -113,7 +113,7 @@ pub fn load_undying() -> Vec<UndyingSession> {
 
 /// Atomic-write the undying set (v0 shape) back to `state/undying.json`.
 /// Plain [`atomic_write`], not `atomic_write_private` — `undying.json` holds
-/// session ids, the same class of data `sessions.json`/`peers.json`
+/// session ids, the same class of data `sessions.json`/`nodes.json`
 /// already keep at default mode; `atomic_write_private` is reserved for the
 /// identity/secret lane (`identity.rs`).
 pub fn save_undying(undying: &[UndyingSession]) -> Result<(), String> {

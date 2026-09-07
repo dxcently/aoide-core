@@ -15,7 +15,7 @@ Lyra — the graphical/rice binary (lyra guide · tier-0 onboarding)
 Identity: `lyra` is AoideOS's PAINTED SURFACE — the self-ricing loop
 (entry: `lyra rice compose <name>`), screen capture/pointer/OCR, the herald
 notification ledger, shellbridge, and the Quickshell reload. Conducting,
-the session graph, A2A, peers, and the daemon are core `aoide` identity —
+the session graph, A2A, nodes, and the daemon are core `aoide` identity —
 `aoide guide` orients there.
 
 Orient through four tiers, in order:

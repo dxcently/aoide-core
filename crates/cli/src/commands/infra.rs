@@ -7,7 +7,7 @@
 //! that used to live in this file moved with its domain: `daemon` +
 //! `shellbridge` + `a2a serve` → `aoide-server`, `adapter melete` →
 //! `aoide-client` (the four `a2a agent` commands moved alongside it, then
-//! were deleted outright — peers superseded them), `conductor` →
+//! were deleted outright — nodes superseded them), `conductor` →
 //! `aoide-conductor`. `mcp serve --stdio`'s real execution path stays
 //! special-cased in `lib.rs::run_cli` (unchanged).
 

@@ -16,7 +16,7 @@
 //! focus affordance). The other three — PROJECTS, LOG, STATUS — are ports of the
 //! originals. `ROSTER` (messaging/presence plan, P-C4; selection + compose
 //! added P-C5) and `PENDING` (P-C5) are later, distinct additions. ROSTER is
-//! presence over this box plus every registered peer, sourced from a
+//! presence over this box plus every registered node, sourced from a
 //! throttled, backgrounded `session --hosts` dispatch (`app`'s "ROSTER" section covers
 //! the threading; this file only paints what `App::roster_flat_rows` hands
 //! it) — plus, since P-C5, selection and an `s`-to-compose affordance.
@@ -636,11 +636,11 @@ fn palette_summary<'a>(app: &App) -> Line<'a> {
     Line::from(spans)
 }
 
-// ── [5] ROSTER — presence over this box + every registered peer ────────────
+// ── [5] ROSTER — presence over this box + every registered node ────────────
 //
 // Read-only (messaging/presence plan, P-C4): rows come straight from the
 // cached `session --hosts --json` `Outcome` (`App::roster_nodes` — a
-// reshape, never a re-derivation), local box first then peers in the
+// reshape, never a re-derivation), local box first then nodes in the
 // roster's own order. Node glyphs (`●`/`◐`/`○`) call
 // `aoide_conduct::graph::glyph` DIRECTLY — widened to `pub` for exactly this
 // (P-C4 review nits; no forked copy here); session glyphs are the
@@ -1373,8 +1373,8 @@ mod tests {
 
     /// A fixed `session --hosts --json` fixture, shaped exactly like
     /// `conduct/src/graph/who.rs::session_roster_with`'s real `Outcome.data`
-    /// (this box online, one unreachable peer with a stale-cache session,
-    /// one never-pulled peer) — the ONLY input `draw_roster` is allowed to
+    /// (this box online, one unreachable node with a stale-cache session,
+    /// one never-pulled node) — the ONLY input `draw_roster` is allowed to
     /// read.
     fn roster_fixture() -> aoide_protocol::output::Outcome {
         let data = serde_json::json!({
@@ -1448,11 +1448,11 @@ mod tests {
         );
         assert!(
             out.contains("◐ yomi-strix — unreachable (last seen 2026-08-20T23:00:00Z)"),
-            "peer node: unreachable glyph + staleness stamp: {out}"
+            "mesh node: unreachable glyph + staleness stamp: {out}"
         );
         assert!(
             out.contains("○ ghost — never pulled"),
-            "peer node: never-pulled glyph: {out}"
+            "mesh node: never-pulled glyph: {out}"
         );
         assert!(
             out.contains("brave-otter") && out.contains('♪'),
@@ -1460,14 +1460,14 @@ mod tests {
         );
         assert!(
             out.contains("misty-comet"),
-            "an unreachable peer's last-known session still surfaces: {out}"
+            "an unreachable node's last-known session still surfaces: {out}"
         );
 
-        // Local box first, then peers — the roster's own node order, never
+        // Local box first, then nodes — the roster's own node order, never
         // re-sorted here.
         let local_pos = out.find("sakaki (this host)").unwrap();
-        let peer_pos = out.find("yomi-strix").unwrap();
-        assert!(local_pos < peer_pos, "local box renders before peers: {out}");
+        let node_pos = out.find("yomi-strix").unwrap();
+        assert!(local_pos < node_pos, "local box renders before nodes: {out}");
     }
 
     #[test]

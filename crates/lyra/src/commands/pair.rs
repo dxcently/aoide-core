@@ -53,7 +53,7 @@
 //! this code back to `<name>`'s operator · id <id>" (`pair show`) — the
 //! same "one place this wording lives" discipline
 //! `aoide_secrets::watch::format_origin_line` holds for its own `--from`.
-//! `name`/`host` are PEER-SUPPLIED (a `pair-parked`/`pair-revealed` feed
+//! `name`/`host` are NODE-SUPPLIED (a `pair-parked`/`pair-revealed` feed
 //! record, or an outbound/inbound entry's own recorded name), so this text
 //! is rendered byte-for-byte, never interpreted, and the shared renderer's
 //! `qml_escape` is what keeps it from ever breaking out of its own QML
@@ -98,7 +98,7 @@ pub fn register(r: &mut Registry) {
         args: [],
         flags: [
             flag!("id", "string", "The pairing request id (display + audit only)."),
-            flag!("name", "string", "The peer's claimed name -- used for the dialog's window title (untrusted display data)."),
+            flag!("name", "string", "The node's claimed name -- used for the dialog's window title (untrusted display data)."),
             flag!("context", "string", "The pre-formatted context line -- 'pairing request from `name` (host) . id <id>' (inbound) or 'type the reply code shown on `name`'s screen . id <id>' (outbound), already built once by the caller so zenity and this dialog render byte-identical wording.")
         ],
         gated: false,
@@ -111,7 +111,7 @@ pub fn register(r: &mut Registry) {
         args: [],
         flags: [
             flag!("id", "string", "The pairing request id (display + audit only)."),
-            flag!("name", "string", "The peer's claimed name -- used for the dialog's window title (untrusted display data)."),
+            flag!("name", "string", "The node's claimed name -- used for the dialog's window title (untrusted display data)."),
             flag!("context", "string", "The pre-formatted context line -- 'read this code back to `name`'s operator . id <id>', already built once by the caller so zenity and this dialog render byte-identical wording."),
             flag!("code", "string", "This instance's own locally-derived reply SAS -- shown large and plain with a Copy control, never compared against anything (a display dialog has no typed value to compare).")
         ],

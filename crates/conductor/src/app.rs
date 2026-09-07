@@ -185,7 +185,7 @@ pub struct LogTail {
 /// (messaging/presence plan, P-C4; the retired standalone `who` command's
 /// own throttle, unchanged — session-surface redesign, command-defrag lane
 /// X, 2026-08-28). `session --hosts` performs a LIVE network probe of every
-/// registered peer on each invocation (`conduct/src/graph/who.rs`'s module
+/// registered node on each invocation (`conduct/src/graph/who.rs`'s module
 /// doc — the roster core), so the pane re-dispatches at most this often —
 /// never on every ~500ms UI tick.
 pub const ROSTER_THROTTLE: std::time::Duration = std::time::Duration::from_secs(15);
@@ -202,7 +202,7 @@ pub struct RosterSession {
     pub state: String,
 }
 
-/// One node (this box, or a registered peer) as `session --hosts --json`
+/// One node (this box, or a registered node) as `session --hosts --json`
 /// reports it — parsed from the cached `Outcome`'s `data.nodes[]`.
 /// `presence` is one of the roster core's own three node-level classes:
 /// `online` | `unreachable` | `never-pulled` (`who.rs`'s module doc,
@@ -391,7 +391,7 @@ impl App {
         }
     }
 
-    /// Test-only constructor: an App seeded from in-memory data, no disk. Lets
+    /// Test-only function Object() { [native code] }: an App seeded from in-memory data, no disk. Lets
     /// the panel unit tests exercise pure rendering without a stage tree.
     #[cfg(test)]
     pub fn for_test(
@@ -406,7 +406,7 @@ impl App {
         app
     }
 
-    /// Test-only constructor: like [`App::for_test`] but also wires a real
+    /// Test-only function Object() { [native code] }: like [`App::for_test`] but also wires a real
     /// `DispatchFn` — the ROSTER throttle tests need to observe actual
     /// dispatch calls (a counting `fn`), not just render/select/navigate.
     #[cfg(test)]
@@ -630,13 +630,13 @@ impl App {
     // changed) ──────────────────────────────────────────────────────────
     //
     // `session --hosts` performs a live network probe of every registered
-    // peer on EVERY invocation (`conduct/src/graph/who.rs`'s module doc —
-    // the roster core) — up to ~2s per peer, run in parallel inside the
+    // node on EVERY invocation (`conduct/src/graph/who.rs`'s module doc —
+    // the roster core) — up to ~2s per node, run in parallel inside the
     // roster core itself but still ~2s wall-clock in the worst case.
     // Calling it through `App::dispatch` the way every other action does
     // would block the ~500ms tick loop for that long, so this dispatch runs
     // on its OWN `std::thread` (the exact pattern the roster core's own
-    // `probe_peers` already uses one layer down) and reports back over an
+    // `probe_nodes` already uses one layer down) and reports back over an
     // `mpsc` channel that the tick loop only ever polls non-blockingly. This
     // is the ONE dispatch site in the crate that does not go through
     // `App::dispatch` — the roster never mutates anything, so there is no
@@ -712,7 +712,7 @@ impl App {
     fn poll_roster(&mut self) -> bool {
         let mut changed = self.drain_roster();
         if changed {
-            // A landed fetch can SHRINK the roster (a peer went unreachable,
+            // A landed fetch can SHRINK the roster (a node went unreachable,
             // a session ended) — `roster_sel` was clamped against the OLD
             // row count. `reload_all`/`poll_refresh`'s stage-mtime path
             // clamps after every reload, but a background roster fetch
@@ -798,7 +798,7 @@ impl App {
     /// [`App::status_message`] uses for the global status line (house
     /// style; P-C4 review nit). Without this branch a failed fetch would
     /// render as a bare "fetched Ns ago" over an empty roster, silently
-    /// indistinguishable from "this box and every peer really have zero
+    /// indistinguishable from "this box and every node really have zero
     /// sessions."
     pub fn roster_status(&self) -> String {
         let probing = self.roster_rx.is_some();
@@ -819,7 +819,7 @@ impl App {
     //
     // Unlike ROSTER's `session --hosts`, `session pending list` is a local file read (no
     // network) — refreshing it costs one JSON parse of `state/stage/pending.json`,
-    // not a ~2s-per-peer probe. So there is no throttle window and no
+    // not a ~2s-per-node probe. So there is no throttle window and no
     // background thread here: [`App::refresh_pending`] runs synchronously,
     // called from `reload_all` (which fires after every dispatch — this is
     // what makes "re-list after every resolve" true) and from
@@ -1512,7 +1512,7 @@ impl App {
                     // `pending_approve`'s in-process re-drive uses
                     // (`conduct/src/graph/pending.rs`). `--yes` is a
                     // documented no-op for a REMOTE target (the receiving
-                    // peer gates its own delivery); `deliver_remote` folds
+                    // node gates its own delivery); `deliver_remote` folds
                     // that note straight into the Outcome message, so
                     // `status_message` surfaces it same as any other
                     // dispatch — no special-casing needed here.
@@ -2170,7 +2170,7 @@ mod tests {
         app.roster.fetched_at = Some(Instant::now());
 
         let nodes = app.roster_nodes();
-        assert_eq!(nodes.len(), 2, "local + one peer, in the roster's own order");
+        assert_eq!(nodes.len(), 2, "local + one node, in the roster's own order");
         assert!(nodes[0].is_local && nodes[0].name == "sakaki", "local box first");
         assert_eq!(nodes[0].sessions[0].label, "sakaki/root/s1");
         assert_eq!(nodes[0].sessions[0].state, "working");

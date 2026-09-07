@@ -22,7 +22,7 @@
 //! commitment — [`reconcile`] re-derives the SAS locally from THIS
 //! instance's own identity plus the parked/pending entry, exactly the
 //! arg order `approve_inbound`/`approve_outbound`
-//! (`aoide_client::commands`) already use for each direction — `peer
+//! (`aoide_client::commands`) already use for each direction — `node
 //! pending` itself carries no SAS at all (P-PV2, the User's locked spec).
 //! A missed
 //! or malformed line never strands a request: [`run`]'s 30s reconcile
@@ -32,7 +32,7 @@
 //! `--popup` is REFUSED up front when NEITHER `lyra` nor `zenity` resolves,
 //! the same "refuse before ever entering popup mode" gate `aoide_secrets::
 //! watch::run` already holds for its own two dialog binaries. `--popup`+
-//! `--json` together is refused one layer up, by `handle_peer_pair_watch`
+//! `--json` together is refused one layer up, by `handle_node_pair_watch`
 //! (`aoide_client::commands`) — the same split `aoide_secrets::commands::
 //! handle_secrets_watch`/`aoide_server::commands::handle_events_tail`
 //! already hold between "gate the door and the flag combo" (the
@@ -413,7 +413,7 @@ pub fn reconcile(now_epoch: i64) -> Vec<Pending> {
 /// can find it (`aoide_storage::pairing::mark_inbound_approved`), so a
 /// SAS alone would re-raise the code dialog on every tick for a request
 /// this operator already answered. An outbound entry only once it reached
-/// `awaiting-confirm` (`awaiting-approval` means the PEER hasn't approved
+/// `awaiting-confirm` (`awaiting-approval` means the NODE hasn't approved
 /// yet — nothing on THIS end to confirm, `approve_outbound`'s own
 /// refusal).
 pub fn actionable(p: &Pending) -> bool {
@@ -538,7 +538,7 @@ fn dialog_context(p: &Pending) -> String {
 /// [`dialog_context`], but this one DOES describe a code (never the code
 /// itself — that is a separate `--code`/`--text` argument on either spawn
 /// path, never interpolated into this line): this dialog fires only after
-/// an inbound commit already succeeded, so `p.name` here is the PEER whose
+/// an inbound commit already succeeded, so `p.name` here is the NODE whose
 /// operator needs the code relayed back to them, out-of-band.
 fn show_context(p: &Pending) -> String {
     format!("read this code back to `{}`'s operator \u{b7} id {}", p.name, p.id)
@@ -647,8 +647,8 @@ fn show_reply_code(lyra_cmd: Option<&str>, p: &Pending, code: &str, json_mode: b
 /// The reply-code toast's SUMMARY and BODY — pure (module doc's structural
 /// rule 1 applies here too: built only from what [`commit_approval`]'s own
 /// outcome already handed back, never a feed line), so it is unit-testable
-/// with no `notify-send` spawn involved. `name` is the PEER's own display
-/// name (peer-supplied, root `AGENTS.md` house rule 4's untrusted-display-
+/// with no `notify-send` spawn involved. `name` is the NODE's own display
+/// name (node-supplied, root `AGENTS.md` house rule 4's untrusted-display-
 /// data rule) — it lands in the returned strings as plain text and reaches
 /// `notify-send` as a single argv element in [`notify_reply_code`], never
 /// through a shell, so nothing in it is ever interpreted.
@@ -771,7 +771,7 @@ fn eligible_for_dialog(p: &Pending, ignored: bool, marker_live: bool) -> bool {
 /// candidate-SELECTION time, so a dialog already open when the marker
 /// appeared sat there, oblivious — racing the SAME commit
 /// ([`PairActiveMarker`]'s own doc) the marker exists to prevent, and
-/// `peer_store::save_peers` has no cross-process lock of its own
+/// `node_store::save_nodes` has no cross-process lock of its own
 /// (plain load → modify → atomic write), so two concurrent commits are a
 /// genuine lost update, not a cosmetic double-dialog. Extracted as its
 /// own pure function (rather than left inline in the closures) so this
@@ -844,7 +844,7 @@ const OUTBOUND_POLL_BACKOFF_INITIAL: Duration = OUTBOUND_POLL_INTERVAL;
 /// Ceiling [`next_outbound_poll_backoff`] never exceeds — 30 minutes,
 /// well inside a pairing request's own 4-hour default expiry
 /// (`aoide_storage::pairing::DEFAULT_PAIRING_TIMEOUT_SECS`), so a
-/// persistently unreachable peer still gets checked roughly every half
+/// persistently unreachable node still gets checked roughly every half
 /// hour rather than the ~240 blind round trips a flat 60s cadence would
 /// cost over the same window (review defect 2's own arithmetic: 4h / 60s).
 const OUTBOUND_POLL_BACKOFF_MAX: Duration = Duration::from_secs(30 * 60);
@@ -1388,7 +1388,7 @@ mod tests {
 
     // ── reconcile: the swap-catcher ──────────────────────────────────────
 
-    fn with_peer_state<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+    fn with_node_state<T>(tag: &str, f: impl FnOnce() -> T) -> T {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let dir = std::env::temp_dir().join(format!(
@@ -1414,7 +1414,7 @@ mod tests {
     /// path directly instead.
     #[test]
     fn reconcile_derives_the_same_sas_approve_inbound_would() {
-        with_peer_state("swap-catcher", || {
+        with_node_state("swap-catcher", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             aoide_storage::pairing::park_inbound(
                 &"a".repeat(64),
@@ -1450,7 +1450,7 @@ mod tests {
 
     #[test]
     fn an_unrevealed_inbound_entry_is_never_actionable() {
-        with_peer_state("unrevealed", || {
+        with_node_state("unrevealed", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             aoide_storage::pairing::park_inbound(
                 &"a".repeat(64),
@@ -1473,7 +1473,7 @@ mod tests {
 
     #[test]
     fn an_outbound_entry_awaiting_approval_is_never_actionable() {
-        with_peer_state("awaiting-approval", || {
+        with_node_state("awaiting-approval", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
                 id: "deadbeef".to_string(),
@@ -1493,13 +1493,13 @@ mod tests {
             let pending = reconcile(now_epoch);
             assert_eq!(pending.len(), 1);
             assert!(pending[0].sas.is_some(), "outbound always carries its own nonce, so a SAS is always derivable");
-            assert!(!actionable(&pending[0]), "awaiting-approval means the PEER hasn't approved yet — nothing on this end to confirm");
+            assert!(!actionable(&pending[0]), "awaiting-approval means the NODE hasn't approved yet — nothing on this end to confirm");
         });
     }
 
     #[test]
     fn an_approved_inbound_entry_stops_being_actionable() {
-        with_peer_state("approved-inbound", || {
+        with_node_state("approved-inbound", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             let nonce = "c".repeat(32);
             let id = aoide_storage::pairing::park_inbound(
@@ -1716,7 +1716,7 @@ mod tests {
 
     #[test]
     fn poll_pending_outbound_advances_an_awaiting_approval_entry_to_awaiting_confirm() {
-        with_peer_state("poll-pending-outbound", || {
+        with_node_state("poll-pending-outbound", || {
             let pubkey_b = "b".repeat(64);
             let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"approved","pubkeyHex":"{pubkey_b}"}}}}"#);
             let body: &'static str = Box::leak(body.into_boxed_str());
@@ -1774,7 +1774,7 @@ mod tests {
     /// that suppresses that immediate re-poll.
     #[test]
     fn poll_pending_outbound_backs_off_after_a_refused_answer_instead_of_retrying_immediately() {
-        with_peer_state("poll-pending-outbound-backoff", || {
+        with_node_state("poll-pending-outbound-backoff", || {
             let pubkey_b = "b".repeat(64);
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             // Port 1 on loopback: nothing listens, so the poll fails fast
@@ -1815,7 +1815,7 @@ mod tests {
 
     #[test]
     fn poll_pending_outbound_clears_backoff_once_a_poll_stops_being_refused() {
-        with_peer_state("poll-pending-outbound-backoff-clears", || {
+        with_node_state("poll-pending-outbound-backoff-clears", || {
             let pubkey_b = "b".repeat(64);
             let body = r#"{"jsonrpc":"2.0","id":1,"result":{"status":"pending"}}"#;
             let (_listener, port) = spawn_fake_pair_poll_server(body);
@@ -2099,7 +2099,7 @@ mod tests {
     // ── reply_notification_text (the reply-code toast) ─────────────────────
 
     #[test]
-    fn reply_notification_text_names_the_peer_and_the_code_prominently() {
+    fn reply_notification_text_names_the_node_and_the_code_prominently() {
         let (summary, body) = reply_notification_text("box-a", "222-333");
         assert!(summary.contains("box-a"), "{summary}");
         assert!(summary.to_lowercase().contains("pairing"), "{summary}");
@@ -2108,7 +2108,7 @@ mod tests {
     }
 
     #[test]
-    fn reply_notification_text_survives_a_hostile_peer_name_as_plain_data() {
+    fn reply_notification_text_survives_a_hostile_node_name_as_plain_data() {
         // Same discipline as `dialog_context_and_title_survive_hostile_name_
         // intact_and_never_carry_the_sas`: the builder never escapes or
         // truncates a hostile name — it just formats what it was given.
@@ -2185,15 +2185,15 @@ mod tests {
         remove_shim(&lyra_shim);
     }
 
-    // ── commit_approval: same peers.json the CLI's `--yes` path writes ────
+    // ── commit_approval: same nodes.json the CLI's `--yes` path writes ────
 
     /// `approve_inbound`'s own commit is now PURELY LOCAL (Design A, task
     /// #119 — module doc on `commands::approve_inbound`): no network call at
     /// all, so this test needs no fake server the way the old callback-era
     /// version of it did — proving that IS part of the point.
     #[test]
-    fn commit_approval_on_an_inbound_entry_writes_the_same_peers_json_the_cli_would() {
-        with_peer_state("commit-approval-inbound", || {
+    fn commit_approval_on_an_inbound_entry_writes_the_same_nodes_json_the_cli_would() {
+        with_node_state("commit-approval-inbound", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             aoide_storage::pairing::park_inbound(
                 &"a".repeat(64),
@@ -2217,11 +2217,11 @@ mod tests {
             let outcome = commit_approval(&pending[0], &sas, now_epoch);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
 
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].name, "box-a");
-            assert_eq!(peers[0].pubkey.as_deref(), Some("a".repeat(64).as_str()));
-            assert!(peers[0].verified);
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].name, "box-a");
+            assert_eq!(nodes[0].pubkey.as_deref(), Some("a".repeat(64).as_str()));
+            assert!(nodes[0].verified);
 
             // Design A: the parked entry stays PARKED, marked approved, for
             // the requester's own poll to find later — never taken here.
@@ -2240,7 +2240,7 @@ mod tests {
     /// that half; this pins the popup wiring reaches the identical gate).
     #[test]
     fn commit_approval_inbound_wrong_code_counts_a_try_then_auto_denies_at_max_tries() {
-        with_peer_state("commit-approval-inbound-wrong-code", || {
+        with_node_state("commit-approval-inbound-wrong-code", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             aoide_storage::pairing::park_inbound(
                 &"a".repeat(64),
@@ -2273,13 +2273,13 @@ mod tests {
             assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
             assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("auto-deny-on-code-mismatch"));
             assert!(aoide_storage::pairing::list_inbound(now_epoch).is_empty(), "auto-denied — the parked entry is removed");
-            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing was ever committed");
+            assert!(aoide_storage::node_store::load_nodes().is_empty(), "nothing was ever committed");
         });
     }
 
     /// The expected reply code an outbound entry built inline by these
     /// tests gates its final commit on — `derive_reply_sas` from THIS
-    /// process's own freshly-minted identity (`with_peer_state`'s
+    /// process's own freshly-minted identity (`with_node_state`'s
     /// sandboxed `AOIDE_STATE_DIR`) plus the fixture's own transcript
     /// fields, the exact computation `commit_outbound` itself performs
     /// (`commands.rs`'s own `expected_reply_sas` test helper, mirrored
@@ -2291,8 +2291,8 @@ mod tests {
     }
 
     #[test]
-    fn commit_approval_on_an_outbound_entry_writes_the_same_peers_json_the_cli_would() {
-        with_peer_state("commit-approval-outbound", || {
+    fn commit_approval_on_an_outbound_entry_writes_the_same_nodes_json_the_cli_would() {
+        with_node_state("commit-approval-outbound", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             let pubkey_b = "b".repeat(64);
             aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
@@ -2321,11 +2321,11 @@ mod tests {
             let outcome = commit_approval(&pending[0], &expected_reply_sas(&pubkey_b), now_epoch);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
 
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].name, "box-b");
-            assert_eq!(peers[0].pubkey.as_deref(), Some("b".repeat(64).as_str()));
-            assert!(peers[0].verified);
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].name, "box-b");
+            assert_eq!(nodes[0].pubkey.as_deref(), Some("b".repeat(64).as_str()));
+            assert!(nodes[0].verified);
             assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the parked entry is taken on commit");
         });
     }
@@ -2340,7 +2340,7 @@ mod tests {
     /// reversal's own reasoning.)
     #[test]
     fn commit_approval_on_an_outbound_entry_with_a_wrong_code_counts_a_try_and_does_not_commit() {
-        with_peer_state("commit-approval-outbound-wrong-code", || {
+        with_node_state("commit-approval-outbound-wrong-code", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
                 id: "deadbeef".to_string(),
@@ -2364,7 +2364,7 @@ mod tests {
             let outcome = commit_approval(&pending[0], "xxx-xxx", now_epoch);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
             assert_eq!(aoide_storage::pairing::list_outbound(now_epoch)[0].tries, 1);
-            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing was ever committed on a wrong code");
+            assert!(aoide_storage::node_store::load_nodes().is_empty(), "nothing was ever committed on a wrong code");
         });
     }
 
@@ -2374,10 +2374,10 @@ mod tests {
     /// `PopupDecision::Reject`/`Ignore`, and `popup_tick`'s match only
     /// ever calls `commit_approval` from the `Approve` arm. This test pins
     /// the OUTBOUND storage side of that: neither a reject nor an ignore
-    /// touches `peers.json` or takes the parked entry.
+    /// touches `nodes.json` or takes the parked entry.
     #[test]
     fn an_outbound_entry_is_untouched_by_reject_and_by_a_bare_ignore() {
-        with_peer_state("outbound-reject-and-ignore-untouched", || {
+        with_node_state("outbound-reject-and-ignore-untouched", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             aoide_storage::pairing::park_outbound(aoide_storage::pairing::OutboundPairingRequest {
                 id: "deadbeef".to_string(),
@@ -2402,7 +2402,7 @@ mod tests {
             let out = crate::commands::reject_by_id("pair.reject", "deadbeef");
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
-            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing was ever committed");
+            assert!(aoide_storage::node_store::load_nodes().is_empty(), "nothing was ever committed");
             assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "reject aborts the outbound entry outright");
         });
     }

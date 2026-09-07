@@ -1,6 +1,6 @@
 //! The A2A client-side wire builders: resolving a remote AgentCard URL, and
 //! building the outbound `message/send` JSON-RPC request body aoide POSTs
-//! when reaching a registered peer.
+//! when reaching a registered node.
 //!
 //! Moved from root `src/a2a.rs` (Phase 4b restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md — the CLIENT-side region of that file;
@@ -25,16 +25,16 @@ pub fn resolve_card_url(url: &str) -> String {
 }
 
 /// Build the JSON-RPC `message/send` request body aoide POSTs when DRIVING a
-/// registered peer (the outbound half of the bidirectional link). Mirrors
+/// registered node (the outbound half of the bidirectional link). Mirrors
 /// the inbound shape the server's `parse_message_send_params` (`src/a2a.rs`)
 /// reads. Pure — the caller generates `message_id`, so the body stays
 /// deterministic in tests.
 ///
-/// `context_id` threads a target session id for a PEER send (messaging plan
-/// P-C3: `graph send --to <peer>/<query>` resolves a remote sessionId and
-/// hands it here so the receiving peer's `message_send` Inject arm can find
+/// `context_id` threads a target session id for a NODE send (messaging plan
+/// P-C3: `graph send --to <node>/<query>` resolves a remote sessionId and
+/// hands it here so the receiving node's `message_send` Inject arm can find
 /// it — see `crates/server/src/a2a.rs::decide_send_action`). Every OTHER
-/// caller (today: `peer spawn`, addressing a peer with no aoide sessionId
+/// caller (today: `node spawn`, addressing a node with no aoide sessionId
 /// to target) passes `None`.
 pub fn build_message_send_body(text: &str, message_id: &str, context_id: Option<&str>) -> Value {
     let params = MessageSendParams {
@@ -107,8 +107,8 @@ mod tests {
 
     #[test]
     fn build_message_send_body_threads_a_context_id_when_given() {
-        // P-C3: a peer-targeted send carries the resolved remote sessionId
-        // as `contextId` so the receiving peer's Inject arm can find it.
+        // P-C3: a node-targeted send carries the resolved remote sessionId
+        // as `contextId` so the receiving node's Inject arm can find it.
         let body = build_message_send_body("hello there", "mid-123", Some("sess-9"));
         assert_eq!(body["params"]["message"]["contextId"], "sess-9");
     }

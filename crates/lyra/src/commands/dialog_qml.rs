@@ -143,7 +143,7 @@ pub(crate) fn run_code_entry_dialog(
 /// **Done** control — no reject control at all. This is the pairing
 /// ceremony's REPLY-code display, spawned by `aoide pair watch --popup`
 /// immediately after a popup-driven INBOUND commit succeeds: the approver
-/// already committed their own peer record (this dialog fires AFTER that,
+/// already committed their own node record (this dialog fires AFTER that,
 /// never before), so there is nothing left here to approve OR reject — the
 /// operator's only job is to relay the code shown out-of-band and dismiss
 /// the window once they have, by whichever of Done/Esc/close they reach for
@@ -188,7 +188,7 @@ fn write_temp_qml(file_prefix: &str, contents: &str) -> std::io::Result<PathBuf>
     ));
     // `0600` from creation, then `set_permissions` again (belt-and-
     // suspenders against a permissive umask) — only ever display data (a
-    // secret/peer NAME, never a value), but costs nothing to hold to the
+    // secret/node NAME, never a value), but costs nothing to hold to the
     // same standard `aoide_secrets::store::secure_file` does.
     let mut file = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(&path)?;
     file.write_all(contents.as_bytes())?;
@@ -285,7 +285,7 @@ fn parse_marker_line(line: &str, result_marker: &str) -> Option<AskResult> {
 }
 
 /// Escape a string for embedding inside a QML double-quoted string literal —
-/// every value this function escapes is UNTRUSTED display text (a peer
+/// every value this function escapes is UNTRUSTED display text (a node
 /// name, an origin address, a self-asserted reason). See the original `lyra
 /// secrets ask` doc (P3) for the full character-by-character reasoning
 /// (backslash/quote, raw newline/CR being a QML/JS syntax error, U+2028/
@@ -525,7 +525,7 @@ __HEADER_BLOCK__
 /// ([`parse_marker_line`]'s own doc), since nothing distinguishes "clicked
 /// Done" from "closed the window" when nothing is at stake either way.
 /// `code` is UNTRUSTED-ADJACENT in the sense that it is this instance's OWN
-/// locally-derived value (never peer-supplied) but still routed through
+/// locally-derived value (never node-supplied) but still routed through
 /// [`qml_escape`] on principle, the same "escape every value this function
 /// touches, don't special-case one as trusted" posture `header_line_qml`
 /// already holds.
@@ -745,7 +745,7 @@ mod tests {
     fn render_wraps_a_header_line_inside_the_window_instead_of_clipping_it() {
         // The live defect this closes: a context line longer than the fixed
         // 400px window rendered at its natural width and was cut at both
-        // edges, taking the peer name and the request id — the two facts the
+        // edges, taking the node name and the request id — the two facts the
         // operator is being asked to judge — off screen with it. Both
         // dialog shapes share `header_line_qml`, so both are asserted.
         let long = "pairing request from `osaka` (192.168.1.201) · id demo-7f2a";

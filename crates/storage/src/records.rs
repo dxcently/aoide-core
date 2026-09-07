@@ -351,9 +351,9 @@ pub struct SessionRecord {
     )]
     pub resumed_from: Option<String>,
     /// Who caused this session to exist, when it wasn't a local registration
-    /// (P-P3, `docs/architecture/PAIRING.md` decision 7): `"peer:<name>"`
+    /// (P-P3, `docs/architecture/PAIRING.md` decision 7): `"node:<name>"`
     /// for a session the A2A door spawned on behalf of an identified,
-    /// paired peer (`aoide-server`'s `a2a::do_spawn`). Additive/v0-safe —
+    /// paired node (`aoide-server`'s `a2a::do_spawn`). Additive/v0-safe —
     /// absent on a legacy record and on every LOCALLY-registered session
     /// (a plain `aoide conduct`/`graph spawn`/hook registration never sets
     /// it). Stamped once, at registration (`stamp_origin`), never changed

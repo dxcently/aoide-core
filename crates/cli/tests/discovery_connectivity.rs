@@ -1,7 +1,7 @@
 //! Real UDP broadcast round trip for the discovery advertisement (P-P6 +
 //! task #120, `docs/architecture/PAIRING.md`'s "Discovery
 //! (advertise-but-locked)" section) — same "genuine network, not a mock"
-//! priority `peer_connectivity.rs` already holds for the pairing ceremony,
+//! priority `node_connectivity.rs` already holds for the pairing ceremony,
 //! and the SAME `#[ignore]`'d-not-skipped reasoning: this drives a REAL
 //! `aoide-server::discovery::spawn_advertiser` background thread sending
 //! REAL UDP datagrams to the limited-broadcast address, and a REAL
@@ -22,15 +22,15 @@
 //! serialize/validate, the malformed-variant drops, the bounded
 //! dedupe-by-(name, source) fold, `pair`'s hostname arm's
 //! zero/one/many-match resolution, the advertise switch's off-by-default
-//! idempotence, `peer discover` never writing `state/peers.json`, the
+//! idempotence, `node discover` never writing `state/nodes.json`, the
 //! loopback-path sweep round trip, and `pair`'s hostname arm calling
 //! the identical `run_pair_request` its url arm runs — is proven WITHOUT
 //! leaving the sandbox, in `aoide-storage::advertise::tests`,
 //! `aoide-client::discover::tests` (whose
 //! `run_sweep_hears_an_advertisement_sent_over_the_real_loopback_stack`
 //! exercises the real socket over loopback, un-gated), `aoide-client::
-//! commands::tests::peer_discover_*`/`peer_advertise_*`/
-//! `peer_pair_hostname_arm_and_url_arm_are_the_same_function_not_two_copies`,
+//! commands::tests::node_discover_*`/`node_advertise_*`/
+//! `node_pair_hostname_arm_and_url_arm_are_the_same_function_not_two_copies`,
 //! and `aoide-server::a2a::tests::resolve_discovery_advertise_*`. This
 //! file holds only the two tests that genuinely need a live, routable
 //! network: the bare advertise→discover round trip over real broadcast,
@@ -48,7 +48,7 @@ fn free_port() -> u16 {
 }
 
 /// Poll (never a blind sleep as the ASSERTION) until a real TCP connect
-/// succeeds — same idiom `peer_connectivity.rs`'s own `wait_for_tcp_up`
+/// succeeds — same idiom `node_connectivity.rs`'s own `wait_for_tcp_up`
 /// uses, duplicated here rather than shared since integration test files
 /// in this crate are separate compilation units (that file's own header
 /// comment notes the same constraint).
@@ -156,36 +156,36 @@ fn advertise_then_discover_and_invite_resolve_round_trip_over_real_broadcast() {
 /// `pair`'s hostname arm's single-match path must reach the EXACT
 /// same `run_pair_request` body its url arm runs (client/AGENTS.md's own
 /// invariant on this). `aoide-client`'s own unit tests (`commands::tests::
-/// peer_pair_hostname_arm_and_url_arm_are_the_same_function_not_two_copies`)
+/// node_pair_hostname_arm_and_url_arm_are_the_same_function_not_two_copies`)
 /// prove this without a network, by calling both arms against an
 /// unreachable door and diffing the outcome. What THAT test can't reach is
 /// the wiring in between — `pair_via_hostname`'s own discover → resolve
 /// pipeline actually producing a real `Heard` to feed the shared function.
-/// This test closes that gap for real: a REAL second A2A door ("peer B"),
+/// This test closes that gap for real: a REAL second A2A door ("node B"),
 /// its REAL discovery advertisement, and `aoide pair <name> --yes`
 /// dispatched exactly as an operator would type it — then the SAME
 /// observable state change the url arm itself produces is asserted
 /// directly: an outbound pairing request parked in
-/// `peer-pairing-outbound.json`, pointed at the OBSERVED-address dial url
+/// `node-pairing-outbound.json`, pointed at the OBSERVED-address dial url
 /// `pair_via_hostname` composed.
 ///
 /// Two accommodations for the advertisement carrying no door URL (task
 /// #120), both confined to this `#[ignore]`'d file: `AOIDE_A2A_PORT` is
-/// pinned to peer B's ephemeral port so `pair_via_hostname`'s
+/// pinned to node B's ephemeral port so `pair_via_hostname`'s
 /// `default_a2a_port` dial resolves to the door that actually exists, and
-/// peer B binds `0.0.0.0` — a broadcast's observed source is this box's
+/// node B binds `0.0.0.0` — a broadcast's observed source is this box's
 /// own interface address, so a loopback-bound door would be unreachable at
 /// the composed target. A routable bind is a TEST harness necessity here,
 /// never a deployment shape (doors stay loopback-bound; `docs/
 /// architecture/PAIRING.md`'s Transport section).
 #[test]
 #[ignore = "real UDP broadcast + real TCP on a routable bind — no network in the nix sandbox; run with --ignored"]
-fn peer_pair_hostname_arm_single_match_reaches_the_shared_run_pair_request_over_real_broadcast_and_tcp() {
+fn node_pair_hostname_arm_single_match_reaches_the_shared_run_pair_request_over_real_broadcast_and_tcp() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("invite-ceremony");
     setup_env(&root);
 
-    // Peer B: a real A2A door — genuine accept loop, genuine HTTP/1.1
+    // Node B: a real A2A door — genuine accept loop, genuine HTTP/1.1
     // parsing, genuine JSON-RPC dispatch, no mock.
     let port_b = free_port();
     std::env::set_var("AOIDE_A2A_PORT", port_b.to_string());
@@ -195,7 +195,7 @@ fn peer_pair_hostname_arm_single_match_reaches_the_shared_run_pair_request_over_
             port_b,
             &PathBuf::from("/dev/null"),
             "",
-            "advertise-peer-b",
+            "advertise-node-b",
             "",
             "",
             Path::new("/tmp/aoide-a2a-discovery-connectivity-unused.sock"),
@@ -209,14 +209,14 @@ fn peer_pair_hostname_arm_single_match_reaches_the_shared_run_pair_request_over_
     // `discover::run_sweep` on the pairing side parses. The name must
     // differ from this box's own hostname or `pair`'s self-guard
     // (rightly) refuses it.
-    let name = "advertise-peer-b";
-    let _advertiser = aoide_server::discovery::spawn_advertiser(name, "peer-b-host", "khoa", true);
+    let name = "advertise-node-b";
+    let _advertiser = aoide_server::discovery::spawn_advertiser(name, "node-b-host", "khoa", true);
 
     // `pair <hostname>` end to end — the exact command an operator
     // types. `--secs 20` covers the advertiser's real send jitter on a
     // loaded box.
     // --wait 0: this test asserts the PARKED entry (nobody will ever
-    // approve advertise-peer-b), so it drives the detached shape.
+    // approve advertise-node-b), so it drives the detached shape.
     let pair_out = dispatch(&cli_invocation(&["pair"], &[name], &[("yes", "true"), ("secs", "20"), ("wait", "0")]));
     assert_eq!(pair_out.status, aoide_protocol::output::Status::Ok, "{}", pair_out.message);
 

@@ -7,12 +7,12 @@
 //!
 //! **Two files, two directions — never one.** A request rides from the
 //! REQUESTER (box A) to the APPROVER (box B); box B parks it
-//! ([`InboundPairingRequest`], `state/peer-pairing-inbound.json`) and box A
+//! ([`InboundPairingRequest`], `state/node-pairing-inbound.json`) and box A
 //! remembers it sent one ([`OutboundPairingRequest`],
-//! `state/peer-pairing-outbound.json`) so its own A2A door can finish the
+//! `state/node-pairing-outbound.json`) so its own A2A door can finish the
 //! ceremony when B's approval callback arrives, possibly long after the
 //! `pair` CLI process that sent it has exited. Same `state/`
-//! dir family as `peer_store`'s own `state/peers.json` (account/global
+//! dir family as `node_store`'s own `state/nodes.json` (account/global
 //! runtime, not song-scoped), same tolerate-missing/additive-round-trip
 //! discipline, same atomic writes.
 //!
@@ -41,7 +41,7 @@
 //! (the pending listing) lists it without a code, `pair <id>` refuses it
 //! outright (`docs/architecture/PAIRING.md`'s "awaiting reveal" wording).
 //!
-//! **Neither side commits a peer record on the FIRST human confirmation
+//! **Neither side commits a node record on the FIRST human confirmation
 //! alone (review-bounce fix, decision 4's mutual confirmation, for real).**
 //! B's `pair <id>` still commits B's own record right away — but,
 //! since Design A (task #119, poll-based completion — B's own door may be
@@ -57,7 +57,7 @@
 //! [`mark_outbound_awaiting_confirm`] to transition the entry to
 //! [`OutboundState::AwaitingConfirm`] and falls straight through to the SAME
 //! confirm-then-commit y/N prompt B's own approve already holds, only THEN
-//! calling `upsert_paired_peer` — the poll REPLACES the callback as the
+//! calling `upsert_paired_node` — the poll REPLACES the callback as the
 //! trigger for this transition; the state machine and the human-confirm gate
 //! it protects are otherwise unchanged. `pair reject <id>` aborts an
 //! outbound entry at EITHER state ([`OutboundState::AwaitingApproval`] or
@@ -91,7 +91,7 @@
 //! connection held open for the whole park), this queue is disk-persisted
 //! and unauthenticated by design (module doc on `pair_request` in
 //! `aoide-server::a2a`) — an unbounded queue of parked requests is an
-//! unbounded `state/peer-pairing-inbound.json`, cheap for an on-path or
+//! unbounded `state/node-pairing-inbound.json`, cheap for an on-path or
 //! local attacker to grow with no credential at all. `park_inbound` checks
 //! the (post-sweep) length against the cap and inserts under the SAME
 //! process-local [`std::sync::Mutex`] acquisition — never a separate
@@ -106,7 +106,7 @@
 //! second lock file would be a new abstraction for zero added
 //! correctness"): the resident `a2a serve` process and a concurrent CLI
 //! invocation (`pair`/`pair reject`, a poll release) mutate the
-//! same `state/peer-pairing-{inbound,outbound}.json`, and an unserialized
+//! same `state/node-pairing-{inbound,outbound}.json`, and an unserialized
 //! pair of read-modify-writes would silently drop an `approved` flag or a
 //! `tries` increment. `PARK_LOCK` stays alongside it as the in-process cap
 //! guard: `with_stage_lock` is best-effort by contract (a lock hiccup runs
@@ -151,7 +151,7 @@
 //! `docs/architecture/PAIRING.md`'s Transport section): reaching
 //! `pair_request` at all already requires a shell on the box or an ssh
 //! tunnel into it, and that same reach already grants a direct read of
-//! `state/peer-pairing-inbound.json` — the eviction discloses nothing that
+//! `state/node-pairing-inbound.json` — the eviction discloses nothing that
 //! access does not already hand over. Bound routably instead, the calculus
 //! flips (CONTRACTS.md §6's own park-cap paragraph states the same
 //! condition).
@@ -216,7 +216,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::sync::Mutex;
 
-/// `state/peer-pairing-inbound.json`/`-outbound.json` schema version.
+/// `state/node-pairing-inbound.json`/`-outbound.json` schema version.
 pub const PAIRING_VERSION: &str = "0";
 
 /// Env override for how long an unapproved pairing request stays parked
@@ -402,7 +402,7 @@ fn same_pubkey(a: &str, b: &str) -> bool {
 /// One pairing request parked on the APPROVER's own instance — everything
 /// the approver needs to display it (the bare `pair` pending listing), derive the SAS
 /// once revealed (`derive_sas` against this instance's own identity), and
-/// commit a peer record on approval (`pair <id>`), all without any
+/// commit a node record on approval (`pair <id>`), all without any
 /// further wire round trip to the requester until the approval callback
 /// itself.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -413,11 +413,11 @@ pub struct InboundPairingRequest {
     pub pubkey_hex: String,
     /// The requester's self-claimed local nickname (`pair
     /// <url> --name <n>`, or that command's own URL-derived default) — used,
-    /// self-asserted, as the approver's OWN nickname for this peer too
+    /// self-asserted, as the approver's OWN nickname for this node too
     /// (`pair <id>` takes no separate `--name`).
     pub name: String,
-    /// The connecting TCP peer's own address, as classified by
-    /// [`crate` — server crate's] `PeerOrigin` at park time — display-only
+    /// The connecting TCP node's own address, as classified by
+    /// [`crate` — server crate's] `ConnOrigin` at park time — display-only
     /// (PAIRING.md: "parks pending (id, ... origin addr)"); never a
     /// security decision in this phase (no pairing exists yet to gate on).
     #[serde(rename = "originAddr")]
@@ -478,12 +478,12 @@ pub struct InboundPairingRequest {
     /// approver can derive a working `via` from the connection it observes:
     /// a request arriving over the requester's own ssh tunnel is seen from
     /// loopback, not the requester's real address, so nothing about the
-    /// connection itself can ever answer "how do I dial this peer back."
+    /// connection itself can ever answer "how do I dial this node back."
     /// `self_via` is the requester's own claim of that hop — same trust
     /// class as [`Self::url`] (self-asserted DATA, a transport marker only;
     /// trust stays in pubkeys + SAS) — carried through so `pair
     /// <id>`'s own commit ([`crate` client crate's `approve_inbound`])
-    /// can record a peer `via` that actually reaches back out.
+    /// can record a node `via` that actually reaches back out.
     /// `#[serde(default, skip_serializing_if = "Option::is_none")]` so a
     /// parked entry predating this field loads `None` and a `None` here
     /// never grows the file — the same additive discipline
@@ -501,7 +501,7 @@ struct InboundPairingFile {
 }
 
 fn inbound_path() -> std::path::PathBuf {
-    state_dir().join("peer-pairing-inbound.json")
+    state_dir().join("node-pairing-inbound.json")
 }
 
 fn load_inbound_raw() -> Vec<InboundPairingRequest> {
@@ -516,7 +516,7 @@ fn save_inbound(requests: &[InboundPairingRequest]) -> Result<(), String> {
         schema_version: PAIRING_VERSION.to_string(),
         requests: requests.to_vec(),
     };
-    let body = serde_json::to_string_pretty(&file).map_err(|e| format!("serialize peer-pairing-inbound.json: {e}"))? + "\n";
+    let body = serde_json::to_string_pretty(&file).map_err(|e| format!("serialize node-pairing-inbound.json: {e}"))? + "\n";
     let path = inbound_path();
     atomic_write(&path, &body).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -644,7 +644,7 @@ pub enum RevealError {
     /// there is nothing left worth keeping parked once the commitment
     /// fails to check out.
     Mismatch,
-    /// Reading or writing `state/peer-pairing-inbound.json` itself failed.
+    /// Reading or writing `state/node-pairing-inbound.json` itself failed.
     Io(String),
 }
 
@@ -694,13 +694,13 @@ pub enum MarkApprovedError {
     /// No parked inbound request has this id (unknown, already resolved, or
     /// expired).
     Unknown,
-    /// Reading or writing `state/peer-pairing-inbound.json` itself failed.
+    /// Reading or writing `state/node-pairing-inbound.json` itself failed.
     Io(String),
 }
 
-/// Design A (poll-based completion, task #119): the APPROVER's own `peer
+/// Design A (poll-based completion, task #119): the APPROVER's own `node
 /// pair approve <id>` calls this in place of the old callback delivery,
-/// AFTER it has already confirmed the SAS and committed its own peer
+/// AFTER it has already confirmed the SAS and committed its own node
 /// record — the entry stays PARKED (never taken) with [`InboundPairingRequest::approved`]
 /// flipped `true`, so the requester's own `aoide/pairPoll` can find and
 /// release it later, however long after this CLI process exits. Idempotent:
@@ -815,7 +815,7 @@ pub struct OutboundPairingRequest {
     /// Same id the approver parked it under (module doc — one shared id,
     /// no separate counters to reconcile).
     pub id: String,
-    /// The approver's own A2A door URL — this becomes the peer record's
+    /// The approver's own A2A door URL — this becomes the node record's
     /// `url` on commit.
     pub url: String,
     /// THIS instance's own local nickname for the approver
@@ -846,9 +846,9 @@ pub struct OutboundPairingRequest {
     #[serde(default)]
     pub state: OutboundState,
     /// The ssh-transport marker (P-S4, K1) this ceremony resolved for the
-    /// approver at REQUEST time — a `--via` flag, or (`peer invite`) the
+    /// approver at REQUEST time — a `--via` flag, or (`node invite`) the
     /// discovery advertisement's observed source address — carried here because
-    /// the actual peer-record commit happens LATER, in a SEPARATE `peer
+    /// the actual node-record commit happens LATER, in a SEPARATE `node
     /// pair approve <id>` invocation (`approve_outbound`), which has no
     /// other way to recover what this instance resolved when the request
     /// was first sent. `#[serde(default)]` so a file predating this field
@@ -880,7 +880,7 @@ struct OutboundPairingFile {
 }
 
 fn outbound_path() -> std::path::PathBuf {
-    state_dir().join("peer-pairing-outbound.json")
+    state_dir().join("node-pairing-outbound.json")
 }
 
 fn load_outbound_raw() -> Vec<OutboundPairingRequest> {
@@ -895,7 +895,7 @@ fn save_outbound(requests: &[OutboundPairingRequest]) -> Result<(), String> {
         schema_version: PAIRING_VERSION.to_string(),
         requests: requests.to_vec(),
     };
-    let body = serde_json::to_string_pretty(&file).map_err(|e| format!("serialize peer-pairing-outbound.json: {e}"))? + "\n";
+    let body = serde_json::to_string_pretty(&file).map_err(|e| format!("serialize node-pairing-outbound.json: {e}"))? + "\n";
     let path = outbound_path();
     atomic_write(&path, &body).map_err(|e| format!("{}: {e}", path.display()))
 }
@@ -958,7 +958,7 @@ pub enum ConfirmMarkError {
     /// nothing to restore since nothing was ever taken off the queue for
     /// this check).
     Mismatch,
-    /// Reading or writing `state/peer-pairing-outbound.json` itself failed.
+    /// Reading or writing `state/node-pairing-outbound.json` itself failed.
     Io(String),
 }
 
@@ -967,7 +967,7 @@ pub enum ConfirmMarkError {
 /// effect): on a pubkey match, transition the outbound entry to
 /// [`OutboundState::AwaitingConfirm`] — deliberately NOT a commit. This
 /// instance's OWN operator still has to run `pair <id>` and
-/// confirm the SAS before `upsert_paired_peer` ever runs on this side
+/// confirm the SAS before `upsert_paired_node` ever runs on this side
 /// (module doc: mutual confirmation, for real).
 pub fn mark_outbound_awaiting_confirm(id: &str, pubkey_hex: &str, now_epoch: i64) -> Result<OutboundPairingRequest, ConfirmMarkError> {
     with_stage_lock(|| {

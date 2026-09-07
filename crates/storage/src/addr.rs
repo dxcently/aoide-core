@@ -2,7 +2,7 @@
 //! `display::session_label`: that module builds a string for a human to
 //! read; this one takes a string a human TYPED and works backward to a
 //! session identity. Zero I/O: [`resolve`] takes only slices the caller
-//! already has in hand (no stage read, no peer-cache read) so it is
+//! already has in hand (no stage read, no node-cache read) so it is
 //! trivially unit-testable and safe to call from any door (CLI, MCP, A2A).
 //!
 //! ## Grammar, tried in precedence order
@@ -27,10 +27,10 @@
 //!    the first must equal the caller's own `host`, the second and third
 //!    match a candidate's `role`/`petname` pair. This is `session_label`'s
 //!    full line, typed back verbatim.
-//! 5. **`peer/<rest>`** — a leading component (up to the first `/`) that
-//!    names a KNOWN peer defers resolution instead of resolving locally:
-//!    [`Resolution::Remote`] carries the peer name and the remainder
-//!    verbatim, unresolved — the peer's own graph resolves `query` on its
+//! 5. **`node/<rest>`** — a leading component (up to the first `/`) that
+//!    names a KNOWN node defers resolution instead of resolving locally:
+//!    [`Resolution::Remote`] carries the node name and the remainder
+//!    verbatim, unresolved — the node's own graph resolves `query` on its
 //!    side (C3 sends it over as the query half of a remote lookup, not
 //!    something this crate ever inspects further).
 //!
@@ -49,28 +49,28 @@
 //! Ambiguity is strictly WITHIN a tier. ACROSS tiers there is no ambiguity
 //! by construction: tiers are consulted in order and the first one with any
 //! candidate wins outright, full stop — so a query that could structurally
-//! read as BOTH a tier-4 `host/role/petname` line and a tier-5 `peer/<rest>`
-//! (e.g. this box's own hostname is also the name of a registered peer, and
+//! read as BOTH a tier-4 `host/role/petname` line and a tier-5 `node/<rest>`
+//! (e.g. this box's own hostname is also the name of a registered node, and
 //! the query has exactly two slashes) resolves via tier 4 alone whenever
 //! tier 4 finds a candidate; tier 5 is only ever reached when every earlier
 //! tier came up completely empty.
 //!
-//! ## The bare-known-peer-name decision
+//! ## The bare-known-node-name decision
 //!
-//! A bare token (no `/`) that names a known peer but matches no local
-//! session is `NotFound`, never [`Resolution::Remote`]. The `peer/<rest>`
+//! A bare token (no `/`) that names a known node but matches no local
+//! session is `NotFound`, never [`Resolution::Remote`]. The `node/<rest>`
 //! grammar (tier 5) requires the slash form by construction — there is no
 //! `<rest>` to defer without one, and C3 (the first real consumer) always
-//! resolves a query to a specific remote SESSION, never "the whole peer" —
+//! resolves a query to a specific remote SESSION, never "the whole node" —
 //! so a `Remote` with an empty, unrequested query is a feature nothing
-//! downstream reads. `peer/` (a literal trailing slash, empty `<rest>`) is
+//! downstream reads. `node/` (a literal trailing slash, empty `<rest>`) is
 //! the deliberately different case: the slash form WAS typed, so tier 5
-//! still applies and yields `Remote { peer, query: "" }` — an explicit
-//! "resolve nothing further on your side" query the peer is free to reject,
-//! rather than this crate inventing a whole-peer reference type nobody
+//! still applies and yields `Remote { node, query: "" }` — an explicit
+//! "resolve nothing further on your side" query the node is free to reject,
+//! rather than this crate inventing a whole-node reference type nobody
 //! asked for.
 //!
-//! A bare token that happens to equal BOTH a local petname AND a known peer
+//! A bare token that happens to equal BOTH a local petname AND a known node
 //! name is likewise not ambiguous: tier 3 (petname) is strictly ahead of
 //! tier 5 in precedence, and tier 5 never engages on a slash-free query in
 //! the first place, so the petname wins deterministically every time.
@@ -92,8 +92,8 @@
 //! `aoide who`) uses it to resolve a
 //! filter argument against the live-probed roster; **C3** (`graph send
 //! --to <target>`) uses it to turn `--to` into either a local `sessionId`
-//! (existing send path, unchanged) or a `Remote { peer, query }` it hands
-//! to the peer as an A2A `message/send` lookup.
+//! (existing send path, unchanged) or a `Remote { node, query }` it hands
+//! to the node as an A2A `message/send` lookup.
 
 use crate::display::short_tail;
 
@@ -111,7 +111,7 @@ pub struct LocalCandidate<'a> {
 
 impl<'a> LocalCandidate<'a> {
     /// Build a candidate from a live `SessionRecord` plus its caller-derived
-    /// `role` — the ergonomic constructor C2/C3 are expected to map their
+    /// `role` — the ergonomic function Object() { [native code] } C2/C3 are expected to map their
     /// session slice through (mirrors `display::session_label`'s own
     /// `(rec, host, role)` argument shape). A caller that wants a "done"
     /// session excluded from resolution filters it out of the slice before
@@ -134,9 +134,9 @@ impl<'a> LocalCandidate<'a> {
 pub enum Resolution {
     /// Resolved to exactly one local session id.
     Local(String),
-    /// A leading `peer/` component named a known peer; `query` is the
-    /// unresolved remainder, verbatim, for the peer's own side to resolve.
-    Remote { peer: String, query: String },
+    /// A leading `node/` component named a known node; `query` is the
+    /// unresolved remainder, verbatim, for the node's own side to resolve.
+    Remote { node: String, query: String },
     /// More than one candidate matched within the SAME tier — every
     /// matching session id, in candidate-slice order.
     Ambiguous(Vec<String>),
@@ -144,14 +144,14 @@ pub enum Resolution {
     NotFound,
 }
 
-/// Resolve `query` against `locals` (this box's known sessions) and `peers`
-/// (this box's known peer names) as of the caller's own snapshot — zero I/O,
+/// Resolve `query` against `locals` (this box's known sessions) and `nodes`
+/// (this box's known node names) as of the caller's own snapshot — zero I/O,
 /// see the module doc for the full grammar and precedence. `host` is this
 /// box's own display host name (`display::local_host_name()`, resolved once
 /// by the caller — mirrors every other display-grammar call site's "host
 /// resolved once per pass" rule rather than this function reaching for it
 /// itself).
-pub fn resolve(query: &str, host: &str, locals: &[LocalCandidate<'_>], peers: &[&str]) -> Resolution {
+pub fn resolve(query: &str, host: &str, locals: &[LocalCandidate<'_>], nodes: &[&str]) -> Resolution {
     let query = query.trim();
     if query.is_empty() {
         return Resolution::NotFound;
@@ -174,7 +174,7 @@ pub fn resolve(query: &str, host: &str, locals: &[LocalCandidate<'_>], peers: &[
     }
 
     // Tier 3: bare petname — only when the query carries no `/` at all, so
-    // it can never shadow the compound or peer forms below.
+    // it can never shadow the compound or node forms below.
     if !query.contains('/') {
         if let Some(r) = match_tier(locals, |c| c.petname == Some(query)) {
             return r;
@@ -191,12 +191,12 @@ pub fn resolve(query: &str, host: &str, locals: &[LocalCandidate<'_>], peers: &[
         }
     }
 
-    // Tier 5: `peer/<rest>` — a leading component naming a KNOWN peer
+    // Tier 5: `node/<rest>` — a leading component naming a KNOWN node
     // defers resolution; the rest is not this crate's to interpret further.
-    if let Some((peer, rest)) = query.split_once('/') {
-        if peers.contains(&peer) {
+    if let Some((node, rest)) = query.split_once('/') {
+        if nodes.contains(&node) {
             return Resolution::Remote {
-                peer: peer.to_string(),
+                node: node.to_string(),
                 query: rest.to_string(),
             };
         }
@@ -207,30 +207,30 @@ pub fn resolve(query: &str, host: &str, locals: &[LocalCandidate<'_>], peers: &[
 
 /// Compose [`resolve`] with the P-D5 hub preference: when every tier above
 /// comes up completely empty (`Resolution::NotFound` — no exact id, no
-/// tail4, no petname, no host/role match, no peer-name match), a
-/// hub-designated peer (if the caller names one via `hub`) is offered as
-/// one last, least-specific candidate — `Resolution::Remote { peer: hub,
+/// tail4, no petname, no host/role match, no node-name match), a
+/// hub-designated node (if the caller names one via `hub`) is offered as
+/// one last, least-specific candidate — `Resolution::Remote { node: hub,
 /// query }`, carrying the ORIGINAL trimmed query verbatim, since no
-/// `peer/<rest>` prefix was ever recognized in it for there to be anything
+/// `node/<rest>` prefix was ever recognized in it for there to be anything
 /// to strip. Any OTHER resolution — `Local`, tier 5's own `Remote`, or
 /// `Ambiguous` — passes through completely untouched: the hub is a
 /// fallback of last resort, never a shadow over any tier's existing
 /// precedence (`docs/architecture/AOIDED.md`'s "The hub option": "resolution
-/// prefers the hub only when nothing else matches"). `hub: None` (no peer
-/// currently marked hub, `peer_store::Peer::hub`) makes this an identity
+/// prefers the hub only when nothing else matches"). `hub: None` (no node
+/// currently marked hub, `node_store::Node::hub`) makes this an identity
 /// wrapper over [`resolve`] — a mesh with no hub behaves exactly as before
 /// this function existed.
 pub fn resolve_with_hub(
     query: &str,
     host: &str,
     locals: &[LocalCandidate<'_>],
-    peers: &[&str],
+    nodes: &[&str],
     hub: Option<&str>,
 ) -> Resolution {
-    match resolve(query, host, locals, peers) {
+    match resolve(query, host, locals, nodes) {
         Resolution::NotFound => match hub {
             Some(name) => Resolution::Remote {
-                peer: name.to_string(),
+                node: name.to_string(),
                 query: query.trim().to_string(),
             },
             None => Resolution::NotFound,
@@ -261,7 +261,7 @@ mod tests {
         query: &'static str,
         host: &'static str,
         locals: Vec<LocalCandidate<'static>>,
-        peers: Vec<&'static str>,
+        nodes: Vec<&'static str>,
         expected: Resolution,
     }
 
@@ -277,7 +277,7 @@ mod tests {
                 query: "sess-aaaa-1111",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::Local("sess-aaaa-1111".into()),
             },
             Case {
@@ -290,7 +290,7 @@ mod tests {
                     cand("sess-aaaa-root", Some("brave-otter"), "root"),
                     cand("sess-bbbb-root", Some("calm-thorn"), "child"),
                 ],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::Local("sess-aaaa-root".into()),
             },
             Case {
@@ -301,7 +301,7 @@ mod tests {
                 query: "session:sess-aaaa-1111",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::Local("sess-aaaa-1111".into()),
             },
             Case {
@@ -309,10 +309,10 @@ mod tests {
                 // unrecognised one is left verbatim and still fails every
                 // tier, exactly as before this fix.
                 name: "an id with an unknown prefix is still not found",
-                query: "peerish:sess-aaaa-1111",
+                query: "nodeish:sess-aaaa-1111",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::NotFound,
             },
             // ── Tier 2: id tail4 ──────────────────────────────────────────
@@ -321,7 +321,7 @@ mod tests {
                 query: "1111",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::Local("sess-aaaa-1111".into()),
             },
             Case {
@@ -332,7 +332,7 @@ mod tests {
                     cand("sess-aaaa-1111", Some("brave-otter"), "root"),
                     cand("sess-cccc-1111", None, "root"),
                 ],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::Ambiguous(vec!["sess-aaaa-1111".into(), "sess-cccc-1111".into()]),
             },
             // ── Tier 3: petname ───────────────────────────────────────────
@@ -344,7 +344,7 @@ mod tests {
                     cand("sess-aaaa-1111", Some("brave-otter"), "root"),
                     cand("sess-bbbb-2222", Some("calm-thorn"), "child"),
                 ],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::Local("sess-aaaa-1111".into()),
             },
             Case {
@@ -355,7 +355,7 @@ mod tests {
                     cand("sess-aaaa-1111", Some("brave-otter"), "root"),
                     cand("sess-dddd-3333", Some("brave-otter"), "child"),
                 ],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::Ambiguous(vec!["sess-aaaa-1111".into(), "sess-dddd-3333".into()]),
             },
             Case {
@@ -363,7 +363,7 @@ mod tests {
                 query: "sess-cccc-1111",
                 host: "sakaki",
                 locals: vec![cand("sess-cccc-1111", None, "root")],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::Local("sess-cccc-1111".into()),
             },
             // ── Tier 4: host/role/petname compound ───────────────────────
@@ -375,7 +375,7 @@ mod tests {
                     cand("sess-aaaa-1111", Some("brave-otter"), "root"),
                     cand("sess-dddd-3333", Some("brave-otter"), "child"),
                 ],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::Local("sess-aaaa-1111".into()),
             },
             Case {
@@ -386,15 +386,15 @@ mod tests {
                     cand("sess-aaaa-1111", Some("brave-otter"), "root"),
                     cand("sess-eeee-4444", Some("brave-otter"), "root"),
                 ],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::Ambiguous(vec!["sess-aaaa-1111".into(), "sess-eeee-4444".into()]),
             },
             Case {
-                name: "host/role/petname with the wrong host is not found (no peer named for it)",
+                name: "host/role/petname with the wrong host is not found (no node named for it)",
                 query: "yomi-strix/root/brave-otter",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::NotFound,
             },
             Case {
@@ -402,80 +402,80 @@ mod tests {
                 query: "sakaki/child/brave-otter",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::NotFound,
             },
-            // ── Tier 5: peer/<rest> ───────────────────────────────────────
+            // ── Tier 5: node/<rest> ───────────────────────────────────────
             Case {
-                name: "peer/<rest> defers to Remote for a known peer",
+                name: "node/<rest> defers to Remote for a known node",
                 query: "yomi-strix/brave-otter",
                 host: "sakaki",
                 locals: vec![],
-                peers: vec!["yomi-strix"],
-                expected: Resolution::Remote { peer: "yomi-strix".into(), query: "brave-otter".into() },
+                nodes: vec!["yomi-strix"],
+                expected: Resolution::Remote { node: "yomi-strix".into(), query: "brave-otter".into() },
             },
             Case {
-                name: "peer/<rest> with a multi-segment rest passes it through verbatim",
+                name: "node/<rest> with a multi-segment rest passes it through verbatim",
                 query: "yomi-strix/root/brave-otter",
                 host: "sakaki",
                 locals: vec![],
-                peers: vec!["yomi-strix"],
-                expected: Resolution::Remote { peer: "yomi-strix".into(), query: "root/brave-otter".into() },
+                nodes: vec!["yomi-strix"],
+                expected: Resolution::Remote { node: "yomi-strix".into(), query: "root/brave-otter".into() },
             },
             Case {
-                name: "slash form with an unknown peer is not found",
-                query: "ghost-peer/brave-otter",
+                name: "slash form with an unknown node is not found",
+                query: "ghost-node/brave-otter",
                 host: "sakaki",
                 locals: vec![],
-                peers: vec!["yomi-strix"],
+                nodes: vec!["yomi-strix"],
                 expected: Resolution::NotFound,
             },
             Case {
-                name: "a trailing-slash peer form with empty rest still resolves via tier 5",
+                name: "a trailing-slash node form with empty rest still resolves via tier 5",
                 query: "yomi-strix/",
                 host: "sakaki",
                 locals: vec![],
-                peers: vec!["yomi-strix"],
-                expected: Resolution::Remote { peer: "yomi-strix".into(), query: "".into() },
+                nodes: vec!["yomi-strix"],
+                expected: Resolution::Remote { node: "yomi-strix".into(), query: "".into() },
             },
             // ── Cross-tier precedence (not ambiguity — see module doc) ───
             Case {
-                name: "host/role/petname tier wins outright over a same-named peer when it has a hit",
+                name: "host/role/petname tier wins outright over a same-named node when it has a hit",
                 query: "sakaki/root/brave-otter",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                // "sakaki" is ALSO a registered peer name — tier 4 still wins,
+                // "sakaki" is ALSO a registered node name — tier 4 still wins,
                 // tier 5 is never even consulted.
-                peers: vec!["sakaki"],
+                nodes: vec!["sakaki"],
                 expected: Resolution::Local("sess-aaaa-1111".into()),
             },
             Case {
-                name: "host/role/petname tier empty falls through to peer/<rest> for the same query shape",
+                name: "host/role/petname tier empty falls through to node/<rest> for the same query shape",
                 query: "sakaki/root/ghost-name",
                 host: "sakaki",
                 // No local session named `ghost-name` as `root` — tier 4
                 // finds nothing, so tier 5 gets a turn.
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                peers: vec!["sakaki"],
-                expected: Resolution::Remote { peer: "sakaki".into(), query: "root/ghost-name".into() },
+                nodes: vec!["sakaki"],
+                expected: Resolution::Remote { node: "sakaki".into(), query: "root/ghost-name".into() },
             },
             Case {
-                name: "a bare token matching both a local petname and a peer name resolves to the petname, deterministically",
+                name: "a bare token matching both a local petname and a node name resolves to the petname, deterministically",
                 query: "brave-otter",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                // A peer coincidentally sharing the petname's exact text —
+                // A node coincidentally sharing the petname's exact text —
                 // tier 5 never engages on a slash-free query, so this is not
                 // ambiguous, it's tier 3 winning outright.
-                peers: vec!["brave-otter"],
+                nodes: vec!["brave-otter"],
                 expected: Resolution::Local("sess-aaaa-1111".into()),
             },
             Case {
-                name: "a bare known-peer-name with no local match is NotFound, not a whole-peer Remote",
+                name: "a bare known-node-name with no local match is NotFound, not a whole-node Remote",
                 query: "yomi-strix",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                peers: vec!["yomi-strix"],
+                nodes: vec!["yomi-strix"],
                 expected: Resolution::NotFound,
             },
             // ── Case handling ─────────────────────────────────────────────
@@ -484,7 +484,7 @@ mod tests {
                 query: "Brave-Otter",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::NotFound,
             },
             Case {
@@ -492,7 +492,7 @@ mod tests {
                 query: "AB12",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-ab12", Some("brave-otter"), "root")],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::NotFound,
             },
             // ── Empty / garbage input ─────────────────────────────────────
@@ -501,7 +501,7 @@ mod tests {
                 query: "",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                peers: vec!["yomi-strix"],
+                nodes: vec!["yomi-strix"],
                 expected: Resolution::NotFound,
             },
             Case {
@@ -509,7 +509,7 @@ mod tests {
                 query: "   ",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::NotFound,
             },
             Case {
@@ -517,15 +517,15 @@ mod tests {
                 query: "???/???",
                 host: "sakaki",
                 locals: vec![cand("sess-aaaa-1111", Some("brave-otter"), "root")],
-                peers: vec!["yomi-strix"],
+                nodes: vec!["yomi-strix"],
                 expected: Resolution::NotFound,
             },
             Case {
-                name: "an empty candidate/peer set is always not found",
+                name: "an empty candidate/node set is always not found",
                 query: "brave-otter",
                 host: "sakaki",
                 locals: vec![],
-                peers: vec![],
+                nodes: vec![],
                 expected: Resolution::NotFound,
             },
         ]
@@ -534,7 +534,7 @@ mod tests {
     #[test]
     fn resolve_matches_the_grammar_table() {
         for c in cases() {
-            let got = resolve(c.query, c.host, &c.locals, &c.peers);
+            let got = resolve(c.query, c.host, &c.locals, &c.nodes);
             assert_eq!(got, c.expected, "case failed: {}", c.name);
         }
     }
@@ -556,7 +556,7 @@ mod tests {
         // the last-resort remote, carrying the original query verbatim.
         assert_eq!(
             resolve_with_hub("ghost-name", "sakaki", &locals, &[], Some("hub-box")),
-            Resolution::Remote { peer: "hub-box".into(), query: "ghost-name".into() }
+            Resolution::Remote { node: "hub-box".into(), query: "ghost-name".into() }
         );
     }
 
@@ -572,13 +572,13 @@ mod tests {
     }
 
     #[test]
-    fn tier_5_peer_rest_beats_the_hub_outright() {
+    fn tier_5_node_rest_beats_the_hub_outright() {
         let locals: Vec<LocalCandidate<'_>> = vec![];
-        // `yomi-strix` is a KNOWN peer distinct from the hub — tier 5 wins,
-        // the hub (a different peer) never gets a turn.
+        // `yomi-strix` is a KNOWN node distinct from the hub — tier 5 wins,
+        // the hub (a different node) never gets a turn.
         assert_eq!(
             resolve_with_hub("yomi-strix/brave-otter", "sakaki", &locals, &["yomi-strix"], Some("hub-box")),
-            Resolution::Remote { peer: "yomi-strix".into(), query: "brave-otter".into() }
+            Resolution::Remote { node: "yomi-strix".into(), query: "brave-otter".into() }
         );
     }
 

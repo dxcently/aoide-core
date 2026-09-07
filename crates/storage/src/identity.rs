@@ -165,7 +165,7 @@ fn fingerprint(pubkey: &[u8]) -> String {
 /// A key file present but the wrong length, or a corrupt/missing
 /// `created_at` sidecar, are handled honestly rather than treated as fatal:
 /// a bad-length key file is refused (never silently re-minted over — that
-/// would invalidate every peer that already trusted the old pubkey without
+/// would invalidate every node that already trusted the old pubkey without
 /// telling anyone); a missing/corrupt `created_at` next to a GOOD key
 /// degrades to reporting the load moment as the timestamp, since there is
 /// no way to recover the true mint time and fabricating one would be

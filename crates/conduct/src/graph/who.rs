@@ -1,9 +1,9 @@
 //! The ROSTER core (messaging/presence plan, P-C2; folded under `session` at
 //! the session-surface redesign, command-defrag lane X, 2026-08-28) — live
-//! presence over this box's own sessions plus every registered peer. A
-//! PROJECTION, never a store: `build_graph`'s peer fold (`doc.rs:156-201`)
-//! already folds registered peers with freshness off their pull CACHE; this
-//! module never writes `state/peer-cache/<name>.json` — nothing here is a
+//! presence over this box's own sessions plus every registered node. A
+//! PROJECTION, never a store: `build_graph`'s node fold (`doc.rs:156-201`)
+//! already folds registered nodes with freshness off their pull CACHE; this
+//! module never writes `state/node-cache/<name>.json` — nothing here is a
 //! second source of truth for it.
 //!
 //! **The standalone `aoide who` command is RETIRED (hard cutover, no
@@ -23,14 +23,14 @@
 //!
 //! ## Presence model (User-decided, verbatim from the plan)
 //!
-//! Every registered peer is ALWAYS-ON: a resident door means host-up ==
-//! door-answering. So this module probes every registered peer LIVE on EVERY
-//! invocation — one [`std::thread`] per peer (no new deps), each bounded by
-//! a short per-peer timeout (~2s) enforced by the transport itself (curl's
-//! own `--max-time`, inside [`aoide_client::commands::pull_peer_live`]) —
+//! Every registered node is ALWAYS-ON: a resident door means host-up ==
+//! door-answering. So this module probes every registered node LIVE on EVERY
+//! invocation — one [`std::thread`] per node (no new deps), each bounded by
+//! a short per-node timeout (~2s) enforced by the transport itself (curl's
+//! own `--max-time`, inside [`aoide_client::commands::pull_node_live`]) —
 //! never a manual join-with-timeout here. There is no pull timer anywhere;
-//! the cache is consulted ONLY as the fallback for a peer this invocation's
-//! live probe fails to reach, so an unreachable peer still renders (never
+//! the cache is consulted ONLY as the fallback for a node this invocation's
+//! live probe fails to reach, so an unreachable node still renders (never
 //! silently drops off the roster) with its last-known sessions labeled by
 //! the cache's own `fetchedAt`.
 //!
@@ -46,20 +46,20 @@
 //!
 //! ## The probe seam (why tests need no network)
 //!
-//! [`probe_peers`] takes the peer list AND a `pull` closure — production
-//! wires it to `aoide_client::commands::pull_peer_live` (2s), tests inject a
+//! [`probe_nodes`] takes the node list AND a `pull` closure — production
+//! wires it to `aoide_client::commands::pull_node_live` (2s), tests inject a
 //! closure returning canned `Ok`/`Err` values instantly. This is the ONLY
-//! way the per-peer-timeout behavior is exercisable in a sandbox at all: the
+//! way the per-node-timeout behavior is exercisable in a sandbox at all: the
 //! real 2s bound lives inside curl, one process this crate's tests never
 //! spawn.
 //!
 //! ## Filter semantics (`--hosts` rendering only)
 //!
 //! An optional positional `filter` narrows what's DISPLAYED; it never
-//! changes what gets probed (every peer is probed regardless — see
+//! changes what gets probed (every node is probed regardless — see
 //! [`session_roster_with`]). Resolution order: try `storage::addr::resolve`
 //! first — `Local`/`Ambiguous` narrows to exactly those local session ids;
-//! `Remote{peer, query}` narrows to that one peer node, additionally
+//! `Remote{node, query}` narrows to that one node, additionally
 //! substring-matching its sessions when `query` is non-empty. A query the
 //! resolver can't place at all (`NotFound` — most commonly a plain
 //! substring nobody typed as a full grammar token) falls back to a
@@ -74,12 +74,12 @@
 //! [`project_bucket`] reuses whichever attribution the codebase already
 //! computes — never a third one: a registered `projects.json` name
 //! ([`super::model::anchor_for`], longest-prefix, PURE string matching, so
-//! it resolves identically for a peer session's cwd under the fleet's
-//! shared-path convention the same way `grant.rs`'s peer-spec relativization
+//! it resolves identically for a node session's cwd under the fleet's
+//! shared-path convention the same way `grant.rs`'s node-spec relativization
 //! already leans on) wins when present; else a `.aoide/project.json`
 //! manifest found by walking up from the cwd ON THIS HOST'S OWN FILESYSTEM
 //! (`aoide_storage::manifest::walk_up`) renders by that directory's own
-//! basename — a peer's foreign cwd simply never resolves a manifest here
+//! basename — a node's foreign cwd simply never resolves a manifest here
 //! (the walk is real `Path::is_file()` checks against THIS filesystem), so
 //! it falls through harmlessly rather than lying about a match. Neither
 //! resolving lands the session in the trailing [`NO_PROJECT`] bucket.
@@ -88,22 +88,22 @@ use super::model::{resolved_parent, HookRecord, Project, SessionRecord};
 use aoide_protocol::output::Outcome;
 use aoide_protocol::Invocation;
 use aoide_storage::addr::{self, LocalCandidate, Resolution};
-use aoide_storage::peer_store::{Peer, PeerCacheEntry};
+use aoide_storage::node_store::{Node, NodeCacheEntry};
 use serde_json::{json, Value};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-/// A roster-probe pull closure: given a peer, return its live resolved graph
+/// A roster-probe pull closure: given a node, return its live resolved graph
 /// document (`{nodes, edges}`) or a reason it couldn't be fetched. Boxed so
-/// production (`aoide_client::commands::pull_peer_live`) and tests (a canned
+/// production (`aoide_client::commands::pull_node_live`) and tests (a canned
 /// closure) share the exact same call shape.
-pub(super) type PullFn = Arc<dyn Fn(&Peer) -> Result<Value, String> + Send + Sync>;
+pub(super) type PullFn = Arc<dyn Fn(&Node) -> Result<Value, String> + Send + Sync>;
 
 /// One session as the roster renders it — local or remote, uniformly.
 /// `pub(super)` (fields too) for three consumers: `session_pick`-turned-
-/// `grant.rs`'s undying picker (U3) builds its peer rows off the same
-/// [`sessions_from_graph`] extraction rather than re-parsing a peer's cached
-/// graph document a second time, and `peer_list.rs`'s mesh roster (task
+/// `grant.rs`'s undying picker (U3) builds its node rows off the same
+/// [`sessions_from_graph`] extraction rather than re-parsing a node's cached
+/// graph document a second time, and `node_list.rs`'s mesh roster (task
 /// #120 P2) does likewise (this crate's own "no cross-crate copying"
 /// discipline, applied in-file).
 #[derive(Debug, Clone, PartialEq)]
@@ -116,16 +116,16 @@ pub(super) struct SessionView {
     pub(super) presence: &'static str,
     pub(super) cwd: String,
     /// `SessionRecord::exempt` (task #20), carried through for the roster's
-    /// one-word tag. Local rows read the real record; a peer row has no
+    /// one-word tag. Local rows read the real record; a node row has no
     /// cross-host exempt story yet (`grant.rs`'s module doc — out of scope,
     /// not a regression) and always reads `false`.
     pub(super) exempt: bool,
 }
 
-/// One node (this box, or one registered peer) as the host-grouped rendering
-/// shows it. `pub(super)` (fields too) for a second consumer: `peer_list.rs`'s
+/// One node (this box, or one registered node) as the host-grouped rendering
+/// shows it. `pub(super)` (fields too) for a second consumer: `node_list.rs`'s
 /// mesh roster (task #120 P2) classifies its paired rows off the SAME
-/// probe-outcome/cache fold ([`build_peer_node`]) rather than re-deriving a
+/// probe-outcome/cache fold ([`build_mesh_node`]) rather than re-deriving a
 /// second presence model — same discipline as [`SessionView`]'s widening
 /// note above.
 #[derive(Debug, Clone, PartialEq)]
@@ -152,7 +152,7 @@ fn session_presence(state: &str) -> &'static str {
 
 /// This box's own [`NodeView`] — always `online` (we're running on it right
 /// now). `sessions`/`hooks` are the caller's already-loaded stage files
-/// (`common::load_inputs`); pure otherwise. `pub(super)` for `peer_list.rs`
+/// (`common::load_inputs`); pure otherwise. `pub(super)` for `node_list.rs`
 /// (see [`NodeView`]'s widening note).
 pub(super) fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord], host: &str) -> NodeView {
     let merged = super::model::merged_sessions(sessions, hooks);
@@ -176,13 +176,13 @@ pub(super) fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord],
     NodeView { name: host.to_string(), is_local: true, presence: "online", fetched_at: None, error: None, sessions }
 }
 
-/// Extract every `kind:"session"` node from a (local or peer) resolved graph
+/// Extract every `kind:"session"` node from a (local or node) resolved graph
 /// document into [`SessionView`]s, `role` (root/child, for
 /// `display::session_label`) derived from the SAME document's own
-/// `spawned` edges — the peer computed this document with its own
+/// `spawned` edges — the node computed this document with its own
 /// `build_graph`, so its edges carry exactly the shape ours do
-/// (`doc.rs:122-134`). `host` is the label prefix — the peer's registered
-/// name for a remote graph, mirroring the `peer/<rest>` grammar
+/// (`doc.rs:122-134`). `host` is the label prefix — the node's registered
+/// name for a remote graph, mirroring the `node/<rest>` grammar
 /// `storage::addr` resolves queries against.
 pub(super) fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView> {
     let empty: Vec<Value> = Vec::new();
@@ -215,7 +215,7 @@ pub(super) fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView>
                 session_id,
                 petname,
                 // No cross-host exempt story yet (module doc's widening
-                // note on `SessionView::exempt`) — a peer's own graph.json
+                // note on `SessionView::exempt`) — a node's own graph.json
                 // never carries the field either, so this always reads
                 // `false`.
                 exempt: false,
@@ -224,28 +224,28 @@ pub(super) fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView>
         .collect()
 }
 
-/// Pure: classify one peer's [`NodeView`] from its live-probe OUTCOME and
+/// Pure: classify one node's [`NodeView`] from its live-probe OUTCOME and
 /// its already-loaded last cache entry (if any) — no I/O in here at all, so
 /// it is trivially unit-testable with synthetic data. The caller
-/// ([`collect_roster`], and `peer_list.rs`'s `peer_list_with` — see
+/// ([`collect_roster`], and `node_list.rs`'s `node_list_with` — see
 /// [`NodeView`]'s widening note) does the real
-/// `peer_store::load_peer_cache` read and hands the result in.
-pub(super) fn build_peer_node(peer: &Peer, probe: Result<Value, String>, cache: Option<PeerCacheEntry>) -> NodeView {
+/// `node_store::load_node_cache` read and hands the result in.
+pub(super) fn build_mesh_node(node: &Node, probe: Result<Value, String>, cache: Option<NodeCacheEntry>) -> NodeView {
     match probe {
         Ok(graph) => NodeView {
-            name: peer.name.clone(),
+            name: node.name.clone(),
             is_local: false,
             presence: "online",
             fetched_at: None,
             error: None,
-            sessions: sessions_from_graph(&graph, &peer.name),
+            sessions: sessions_from_graph(&graph, &node.name),
         },
         Err(e) => match cache {
             Some(entry) => {
                 let sessions =
-                    entry.graph.as_ref().map(|g| sessions_from_graph(g, &peer.name)).unwrap_or_default();
+                    entry.graph.as_ref().map(|g| sessions_from_graph(g, &node.name)).unwrap_or_default();
                 NodeView {
-                    name: peer.name.clone(),
+                    name: node.name.clone(),
                     is_local: false,
                     presence: "unreachable",
                     fetched_at: entry.fetched_at,
@@ -254,7 +254,7 @@ pub(super) fn build_peer_node(peer: &Peer, probe: Result<Value, String>, cache: 
                 }
             }
             None => NodeView {
-                name: peer.name.clone(),
+                name: node.name.clone(),
                 is_local: false,
                 presence: "never-pulled",
                 fetched_at: None,
@@ -265,27 +265,27 @@ pub(super) fn build_peer_node(peer: &Peer, probe: Result<Value, String>, cache: 
     }
 }
 
-/// Live-probe every peer in `peers`, one [`std::thread`] each, via the
-/// injected `pull` closure — see the module doc's "The probe seam". Peer
+/// Live-probe every node in `nodes`, one [`std::thread`] each, via the
+/// injected `pull` closure — see the module doc's "The probe seam". Node
 /// identity is never at risk of a mismatch on a panicked probe: results are
-/// re-paired with `peers` by INDEX (`zip`), never by anything the spawned
+/// re-paired with `nodes` by INDEX (`zip`), never by anything the spawned
 /// thread itself returns.
-pub(super) fn probe_peers(peers: &[Peer], pull: PullFn) -> Vec<(Peer, Result<Value, String>)> {
-    let handles: Vec<std::thread::JoinHandle<Result<Value, String>>> = peers
+pub(super) fn probe_nodes(nodes: &[Node], pull: PullFn) -> Vec<(Node, Result<Value, String>)> {
+    let handles: Vec<std::thread::JoinHandle<Result<Value, String>>> = nodes
         .iter()
         .cloned()
-        .map(|peer| {
+        .map(|node| {
             let pull = Arc::clone(&pull);
-            std::thread::spawn(move || pull(&peer))
+            std::thread::spawn(move || pull(&node))
         })
         .collect();
-    peers
+    nodes
         .iter()
         .cloned()
         .zip(handles)
-        .map(|(peer, h)| {
+        .map(|(node, h)| {
             let res = h.join().unwrap_or_else(|_| Err("probe thread panicked".to_string()));
-            (peer, res)
+            (node, res)
         })
         .collect()
 }
@@ -309,9 +309,9 @@ fn apply_filter(filter: &str, host: &str, nodes: Vec<NodeView>, locals: &[Sessio
             LocalCandidate { session_id: &s.session_id, petname: s.petname.as_deref(), role }
         })
         .collect();
-    let peer_names: Vec<&str> = nodes.iter().filter(|n| !n.is_local).map(|n| n.name.as_str()).collect();
+    let node_names: Vec<&str> = nodes.iter().filter(|n| !n.is_local).map(|n| n.name.as_str()).collect();
 
-    match addr::resolve(filter, host, &candidates, &peer_names) {
+    match addr::resolve(filter, host, &candidates, &node_names) {
         Resolution::Local(id) => nodes
             .into_iter()
             .filter(|n| n.is_local)
@@ -328,9 +328,9 @@ fn apply_filter(filter: &str, host: &str, nodes: Vec<NodeView>, locals: &[Sessio
                 n
             })
             .collect(),
-        Resolution::Remote { peer, query } => nodes
+        Resolution::Remote { node, query } => nodes
             .into_iter()
-            .filter(|n| n.name == peer)
+            .filter(|n| n.name == node)
             .map(|mut n| {
                 if !query.is_empty() {
                     n.sessions.retain(|sv| session_matches_substring(sv, &query));
@@ -390,7 +390,7 @@ fn render_nodes(nodes: &[NodeView]) -> String {
         }
     }
     if out.is_empty() {
-        return "(no local sessions, no peers registered)".to_string();
+        return "(no local sessions, no nodes registered)".to_string();
     }
     out.join("\n")
 }
@@ -451,7 +451,7 @@ struct ProjectGroup {
 
 /// Fold every node's sessions into project buckets — a single pass over
 /// `nodes` in the SAME order [`collect_roster`] built them (local first,
-/// then each peer in probe order), so within a bucket session order mirrors
+/// then each node in probe order), so within a bucket session order mirrors
 /// the host-grouped rendering's own order. Buckets are sorted
 /// alphabetically by name, [`NO_PROJECT`] always trailing last (module
 /// doc's "Project attribution" / the task brief's own wording).
@@ -495,7 +495,7 @@ fn render_groups(groups: &[ProjectGroup]) -> String {
         }
     }
     if out.is_empty() {
-        return "(no local sessions, no peers registered)".to_string();
+        return "(no local sessions, no nodes registered)".to_string();
     }
     out.join("\n")
 }
@@ -518,7 +518,7 @@ fn group_json(g: &ProjectGroup) -> Value {
 
 /// Everything bare `session`'s two renderings share before they diverge —
 /// local sessions/hooks/projects loaded once (`common::load_inputs`), every
-/// registered peer probed LIVE exactly as the retired `who` command did
+/// registered node probed LIVE exactly as the retired `who` command did
 /// (module doc's "Presence model"). `host`/`--hosts` rendering and the
 /// PROJECT rendering both call this and then diverge purely on how they
 /// group/render `nodes`.
@@ -534,24 +534,24 @@ pub(super) fn collect_roster(cmd: &str, pull: PullFn) -> Result<Roster, Outcome>
     let host = aoide_storage::display::local_host_name();
     let local_node = build_local_node(&s.sessions, &h.hooks, &host);
 
-    let peers = aoide_storage::peer_store::load_peers();
-    let probed = probe_peers(&peers, pull);
+    let nodes = aoide_storage::node_store::load_nodes();
+    let probed = probe_nodes(&nodes, pull);
 
     let mut nodes = vec![local_node];
-    for (peer, result) in probed {
-        let cache = aoide_storage::peer_store::load_peer_cache(&peer.name);
-        nodes.push(build_peer_node(&peer, result, cache));
+    for (node, result) in probed {
+        let cache = aoide_storage::node_store::load_node_cache(&node.name);
+        nodes.push(build_mesh_node(&node, result, cache));
     }
 
     Ok(Roster { host, projects: p.projects, locals: s.sessions, nodes })
 }
 
-/// Per-peer live-probe timeout (module doc's presence model — "short
-/// per-peer timeout ~2s"). One named constant rather than a magic number at
+/// Per-node live-probe timeout (module doc's presence model — "short
+/// per-node timeout ~2s"). One named constant rather than a magic number at
 /// the two call sites that need it ([`session_roster`] below, and
-/// `peer_list.rs`'s own production entry — the SAME probe, so the SAME
+/// `node_list.rs`'s own production entry — the SAME probe, so the SAME
 /// bound).
-pub(super) const PEER_PROBE_TIMEOUT_SECS: u64 = 2;
+pub(super) const NODE_PROBE_TIMEOUT_SECS: u64 = 2;
 
 /// The testable core: everything `session`'s bare listing does EXCEPT
 /// choosing the real `pull` closure. `--hosts` renders exactly what the
@@ -609,12 +609,12 @@ pub(super) fn session_roster_with(inv: &Invocation, pull: PullFn) -> Outcome {
 }
 
 /// `aoide session [filter] [--hosts] [--json] [--all]` — the real entry
-/// point: wires the live probe to `aoide_client::commands::pull_peer_live`
-/// (the SAME transport `peer pull` uses, per the crate's `Cargo.toml` note
+/// point: wires the live probe to `aoide_client::commands::pull_node_live`
+/// (the SAME transport `node pull` uses, per the crate's `Cargo.toml` note
 /// on the `conduct → client` edge) and hands off to
 /// [`session_roster_with`].
 pub fn session_roster(inv: &Invocation) -> Outcome {
-    let pull: PullFn = Arc::new(|p: &Peer| aoide_client::commands::pull_peer_live(p, PEER_PROBE_TIMEOUT_SECS));
+    let pull: PullFn = Arc::new(|p: &Node| aoide_client::commands::pull_node_live(p, NODE_PROBE_TIMEOUT_SECS));
     session_roster_with(inv, pull)
 }
 
@@ -623,8 +623,8 @@ mod tests {
     use super::*;
     use crate::graph::testutil::*;
 
-    fn peer(name: &str) -> Peer {
-        Peer {
+    fn node(name: &str) -> Node {
+        Node {
             name: name.to_string(),
             url: format!("http://{name}/"),
             autogate: false,
@@ -639,8 +639,8 @@ mod tests {
         }
     }
 
-    fn cache(name: &str, fetched_at: &str, graph: Value) -> PeerCacheEntry {
-        PeerCacheEntry {
+    fn cache(name: &str, fetched_at: &str, graph: Value) -> NodeCacheEntry {
+        NodeCacheEntry {
             schema_version: "0".to_string(),
             name: name.to_string(),
             instance: None,
@@ -651,7 +651,7 @@ mod tests {
         }
     }
 
-    fn peer_graph(sessions: &[(&str, &str, &str, Option<&str>)]) -> Value {
+    fn node_graph(sessions: &[(&str, &str, &str, Option<&str>)]) -> Value {
         // (sessionId, state, cwd, petname)
         let nodes: Vec<Value> = sessions
             .iter()
@@ -708,13 +708,13 @@ mod tests {
         assert_eq!(child.presence, "online");
     }
 
-    // ── build_peer_node: the pure probe-outcome + cache classifier ───────
+    // ── build_mesh_node: the pure probe-outcome + cache classifier ───────
 
     #[test]
-    fn build_peer_node_online_when_the_live_probe_succeeds() {
-        let p = peer("yomi-strix");
-        let graph = peer_graph(&[("s1", "working", "/x", Some("brave-otter"))]);
-        let node = build_peer_node(&p, Ok(graph), None);
+    fn build_mesh_node_online_when_the_live_probe_succeeds() {
+        let p = node("yomi-strix");
+        let graph = node_graph(&[("s1", "working", "/x", Some("brave-otter"))]);
+        let node = build_mesh_node(&p, Ok(graph), None);
         assert_eq!(node.presence, "online");
         assert!(node.fetched_at.is_none());
         assert!(node.error.is_none());
@@ -723,10 +723,10 @@ mod tests {
     }
 
     #[test]
-    fn build_peer_node_unreachable_falls_back_to_the_cache() {
-        let p = peer("yomi-strix");
-        let graph = peer_graph(&[("s1", "idle", "/x", None)]);
-        let node = build_peer_node(&p, Err("HTTP 000".to_string()), Some(cache("yomi-strix", "2026-08-14T00:05:00Z", graph)));
+    fn build_mesh_node_unreachable_falls_back_to_the_cache() {
+        let p = node("yomi-strix");
+        let graph = node_graph(&[("s1", "idle", "/x", None)]);
+        let node = build_mesh_node(&p, Err("HTTP 000".to_string()), Some(cache("yomi-strix", "2026-08-14T00:05:00Z", graph)));
         assert_eq!(node.presence, "unreachable");
         assert_eq!(node.fetched_at.as_deref(), Some("2026-08-14T00:05:00Z"));
         assert_eq!(node.error.as_deref(), Some("HTTP 000"));
@@ -734,27 +734,27 @@ mod tests {
     }
 
     #[test]
-    fn build_peer_node_never_pulled_when_probe_fails_and_no_cache_exists() {
-        let p = peer("ghost");
-        let node = build_peer_node(&p, Err("could not reach the agent".to_string()), None);
+    fn build_mesh_node_never_pulled_when_probe_fails_and_no_cache_exists() {
+        let p = node("ghost");
+        let node = build_mesh_node(&p, Err("could not reach the agent".to_string()), None);
         assert_eq!(node.presence, "never-pulled");
         assert!(node.fetched_at.is_none());
         assert!(node.sessions.is_empty());
     }
 
-    // ── probe_peers: parallel probe, results correctly paired by peer ────
+    // ── probe_nodes: parallel probe, results correctly paired by node ────
 
     #[test]
-    fn probe_peers_pairs_every_result_with_its_own_peer_regardless_of_completion_order() {
-        let peers = vec![peer("alpha"), peer("beta"), peer("gamma")];
-        let pull: PullFn = Arc::new(|p: &Peer| {
+    fn probe_nodes_pairs_every_result_with_its_own_node_regardless_of_completion_order() {
+        let nodes = vec![node("alpha"), node("beta"), node("gamma")];
+        let pull: PullFn = Arc::new(|p: &Node| {
             if p.name == "beta" {
                 Err("down".to_string())
             } else {
                 Ok(json!({ "nodes": [], "edges": [] }))
             }
         });
-        let results = probe_peers(&peers, pull);
+        let results = probe_nodes(&nodes, pull);
         assert_eq!(results.len(), 3);
         let by_name: std::collections::HashMap<_, _> =
             results.into_iter().map(|(p, r)| (p.name, r)).collect();
@@ -817,7 +817,7 @@ mod tests {
         assert!(rendered.lines().last().unwrap().ends_with(" exempt"), "{rendered}");
     }
 
-    // ── apply_filter: local id / peer+query / substring fallback ─────────
+    // ── apply_filter: local id / node+query / substring fallback ─────────
 
     fn sample_nodes() -> (Vec<NodeView>, Vec<SessionRecord>) {
         let locals = vec![
@@ -829,7 +829,7 @@ mod tests {
         locals[1].petname = Some("calm-thorn".to_string());
 
         let local_node = build_local_node(&locals, &[], "sakaki");
-        let peer_node = NodeView {
+        let mesh_node = NodeView {
             name: "yomi-strix".to_string(),
             is_local: false,
             presence: "online",
@@ -846,21 +846,21 @@ mod tests {
                 exempt: false,
             }],
         };
-        (vec![local_node, peer_node], locals)
+        (vec![local_node, mesh_node], locals)
     }
 
     #[test]
     fn apply_filter_local_id_narrows_to_the_local_node_and_session_only() {
         let (nodes, locals) = sample_nodes();
         let out = apply_filter("brave-otter", "sakaki", nodes, &locals);
-        assert_eq!(out.len(), 1, "the peer node is dropped entirely");
+        assert_eq!(out.len(), 1, "the mesh node is dropped entirely");
         assert!(out[0].is_local);
         assert_eq!(out[0].sessions.len(), 1);
         assert_eq!(out[0].sessions[0].session_id, "sess-aaaa-1111");
     }
 
     #[test]
-    fn apply_filter_peer_slash_query_narrows_to_that_peer_and_substring_matches() {
+    fn apply_filter_node_slash_query_narrows_to_that_node_and_substring_matches() {
         let (nodes, locals) = sample_nodes();
         let out = apply_filter("yomi-strix/misty", "sakaki", nodes, &locals);
         assert_eq!(out.len(), 1);
@@ -869,7 +869,7 @@ mod tests {
     }
 
     #[test]
-    fn apply_filter_peer_slash_with_no_matching_remainder_empties_that_peers_sessions() {
+    fn apply_filter_node_slash_with_no_matching_remainder_empties_that_nodes_sessions() {
         let (nodes, locals) = sample_nodes();
         let out = apply_filter("yomi-strix/nonexistent", "sakaki", nodes, &locals);
         assert_eq!(out.len(), 1);
@@ -948,8 +948,8 @@ mod tests {
 
     #[test]
     fn group_by_project_attributes_a_remote_sessions_cwd_the_same_host_agnostic_way() {
-        // A peer's session cwd matching a LOCALLY-registered project's path
-        // string (the fleet's shared-path convention, `grant.rs`'s own peer
+        // A node's session cwd matching a LOCALLY-registered project's path
+        // string (the fleet's shared-path convention, `grant.rs`'s own node
         // relativization leans on the same thing) attributes purely by
         // string match — no filesystem access, so it works identically for
         // a foreign host's cwd.
@@ -1017,7 +1017,7 @@ mod tests {
     }
 
     fn never_called_pull() -> PullFn {
-        Arc::new(|_: &Peer| panic!("no peers registered — pull must never be called"))
+        Arc::new(|_: &Node| panic!("no nodes registered — pull must never be called"))
     }
 
     fn hosts_invocation(args: &[&str], flags: &[(&str, &str)]) -> Invocation {
@@ -1035,8 +1035,8 @@ mod tests {
     }
 
     #[test]
-    fn hosts_mode_reports_local_sessions_with_no_peers_registered() {
-        let _env = Env::set_up("no-peers");
+    fn hosts_mode_reports_local_sessions_with_no_nodes_registered() {
+        let _env = Env::set_up("no-nodes");
         let sf = super::super::model::SessionsFile {
             schema_version: "0".to_string(),
             sessions: vec![session("s1", "/x", "working", "1", None)],
@@ -1074,20 +1074,20 @@ mod tests {
     }
 
     #[test]
-    fn hosts_mode_probes_every_registered_peer_and_classifies_by_outcome() {
-        let _env = Env::set_up("peers-probed");
-        aoide_storage::peer_store::save_peers(&[peer("alpha"), peer("beta")]).unwrap();
+    fn hosts_mode_probes_every_registered_node_and_classifies_by_outcome() {
+        let _env = Env::set_up("nodes-probed");
+        aoide_storage::node_store::save_nodes(&[node("alpha"), node("beta")]).unwrap();
         // `beta` has a stale cache to fall back on; `alpha` has none.
-        aoide_storage::peer_store::save_peer_cache(&cache(
+        aoide_storage::node_store::save_node_cache(&cache(
             "beta",
             "2026-08-14T00:00:00Z",
-            peer_graph(&[("r1", "idle", "/z", None)]),
+            node_graph(&[("r1", "idle", "/z", None)]),
         ))
         .unwrap();
 
-        let pull: PullFn = Arc::new(|p: &Peer| {
+        let pull: PullFn = Arc::new(|p: &Node| {
             if p.name == "alpha" {
-                Ok(peer_graph(&[("r2", "working", "/a", None)]))
+                Ok(node_graph(&[("r2", "working", "/a", None)]))
             } else {
                 Err("unreachable".to_string())
             }
@@ -1108,12 +1108,12 @@ mod tests {
     }
 
     #[test]
-    fn hosts_mode_filter_never_changes_which_peers_get_probed() {
+    fn hosts_mode_filter_never_changes_which_nodes_get_probed() {
         let _env = Env::set_up("filter-probes-all");
-        aoide_storage::peer_store::save_peers(&[peer("alpha"), peer("beta")]).unwrap();
+        aoide_storage::node_store::save_nodes(&[node("alpha"), node("beta")]).unwrap();
         let probed = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let probed2 = Arc::clone(&probed);
-        let pull: PullFn = Arc::new(move |p: &Peer| {
+        let pull: PullFn = Arc::new(move |p: &Node| {
             probed2.lock().unwrap().push(p.name.clone());
             Ok(json!({ "nodes": [], "edges": [] }))
         });
@@ -1121,7 +1121,7 @@ mod tests {
         let out = session_roster_with(&hosts_invocation(&["alpha"], &[]), pull);
         let mut names = probed.lock().unwrap().clone();
         names.sort();
-        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()], "every peer was probed");
+        assert_eq!(names, vec!["alpha".to_string(), "beta".to_string()], "every node was probed");
         let data = out.data.unwrap();
         let nodes = data["nodes"].as_array().unwrap();
         assert!(nodes.iter().all(|n| n["name"] != "beta"), "but only alpha is displayed");
@@ -1211,9 +1211,9 @@ mod tests {
             projects: vec![project("aoide", "/home/k/Aoide")],
         };
         super::super::model::write_stage(&super::super::model::projects_path(), &pf).unwrap();
-        aoide_storage::peer_store::save_peers(&[peer("yomi-strix")]).unwrap();
+        aoide_storage::node_store::save_nodes(&[node("yomi-strix")]).unwrap();
 
-        let pull: PullFn = Arc::new(|_: &Peer| Ok(peer_graph(&[("r1", "working", "/home/k/Aoide/pkgs/aoide", None)])));
+        let pull: PullFn = Arc::new(|_: &Node| Ok(node_graph(&[("r1", "working", "/home/k/Aoide/pkgs/aoide", None)])));
         let out = session_roster_with(&project_invocation(), pull);
         let data = out.data.unwrap();
         let projects = data["projects"].as_array().unwrap();

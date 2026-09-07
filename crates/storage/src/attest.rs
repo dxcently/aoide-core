@@ -207,6 +207,17 @@ pub fn attested_caller(start_pid: i32) -> Option<(String, String)> {
         .map(|rec| (rec.session_id.clone(), rec.origin.clone().unwrap_or_default()))
 }
 
+/// Does `origin` mark a session as remote-node-spawned? The one place this
+/// check lives, shared by `aoide-conduct`'s resurrect/registration gates and
+/// `aoide-secrets`' broker origin gate (same DAG constraint as
+/// [`attested_caller`] above) — a `node:<name>` origin is the current wire
+/// shape (peer -> node rename); a `peer:<name>` origin is a session record
+/// stamped before that rename and still on disk. Retire the `peer:` arm
+/// once no session record predating the rename survives on any box.
+pub fn is_node_origin(origin: &str) -> bool {
+    origin.starts_with("node:") || origin.starts_with("peer:")
+}
+
 // ── the daemon pubkey channel ────────────────────────────────────────────
 
 /// The connect half's budget — short, since a live daemon on the same host
@@ -416,14 +427,14 @@ mod tests {
             session_id: "s-stale".to_string(),
             pid: me,
             pid_starttime: 1, // a plausible-looking but WRONG (stale) starttime
-            origin_class: "peer:box-b".to_string(),
+            origin_class: "node:box-b".to_string(),
             issued_at: 1_700_000_000,
         };
         let rec = SessionRecord {
             session_id: "s-stale".to_string(),
             state: "idle".to_string(),
             pid: Some(me as u32),
-            origin: Some("peer:box-b".to_string()),
+            origin: Some("node:box-b".to_string()),
             seal: Some(mint_seal(&kp, &stale)),
             sealed_issued_at: Some(1_700_000_000),
             ..Default::default()
@@ -511,7 +522,7 @@ mod tests {
         let me = std::process::id() as i32;
         let roster = SessionsFile {
             schema_version: "0".to_string(),
-            sessions: vec![sealed_record("remote-orch", me, Some("peer:box-b"), &kp)],
+            sessions: vec![sealed_record("remote-orch", me, Some("node:box-b"), &kp)],
         };
         std::fs::create_dir_all(crate::stage::sessions_path().parent().unwrap()).unwrap();
         crate::stage::write_stage(&crate::stage::sessions_path(), &roster).unwrap();
@@ -522,7 +533,7 @@ mod tests {
         std::env::set_var("AOIDE_DAEMON_SOCKET", &sock);
         assert_eq!(
             attested_caller(me),
-            Some(("remote-orch".to_string(), "peer:box-b".to_string()))
+            Some(("remote-orch".to_string(), "node:box-b".to_string()))
         );
         let _ = std::fs::remove_file(&sock);
 

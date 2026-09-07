@@ -30,7 +30,7 @@
 //! sharing its entry surface — root-coupled like `meta`/`onboard` in shape,
 //! all appended LAST per golden discipline's "append, never reorder,"
 //! `pkgs/aoide/crates/AGENTS.md`). Core-only groups (graph, adapter melete,
-//! conductor, a2a serve, agents, peers, usage, hooks, daemon, soundcheck)
+//! conductor, a2a serve, agents, nodes, usage, hooks, daemon, soundcheck)
 //! are absent — lyra never registers them.
 //!
 //! Path count: 2 (meta) + 1 (onboard) + 1 (mcp.serve) + 3 (rice) + 3 (draft)

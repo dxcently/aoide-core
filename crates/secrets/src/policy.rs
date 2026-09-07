@@ -5,15 +5,15 @@
 //! shape doesn't shift out from under it later.
 //!
 //! **Name validation is fresh here, not reused from
-//! `aoide_storage::peer_store::valid_peer_name`** (the `aoide-storage`
+//! `aoide_storage::node_store::valid_node_name`** (the `aoide-storage`
 //! dependency the crate now carries arrived at LANE IDENTITY P-ID4 for
 //! `attest::attested_caller` alone — the name rule below predates it and
 //! stays deliberately independent):
 //! the plan's B2 salvage note calls for a secret name STRICTER than a
-//! peer name even though both restrict to the same character set
+//! node name even though both restrict to the same character set
 //! (`[a-z0-9-]`) — [`valid_secret_name`] additionally forbids a leading
 //! or trailing hyphen and any run of consecutive hyphens, where
-//! `valid_peer_name` allows both. The superseded workstream-B design
+//! `valid_node_name` allows both. The superseded workstream-B design
 //! (`P-B2`) is dead; only this naming decision survives into aoide-secrets.
 
 use serde::{Deserialize, Serialize};
@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 /// A secret's nickname: `[a-z0-9]` for the first and last character,
 /// `[a-z0-9-]` in between, and no `--` run anywhere. Rejects empty
 /// strings. Joined into on-disk paths by later phases (V2's backend
-/// stores) the same way a peer name is — this is the traversal guard for
+/// stores) the same way a node name is — this is the traversal guard for
 /// that, made stricter per the plan's salvage note (module doc).
 pub fn valid_secret_name(name: &str) -> bool {
     let bytes = name.as_bytes();
@@ -75,7 +75,7 @@ pub struct Automation {
 #[serde(rename_all = "camelCase")]
 pub struct Policy {
     /// The secret's nickname (see [`valid_secret_name`]); not enforced
-    /// by `Deserialize` itself (matching `valid_peer_name`'s precedent —
+    /// by `Deserialize` itself (matching `valid_node_name`'s precedent —
     /// storage-layer validation is a call-site concern) but MUST be
     /// checked before this policy is ever persisted, at V2.
     pub name: String,
@@ -121,7 +121,7 @@ pub struct Policy {
     pub remote: bool,
     /// Remote-ORIGIN admission (LANE IDENTITY P-ID4) — the third, distinct
     /// axis next to `automation` and `remote`: may a LOCAL resolve made by
-    /// a session that a REMOTE PEER created (sealed `originClass` `peer:*`,
+    /// a session that a REMOTE NODE created (sealed `originClass` `node:*`,
     /// positively attested via `aoide_storage::attest::attested_caller`)
     /// be admitted for THIS secret? `remote` above is the TRANSPORT axis
     /// (may the secret be served through a non-local entry point);
@@ -193,10 +193,10 @@ mod tests {
     }
 
     #[test]
-    fn valid_secret_name_rejects_what_valid_peer_name_would_accept() {
-        // These are exactly the shapes `aoide_storage::peer_store::
-        // valid_peer_name` allows but this stricter rule does not —
-        // the "stricter than valid_peer_name" delta from the plan.
+    fn valid_secret_name_rejects_what_valid_node_name_would_accept() {
+        // These are exactly the shapes `aoide_storage::node_store::
+        // valid_node_name` allows but this stricter rule does not —
+        // the "stricter than valid_node_name" delta from the plan.
         assert!(!valid_secret_name("a-"), "trailing hyphen");
         assert!(!valid_secret_name("a--b"), "double hyphen");
         assert!(!valid_secret_name("ab--"), "trailing double hyphen");

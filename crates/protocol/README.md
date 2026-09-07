@@ -39,12 +39,12 @@ other crate in this workspace sits above.
   parameterized by a `special` hook so each binary's one-shot exceptions
   (`mcp serve --stdio`, `a2a serve`, `conductor`, `guide`/`schema` raw
   output) don't fork the loop itself. `parse` also resolves CLI-only
-  ergonomic shorthands (`ALIASES`, e.g. `peer rm` for `peer remove`) to
+  ergonomic shorthands (`ALIASES`, e.g. `node rm` for `node remove`) to
   their canonical path before the greedy match runs, so a shorthand is
   never a second registered command — the registry, `schema --json`, and
   every golden snapshot see only the canonical spelling. Flag arity is the
   registry's call, not the spelling's: a flag declared `"bool"` never
-  consumes the following token as its value (`peer add --no-verify alice`
+  consumes the following token as its value (`node add --no-verify alice`
   keeps `alice` positional), a valued flag consumes exactly one, and any
   token that reads both ways — a value colliding with a command-path
   segment, or a flag bool-for-one-candidate valued-for-another — is a loud

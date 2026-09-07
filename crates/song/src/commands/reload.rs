@@ -5,7 +5,7 @@
 //!
 //! - **declarative** — SHELL RELOAD ONLY, byte-for-byte the old `quickshell
 //!   reload` command ([`shell_reload_only`]), which this command absorbs
-//!   outright — hard cutover, no alias, the `peer invite` precedent. Nothing
+//!   outright — hard cutover, no alias, the `node invite` precedent. Nothing
 //!   is unlocked, so there is nothing to snapshot or sync.
 //! - **staging** — 1. sync via [`super::rice::handle_rice_stage`]'s own body
 //!   (the existing seam, never a copy: re-derives `stage/livery.json` from

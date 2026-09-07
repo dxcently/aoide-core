@@ -1,8 +1,8 @@
-//! `aoide peer list [--json]` — the one-glance mesh roster (task #120 P2,
+//! `aoide node list [--json]` — the one-glance mesh roster (task #120 P2,
 //! User riders 4/5/6): every known node on one screen — this host, every
-//! registered peer, and every advertising instance heard on the LAN — one
-//! row each, with its running sessions indented beneath. `peer status`
-//! keeps the deep per-peer registry detail (full `Peer` row + cache
+//! registered node, and every advertising instance heard on the LAN — one
+//! row each, with its running sessions indented beneath. `node status`
+//! keeps the deep per-node registry detail (full `Node` row + cache
 //! staleness); this command is the wide shallow view, not a second copy of
 //! that one.
 //!
@@ -12,13 +12,13 @@
 //! other modules already own the machinery for:
 //!
 //! - **Presence + sessions** come from `who.rs`'s own roster core, called
-//!   directly: [`probe_peers`] (one bounded live pull per registered peer,
-//!   in parallel), [`build_peer_node`] (probe-outcome/cache-fallback
+//!   directly: [`probe_nodes`] (one bounded live pull per registered node,
+//!   in parallel), [`build_mesh_node`] (probe-outcome/cache-fallback
 //!   classification), [`build_local_node`] (this box's own stage). The
 //!   probe closure is `session --hosts`'s exact production wiring (the
 //!   retired standalone `who` command's own wiring, unchanged —
-//!   `aoide_client::commands::pull_peer_live`, [`PEER_PROBE_TIMEOUT_SECS`])
-//!   — never a re-implementation, so `session --hosts` and `peer list` can
+//!   `aoide_client::commands::pull_node_live`, [`NODE_PROBE_TIMEOUT_SECS`])
+//!   — never a re-implementation, so `session --hosts` and `node list` can
 //!   never disagree about which nodes are up.
 //! - **Advertising instances** come from ONE bounded discovery sweep —
 //!   `aoide_client::discover::run_sweep` ([`SWEEP_SECS`], P-P6/task #120's
@@ -30,7 +30,7 @@
 //!   that cannot LISTEN (bind failure) only annotates the roster
 //!   (`data.sweep.error` + one trailing line), never fails the command —
 //!   the paired half of the roster is still true.
-//! - **Peer rows** come from `aoide_storage::peer_store` — `peer status`'s
+//! - **Node rows** come from `aoide_storage::node_store` — `node status`'s
 //!   own source.
 //!
 //! A heard advertisement is UNTRUSTED display data: it reaches this module
@@ -40,7 +40,7 @@
 //! never the claimed hop as a dial target (PAIRING.md's claim-vs-fact
 //! rule). Discovery still grants nothing: an unknown advertiser renders as
 //! a `◆` pair CANDIDATE row and nothing else — nothing here writes
-//! `state/peers.json` or `state/peer-cache/`.
+//! `state/nodes.json` or `state/node-cache/`.
 //!
 //! ## The mark grammar
 //!
@@ -49,17 +49,17 @@
 //! row's mark (`●◆`/`○◆`) when a heard name matches it, standing alone for
 //! an unpaired candidate. The local row is marked advertising when the
 //! sweep heard this instance itself (`discover::is_self_target` — the same
-//! name/loopback guard `peer invite` uses), and a self-heard advertisement
+//! name/loopback guard `node invite` uses), and a self-heard advertisement
 //! never becomes a candidate row.
 
 use super::who::{
-    build_local_node, build_peer_node, probe_peers, NodeView, PullFn, SessionView,
-    PEER_PROBE_TIMEOUT_SECS,
+    build_local_node, build_mesh_node, probe_nodes, NodeView, PullFn, SessionView,
+    NODE_PROBE_TIMEOUT_SECS,
 };
 use aoide_client::discover::{is_self_target, Heard, SweepResult};
 use aoide_protocol::output::Outcome;
 use aoide_protocol::Invocation;
-use aoide_storage::peer_store::Peer;
+use aoide_storage::node_store::Node;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
@@ -71,7 +71,7 @@ use std::sync::Arc;
 /// sweep.
 pub(super) type SweepFn = Box<dyn FnOnce() -> Result<SweepResult, String> + Send>;
 
-/// One roster row — this host, a registered peer, or an unpaired
+/// One roster row — this host, a registered node, or an unpaired
 /// advertiser. `presence` carries `who.rs`'s own three-way node vocabulary
 /// (`online`/`unreachable`/`never-pulled`) for paired rows; a candidate row
 /// is `online` by construction (it was heard within this very sweep).
@@ -83,12 +83,12 @@ struct Row {
     verified: bool,
     advertising: bool,
     presence: &'static str,
-    /// The row's reachable address: for an ONLINE paired peer its `via`
+    /// The row's reachable address: for an ONLINE paired node its `via`
     /// ssh marker when set, else its registered `url` (doors are
-    /// loopback-bound, so a tunneled peer's `url` is `127.0.0.1` — the
+    /// loopback-bound, so a tunneled node's `url` is `127.0.0.1` — the
     /// `via` hop is the address that actually distinguishes it); the
     /// observed sweep source for a candidate; `None` (rendered `—`) for
-    /// this host and for an offline peer.
+    /// this host and for an offline node.
     addr: Option<String>,
     /// An offline paired row's cache `fetchedAt` — both the "last seen"
     /// in its status text and the "as of" label on its cached sessions.
@@ -129,17 +129,17 @@ fn status_text(r: &Row) -> String {
     s
 }
 
-/// THE pure fold (the brief's testable core): local node + per-peer
+/// THE pure fold (the brief's testable core): local node + per-node
 /// probe/cache classifications + one sweep's heard-set → the ordered row
-/// list. Order is fixed: this host first, registered peers in registry
+/// list. Order is fixed: this host first, registered nodes in registry
 /// order, unknown advertisers in heard order. No I/O.
 fn assemble_roster(
     local: NodeView,
-    peers: Vec<(Peer, NodeView)>,
+    nodes: Vec<(Node, NodeView)>,
     heard: &[Heard],
     host: &str,
 ) -> Vec<Row> {
-    let mut rows = Vec::with_capacity(1 + peers.len() + heard.len());
+    let mut rows = Vec::with_capacity(1 + nodes.len() + heard.len());
     rows.push(Row {
         name: local.name,
         is_local: true,
@@ -151,16 +151,16 @@ fn assemble_roster(
         last_seen: None,
         sessions: local.sessions,
     });
-    let peer_names: Vec<String> = peers.iter().map(|(p, _)| p.name.clone()).collect();
-    for (peer, node) in peers {
-        let advertising = heard.iter().any(|h| h.advertisement.name == peer.name);
-        let addr =
-            (node.presence == "online").then(|| peer.via.clone().unwrap_or_else(|| peer.url.clone()));
+    let node_names: Vec<String> = nodes.iter().map(|(p, _)| p.name.clone()).collect();
+    for (mesh_node, node) in nodes {
+        let advertising = heard.iter().any(|h| h.advertisement.name == node.name);
+        let addr = (node.presence == "online")
+            .then(|| mesh_node.via.clone().unwrap_or_else(|| mesh_node.url.clone()));
         rows.push(Row {
-            name: peer.name,
+            name: node.name,
             is_local: false,
             paired: true,
-            verified: peer.verified,
+            verified: mesh_node.verified,
             advertising,
             presence: node.presence,
             addr,
@@ -171,14 +171,14 @@ fn assemble_roster(
     // The candidates: heard, not self, not registered. `heard` is already
     // distinct by (name, source) and MAX_HEARD-bounded (`run_sweep`'s own
     // fold) — two sources claiming one name stay two rows here for
-    // UNPAIRED names, exactly as `peer discover` keeps an impostor
-    // visible beside the real thing. A heard name matching a PAIRED peer
-    // instead folds into that peer's row as its advertising mark (above)
+    // UNPAIRED names, exactly as `node discover` keeps an impostor
+    // visible beside the real thing. A heard name matching a PAIRED node
+    // instead folds into that node's row as its advertising mark (above)
     // and its observed source is not rendered — a spoofer can light a
     // paired row's advertising mark, never touch its addr/verified/paired
     // fields (those come only from the registry and the probe).
     for h in heard {
-        if is_self_target(h, host) || peer_names.iter().any(|n| *n == h.advertisement.name) {
+        if is_self_target(h, host) || node_names.iter().any(|n| *n == h.advertisement.name) {
             continue;
         }
         rows.push(Row {
@@ -261,13 +261,13 @@ fn row_json(r: &Row) -> Value {
 }
 
 /// The testable core, `who.rs::session_roster_with`'s exact shape one seam
-/// wider: real local stage + peer-store I/O, but BOTH network-shaped steps —
-/// the per-peer probes and the discovery sweep — arrive injected, so a test
+/// wider: real local stage + node-store I/O, but BOTH network-shaped steps —
+/// the per-node probes and the discovery sweep — arrive injected, so a test
 /// never opens a socket. The sweep runs on its own thread beside the probe
 /// fan-out (both are ~2s walls; serial would double the command's latency
 /// for nothing).
-pub(super) fn peer_list_with(_inv: &Invocation, pull: PullFn, sweep: SweepFn) -> Outcome {
-    let cmd = "peer.list";
+pub(super) fn node_list_with(_inv: &Invocation, pull: PullFn, sweep: SweepFn) -> Outcome {
+    let cmd = "node.list";
     let (_, s, h) = match super::common::load_inputs(cmd) {
         Ok(v) => v,
         Err(e) => return e,
@@ -276,14 +276,14 @@ pub(super) fn peer_list_with(_inv: &Invocation, pull: PullFn, sweep: SweepFn) ->
     let sweep_handle = std::thread::spawn(sweep);
 
     let local = build_local_node(&s.sessions, &h.hooks, &host);
-    let peers = aoide_storage::peer_store::load_peers();
-    let probed = probe_peers(&peers, pull);
-    let peer_nodes: Vec<(Peer, NodeView)> = probed
+    let nodes = aoide_storage::node_store::load_nodes();
+    let probed = probe_nodes(&nodes, pull);
+    let mesh_nodes: Vec<(Node, NodeView)> = probed
         .into_iter()
-        .map(|(peer, result)| {
-            let cache = aoide_storage::peer_store::load_peer_cache(&peer.name);
-            let node = build_peer_node(&peer, result, cache);
-            (peer, node)
+        .map(|(mesh_node, result)| {
+            let cache = aoide_storage::node_store::load_node_cache(&mesh_node.name);
+            let node = build_mesh_node(&mesh_node, result, cache);
+            (mesh_node, node)
         })
         .collect();
 
@@ -294,7 +294,7 @@ pub(super) fn peer_list_with(_inv: &Invocation, pull: PullFn, sweep: SweepFn) ->
         Err(e) => (Vec::new(), 0, Some(e)),
     };
 
-    let mut rows = assemble_roster(local, peer_nodes, &heard, &host);
+    let mut rows = assemble_roster(local, mesh_nodes, &heard, &host);
     // RUNNING sessions (rider 6) — `done` never makes the roster (`session`'s
     // default view, minus its `--all` escape: the deep view owns that).
     for r in &mut rows {
@@ -321,23 +321,23 @@ pub(super) fn peer_list_with(_inv: &Invocation, pull: PullFn, sweep: SweepFn) ->
 }
 
 /// The sweep's listen window — short (the brief's ~2s): the roster wants
-/// "who is advertising right now", not `peer discover`'s fuller default
+/// "who is advertising right now", not `node discover`'s fuller default
 /// window, and advertisers repeat on a ~30s cadence either way, so any
 /// single window is a sample, never a census.
 const SWEEP_SECS: u64 = 2;
 
-/// `aoide peer list [--json]` — the real entry point: the roster core's
+/// `aoide node list [--json]` — the real entry point: the roster core's
 /// exact probe wiring (`session --hosts`'s own — the retired `who`
 /// command's wiring, unchanged) plus one real `run_sweep`, handed to
-/// [`peer_list_with`].
-pub fn peer_list(inv: &Invocation) -> Outcome {
+/// [`node_list_with`].
+pub fn node_list(inv: &Invocation) -> Outcome {
     let pull: PullFn =
-        Arc::new(|p: &Peer| aoide_client::commands::pull_peer_live(p, PEER_PROBE_TIMEOUT_SECS));
+        Arc::new(|p: &Node| aoide_client::commands::pull_node_live(p, NODE_PROBE_TIMEOUT_SECS));
     let sweep: SweepFn = Box::new(|| {
         aoide_client::discover::run_sweep(SWEEP_SECS)
             .map_err(|e| aoide_client::discover::describe_sweep_error(&e))
     });
-    peer_list_with(inv, pull, sweep)
+    node_list_with(inv, pull, sweep)
 }
 
 #[cfg(test)]
@@ -345,10 +345,10 @@ mod tests {
     use super::*;
     use crate::graph::testutil::*;
     use aoide_storage::advertise::Advertisement;
-    use aoide_storage::peer_store::PeerCacheEntry;
+    use aoide_storage::node_store::NodeCacheEntry;
 
-    fn peer(name: &str) -> Peer {
-        Peer {
+    fn mesh_node(name: &str) -> Node {
+        Node {
             name: name.to_string(),
             url: format!("http://{name}:8710/"),
             autogate: false,
@@ -402,7 +402,7 @@ mod tests {
         }
     }
 
-    fn peer_graph(sessions: &[(&str, &str, Option<&str>)]) -> Value {
+    fn node_graph(sessions: &[(&str, &str, Option<&str>)]) -> Value {
         let nodes: Vec<Value> = sessions
             .iter()
             .map(|(id, state, petname)| {
@@ -416,8 +416,8 @@ mod tests {
         json!({ "schemaVersion": "0", "nodes": nodes, "edges": [] })
     }
 
-    fn cache(name: &str, fetched_at: &str, graph: Value) -> PeerCacheEntry {
-        PeerCacheEntry {
+    fn cache(name: &str, fetched_at: &str, graph: Value) -> NodeCacheEntry {
+        NodeCacheEntry {
             schema_version: "0".to_string(),
             name: name.to_string(),
             instance: None,
@@ -432,8 +432,8 @@ mod tests {
 
     #[test]
     fn paired_online_row_is_a_filled_dot_with_the_registered_url() {
-        let p = peer("sakaki");
-        let node = build_peer_node(&p, Ok(peer_graph(&[("s1", "working", None)])), None);
+        let p = mesh_node("sakaki");
+        let node = build_mesh_node(&p, Ok(node_graph(&[("s1", "working", None)])), None);
         let rows = assemble_roster(local_node("yomi", vec![]), vec![(p, node)], &[], "yomi");
         let r = &rows[1];
         assert_eq!(mark(r), "●");
@@ -443,22 +443,22 @@ mod tests {
     }
 
     #[test]
-    fn an_online_tunneled_peers_addr_is_its_via_hop_not_its_loopback_url() {
-        let mut p = peer("sakaki");
+    fn an_online_tunneled_nodes_addr_is_its_via_hop_not_its_loopback_url() {
+        let mut p = mesh_node("sakaki");
         p.url = "http://127.0.0.1:8710/".to_string();
         p.via = Some("ssh://k@192.168.1.202".to_string());
-        let node = build_peer_node(&p, Ok(peer_graph(&[])), None);
+        let node = build_mesh_node(&p, Ok(node_graph(&[])), None);
         let rows = assemble_roster(local_node("yomi", vec![]), vec![(p, node)], &[], "yomi");
         assert_eq!(rows[1].addr.as_deref(), Some("ssh://k@192.168.1.202"));
     }
 
     #[test]
     fn paired_offline_row_is_a_hollow_dot_with_last_seen_and_no_addr() {
-        let p = peer("chiyo");
-        let node = build_peer_node(
+        let p = mesh_node("chiyo");
+        let node = build_mesh_node(
             &p,
             Err("HTTP 000".to_string()),
-            Some(cache("chiyo", "2026-08-27T10:00:00Z", peer_graph(&[("s2", "idle", None)]))),
+            Some(cache("chiyo", "2026-08-27T10:00:00Z", node_graph(&[("s2", "idle", None)]))),
         );
         let rows = assemble_roster(local_node("yomi", vec![]), vec![(p, node)], &[], "yomi");
         let r = &rows[1];
@@ -470,8 +470,8 @@ mod tests {
 
     #[test]
     fn paired_never_pulled_row_says_so_instead_of_a_fake_last_seen() {
-        let p = peer("osaka");
-        let node = build_peer_node(&p, Err("unreachable".to_string()), None);
+        let p = mesh_node("osaka");
+        let node = build_mesh_node(&p, Err("unreachable".to_string()), None);
         let rows = assemble_roster(local_node("yomi", vec![]), vec![(p, node)], &[], "yomi");
         assert_eq!(mark(&rows[1]), "○");
         assert_eq!(status_text(&rows[1]), "paired · never pulled");
@@ -479,10 +479,10 @@ mod tests {
 
     #[test]
     fn advertising_marks_ride_on_paired_rows_online_and_offline() {
-        let up = peer("sakaki");
-        let up_node = build_peer_node(&up, Ok(peer_graph(&[])), None);
-        let down = peer("chiyo");
-        let down_node = build_peer_node(&down, Err("down".to_string()), None);
+        let up = mesh_node("sakaki");
+        let up_node = build_mesh_node(&up, Ok(node_graph(&[])), None);
+        let down = mesh_node("chiyo");
+        let down_node = build_mesh_node(&down, Err("down".to_string()), None);
         let heard = [heard("sakaki", "192.168.1.20"), heard("chiyo", "192.168.1.30")];
         let rows = assemble_roster(
             local_node("yomi", vec![]),
@@ -494,7 +494,7 @@ mod tests {
         assert_eq!(status_text(&rows[1]), "paired · online · advertising");
         assert_eq!(mark(&rows[2]), "○◆");
         assert_eq!(status_text(&rows[2]), "paired · never pulled · advertising");
-        assert_eq!(rows.len(), 3, "a heard name matching a peer never doubles as a candidate");
+        assert_eq!(rows.len(), 3, "a heard name matching a node never doubles as a candidate");
     }
 
     #[test]
@@ -547,23 +547,23 @@ mod tests {
 
     #[test]
     fn cached_sessions_under_an_offline_row_carry_the_as_of_label() {
-        let p = peer("chiyo");
-        let node = build_peer_node(
+        let p = mesh_node("chiyo");
+        let node = build_mesh_node(
             &p,
             Err("down".to_string()),
-            Some(cache("chiyo", "2026-08-27T10:00:00Z", peer_graph(&[("s2", "idle", Some("calm-thorn"))]))),
+            Some(cache("chiyo", "2026-08-27T10:00:00Z", node_graph(&[("s2", "idle", Some("calm-thorn"))]))),
         );
         let rows = assemble_roster(local_node("yomi", vec![]), vec![(p, node)], &[], "yomi");
         let rendered = render_roster(&rows);
         assert!(rendered.contains("└─ claude  idle  calm-thorn  (as of 2026-08-27T10:00:00Z)"), "{rendered}");
         // An ONLINE row's sessions carry no as-of — they are live.
-        let p2 = peer("sakaki");
-        let node2 = build_peer_node(&p2, Ok(peer_graph(&[("s3", "working", None)])), None);
+        let p2 = mesh_node("sakaki");
+        let node2 = build_mesh_node(&p2, Ok(node_graph(&[("s3", "working", None)])), None);
         let rows2 = assemble_roster(local_node("yomi", vec![]), vec![(p2, node2)], &[], "yomi");
         assert!(!render_roster(&rows2).contains("as of"));
     }
 
-    // ── peer_list_with: the full pipeline, both seams injected ───────────
+    // ── node_list_with: the full pipeline, both seams injected ───────────
 
     /// Same shape as `who.rs`'s test Env, with `testutil::EnvVars` as the
     /// restore half. Field order is load-bearing: fields drop in
@@ -594,7 +594,7 @@ mod tests {
     }
 
     fn no_pull() -> PullFn {
-        Arc::new(|_: &Peer| panic!("no peers registered — pull must never be called"))
+        Arc::new(|_: &Node| panic!("no nodes registered — pull must never be called"))
     }
 
     fn empty_sweep() -> SweepFn {
@@ -604,7 +604,7 @@ mod tests {
     #[test]
     fn empty_mesh_is_one_local_row_and_a_zero_count_never_an_error() {
         let _env = Env::set_up("pl-empty");
-        let out = peer_list_with(&invocation(&["peer", "list"], &[]), no_pull(), empty_sweep());
+        let out = node_list_with(&invocation(&["node", "list"], &[]), no_pull(), empty_sweep());
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let data = out.data.unwrap();
         let nodes = data["nodes"].as_array().unwrap();
@@ -617,11 +617,11 @@ mod tests {
     #[test]
     fn json_rows_carry_the_full_roster_shape() {
         let _env = Env::set_up("pl-shape");
-        aoide_storage::peer_store::save_peers(&[peer("sakaki")]).unwrap();
+        aoide_storage::node_store::save_nodes(&[mesh_node("sakaki")]).unwrap();
         let pull: PullFn = Arc::new(|_| Ok(json!({ "nodes": [], "edges": [] })));
         let stranger = heard("stranger", "192.168.1.99");
         let sweep: SweepFn = Box::new(move || Ok(SweepResult { heard: vec![stranger], dropped: 3 }));
-        let out = peer_list_with(&invocation(&["peer", "list"], &[]), pull, sweep);
+        let out = node_list_with(&invocation(&["node", "list"], &[]), pull, sweep);
         let data = out.data.unwrap();
         let nodes = data["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 3, "local + paired + candidate");
@@ -637,10 +637,10 @@ mod tests {
     }
 
     #[test]
-    fn the_roster_never_writes_peers_json_or_any_state_file() {
+    fn the_roster_never_writes_nodes_json_or_any_state_file() {
         let _env = Env::set_up("pl-writeban");
-        aoide_storage::peer_store::save_peers(&[peer("sakaki")]).unwrap();
-        let before = std::fs::read(aoide_storage::peer_store::peers_path()).unwrap();
+        aoide_storage::node_store::save_nodes(&[mesh_node("sakaki")]).unwrap();
+        let before = std::fs::read(aoide_storage::node_store::nodes_path()).unwrap();
         let state_files = |dir: &std::path::Path| -> Vec<String> {
             std::fs::read_dir(dir)
                 .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.file_name().to_string_lossy().into_owned())).collect())
@@ -655,31 +655,31 @@ mod tests {
         let sweep: SweepFn = Box::new(move || {
             Ok(SweepResult { heard: vec![impostor.clone(), stranger.clone()], dropped: 0 })
         });
-        let out = peer_list_with(&invocation(&["peer", "list"], &[]), pull, sweep);
+        let out = node_list_with(&invocation(&["node", "list"], &[]), pull, sweep);
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
-        let after = std::fs::read(aoide_storage::peer_store::peers_path()).unwrap();
-        assert_eq!(before, after, "peers.json must be byte-identical after a roster run");
+        let after = std::fs::read(aoide_storage::node_store::nodes_path()).unwrap();
+        assert_eq!(before, after, "nodes.json must be byte-identical after a roster run");
         assert_eq!(listing_before, state_files(&_env.state), "no state file created or removed");
     }
 
     #[test]
-    fn peer_store_only_roster_renders_with_an_empty_sweep() {
+    fn node_store_only_roster_renders_with_an_empty_sweep() {
         let _env = Env::set_up("pl-nosweep");
-        aoide_storage::peer_store::save_peers(&[peer("sakaki"), peer("chiyo")]).unwrap();
-        aoide_storage::peer_store::save_peer_cache(&cache(
+        aoide_storage::node_store::save_nodes(&[mesh_node("sakaki"), mesh_node("chiyo")]).unwrap();
+        aoide_storage::node_store::save_node_cache(&cache(
             "chiyo",
             "2026-08-27T10:00:00Z",
-            peer_graph(&[("r1", "idle", None)]),
+            node_graph(&[("r1", "idle", None)]),
         ))
         .unwrap();
-        let pull: PullFn = Arc::new(|p: &Peer| {
+        let pull: PullFn = Arc::new(|p: &Node| {
             if p.name == "sakaki" {
-                Ok(peer_graph(&[("r2", "working", Some("misty-comet"))]))
+                Ok(node_graph(&[("r2", "working", Some("misty-comet"))]))
             } else {
                 Err("unreachable".to_string())
             }
         });
-        let out = peer_list_with(&invocation(&["peer", "list"], &[]), pull, empty_sweep());
+        let out = node_list_with(&invocation(&["node", "list"], &[]), pull, empty_sweep());
         assert!(out.message.contains("paired · online"), "{}", out.message);
         assert!(out.message.contains("paired · last seen 2026-08-27T10:00:00Z"), "{}", out.message);
         assert!(!out.message.contains("◆"), "no advertising marks from an empty sweep");
@@ -692,7 +692,7 @@ mod tests {
     fn a_sweep_that_cannot_listen_annotates_the_roster_instead_of_failing_it() {
         let _env = Env::set_up("pl-sweeperr");
         let sweep: SweepFn = Box::new(|| Err("port 8711 already bound".to_string()));
-        let out = peer_list_with(&invocation(&["peer", "list"], &[]), no_pull(), sweep);
+        let out = node_list_with(&invocation(&["node", "list"], &[]), no_pull(), sweep);
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "the paired half is still true");
         assert!(out.message.contains("sweep unavailable — port 8711 already bound"));
         assert_eq!(out.data.unwrap()["sweep"]["error"], "port 8711 already bound");
@@ -709,7 +709,7 @@ mod tests {
             ],
         };
         super::super::model::write_stage(&super::super::model::sessions_path(), &sf).unwrap();
-        let out = peer_list_with(&invocation(&["peer", "list"], &[]), no_pull(), empty_sweep());
+        let out = node_list_with(&invocation(&["node", "list"], &[]), no_pull(), empty_sweep());
         let data = out.data.unwrap();
         assert_eq!(data["nodes"][0]["sessions"].as_array().unwrap().len(), 1, "running only");
     }

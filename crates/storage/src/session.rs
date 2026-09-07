@@ -125,7 +125,7 @@ pub fn upsert_session(
             // `stamp_resumed_from`, once the new record exists.
             resumed_from: None,
             // Stamped later by `stamp_origin` (P-P3), only for a session
-            // aoide-server's A2A door spawned on behalf of a paired peer; a
+            // aoide-server's A2A door spawned on behalf of a paired node; a
             // fresh registration otherwise starts without one.
             origin: None,
             // Stamped later by `stamp_seal` (LANE IDENTITY P-ID1), only once

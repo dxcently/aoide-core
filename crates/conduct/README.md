@@ -77,15 +77,15 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   unchanged. `send` gained `--to <target>` (messaging plan P-C3, mutually exclusive
   with `--id`): resolves via `aoide_storage::addr::resolve` (itself
   `session:`-prefix-tolerant on its exact-id tier) against local
-  sessions + registered peers — a LOCAL match re-drives the exact `--id`
-  path unchanged, a REMOTE match (`peer/<query>`, resolved against that
-  peer's CACHED graph, never a live pull) delivers over A2A `message/send`
-  instead, gated entirely on the RECEIVING peer's side (this door's own
+  sessions + registered nodes — a LOCAL match re-drives the exact `--id`
+  path unchanged, a REMOTE match (`node/<query>`, resolved against that
+  node's CACHED graph, never a live pull) delivers over A2A `message/send`
+  instead, gated entirely on the RECEIVING node's side (this door's own
   `--yes`/pending/autogate machinery is a local-socket concept and does not
   apply to a remote delivery). A `--to` query that resolves against neither
-  a local session nor any peer/prefix form falls through to a registered
-  **hub peer** (P-D5's `peer hub`, wired here at P-D6 —
-  `aoide_storage::addr::resolve_with_hub`, given the one peer with
+  a local session nor any node/prefix form falls through to a registered
+  **hub node** (P-D5's `node hub`, wired here at P-D6 —
+  `aoide_storage::addr::resolve_with_hub`, given the one node with
   `hub: true` if any) instead of erroring `not-found` — the ONE routing
   consumer of the hub preference in this crate; `who.rs`'s own listing
   filter deliberately keeps the plain, hub-blind `addr::resolve`. `send::deliver_local`'s success path is ONE
@@ -169,22 +169,22 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   this crate already depends on `aoide-protocol` the same way `song`'s own
   `prune_picker` does; there was no missing primitive to add to `pick.rs`.
   Rows come from this box's own roster (`merged_sessions`, never
-  re-derived) plus every registered peer's CACHED graph via `who.rs`'s
+  re-derived) plus every registered node's CACHED graph via `who.rs`'s
   `sessions_from_graph` (`pub(super)`, `SessionView` alongside it — see
-  `glyph`'s own widening note in `who.rs` for the precedent) — no live peer
+  `glyph`'s own widening note in `who.rs` for the precedent) — no live node
   probe anywhere in this module. A LOCAL row's mark toggles
   `state/undying.json` through one load, N mutations, one save (widening
   `undying_grant`'s own single-id discipline to a whole confirm's diff at
-  once); a PEER row's mark writes a `.aoide/project.json` spec instead — the
-  id lives on the peer, so this conductor cannot write ITS store — resolved
+  once); a NODE row's mark writes a `.aoide/project.json` spec instead — the
+  id lives on the node, so this conductor cannot write ITS store — resolved
   against the CURRENT project via the exact same `walk_up` `resurrect`'s
   bare mode already uses, U2, and NEVER auto-created: no manifest above cwd
-  reports every peer mark/unmark in that confirm as `skipped[]`, while any
-  local rows in the SAME confirm still land. A peer cwd that cannot be
+  reports every node mark/unmark in that confirm as `skipped[]`, while any
+  local rows in the SAME confirm still land. A node cwd that cannot be
   relativized under the project root (review round 1's fix) is likewise
   rejected BEFORE it ever touches `manifest.sessions` — never a raw-cwd
   fallback, which `save_manifest`'s own whole-batch validation would refuse
-  outright, silently sinking every other legitimate peer change in the same
+  outright, silently sinking every other legitimate node change in the same
   confirm; `changed[]` only ever names what the save actually persisted.
   Unmarking removes EVERY spec matching `{host, dir, agent}`, not just the
   first. The kind dispatch in `session_grant` is a plain match arm — a
@@ -313,7 +313,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   post-cutover) — the `graph` family narrowed at task #101 R1 to the bare
   render plus `graph link`, while `send`/`spawn`/`resurrect` went bare and
   `session *`/`project *` promoted to their own top-level groups — plus
-  `conduct`, `hooks install`, `peer list` (the standalone `who` command that
+  `conduct`, `hooks install`, `node list` (the standalone `who` command that
   used to round out this list is retired, session-surface redesign,
   command-defrag lane X, 2026-08-28 — folded into bare `session`/`--hosts`).
 - **The durable session ledger + resurrect (P-D8, `docs/architecture/
@@ -394,11 +394,11 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   (`{host, dir, agent, command?}`) resolves independently, one spec's
   failure never aborting the rest: a spec whose `host` isn't this host's
   own name (`aoide_storage::display::local_host_name`) is SUMMONED through
-  the peer door (U4, `summon_remote` — resolves `host` against
-  `state/peers.json` by peer NICKNAME, refuses locally into `failed[]` for
-  an unregistered or unverified peer or nothing to summon with, then calls
-  `aoide_client::commands::spawn_on_peer` — the same signed spawn-shaped
-  `message/send` `aoide peer spawn` drives, never a re-implementation; the
+  the node door (U4, `summon_remote` — resolves `host` against
+  `state/nodes.json` by node NICKNAME, refuses locally into `failed[]` for
+  an unregistered or unverified node or nothing to summon with, then calls
+  `aoide_client::commands::spawn_on_node` — the same signed spawn-shaped
+  `message/send` `aoide node spawn` drives, never a re-implementation; the
   wire carries no cwd, so a spec wanting a specific remote directory says
   so inside its own `command`); a local spec's `dir` resolves through
   `aoide_storage::manifest::resolve_spec_dir` (the containment guard — a
@@ -423,7 +423,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   mode (review fix, U2 round 1: those rows used to carry no `disposition`
   at all). **Manifest-revived sessions are marked undying, LOCAL revivals
   only** (orchestrator design ruling, U2 round 1) — a remote summon's id
-  lives on the peer, never marked here — both LOCAL paths, once their spawn
+  lives on the node, never marked here — both LOCAL paths, once their spawn
   reaches
   `Status::Ok` (`mark_manifest_revival_undying`, its own
   `load_undying`/`set_undying`/`save_undying` call — not a flag threaded
@@ -478,19 +478,19 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 - **Session origin (P-P3, `docs/architecture/PAIRING.md` decision 7;
   write-authority tightened at LANE IDENTITY P-ID0, G16/G5, review round 1):**
   `session_store.rs::stamp_origin` (now `pub`, crossing the crate boundary)
-  stamps `SessionRecord.origin` — `"peer:<name>"` for a session
-  `aoide-server`'s A2A door spawned on behalf of an identified, paired peer.
+  stamps `SessionRecord.origin` — `"node:<name>"` for a session
+  `aoide-server`'s A2A door spawned on behalf of an identified, paired node.
   It has exactly two legitimate STAMP callers: `aoide-server`'s
   `a2a::do_spawn` calls it DIRECTLY on the just-spawned record
   (`stamp_spawn_origin`, polling for the record's registration the same way
-  `spawn_inject_prompt` already does), from the door where the peer name is
-  actually authenticated — the only place a `peer:*` value may originate.
+  `spawn_inject_prompt` already does), from the door where the node name is
+  actually authenticated — the only place a `node:*` value may originate.
   `graph/conduct.rs::session_conduct` calls it for a LOCAL-CLASS value off
   its own inherited `AOIDE_SESSION_ORIGIN` env, right after
   `do_session_start`, same seam `stamp_headless` uses — and REFUSES a
-  `peer:*` shape read from that env (a taught refusal, never a panic):
+  `node:*` shape read from that env (a taught refusal, never a panic):
   inherited env is exactly what a same-uid process can set on itself before
-  invoking `aoide conduct` directly, so a `peer:*` value threaded that way
+  invoking `aoide conduct` directly, so a `node:*` value threaded that way
   was never trustworthy. A THIRD path reads `origin` back rather than
   stamping it fresh: `doc.rs::ledger_session_exit` projects
   `SessionRecord.origin` verbatim into the durable session ledger's own
@@ -498,14 +498,14 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `headless`/`hookAncestry`, consumed internally, not rendered), and
   `graph/resurrect.rs::origin_to_carry` reads that field BACK on a revival to
   carry a LOCAL-class session's own provenance forward onto its revived
-  record (G6, same phase). It REFUSES a `peer:*` shape found there too
+  record (G6, same phase). It REFUSES a `node:*` shape found there too
   (eprintln, never carried): `state/session-ledger.jsonl` is a plain,
   same-uid-writable, append-only file — a same-uid process can append a line
-  claiming `origin:"peer:X"` and then run the ungated local `aoide
+  claiming `origin:"node:X"` and then run the ungated local `aoide
   resurrect`, which has no door and no seal behind it to re-mint that
   authority. `origin_to_carry` is pure and directly unit-tested for exactly
   this refusal. **This closes the STAMP paths, not the files**: a
-  hand-crafted `sessions.json`/ledger line claiming `peer:X` is still a
+  hand-crafted `sessions.json`/ledger line claiming `node:X` is still a
   readable, unflagged string on disk — nothing here makes the files
   tamper-evident; that is P-ID1 (the daemon-signed credential, below) —
   minted and stored, verified on the per-session control socket's own
@@ -518,7 +518,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   secrets broker's origin gate (P-ID4) consumes; the consumer NAME
   presenting a request stays unauthenticated either way (a separate,
   unbuilt axis — CONTRACTS.md's identity-lane accounting). What P-ID0
-  closes: every record-STAMP path this codebase drives refuses a `peer:*`
+  closes: every record-STAMP path this codebase drives refuses a `node:*`
   shape it didn't mint itself at the door — env AND ledger both.
 - **Sealed session credential (LANE IDENTITY P-ID1/P-ID2) — minted by
   `aoide-server`'s daemon, verified and consumed inside this crate.**
@@ -578,8 +578,8 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   read. `shellbridge::serve`'s accept loop (and `aoide-server`'s own
   `accept_loop`, over `aoide_secrets::peercred` — already `pub`, already a
   dependency, so no widening needed there) now refuses any connection whose
-  peer uid doesn't match the process's own euid, fail-closed on an
-  unidentified peer exactly like the secrets broker's `admin_gate`
+  node uid doesn't match the process's own euid, fail-closed on an
+  unidentified node exactly like the secrets broker's `admin_gate`
   precedent (`shellbridge::cross_uid_gate`/`daemon::cross_uid_gate`, pure
   and unit-tested without a real different-uid connection). **This is a
   CROSS-uid floor only** — under OQ1-A every legitimate connector on both
@@ -602,7 +602,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   the daemon's/`a2a serve`'s own ancestry, not the original caller's; in
   production that ancestry never resolves a live sealed session, so this
   already fails closed to `pending` by construction, not because either fix
-  re-derives the real caller's identity — threading the connecting peer's
+  re-derives the real caller's identity — threading the connecting node's
   pid into the gate itself would touch `send.rs`, out of this phase's scope
   fence.
 - **`session` (bare) — the ROSTER (session-surface redesign, command-defrag
@@ -610,33 +610,33 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   who` command, both retired — hard cutover, no alias).** `aoide session
   [filter] [--hosts] [--json] [--all]` (`graph/who.rs`, now the shared
   roster core): live presence over this box's own sessions plus every
-  registered peer, probed in parallel on each invocation (messaging
+  registered node, probed in parallel on each invocation (messaging
   workstream C2 — the exact pipeline `who` used to run, unchanged). Bare
   groups sessions by PROJECT (`project_bucket`: a registered `projects.json`
   name via `anchor_for`, else a `.aoide/project.json` manifest directory's
   own basename via `walk_up`, else a trailing `(no project)` bucket);
-  `--hosts` groups by HOST instead — this host, then each peer,
+  `--hosts` groups by HOST instead — this host, then each node,
   byte-identical to `who`'s old rendering (`render_nodes`/`node_json`
   survive unchanged). `filter`/`--all` narrow `nodes` BEFORE either split,
   so they apply to both groupings uniformly. A PROJECTION, never a store —
-  it never writes `state/peer-cache/`; `build_graph`'s own fold (`doc.rs`)
+  it never writes `state/node-cache/`; `build_graph`'s own fold (`doc.rs`)
   owns that file. `glyph` (the online/unreachable/never-pulled node-presence
   map) is `pub`, re-exported at `graph::glyph` — the conductor's ROSTER
   panel (P-C4) is its second consumer, reusing it rather than redrawing its
   own copy (its dispatch moved from `who` to `session --hosts`, same
   `Outcome` shape).
-- `peer list` — `aoide peer list [--json]` (`graph/peer_list.rs`, task
-  #120 P2): the one-glance mesh roster — this host, every registered peer,
+- `node list` — `aoide node list [--json]` (`graph/node_list.rs`, task
+  #120 P2): the one-glance mesh roster — this host, every registered node,
   every advertising instance heard in one bounded ~2s discovery sweep
   (`aoide_client::discover::run_sweep`, run concurrently with the probes),
   each node's running sessions indented beneath. A PURE fold over the
-  roster core's own probe (`probe_peers`/`build_peer_node`/`build_local_node`/
+  roster core's own probe (`probe_nodes`/`build_node_node`/`build_local_node`/
   `sessions_from_graph`, `pub(super)`) plus the sweep's
   heard-set — never a second prober, never a second presence model, and
-  it writes nothing (`state/peers.json`/`state/peer-cache/` stay other
+  it writes nothing (`state/nodes.json`/`state/node-cache/` stay other
   modules' files). Lives in THIS crate, not `aoide-client` beside the
-  rest of the `peer` family, because `aoide-client` cannot depend on
-  `aoide-conduct`; `peer status` (client) keeps the deep per-peer
+  rest of the `node` family, because `aoide-client` cannot depend on
+  `aoide-conduct`; `node status` (client) keeps the deep per-node
   registry view. CONTRACTS.md §7's CLI surface pins the row/mark grammar
   and the `--json` shape.
 
@@ -645,11 +645,11 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 `aoide-protocol`, `aoide-storage`, `aoide-upkeep` (`session hook`'s check-lane
 trigger, above — the ONLY reach into that crate from outside `cli`),
 `aoide-client` (bare `session`/`--hosts`'s
-and `peer list`'s live per-peer probes call `aoide_client::commands::pull_peer_live`
-— the peer-pull transport `peer pull` itself uses, workstream C2; `peer
+and `node list`'s live per-node probes call `aoide_client::commands::pull_node_live`
+— the node-pull transport `node pull` itself uses, workstream C2; `node
 list`'s discovery sweep calls `aoide_client::discover::run_sweep` —
 P-P6's one sweep implementation, task #120 P2; `send --to`'s
-remote branch calls `aoide_client::commands::send_message_to_peer`,
+remote branch calls `aoide_client::commands::send_message_to_node`,
 workstream C3; every session-write handler calls `aoide_client::daemon::
 daemon_dispatch`, P-D6; see `client`'s own README for why that edge stays).
 

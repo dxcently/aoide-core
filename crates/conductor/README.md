@@ -25,7 +25,7 @@ weight, and conducting orchestration is Aoide's core identity (root
 - `logtail` — the log-tail overlay for headless-session detail.
 - `commands` — this crate's one CLI command, `conductor`.
 
-## ROSTER: presence over this box + every registered peer (P-C4; selection + compose P-C5)
+## ROSTER: presence over this box + every registered node (P-C4; selection + compose P-C5)
 
 Rows are `session --hosts --json`'s `Outcome.data` (the standalone `who`
 command this used to dispatch is retired — session-surface redesign,
@@ -33,7 +33,7 @@ command-defrag lane X, 2026-08-28 — folded into bare `session`'s `--hosts`
 grouping; same `Outcome` shape, only the dispatched path/flags changed),
 dispatched through the same injected `DispatchFn` as every other action —
 never re-derived — parsed into `App::roster_nodes()` (local box first, then
-peers, exactly the roster's own order), then flattened into
+nodes, exactly the roster's own order), then flattened into
 `App::roster_flat_rows()` for selection (one `Vec` is the single source of
 truth for both render and key handling, the same shape `App::dag_rows()`
 uses over the DAG). Node glyphs (`●`/`◐`/`○` —
@@ -44,13 +44,13 @@ musical-note set (`theme::state_glyph`) since the roster classifies
 sessions off the identical state vocabulary the SESSION panel already
 reads.
 
-`session --hosts` performs a LIVE network probe of every registered peer
-(~2s/peer, parallel) on every invocation, so this pane throttles: it
+`session --hosts` performs a LIVE network probe of every registered node
+(~2s/node, parallel) on every invocation, so this pane throttles: it
 re-dispatches at most every ~15s while VISIBLE, never on every ~500ms tick.
 Switching into the pane with a stale cache fires one immediate fetch; `r`
 forces one regardless of the throttle window. The dispatch itself runs on
 its own `std::thread` (mirroring the roster core's own internal
-`probe_peers` pattern) and reports back over an `mpsc` channel the tick
+`probe_nodes` pattern) and reports back over an `mpsc` channel the tick
 loop polls without blocking — the one dispatch in this crate that does not
 go through the synchronous `App::dispatch` (which every mutating action
 uses), because the roster never mutates anything and its live probes would

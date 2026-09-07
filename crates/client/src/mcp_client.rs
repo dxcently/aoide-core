@@ -2,10 +2,10 @@
 //!
 //! Melete's own operator manual is explicit that its "only machine surface
 //! is its MCP connector" — so reaching it is a CLIENT concern, the same
-//! shape every `peer` command already holds for a remote aoide door, not a
+//! shape every `node` command already holds for a remote aoide door, not a
 //! new inbound "door" of our own. This module speaks MCP (JSON-RPC 2.0 over
 //! HTTP POST — `initialize`/`tools/list`/`tools/call`) over
-//! [`crate::commands::post_json`], the SAME curl transport `peer`'s own
+//! [`crate::commands::post_json`], the SAME curl transport `node`'s own
 //! calls use — no new Cargo dependency, TLS comes free with curl. Three
 //! commands, one POST each:
 //!
@@ -24,18 +24,18 @@
 //!
 //! **Configuration (`AOIDE_MELETE_URL`/`AOIDE_MELETE_TOKEN`, env-only,
 //! interim).** Investigated two existing precedents before choosing this:
-//! `aoide_storage::peer_store::Peer` (url + `bearer_secret`, resolved
+//! `aoide_storage::node_store::Node` (url + `bearer_secret`, resolved
 //! through the secrets broker) models AOIDE-TO-AOIDE federation —
-//! AgentCard-verified, signed, per-peer `allows` — over aoide's OWN wire
+//! AgentCard-verified, signed, per-node `allows` — over aoide's OWN wire
 //! protocol; Melete is a third-party claude.ai service speaking plain MCP,
-//! never an aoide peer, so that shape doesn't fit. `aoide_storage::commands`'s
+//! never an aoide node, so that shape doesn't fit. `aoide_storage::commands`'s
 //! `usage` command (its `live` block) is the closer precedent — a single,
 //! external, bearer-authenticated endpoint — but its token rides a LOCAL
 //! FILE Claude Code itself already maintains (`~/.claude/.credentials.json`);
 //! aoide has no equivalent on-disk source for a Melete connector url/token,
 //! and inventing one is explicitly out of scope for this pass (the live
 //! wiring — most likely a secrets-broker-resolved secret, mirroring
-//! `peer add --bearer-secret` — comes later). So both ride a plain env var,
+//! `node add --bearer-secret` — comes later). So both ride a plain env var,
 //! read fresh on every call: absent (either var, or both) is a structured,
 //! taught [`Outcome::error`] naming the two var names, never a silent
 //! degrade and never an invented credential.
@@ -78,14 +78,14 @@ use serde_json::{json, Value};
 /// The MCP protocol version this client claims in `initialize` — mirrors
 /// `aoide-server::mcp::PROTOCOL_VERSION` (aoide's own MCP *server* constant)
 /// byte-for-byte, redefined here rather than imported: this crate sits
-/// BELOW `aoide-server` in the workspace DAG (`peer`/AGENTS.md's `daemon::
+/// BELOW `aoide-server` in the workspace DAG (`node`/AGENTS.md's `daemon::
 /// socket_path` note holds the identical reasoning for re-deriving instead
 /// of importing).
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
 /// Env var naming Melete's MCP connector HTTP endpoint (the JSON-RPC POST
 /// URL). See this module's doc for why this rides a plain env var rather
-/// than `peer_store` or a local credentials file.
+/// than `node_store` or a local credentials file.
 const MELETE_URL_VAR: &str = "AOIDE_MELETE_URL";
 /// Env var naming the bearer token presented to the connector. Read fresh
 /// on every call and held only in this process's own memory for the span
@@ -633,7 +633,7 @@ mod tests {
     #[test]
     fn handle_melete_graph_writes_the_snapshot_under_the_env_overridden_state_dir() {
         // `AOIDE_STATE_DIR` (absolute-path-wins) is `state_dir()`'s own test
-        // seam — the SAME override `commands.rs`'s `with_peer_state` already
+        // seam — the SAME override `commands.rs`'s `with_node_state` already
         // uses, cheaper than pointing `AOIDE_ROOT` at a scratch tree since it
         // names the state dir directly.
         let _g = env_guard();

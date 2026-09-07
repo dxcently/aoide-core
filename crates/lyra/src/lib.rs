@@ -2,7 +2,7 @@
 //! same domain-crate handler code `aoide-cli` assembles (P-A4 of the
 //! binary-split workstream, docs/architecture/PACKAGE-LAYOUT.md): the
 //! self-ricing loop, screen, herald, shellbridge, and quickshell — never
-//! conducting, the graph, A2A, peers, or the daemon (core `aoide` identity).
+//! conducting, the graph, A2A, nodes, or the daemon (core `aoide` identity).
 //! One binary (`lyra`), one schema, same "three doors, one schema" contract
 //! (concepts/Agent-Interface) — the MCP door reuses these exact command
 //! handlers, same as core's.

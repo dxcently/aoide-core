@@ -18,15 +18,15 @@
 //! The CLIENT half — resolving/reaching a remote AgentCard (`resolve_card_url`,
 //! `build_message_send_body`) — stays here, sourced through `aoide-client`
 //! (Phase 4b), unchanged from that phase: it is the outbound half of the
-//! bidirectional link, mirroring the inbound server above. The peer registry
-//! itself (CONTRACTS.md §7) lives in `aoide-storage::peer_store` and
-//! `aoide-client::commands::register_peers`.
+//! bidirectional link, mirroring the inbound server above. The node registry
+//! itself (CONTRACTS.md §7) lives in `aoide-storage::node_store` and
+//! `aoide-client::commands::register_nodes`.
 
 // ── SERVER half (aoide-server, Phase 4c) ─────────────────────────────────────
 pub use aoide_server::a2a::{
     a2a_task_state, agent_card, agent_card_from_commands, decide_send_action, read_expected_token,
-    resolve_bearer_secret, resolve_bind_port, resolve_discovery_advertise, resolve_peer_name,
-    resolve_spawn_agent, resolve_token_file, serve, PeerOrigin, SendAction, SessionRef,
+    resolve_bearer_secret, resolve_bind_port, resolve_discovery_advertise, resolve_node_name,
+    resolve_spawn_agent, resolve_token_file, serve, ConnOrigin, SendAction, SessionRef,
 };
 
 // ── AgentCard resolution (client side) ────────────────────────────────────────

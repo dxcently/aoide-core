@@ -2,7 +2,7 @@
 //! CONTRACTS.md §4's own `config.toml` subsection).
 //!
 //! **INTENT lives here; STATE stays in `state/*.json`.** Every other file
-//! this crate owns records what HAPPENED (`peers.json`'s records/allows/hub,
+//! this crate owns records what HAPPENED (`nodes.json`'s records/allows/hub,
 //! the pairing park queues, `advertise.json`'s switch); this one records what
 //! an operator WANTS, ahead of anything happening. The two never mix, and no
 //! value ever migrates between them.
@@ -31,13 +31,13 @@
 //! every walk it rather than restating it. A new key is one table row plus
 //! its struct field. Two sections today, neither aware the other exists:
 //! `[pairing]`'s `defaultGrant` is a [`ValueKind::ClosedList`] (closed
-//! vocabulary, `peer_store::PEER_CAPABILITIES`); `[upkeep]`'s `verifyCommand`
+//! vocabulary, `node_store::NODE_CAPABILITIES`); `[upkeep]`'s `verifyCommand`
 //! is a [`ValueKind::Scalar`] — the check lane's own verification command
 //! (`aoide session hook`'s SessionStart/Stop wiring), free-form because core
 //! cannot know what "clean" means on every host. A scalar key is the one
 //! place [`SCHEMA`] gives up checking a vocabulary: there isn't one to check.
 //! **[`Mesh`] is validated but deliberately NOT in [`SCHEMA`] (task #135
-//! P4).** A mesh's keys are an operator's own peer names, chosen at write
+//! P4).** A mesh's keys are an operator's own node names, chosen at write
 //! time — [`SectionSpec`]/[`KeySpec`] are entirely `&'static`, and admitting
 //! them would mean rebuilding the whole table as an owned, dynamically-built
 //! one to serve one section. `[mesh]` is validated directly in [`validate`]
@@ -56,7 +56,7 @@
 //! 2. else `$AOIDE_ROOT/config.toml` → UNMANAGED, writable by [`set`].
 //!
 //! A missing file is all defaults, never an error — the same tolerate-missing
-//! stance `advertise::enabled` and `peer_store::load_peers` already hold. A
+//! stance `advertise::enabled` and `node_store::load_nodes` already hold. A
 //! file that EXISTS but doesn't parse, or carries an unknown key or an unknown
 //! capability, is a loud error naming the offence.
 
@@ -105,10 +105,10 @@ pub struct Config {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pairing {
-    /// The capability set a peer is granted when it FIRST becomes verified.
-    /// Values come from `peer_store::PEER_CAPABILITIES`, the same closed
-    /// vocabulary `peer allow` already validates against — never a second,
-    /// drifting list. Default `["read"]`: read is what a peer needs to be
+    /// The capability set a node is granted when it FIRST becomes verified.
+    /// Values come from `node_store::NODE_CAPABILITIES`, the same closed
+    /// vocabulary `node allow` already validates against — never a second,
+    /// drifting list. Default `["read"]`: read is what a node needs to be
     /// useful, spawn is what it needs to run code here, and the second is an
     /// explicit widening.
     #[serde(rename = "defaultGrant", default = "default_grant")]
@@ -147,30 +147,30 @@ impl Default for Upkeep {
     }
 }
 
-/// `[mesh.<name>]` — a declared mesh: a named set of peers an operator
+/// `[mesh.<name>]` — a declared mesh: a named set of nodes an operator
 /// intends to keep paired, meant to be deployed identically to every box in
 /// it (task #135 P4). This is INTENT, same as the rest of [`Config`] — it
-/// names nothing about whether a peer is actually paired yet; `aoide mesh`
-/// (`aoide-client`) compares it against `state/peers.json` and reports the
-/// difference. Validated in [`validate`] (mesh/peer names, hop shape, grant
+/// names nothing about whether a node is actually paired yet; `aoide mesh`
+/// (`aoide-client`) compares it against `state/nodes.json` and reports the
+/// difference. Validated in [`validate`] (mesh/node names, hop shape, grant
 /// vocabulary, no name shared across two meshes) but never in [`SCHEMA`] —
 /// see the module doc.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Mesh {
     /// A capability set, declared against the same closed vocabulary
-    /// `pairing.defaultGrant` uses (`peer_store::PEER_CAPABILITIES`), never
+    /// `pairing.defaultGrant` uses (`node_store::NODE_CAPABILITIES`), never
     /// a second list. `aoide mesh pair` stamps it at a FIRST verification —
     /// it rides the ceremony as `PairFinish::grant` exactly as a typed
-    /// `aoide pair --allow` would, so `peer_store::upsert_paired_peer`
-    /// leaves an already-verified peer's `allows` untouched and a re-pair
+    /// `aoide pair --allow` would, so `node_store::upsert_paired_node`
+    /// leaves an already-verified node's `allows` untouched and a re-pair
     /// never re-grants. Absent means "this mesh declares no override": the
     /// commit then falls through to `resolve_grant` (`aoide-client`), which
     /// reads `pairing.defaultGrant`. An EMPTY list is the distinct, real
     /// "grant nothing" intent, never the same thing as absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant: Option<Vec<String>>,
-    /// A declared claim that every peer in this mesh is operated by the
+    /// A declared claim that every node in this mesh is operated by the
     /// SAME human. Validated and stored; shown back by `aoide config` and
     /// `aoide mesh`, and read by `mesh pair` for the one line saying the
     /// claim was declared and not acted on. What, if anything, may ever act
@@ -181,20 +181,20 @@ pub struct Mesh {
     pub same_operator: bool,
     /// `name -> ssh hop` (`tunnel::parse_via`'s own `ssh://[user@]host
     /// [:port]` shape). A map, not an array of `{name, via}` records — the
-    /// map's own keys make a duplicate peer name within one mesh
+    /// map's own keys make a duplicate node name within one mesh
     /// structural, not a second check to write.
     ///
     /// One of these keys is expected to name THIS box: `drift`
     /// (`aoide-client`) matches it against `display::local_host_name()` by
     /// bare string equality, nothing fuzzier. The key must be exactly what
     /// that function returns, or this box's own entry is indistinguishable
-    /// from a genuinely unpaired peer. `valid_peer_name` accepts only
+    /// from a genuinely unpaired node. `valid_node_name` accepts only
     /// lowercase letters, digits, and `-`, so a `local_host_name()` that
     /// comes back as an FQDN or mixed-case OS hostname can never be
     /// declared here at all — the same known gap `pair`'s own self-detection
-    /// already carries for a custom `--peer-name` (`PAIRING.md:599-612`).
+    /// already carries for a custom `--node-name` (`PAIRING.md:599-612`).
     #[serde(default)]
-    pub peers: BTreeMap<String, String>,
+    pub nodes: BTreeMap<String, String>,
 }
 
 /// What shape a key's value takes, and what it may contain. A scalar key has
@@ -243,8 +243,8 @@ pub const SCHEMA: &[SectionSpec] = &[
         summary: "The pairing ceremony's own intent.",
         keys: &[KeySpec {
             name: "defaultGrant",
-            kind: ValueKind::ClosedList(crate::peer_store::PEER_CAPABILITIES),
-            summary: "Capabilities a peer is granted when it first becomes verified.",
+            kind: ValueKind::ClosedList(crate::node_store::NODE_CAPABILITIES),
+            summary: "Capabilities a node is granted when it first becomes verified.",
             read: |c| c.pairing.default_grant.clone(),
         }],
     },
@@ -393,47 +393,47 @@ pub fn validate(config: &Config, path: &Path) -> Result<(), LoadError> {
     validate_mesh(&config.mesh, path)
 }
 
-/// [`Config::mesh`]'s own pass: a mesh name and every peer name inside it
-/// must be [`crate::peer_store::valid_peer_name`]-shaped (a mesh name is
-/// typed at a command line as `mesh pair <mesh>`, and a peer name is joined
-/// into `state/peers.json` lookups the same way `peer add`'s already is);
+/// [`Config::mesh`]'s own pass: a mesh name and every node name inside it
+/// must be [`crate::node_store::valid_node_name`]-shaped (a mesh name is
+/// typed at a command line as `mesh pair <mesh>`, and a node name is joined
+/// into `state/nodes.json` lookups the same way `node add`'s already is);
 /// every hop must parse through [`crate::tunnel::parse_via`], whose own
 /// message becomes the detail; every `grant` element must be in
-/// [`crate::peer_store::PEER_CAPABILITIES`], the same closed vocabulary
-/// `pairing.defaultGrant` uses. Phase 1 has one global peer namespace
-/// (`state/peers.json` is keyed by name alone), so a peer name declared in
+/// [`crate::node_store::NODE_CAPABILITIES`], the same closed vocabulary
+/// `pairing.defaultGrant` uses. Phase 1 has one global node namespace
+/// (`state/nodes.json` is keyed by name alone), so a node name declared in
 /// two meshes is an unresolvable declaration and is refused, naming both.
 fn validate_mesh(mesh: &BTreeMap<String, Mesh>, path: &Path) -> Result<(), LoadError> {
     let mut owner: BTreeMap<&str, &str> = BTreeMap::new();
     for (name, m) in mesh {
-        if !crate::peer_store::valid_peer_name(name) {
+        if !crate::node_store::valid_node_name(name) {
             return Err(LoadError::InvalidValue {
                 path: path.to_path_buf(),
                 key: format!("mesh.{name}"),
                 detail: format!(
-                    "`{name}` is not a valid mesh name — expected the same shape a peer nickname \
+                    "`{name}` is not a valid mesh name — expected the same shape a node nickname \
                      takes: lowercase letters, digits, and `-`, starting with a letter or digit"
                 ),
             });
         }
         if let Some(grant) = &m.grant {
             for cap in grant {
-                if !crate::peer_store::PEER_CAPABILITIES.contains(&cap.as_str()) {
+                if !crate::node_store::NODE_CAPABILITIES.contains(&cap.as_str()) {
                     return Err(LoadError::InvalidValue {
                         path: path.to_path_buf(),
                         key: format!("mesh.{name}.grant"),
-                        detail: unknown_element(cap, crate::peer_store::PEER_CAPABILITIES),
+                        detail: unknown_element(cap, crate::node_store::NODE_CAPABILITIES),
                     });
                 }
             }
         }
-        for (peer, hop) in &m.peers {
-            if !crate::peer_store::valid_peer_name(peer) {
+        for (node, hop) in &m.nodes {
+            if !crate::node_store::valid_node_name(node) {
                 return Err(LoadError::InvalidValue {
                     path: path.to_path_buf(),
-                    key: format!("mesh.{name}.peers.{peer}"),
+                    key: format!("mesh.{name}.nodes.{node}"),
                     detail: format!(
-                        "`{peer}` is not a valid peer name — expected lowercase letters, digits, \
+                        "`{node}` is not a valid node name — expected lowercase letters, digits, \
                          and `-`, starting with a letter or digit"
                     ),
                 });
@@ -441,21 +441,21 @@ fn validate_mesh(mesh: &BTreeMap<String, Mesh>, path: &Path) -> Result<(), LoadE
             if let Err(detail) = crate::tunnel::parse_via(hop) {
                 return Err(LoadError::InvalidValue {
                     path: path.to_path_buf(),
-                    key: format!("mesh.{name}.peers.{peer}"),
+                    key: format!("mesh.{name}.nodes.{node}"),
                     detail,
                 });
             }
-            if let Some(&first) = owner.get(peer.as_str()) {
+            if let Some(&first) = owner.get(node.as_str()) {
                 return Err(LoadError::InvalidValue {
                     path: path.to_path_buf(),
-                    key: format!("mesh.{name}.peers.{peer}"),
+                    key: format!("mesh.{name}.nodes.{node}"),
                     detail: format!(
-                        "`{peer}` is declared in both `mesh.{first}` and `mesh.{name}` — a peer \
+                        "`{node}` is declared in both `mesh.{first}` and `mesh.{name}` — a node \
                          name must be unique across every declared mesh"
                     ),
                 });
             }
-            owner.insert(peer.as_str(), name.as_str());
+            owner.insert(node.as_str(), name.as_str());
         }
     }
     Ok(())
@@ -777,12 +777,12 @@ mod tests {
     }
 
     #[test]
-    fn the_pairing_vocabulary_is_the_one_peer_allow_already_enforces() {
+    fn the_pairing_vocabulary_is_the_one_node_allow_already_enforces() {
         let (_, spec) = lookup("pairing.defaultGrant").unwrap();
         let ValueKind::ClosedList(vocabulary) = spec.kind else {
             panic!("pairing.defaultGrant must stay a ClosedList");
         };
-        assert_eq!(vocabulary, crate::peer_store::PEER_CAPABILITIES);
+        assert_eq!(vocabulary, crate::node_store::NODE_CAPABILITIES);
     }
 
     #[test]
@@ -877,7 +877,7 @@ mod tests {
             "[mesh.home]\n\
              grant = [\"read\", \"spawn\"]\n\
              sameOperator = true\n\
-             [mesh.home.peers]\n\
+             [mesh.home.nodes]\n\
              sakaki = \"ssh://khoa@192.168.1.202\"\n\
              chiyo = \"ssh://khoa@192.168.1.186\"\n",
             &probe(),
@@ -886,14 +886,14 @@ mod tests {
         let home = c.mesh.get("home").expect("mesh.home must parse");
         assert_eq!(home.grant, Some(vec!["read".to_string(), "spawn".to_string()]));
         assert!(home.same_operator);
-        assert_eq!(home.peers.get("sakaki").map(String::as_str), Some("ssh://khoa@192.168.1.202"));
-        assert_eq!(home.peers.get("chiyo").map(String::as_str), Some("ssh://khoa@192.168.1.186"));
+        assert_eq!(home.nodes.get("sakaki").map(String::as_str), Some("ssh://khoa@192.168.1.202"));
+        assert_eq!(home.nodes.get("chiyo").map(String::as_str), Some("ssh://khoa@192.168.1.186"));
     }
 
     #[test]
     fn a_mesh_with_no_optional_keys_defaults_grant_and_same_operator() {
         let c = parse(
-            "[mesh.home.peers]\nsakaki = \"ssh://khoa@192.168.1.202\"\n",
+            "[mesh.home.nodes]\nsakaki = \"ssh://khoa@192.168.1.202\"\n",
             &probe(),
         )
         .unwrap();
@@ -903,15 +903,15 @@ mod tests {
     }
 
     #[test]
-    fn a_malformed_hop_is_invalid_value_naming_the_peer_and_carrying_parse_vias_message() {
+    fn a_malformed_hop_is_invalid_value_naming_the_node_and_carrying_parse_vias_message() {
         let err = parse(
-            "[mesh.home.peers]\nsakaki = \"not-a-hop\"\n",
+            "[mesh.home.nodes]\nsakaki = \"not-a-hop\"\n",
             &probe(),
         )
         .unwrap_err();
         let msg = err.to_string();
         assert!(matches!(err, LoadError::InvalidValue { .. }), "{msg}");
-        assert!(msg.contains("mesh.home.peers.sakaki"), "{msg}");
+        assert!(msg.contains("mesh.home.nodes.sakaki"), "{msg}");
         assert!(
             msg.contains(&crate::tunnel::parse_via("not-a-hop").unwrap_err()),
             "the detail must be parse_via's own message: {msg}"
@@ -921,7 +921,7 @@ mod tests {
     #[test]
     fn a_mesh_grant_outside_the_capability_vocabulary_is_invalid_value_naming_the_element() {
         let err = parse(
-            "[mesh.home]\ngrant = [\"read\", \"root\"]\n[mesh.home.peers]\n",
+            "[mesh.home]\ngrant = [\"read\", \"root\"]\n[mesh.home.nodes]\n",
             &probe(),
         )
         .unwrap_err();
@@ -933,16 +933,16 @@ mod tests {
 
     #[test]
     fn an_invalid_mesh_name_is_refused() {
-        let err = parse("[mesh.\"Not Valid\".peers]\n", &probe()).unwrap_err();
+        let err = parse("[mesh.\"Not Valid\".nodes]\n", &probe()).unwrap_err();
         let msg = err.to_string();
         assert!(matches!(err, LoadError::InvalidValue { .. }), "{msg}");
         assert!(msg.contains("Not Valid"), "{msg}");
     }
 
     #[test]
-    fn an_invalid_peer_name_inside_a_mesh_is_refused() {
+    fn an_invalid_node_name_inside_a_mesh_is_refused() {
         let err = parse(
-            "[mesh.home.peers]\n\"Not Valid\" = \"ssh://khoa@192.168.1.202\"\n",
+            "[mesh.home.nodes]\n\"Not Valid\" = \"ssh://khoa@192.168.1.202\"\n",
             &probe(),
         )
         .unwrap_err();
@@ -952,10 +952,10 @@ mod tests {
     }
 
     #[test]
-    fn one_peer_name_declared_in_two_meshes_is_refused_naming_both() {
+    fn one_node_name_declared_in_two_meshes_is_refused_naming_both() {
         let err = parse(
-            "[mesh.home.peers]\nsakaki = \"ssh://khoa@192.168.1.202\"\n\
-             [mesh.away.peers]\nsakaki = \"ssh://khoa@10.0.0.5\"\n",
+            "[mesh.home.nodes]\nsakaki = \"ssh://khoa@192.168.1.202\"\n\
+             [mesh.away.nodes]\nsakaki = \"ssh://khoa@10.0.0.5\"\n",
             &probe(),
         )
         .unwrap_err();
@@ -976,7 +976,7 @@ mod tests {
     #[test]
     fn config_set_refuses_a_mesh_key_as_not_settable() {
         with_temp_root("mesh-not-settable", |_| {
-            let err = set("mesh.home.peers.sakaki", "ssh://khoa@192.168.1.202").unwrap_err();
+            let err = set("mesh.home.nodes.sakaki", "ssh://khoa@192.168.1.202").unwrap_err();
             let msg = err.to_string();
             assert!(matches!(err, SetRefusal::UnknownKey { .. }), "{msg}");
             assert!(msg.contains("not a settable config key"), "{msg}");

@@ -209,13 +209,13 @@
   a consumer filtering the outcome by `disposition` would silently drop.
 - **A remote spec (`host` != this host) is `summon_remote`'s job, not a
   skip (U4, command-defrag lane U).** It resolves `spec.host` against
-  `state/peers.json` by peer NICKNAME (the same nickname U3's picker writes
+  `state/nodes.json` by node NICKNAME (the same nickname U3's picker writes
   a spec's `host` as), refuses LOCALLY into `failed[]` — never `skipped[]`
-  — for an unregistered peer, a registered-but-unverified one (mirrors
-  `aoide-client::commands::handle_peer_spawn`'s own local gate: an unsigned
+  — for an unregistered node, a registered-but-unverified one (mirrors
+  `aoide-client::commands::handle_node_spawn`'s own local gate: an unsigned
   request can never satisfy the remote door's `Signature`-rung spawn gate),
   or nothing to summon with (`summon_text` returns `None`), THEN calls
-  `aoide_client::commands::spawn_on_peer` — never re-implement that wire
+  `aoide_client::commands::spawn_on_node` — never re-implement that wire
   call here, never shell out to the `aoide` CLI; the `conduct` → `client`
   edge is documented in `conduct`'s own `Cargo.toml`. `summon_text` never
   whitespace-splits a spec's `command` (there is no argv on this wire, only
@@ -231,7 +231,7 @@
   path (enrichment via `resurrect_one`, clean-spawn via
   `clean_spawn_from_spec`) lands a row in `resurrected` — which by
   construction only happens past `Status::Ok`. `summon_remote`'s own rows
-  never reach this call: the resurrected id lives on the peer, and
+  never reach this call: the resurrected id lives on the node, and
   `state/undying.json` only ever names ids that live on THIS host — don't
   route a `summoned-remote` row through `mark_manifest_revival_undying`,
   it would mark an id this host has no authority over.
@@ -663,54 +663,54 @@
   branch (`undying.rs::undying_grant`) carries NO such gate — unchanged
   from `session undying`'s own reach from any door, since a script/daemon
   needs it too.
-- **`grant.rs`'s picker branch never live-probes a peer.** Its peer rows
-  come from `peer_store::load_peer_cache` fed through `who.rs`'s
+- **`grant.rs`'s picker branch never live-probes a node.** Its node rows
+  come from `node_store::load_node_cache` fed through `who.rs`'s
   `sessions_from_graph` (`pub(super)`, `SessionView` alongside it, U3). Don't
-  route it through `who.rs::probe_peers`/`collect_roster`'s live-pull path
+  route it through `who.rs::probe_nodes`/`collect_roster`'s live-pull path
   "for freshness" — the brief this landed under is explicit that the
   picker's own tty round-trip must never block on network I/O, and bare
   `session`/`--hosts` already own the live-presence job.
-- **A peer row's mark writes a `.aoide/project.json` spec, never
-  `state/undying.json` (U3) — the id lives on the peer, this conductor
+- **A node row's mark writes a `.aoide/project.json` spec, never
+  `state/undying.json` (U3) — the id lives on the node, this conductor
   cannot write ITS store.** `grant.rs::apply_diff` resolves "current
   project" via `aoide_storage::manifest::walk_up` from cwd, the identical
   discovery `resurrect`'s own bare-manifest mode uses (U2); no manifest
-  found there is NEVER a reason to create one — every peer
+  found there is NEVER a reason to create one — every node
   mark/unmark in that confirm reports `skipped[]` with a taught reason
   instead, while any LOCAL rows in the SAME confirm still apply normally.
   Don't fold the "no manifest" case into a hard command failure — a picker
-  confirm can genuinely be half-local, half-peer, and the local half's
-  success must never be held hostage to the peer half's missing manifest.
-- **A peer row's cwd that `peer_spec_dir` cannot relativize under the
+  confirm can genuinely be half-local, half-node, and the local half's
+  success must never be held hostage to the node half's missing manifest.
+- **A node row's cwd that `node_spec_dir` cannot relativize under the
   project root has NO savable fallback — it is REJECTED before it ever
   reaches `manifest.sessions`, never the raw absolute cwd (review round 1,
   U3).** `save_manifest` refuses the WHOLE batch if ANY spec carries an
   absolute `dir`; a raw-cwd fallback here would therefore not merely write
   an inferior spec, it would silently fail the save for every OTHER
-  legitimate peer change queued in the SAME confirm while `changed[]` still
+  legitimate node change queued in the SAME confirm while `changed[]` still
   reported them all as persisted (the exact defect this bullet's own review
   round caught). Don't reintroduce a `(dir, relativized)`-shaped fallback —
-  `peer_spec_dir` returns `Option<String>`, `None` means "no spec, skip
+  `node_spec_dir` returns `Option<String>`, `None` means "no spec, skip
   with a taught reason," full stop. Correspondingly, `apply_diff`'s
-  `changed[]` for the peer path is populated ONLY after `save_manifest`
-  returns `Ok` — a failed save folds every pending peer change for that
+  `changed[]` for the node path is populated ONLY after `save_manifest`
+  returns `Ok` — a failed save folds every pending node change for that
   confirm into `skipped[]` instead, never a false `changed` entry for a
-  write that never landed. `build_rows`' own peer pre-check goes through
-  the SAME `peer_spec_dir` relativization for the identical reason: a raw
+  write that never landed. `build_rows`' own node pre-check goes through
+  the SAME `node_spec_dir` relativization for the identical reason: a raw
   cwd compared straight against a manifest spec's (always project-relative)
-  `dir` can never match, which would silently show an already-undying peer
+  `dir` can never match, which would silently show an already-undying node
   session as unmarked.
-- **Unmarking a peer row removes EVERY spec matching `{host, dir, agent}`,
+- **Unmarking a node row removes EVERY spec matching `{host, dir, agent}`,
   not just the first (`Vec::retain`, never a single `Vec::remove` by
   position).** A hand-duplicated entry in `.aoide/project.json` (an
   operator who edited the file directly) is cleaned up in one unmark, not
   one confirm per copy — don't narrow this back to a first-match removal.
 - **The roster (`who.rs`, reached at bare `session`/`--hosts`) is a
   projection, never a store.** It must never write
-  `state/peer-cache/<name>.json` — `build_graph`'s own fold (`doc.rs`) is
+  `state/node-cache/<name>.json` — `build_graph`'s own fold (`doc.rs`) is
   the ONLY writer of that cache. Its live probe reads straight off the
-  network via `aoide_client::commands::pull_peer_live` and falls back to
-  the cache (read-only) for an unreachable peer; don't "helpfully" have a
+  network via `aoide_client::commands::pull_node_live` and falls back to
+  the cache (read-only) for an unreachable node; don't "helpfully" have a
   successful live probe refresh the cache as a side effect.
 - **`session --hosts`'s and bare `session`'s PROJECT grouping share ONE
   `collect_roster` — never two collection passes.** `who.rs`'s `Roster`
@@ -718,29 +718,29 @@
   invocation; `session_roster_with` branches ONLY on how it renders/groups
   `nodes` afterward (`render_nodes`/`node_json` for `--hosts`,
   `group_by_project`/`render_groups`/`group_json` otherwise). Don't
-  duplicate the local-stage-load + peer-probe sequence for a future
+  duplicate the local-stage-load + node-probe sequence for a future
   grouping — extend the branch, not the collection.
 - **`project_bucket` reuses whichever project attribution the codebase
   already computes — never a third one.** A registered `projects.json`
   name via `anchor_for` (pure string matching — works identically for a
-  peer session's cwd under the fleet's shared-path convention) wins; else a
+  node session's cwd under the fleet's shared-path convention) wins; else a
   `.aoide/project.json` manifest found by walking up FROM THE SESSION'S OWN
   CWD on this host's own filesystem (`aoide_storage::manifest::walk_up`)
   renders by that directory's basename. Don't walk up from the CURRENT
   process's cwd instead (that's `grant.rs`'s "current project" concept, a
   different thing) — `project_bucket` must attribute EVERY session by its
-  OWN cwd, local or peer, or a multi-session listing would silently
+  OWN cwd, local or node, or a multi-session listing would silently
   misattribute every session but the first.
-- **`peer list` (`graph/peer_list.rs`, task #120 P2) is the roster core's
+- **`node list` (`graph/node_list.rs`, task #120 P2) is the roster core's
   probe under a wider fold — never a fork of it.** Its presence/session data
-  comes ONLY from `who.rs`'s `pub(super)` seam (`probe_peers`/
-  `build_local_node`/`build_peer_node`/`SessionView`/
-  `PEER_PROBE_TIMEOUT_SECS`) and its advertising data ONLY from
+  comes ONLY from `who.rs`'s `pub(super)` seam (`probe_nodes`/
+  `build_local_node`/`build_node_node`/`SessionView`/
+  `NODE_PROBE_TIMEOUT_SECS`) and its advertising data ONLY from
   `aoide_client::discover::run_sweep` — a second prober, a second presence
   classifier, or a private sweep re-implementation here is the exact
   cross-copy this crate's discipline forbids. It inherits the roster's
-  projection rule wholesale (writes nothing: not `state/peers.json`, not
-  `state/peer-cache/`), a failed/empty sweep only ANNOTATES the roster
+  projection rule wholesale (writes nothing: not `state/nodes.json`, not
+  `state/node-cache/`), a failed/empty sweep only ANNOTATES the roster
   (never fails the command — the paired half is still true), and both
   network seams (`PullFn`, `SweepFn`) stay injected so its tests never
   open a socket. Row/mark grammar and `--json` shape are CONTRACTS.md
@@ -777,30 +777,30 @@
   `session_store.rs::stamp_origin` is `pub` (crosses the crate boundary)
   and is the ONE writer function, with THREE call sites today — but the
   invariant that matters is narrower than "exactly two callers": **a
-  `peer:*` shape may be stamped from exactly ONE place, `aoide-server`'s
+  `node:*` shape may be stamped from exactly ONE place, `aoide-server`'s
   `a2a::do_spawn` (`stamp_spawn_origin`)**, called DIRECTLY on the
   just-spawned record — polling for the record's registration the same way
-  `spawn_inject_prompt` already does — from the door where the peer name IS
+  `spawn_inject_prompt` already does — from the door where the node name IS
   authenticated. Every OTHER call site may stamp a LOCAL-CLASS value but
-  MUST refuse a `peer:*` shape, because neither has a door behind it:
+  MUST refuse a `node:*` shape, because neither has a door behind it:
   `graph/conduct.rs::session_conduct` reads its own inherited
   `AOIDE_SESSION_ORIGIN` env (a same-uid process can set that on itself
   before invoking `aoide conduct` directly) and `graph/
   resurrect.rs::origin_to_carry` reads a revived session's OWN ledger entry
   back (`state/session-ledger.jsonl` is a plain, same-uid-writable,
   append-only file — a same-uid process can append a line claiming
-  `origin:"peer:X"` and then run the ungated local `aoide resurrect`,
+  `origin:"node:X"` and then run the ungated local `aoide resurrect`,
   which likewise has no door behind it). Both REFUSE (eprintln, never
-  panic) a `peer:*` value from their own untrusted source instead of
+  panic) a `node:*` value from their own untrusted source instead of
   stamping it. **A future third-plus call site is fine as long as it holds
-  this same refusal** — the invariant is "peer:* only from an authenticated
+  this same refusal** — the invariant is "node:* only from an authenticated
   door", never "count the callers". No `restage_graph()` — like `headless`,
   `origin` is consumed internally (`doc.rs::ledger_session_exit`'s
   projection into the durable ledger, and `origin_to_carry` reading that
   field back to carry a LOCAL-class session's provenance forward onto its
-  revived record — G6, same phase, `peer:*` excluded per above), not
+  revived record — G6, same phase, `node:*` excluded per above), not
   rendered into `graph.json`. **This closes the STAMP paths, not the
-  files**: a hand-crafted `sessions.json`/ledger line claiming `peer:X` is
+  files**: a hand-crafted `sessions.json`/ledger line claiming `node:X` is
   still a readable, unflagged string on disk — nothing here makes the files
   tamper-evident; that is P-ID1 (the daemon-signed credential, below) —
   minted and stored, verified on the per-session control socket's own
@@ -808,7 +808,7 @@
   sockets get a peercred floor of their own as of P-ID3 (below).
   **The raw `origin` field is attribution, not an
   authenticated credential** — a same-uid process can still forge a
-  LOCAL-class origin (`stamp_origin` trusts whatever non-`peer:*` value it
+  LOCAL-class origin (`stamp_origin` trusts whatever non-`node:*` value it
   is given). Don't let a consumer gate a security decision on the raw
   field: the authenticated form is the sealed credential (below), and the
   secrets broker's origin gate (P-ID4) is the model consumer — it gates on
@@ -816,7 +816,7 @@
   The consumer NAME presenting a request stays unauthenticated either way
   (a separate, unbuilt axis — CONTRACTS.md's identity-lane accounting).
   What P-ID0 closes is narrower and real: every
-  record-STAMP path this codebase drives now refuses a `peer:*` shape it
+  record-STAMP path this codebase drives now refuses a `node:*` shape it
   didn't mint itself at the door — env AND the unsealed ledger both.
 - **`SessionRecord.seal`/`sealedIssuedAt` are STAMPED from `aoide-server`
   only, but VERIFIED from inside this crate (LANE IDENTITY P-ID1/P-ID2).**

@@ -61,7 +61,7 @@
   time — there is no equivalent for a directory).
 - **`config` holds INTENT; every other module here holds STATE — never move
   a value across that line (task #135 P-C).** `config.toml` records what an
-  operator WANTS ahead of anything happening; `peers.json`'s records/allows/
+  operator WANTS ahead of anything happening; `nodes.json`'s records/allows/
   hub, the pairing park queues, `advertise.json`'s switch, `undying.json`
   record what HAPPENED. A new decision an operator makes UP FRONT gets a
   `config` key; a fact the system observes or commits gets a state file.
@@ -80,7 +80,7 @@
   a rewrite instead of a reader.
 - **`config`'s vocabularies are borrowed from their own domain, never
   minted here.** `pairing.defaultGrant`'s `ValueKind::ClosedList` IS
-  `peer_store::PEER_CAPABILITIES` — the same closed set `peer allow`
+  `node_store::NODE_CAPABILITIES` — the same closed set `node allow`
   enforces. A second list would drift the moment a capability lands, and
   `config.rs`'s own test asserts the two are the same value, not merely
   equal-looking.
@@ -255,34 +255,34 @@
   complete shape whichever file it came from. Adding `skip_serializing_if`
   to one of `RestoreSnapshot`'s own fields would make the two homes diverge
   in shape for no reason — don't.
-- **`peer_store::upsert_paired_peer` is the ONE write site for `Peer.pubkey`/
-  `Peer.verified` (P-P2).** `peer add` never sets either field; a caller
+- **`node_store::upsert_paired_node` is the ONE write site for `Node.pubkey`/
+  `Node.verified` (P-P2).** `node add` never sets either field; a caller
   wanting to record a verified key relationship goes through this function,
   which touches only `pubkey`/`verified`/`url` on an existing entry and
   leaves `autogate`/`tokenFile`/`bearerSecret`/`hub` untouched — don't widen
-  it to a general-purpose peer editor, and don't set those two fields via a
-  raw `Peer { .. }` literal anywhere outside `peer_store.rs` itself.
+  it to a general-purpose node editor, and don't set those two fields via a
+  raw `Node { .. }` literal anywhere outside `node_store.rs` itself.
   **Its `grant` parameter is the caller's, and this module never resolves
   one (task #135 P1).** The capability set a first pairing stamps is an
   operator's INTENT — `config.toml`'s `[pairing] defaultGrant`, or the
   `--allow` typed on that commit — so the client resolves it and passes the
-  finished list. Reading `config` from inside `peer_store` would be a second
+  finished list. Reading `config` from inside `node_store` would be a second
   resolution path AND would have to swallow a malformed grants file at the
   one moment that must fail loudly; keep the store a store.
-- **`peer_store::set_peer_via` is the ONE write site for `Peer.via` (P-S4),
-  a SIBLING to `upsert_paired_peer`, never a parameter folded into it.**
-  `upsert_paired_peer`'s signature is also called from `aoide-server`'s own
+- **`node_store::set_node_via` is the ONE write site for `Node.via` (P-S4),
+  a SIBLING to `upsert_paired_node`, never a parameter folded into it.**
+  `upsert_paired_node`'s signature is also called from `aoide-server`'s own
   pairing integration tests — a crate outside this field's blast radius —
   so a purely additive setter beside it (mirroring `set_hub`/
-  `set_peer_allow`'s own precedent) keeps that signature untouched. Don't
-  set `Peer.via` via a raw `Peer { .. }` literal anywhere outside
-  `peer_store.rs` itself, and don't fold it into `upsert_paired_peer`
+  `set_node_allow`'s own precedent) keeps that signature untouched. Don't
+  set `Node.via` via a raw `Node { .. }` literal anywhere outside
+  `node_store.rs` itself, and don't fold it into `upsert_paired_node`
   without first checking every one of that function's existing callers.
   **A caller passing `None` must mean "nothing to say," never "clear
-  it"** — `approve_outbound` (`aoide-client`) only calls `set_peer_via` at
+  it"** — `approve_outbound` (`aoide-client`) only calls `set_node_via` at
   all when the ceremony resolved an actual via; a re-pair that named none
   leaves a previously-recorded `via` (e.g. one `aoide pair`'s hostname arm set) exactly
-  as it was, the same untouched-unless-named stance `upsert_paired_peer`
+  as it was, the same untouched-unless-named stance `upsert_paired_node`
   itself holds for `autogate`/`tokenFile`/`bearerSecret`/`hub`/`allows`.
 - **`pairing`'s request ids are deliberately NOT `state/stage/pending.json`'s
   array-position ids.** A pairing correlation must survive the requester's
@@ -359,7 +359,7 @@
   (process-local `static Mutex<()>`, poison-recovering) stays alongside as
   the cap's in-process guarantee: `with_stage_lock` is best-effort by
   contract (a lock hiccup runs the closure unlocked), the mutex is not.
-  Outbound entries (`park_outbound`) are operator-created, one per `peer
+  Outbound entries (`park_outbound`) are operator-created, one per `node
   pair` invocation, and carry no cap.
 - **`park_inbound` SUPERSEDES a same-pubkey live entry, never refuses one
   (R3) — the eviction happens under the SAME `PARK_LOCK` acquisition,
@@ -383,7 +383,7 @@
   FROM X alongside outbound TO X) is untouched by either rule — the two
   park files never reference each other, and neither mutator should ever
   start doing so.
-- **`OutboundPairingRequest.state` defers the requester's own peer-record
+- **`OutboundPairingRequest.state` defers the requester's own node-record
   commit past the approver's approval — never collapse the two-state
   machine back to an implicit "the poll answered means paired."** An entry
   parks `AwaitingApproval`; `mark_outbound_awaiting_confirm` — Design A,
@@ -391,7 +391,7 @@
   own poll-then-mark step (a CLIENT call, never a server-side wire
   handler; the old `aoide/pairApprove` callback used to trigger this from
   `aoide-server`, but the FUNCTION ITSELF is unchanged) — transitions it to
-  `AwaitingConfirm` and nothing else on a pubkey match; no peer-store write
+  `AwaitingConfirm` and nothing else on a pubkey match; no node-store write
   happens inside this crate's own pairing module at all; that write is
   `aoide-client`'s own job, gated behind its own operator confirmation. A
   pubkey mismatch on the release leaves the entry completely untouched
@@ -431,12 +431,12 @@
   param stores whatever `aoide-server::a2a::pair_request` hands it
   straight onto the field with no shape-checking here — the same "only
   ever parsed at dial time, by the caller that actually dials" stance
-  every other recorded `via` string in this crate already holds (`Peer.via`,
+  every other recorded `via` string in this crate already holds (`Node.via`,
   `OutboundPairingRequest.via`). Don't add a `parse_via` call inside
   `park_inbound` — a malformed claim must never refuse the WHOLE pairing
   request; it only ever matters later, at `aoide-client::commands::
   approve_inbound`'s own commit, and even there a bad string just fails
-  that one call the same way a bad `Peer.via` already does. Additive
+  that one call the same way a bad `Node.via` already does. Additive
   `#[serde(default, skip_serializing_if = "Option::is_none")]` — a legacy
   record loads `None` and a `None` here never grows the file, same
   discipline `requester_nonce_hex` already holds.
@@ -450,7 +450,7 @@
   actually flipped).
 - **`undying.json` is written via plain `fs::atomic_write`, never
   `atomic_write_private` — deliberate, not an oversight.** It holds session
-  ids, the same class of data `sessions.json`/`peers.json` already keep
+  ids, the same class of data `sessions.json`/`nodes.json` already keep
   at default mode; `atomic_write_private` stays reserved for the
   identity/secret lane above.
 - **`undying`'s legacy-migration check runs on every `load_undying` call,
@@ -482,10 +482,10 @@
   there rather than continuing to search upward for a "better" one. Don't
   add a fallback-to-parent path; a broken nearest manifest is a bug to
   surface, not paper over with a stale grandparent's specs.
-- **`advertise` never writes `peer_store`, and never will (P-P6).** It
-  reaches into `peer_store` for exactly one READ (`valid_peer_name`, so
+- **`advertise` never writes `node_store`, and never will (P-P6).** It
+  reaches into `node_store` for exactly one READ (`valid_node_name`, so
   the advertisement's `name` shares the same nickname shape check every
-  other peer-name field on the wire already holds to) — don't add a write
+  other node-name field on the wire already holds to) — don't add a write
   path here "for convenience": discovery grants nothing is the whole
   point of the feature (`docs/architecture/PAIRING.md`'s "Discovery
   (advertise-but-locked)" section), and a write site in the ONE module
@@ -514,9 +514,9 @@
   discipline, the same way `undying.json` deliberately does NOT — don't read
   that as the record carrying a secret; it doesn't, and it must never grow
   one (no key material, no bearer token) without re-opening this decision.
-- **`tunnel::dial_url`'s path half MUST come from `peer_store::url_path`,
+- **`tunnel::dial_url`'s path half MUST come from `node_store::url_path`,
   never a second, independently-written cut of the same url.** The
-  ssh-transport plan's §0.4 is the reason: `sign_headers_for_peer`
+  ssh-transport plan's §0.4 is the reason: `sign_headers_for_node`
   (`aoide-client`) signs a canonical string built from the URL's path only,
   so a dial url's authority can be rewritten to `127.0.0.1:<local port>`
   with zero effect on what gets signed PROVIDED the path is copied verbatim.
@@ -526,15 +526,15 @@
   against_url_path_directly` (`tunnel.rs`) pins this directly, not just by
   eyeballing the two functions' output.
 - **`tunnel::record_path`'s two id checks are deliberately DIFFERENT
-  strictness, not an oversight.** `key` reuses `peer_store::valid_peer_name`
-  verbatim (it names a peer or a `--via` target, the same nickname shape
+  strictness, not an oversight.** `key` reuses `node_store::valid_node_name`
+  verbatim (it names a node or a `--via` target, the same nickname shape
   everywhere else on the wire). `sessionId` uses this module's own looser
   `is_safe_id` — a session id is not an operator-typed nickname (the default
   shape is `conduct-<pid>-<unix ts>`, and `aoide conduct --id <id>` lets an
-  operator override it), so it can't hold to `valid_peer_name`'s
+  operator override it), so it can't hold to `valid_node_name`'s
   lowercase-alnum-hyphen shape without rejecting real ids. Don't unify the
   two checks "for consistency" — `is_safe_id` still refuses every traversal
-  shape `valid_peer_name` does (empty, `..`, `/`, a leading `.`), which is
+  shape `valid_node_name` does (empty, `..`, `/`, a leading `.`), which is
   the actual invariant both exist to hold.
 
 ## Extension points
@@ -560,7 +560,7 @@
   as a typo — so the ONLY writer is a direct edit to `config.toml`'s text.
   Reading what the declaration implies about live state, and acting on it,
   are the consuming crate's job, never this one's — `aoide_client::mesh`
-  reads `[mesh.*]` plus `peer_store::load_peers()` to report drift (`aoide
+  reads `[mesh.*]` plus `node_store::load_nodes()` to report drift (`aoide
   mesh`) and to converge it (`aoide mesh pair`); this crate only parses and
   validates the declaration.
   Updates CONTRACTS.md §4's `config.toml` subsection in the same commit,
@@ -571,13 +571,13 @@
   crate's `commands::all()`. The
   pairing ceremony's own CLI commands (`aoide pair`/`pair reject`/`pair
   watch`) live in `aoide-client`
-  instead — this crate exposes the `pairing`/`peer_store` library only,
+  instead — this crate exposes the `pairing`/`node_store` library only,
   since the ceremony needs outbound HTTP transport this crate never holds.
 
 ## Docs update required in the same commit
 
 - This `README.md` when a new module or stage-file shape is added.
-- `CONTRACTS.md §4`/`§7` when a stage-file or peer-registry wire shape
+- `CONTRACTS.md §4`/`§7` when a stage-file or node-registry wire shape
   changes — including `config.toml`'s own subsection when `config::SCHEMA`
   gains or loses a section/key, plus `modules/nucleus/config.nix` when the
   nix authoring front-end's option shape moves with it.

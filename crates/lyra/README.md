@@ -5,7 +5,7 @@ domain-crate handler code `aoide-cli` assembles (P-A4). In Cordis terms
 (CONTRACTS.md §0): a BUNDLE, same as `cli` — its own ordered
 `commands::all()` profile over an independent `Registry`. Owns the
 self-ricing loop, `screen`, `herald`, `shellbridge`, and `quickshell`;
-deliberately never conducting, the graph, A2A, peers, or the daemon (those
+deliberately never conducting, the graph, A2A, nodes, or the daemon (those
 are core `aoide` identity, root `AGENTS.md`).
 
 ## Named seams (what it exposes)
@@ -50,7 +50,7 @@ are core `aoide` identity, root `AGENTS.md`).
   content: the window is a fixed-size hint (that hint is what makes
   Hyprland float it), so a line longer than 400px used to render at its
   natural width and get cut at both edges — live-proven on the pairing
-  ask, which lost its peer name and its request id that way. Extracted from `commands::secrets` (P3's original
+  ask, which lost its node name and its request id that way. Extracted from `commands::secrets` (P3's original
   module) the moment a SECOND caller needed the identical entry
   component; the show variant followed when `commands::pair` needed a
   SECOND surface for its own reply-code display (originally a confirm
@@ -104,7 +104,7 @@ are core `aoide` identity, root `AGENTS.md`).
   `AOIDE_PAIR_ASK_RESULT:` marker; `pair ask` alone carries the
   `"Reject request"` dismiss label, since `pair show` has no dismiss path
   to label. `--context` is pre-formatted ONCE by the caller (untrusted,
-  peer-supplied display text: a requesting host + short id, or a reply
+  node-supplied display text: a requesting host + short id, or a reply
   code's own recipient name) so zenity and the matching lyra dialog
   render byte-identical wording, the same "one place this wording lives"
   discipline `aoide_secrets::watch::format_origin_line` holds for its own

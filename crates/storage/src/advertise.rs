@@ -2,19 +2,19 @@
 //! + task #120, `docs/architecture/PAIRING.md`'s "Discovery
 //! (advertise-but-locked)" section): the one JSON line an `a2a serve`
 //! process may emit by UDP broadcast when discovery advertising is turned
-//! on (`aoide peer advertise on`), and the validation an `aoide peer
-//! discover`/`peer invite` sweep applies to every line it hears before
+//! on (`aoide node advertise on`), and the validation an `aoide node
+//! discover`/`node invite` sweep applies to every line it hears before
 //! trusting a single field of it (root `AGENTS.md` house rule 4 — an
 //! advertisement heard off the network is untrusted data, no different
 //! from a forwarded notification's text).
 //!
 //! **Discovery grants NOTHING** (PAIRING.md, verbatim): an advertisement
-//! only ever feeds `peer discover`'s printed table and `pair`'s
+//! only ever feeds `node discover`'s printed table and `pair`'s
 //! hostname-arm target resolution — the pairing ceremony (`pair`, P-P2) is
-//! the only thing that ever writes `state/peers.json`. This module has no
-//! dependency on `peer_store` for writing anything, and never will; it
-//! reaches into it for exactly one READ (`valid_peer_name`, the same
-//! nickname shape every other peer-name field on the wire already holds
+//! the only thing that ever writes `state/nodes.json`. This module has no
+//! dependency on `node_store` for writing anything, and never will; it
+//! reaches into it for exactly one READ (`valid_node_name`, the same
+//! nickname shape every other node-name field on the wire already holds
 //! to) so the advertisement's `name` never gets a second, drifting shape
 //! check.
 //!
@@ -71,7 +71,7 @@ pub const PORT: u16 = 8711;
 /// ([`parse_and_validate`]) — the same "cheapest check first, on untrusted
 /// bytes" discipline `aoide-server`'s own `daemon::read_capped_line`/
 /// `a2a::MAX_LINE` already hold for their own line-oriented inputs. A real
-/// advertisement (fixed `v`, a `valid_peer_name`-shaped name, a
+/// advertisement (fixed `v`, a `valid_node_name`-shaped name, a
 /// [`valid_host`]-shaped host, a [`valid_user`]-shaped user) never
 /// approaches this; it exists to bound a hostile or corrupt sender, never
 /// a legitimate one.
@@ -98,7 +98,7 @@ pub struct Advertisement {
     pub user: String,
 }
 
-/// Build this instance's own advertisement — the ONE constructor, so `v`
+/// Build this instance's own advertisement — the ONE function Object() { [native code] }, so `v`
 /// can never drift from [`VERSION`] at a call site.
 pub fn build(name: &str, host: &str, user: &str) -> Advertisement {
     Advertisement {
@@ -164,9 +164,9 @@ pub fn valid_user(s: &str) -> bool {
 /// ONE gate every field crosses before a caller may look at it (house
 /// rule 4): the size cap first (cheapest check, on raw bytes, before a
 /// single byte reaches a JSON parser), then the parse itself, then `v`,
-/// `name` ([`crate::peer_store::valid_peer_name`]), `host`
+/// `name` ([`crate::node_store::valid_node_name`]), `host`
 /// ([`valid_host`]), and `user` ([`valid_user`]) — in that order,
-/// short-circuiting on the first failure. `peer discover`/`peer invite`
+/// short-circuiting on the first failure. `node discover`/`node invite`
 /// never display a line that fails any one of these; they only ever
 /// increment a dropped count.
 pub fn parse_and_validate(line: &str) -> Result<Advertisement, RejectReason> {
@@ -177,7 +177,7 @@ pub fn parse_and_validate(line: &str) -> Result<Advertisement, RejectReason> {
     if a.v != VERSION {
         return Err(RejectReason::WrongVersion);
     }
-    if !crate::peer_store::valid_peer_name(&a.name) {
+    if !crate::node_store::valid_node_name(&a.name) {
         return Err(RejectReason::InvalidName);
     }
     if !valid_host(&a.host) {
@@ -191,7 +191,7 @@ pub fn parse_and_validate(line: &str) -> Result<Advertisement, RejectReason> {
 
 // ── The advertise switch ─────────────────────────────────────────────────
 //
-// `aoide peer advertise on|off` (task #120): whether THIS instance emits
+// `aoide node advertise on|off` (task #120): whether THIS instance emits
 // advertisements at all. A tiny state file rather than a config framework
 // — `state/advertise.json`, written atomically like every other state
 // file this crate owns, read by the emitting process (`a2a serve`'s
@@ -220,7 +220,7 @@ fn switch_path() -> std::path::PathBuf {
 
 /// Whether this instance's advertise switch is on. Tolerate-missing: an
 /// absent or unreadable/unparseable file is simply OFF (the default),
-/// never an error — the same additive stance `peer_store::load_peers`
+/// never an error — the same additive stance `node_store::load_nodes`
 /// holds for its own file.
 pub fn enabled() -> bool {
     let Ok(raw) = std::fs::read_to_string(switch_path()) else {
@@ -230,7 +230,7 @@ pub fn enabled() -> bool {
 }
 
 /// Flip the advertise switch, returning what it previously was so the
-/// caller can report "changed" vs "already so" (`peer advertise`'s
+/// caller can report "changed" vs "already so" (`node advertise`'s
 /// idempotence contract). Atomic write via [`crate::fs::atomic_write`];
 /// creates `state/` on first use like every other writer there.
 pub fn set_enabled(on: bool) -> std::io::Result<bool> {

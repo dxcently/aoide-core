@@ -215,7 +215,7 @@ const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(15);
 ///   through everything else, `EAGAIN` included, straight to an immediate
 ///   hard error — making the exact saturated-backlog scenario this
 ///   function exists for WORSE than the old blocking `UnixStream::connect`,
-///   which would have slept in the kernel's `unix_wait_for_peer()` and
+///   which would have slept in the kernel's `unix_wait_for_node()` and
 ///   succeeded once a slot freed). The fix is to retry the `connect(2)`
 ///   SYSCALL ITSELF on a short interval ([`CONNECT_RETRY_INTERVAL`]),
 ///   bounded by the same overall `timeout` budget — not to poll a fd for
@@ -524,7 +524,7 @@ fn read_final_reply(reader: &mut impl BufRead) -> Result<Value, String> {
 /// Resolve a secret's value BOUNDED — an explicit socket read `timeout`
 /// PLUS `wait:false` on the wire — for a caller with no human to type a
 /// TOTP code and that must never hang waiting for one (task #84: the A2A
-/// door's inbound bearer check, and its outbound client's per-peer bearer
+/// door's inbound bearer check, and its outbound client's per-node bearer
 /// presentation — see `crates/server/src/a2a.rs`'s consumers of this
 /// function). Two independent bounds, not one:
 ///
@@ -682,7 +682,7 @@ pub fn put(socket_path: &Path, secret: &str, value: &str, overwrite: bool) -> Re
 /// direct-write path on ([`NoSocket`](AdminError::NoSocket)). Every other
 /// failure — a different connect error, a write/read failure, an
 /// unparseable reply, or the broker's own `{"ok":false}` domain denial
-/// (a bad admin-identity peer uid, "no policy for secret x", a poisoned
+/// (a bad admin-identity node uid, "no policy for secret x", a poisoned
 /// `policy.json`) — is [`Other`](AdminError::Other) and MUST be reported,
 /// never silently downgraded to a direct write: a live-but-sick daemon (a
 /// permission error, a saturated backlog `connect_bounded` gave up
@@ -1610,7 +1610,7 @@ mod tests {
         assert_eq!(ask.consumer, "m");
         // #73: a REAL socket connection's SO_PEERCRED is this same test
         // process's own euid (the resolving thread and this thread are one
-        // process) — proves the peer uid survives the full accept ->
+        // process) — proves the node uid survives the full accept ->
         // park -> pending round trip, not just the in-process unit tests.
         assert_eq!(ask.peer_uid, Some(unsafe { libc::geteuid() }));
 

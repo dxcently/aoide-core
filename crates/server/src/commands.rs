@@ -7,7 +7,7 @@
 //! domain. The root package's `commands::all()` calls [`register_infra`]
 //! directly after its own root-coupled `mcp serve` registration and
 //! [`register_a2a_serve`] directly before
-//! `aoide_client::commands::register_peers`, so `schema --json` order never
+//! `aoide_client::commands::register_nodes`, so `schema --json` order never
 //! shifts.
 //!
 //! `shellbridge` moved out at P-A2 of the binary-split workstream
@@ -124,10 +124,10 @@ pub fn register_a2a_serve(r: &mut Registry) {
             flag!("port", "int", "Override the A2A HTTP port (default aoide.a2a.port)."),
             flag!("bind", "string", "Override the A2A HTTP bind address (default aoide.a2a.bindAddress)."),
             flag!("spawn-agent", "string", "Override the command message/send's spawn path conducts (default aoide.a2a.spawnAgent; empty = spawning disabled)."),
-            flag!("peer-name", "string", "Override this instance's aoide/graphSummary instance name (default: the OS hostname)."),
+            flag!("node-name", "string", "Override this instance's aoide/graphSummary instance name (default: the OS hostname)."),
             flag!("token-file", "string", "Path to a file holding the shared secret an inbound message/send must present (Authorization: Bearer <token>) (default aoide.a2a.tokenFile; empty = no token required, loopback keeps today's automatic trust)."),
             flag!("bearer-secret", "string", "Name of a secret, resolved fresh on every request through the local secrets broker, this door expects as its inbound Authorization: Bearer token (default AOIDE_A2A_BEARER_SECRET; empty = not configured). Takes precedence over --token-file when set; a broker resolve failure fails closed."),
-            flag!("discovery-advertise", "bool", "Force this instance's own discovery advertisement (name + ssh hop user@host, nothing more) on for this process's lifetime — UDP broadcast on the fixed LAN port, ~30s jittered cadence, for aoide peer discover/invite to hear (default aoide.a2a.discoveryAdvertise / AOIDE_DISCOVERY_ADVERTISE; off by default — the runtime switch is aoide peer advertise on|off; discovery grants nothing, docs/architecture/PAIRING.md)."),
+            flag!("discovery-advertise", "bool", "Force this instance's own discovery advertisement (name + ssh hop user@host, nothing more) on for this process's lifetime — UDP broadcast on the fixed LAN port, ~30s jittered cadence, for aoide node discover/invite to hear (default aoide.a2a.discoveryAdvertise / AOIDE_DISCOVERY_ADVERTISE; off by default — the runtime switch is aoide node advertise on|off; discovery grants nothing, docs/architecture/PAIRING.md)."),
         ],
         gated: false,
         implemented: true,

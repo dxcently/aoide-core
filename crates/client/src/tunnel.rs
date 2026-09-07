@@ -367,7 +367,7 @@ fn terminate_pid(pid: u32) {
 
 /// Reserve a free loopback port: bind `:0`, read back what the OS assigned,
 /// then drop the listener so `ssh -L` can bind it itself — the same
-/// bind-read-back-drop idiom `cli/tests/peer_connectivity.rs::free_port`
+/// bind-read-back-drop idiom `cli/tests/node_connectivity.rs::free_port`
 /// already uses. The tiny re-bind race (R6) is accepted, the same way that
 /// test accepts it; `ExitOnForwardFailure=yes` turns a lost race into a
 /// clean, retryable spawn failure rather than a silent half-open tunnel.

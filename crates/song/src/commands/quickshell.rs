@@ -4,7 +4,7 @@
 //! (`commands/reload.rs`, `lyra reload` design settled 2026-08-31): the
 //! declarative arm of that command's mode-aware dispatch IS this file's old
 //! `handle_quickshell_reload` byte-for-byte — hard cutover, no alias, the
-//! `peer invite` precedent. `healthcheck` is a watchdog, not an iteration
+//! `node invite` precedent. `healthcheck` is a watchdog, not an iteration
 //! step, so it stays here, untouched, its own command.
 //!
 //! Named `quickshell`, not `shell` (the User, 2026-08-15): a top-level command

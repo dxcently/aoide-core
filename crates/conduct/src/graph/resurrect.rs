@@ -103,7 +103,7 @@
 //! per-candidate isolation the flag-mode loop already holds: a spec whose
 //! `host` is not this host's own name
 //! (`aoide_storage::display::local_host_name`) is [`summon_remote`]'s job
-//! (U4, command-defrag lane U) — summoned through the peer door rather than
+//! (U4, command-defrag lane U) — summoned through the node door rather than
 //! skipped, see that function's own doc for the local refusal shapes, the
 //! reused signed-spawn wire, and the cwd limitation this phase lands with.
 //! A local spec's `dir` resolves through `aoide_storage::manifest::
@@ -136,9 +136,9 @@
 //!
 //! **Manifest-revived sessions are marked undying (orchestrator design
 //! ruling, U2 review round 1) — LOCAL revivals only.** [`summon_remote`]'s
-//! own rows never reach this: the resurrected id lives on the PEER, and
+//! own rows never reach this: the resurrected id lives on the NODE, and
 //! `state/undying.json` is host-local runtime state naming ids that live on
-//! THIS host (the same reasoning U3's picker already holds toward a peer
+//! THIS host (the same reasoning U3's picker already holds toward a node
 //! row's mark — it writes a manifest spec, never touches `undying.json`
 //! for an id it doesn't own). Once a spawn from EITHER local path actually
 //! lands a row in `resurrected` (which only happens past `Status::Ok`, the
@@ -170,6 +170,7 @@ use super::spawn::session_spawn;
 use aoide_protocol::agents::agent_profile;
 use aoide_protocol::output::{Outcome, Status};
 use aoide_protocol::Invocation;
+use aoide_storage::attest::is_node_origin;
 use aoide_storage::records::RestoreSnapshot;
 use serde_json::json;
 use std::collections::BTreeMap;
@@ -316,12 +317,12 @@ fn restore_delivery(door: aoide_protocol::Door, new_id: &str, restore: &RestoreS
 
 /// What `resurrect_one` does with a ledger entry's `origin` field when
 /// reviving it (LANE IDENTITY P-ID0, G6 MUST-FIX). `Carry` for anything
-/// EXCEPT a `peer:*` shape — a `peer:*` value gets `RefusedPeer` instead of
+/// EXCEPT a `node:*` shape — a `node:*` value gets `RefusedNode` instead of
 /// being silently dropped, because `state/session-ledger.jsonl` is an
 /// UNSEALED append-only file (sealing is P-ID1/P-ID2's job, not this
-/// phase): a same-uid process can append a line claiming `origin:"peer:X"`
+/// phase): a same-uid process can append a line claiming `origin:"node:X"`
 /// and then run this ungated LOCAL `aoide resurrect`, which has no door and
-/// no seal behind it. `peer:*` is door-authenticated identity — only
+/// no seal behind it. `node:*` is door-authenticated identity — only
 /// `a2a::do_spawn`'s `stamp_spawn_origin` may mint it (`stamp_origin`'s own
 /// doc names the two legitimate STAMP callers) — so a local resurrect
 /// re-minting that authority off an unsealed file would be exactly the
@@ -330,13 +331,13 @@ fn restore_delivery(door: aoide_protocol::Door, new_id: &str, restore: &RestoreS
 #[derive(Debug, PartialEq, Eq)]
 enum OriginCarry<'a> {
     Carry(&'a str),
-    RefusedPeer(&'a str),
+    RefusedNode(&'a str),
     Nothing,
 }
 
 fn origin_to_carry(ledger_origin: Option<&str>) -> OriginCarry<'_> {
     match ledger_origin {
-        Some(origin) if origin.starts_with("peer:") => OriginCarry::RefusedPeer(origin),
+        Some(origin) if is_node_origin(origin) => OriginCarry::RefusedNode(origin),
         Some(origin) => OriginCarry::Carry(origin),
         None => OriginCarry::Nothing,
     }
@@ -401,13 +402,13 @@ fn resurrect_one(
     // Carry the ledger entry's own `origin` forward onto the revived record
     // (LANE IDENTITY P-ID0, G6) — LOCAL-CLASS ONLY. `ledger_session_exit`
     // writes `origin` on every exit, but nothing read it back until now, so
-    // a revived LOCAL session silently became origin-less. A `peer:*` value
+    // a revived LOCAL session silently became origin-less. A `node:*` value
     // is refused here on purpose, not carried: `state/session-ledger.jsonl`
     // is an UNSEALED append-only file (the P-ID1 seal covers live session
     // records, never this ledger)
-    // — a same-uid process can append a line claiming `origin:"peer:X"` and
+    // — a same-uid process can append a line claiming `origin:"node:X"` and
     // then run this ungated LOCAL `aoide resurrect`, which has no door and
-    // no seal behind it. `peer:*` is door-authenticated identity (only
+    // no seal behind it. `node:*` is door-authenticated identity (only
     // `a2a::do_spawn`'s `stamp_spawn_origin` may mint it, per `stamp_origin`'s
     // own doc); a local resurrect re-minting that authority off an unsealed
     // file would be exactly the forgery this lane closes, not a fix for it.
@@ -417,7 +418,7 @@ fn resurrect_one(
     // one) means nothing to carry, same as before.
     match origin_to_carry(c.entry.origin.as_deref()) {
         OriginCarry::Carry(origin) => stamp_origin(&new_id, origin),
-        OriginCarry::RefusedPeer(origin) => eprintln!(
+        OriginCarry::RefusedNode(origin) => eprintln!(
             "aoide resurrect: reviving `{}` as LOCAL-class — its ledger origin `{origin}` cannot be trusted from an unsealed ledger and is not carried forward (P-ID1's sealed credential closes this)",
             c.entry.session_id
         ),
@@ -831,17 +832,17 @@ fn resurrect_from_manifest(
 }
 
 /// A manifest spec whose `host` names a DIFFERENT box: summoned through the
-/// peer door rather than skipped (U4, command-defrag lane U — landing the
+/// node door rather than skipped (U4, command-defrag lane U — landing the
 /// U2/U3 module doc's own "remote summoning is a later phase" note).
-/// `spec.host` resolves against `state/peers.json` the exact same way U3's
-/// picker WRITES it (`{host: <peer name>, dir, agent}`, `CONTRACTS.md`'s
-/// `.aoide/project.json` section) — a peer NICKNAME, not a literal DNS/OS
+/// `spec.host` resolves against `state/nodes.json` the exact same way U3's
+/// picker WRITES it (`{host: <node name>, dir, agent}`, `CONTRACTS.md`'s
+/// `.aoide/project.json` section) — a node NICKNAME, not a literal DNS/OS
 /// hostname. Three local refusals, all landing in `failed[]` — never
 /// `skipped[]`, since this spec was tried and refused, not given up on —
 /// before the wire is ever touched:
-/// - no peer named `spec.host` at all — taught, names `peer add`;
-/// - a registered but UNVERIFIED peer — the same local-only refusal
-///   `aoide-client::commands::handle_peer_spawn` already holds (an
+/// - no node named `spec.host` at all — taught, names `node add`;
+/// - a registered but UNVERIFIED node — the same local-only refusal
+///   `aoide-client::commands::handle_node_spawn` already holds (an
 ///   unsigned request can never satisfy the remote door's `Signature`-rung
 ///   spawn gate, P-P4/PAIRING.md decision 6): refused HERE rather than
 ///   earning a doomed round trip;
@@ -850,35 +851,35 @@ fn resurrect_from_manifest(
 ///   [`clean_spawn_from_spec`] refuses locally, mirrored here since there
 ///   is no argv to build a prompt from either.
 ///
-/// Past those three, this reuses [`aoide_client::commands::spawn_on_peer`]
+/// Past those three, this reuses [`aoide_client::commands::spawn_on_node`]
 /// VERBATIM — the identical signed spawn-shaped `message/send`
-/// (`context_id: None`) `aoide peer spawn` drives (the `conduct` → `client`
+/// (`context_id: None`) `aoide node spawn` drives (the `conduct` → `client`
 /// edge this crate's `Cargo.toml` already documents for the roster core's
-/// own live peer probe (`who.rs`, reached via bare `session`/`--hosts`),
+/// own live node probe (`who.rs`, reached via bare `session`/`--hosts`),
 /// extended to this tenant) — never a re-implementation of the wire, never a shell-out
-/// to the `aoide` CLI. No confirm prompt: unlike `peer spawn`'s interactive
+/// to the `aoide` CLI. No confirm prompt: unlike `node spawn`'s interactive
 /// `--yes` gate, a manifest spec IS the operator's own standing
 /// declaration — the identical posture U2's local clean-spawn already
 /// takes toward a spec's own `command`, never re-asked at revival time.
-/// **Which AGENT actually runs is the PEER's own configured
+/// **Which AGENT actually runs is the NODE's own configured
 /// `aoide.a2a.spawnAgent`, never chosen here** — [`summon_text`]'s result
 /// only ever becomes that agent's first typed turn
 /// (`aoide-server::a2a::do_spawn`'s `spawn_inject_prompt`), the same
-/// security model `handle_peer_spawn`'s own doc states; `spec.agent` is
+/// security model `handle_node_spawn`'s own doc states; `spec.agent` is
 /// informational on the remote leg, unlike the local leg where it picks
-/// the actual harness. Every remaining refusal — unreachable peer, the
+/// the actual harness. Every remaining refusal — unreachable node, the
 /// remote door's own gate/autogate/allow-set refusal — surfaces VERBATIM
-/// into `failed[]` as `spawn_on_peer`'s own `Err` text; per-spec isolation
+/// into `failed[]` as `spawn_on_node`'s own `Err` text; per-spec isolation
 /// holds exactly as every other row in this loop already does.
 ///
 /// **The cwd limitation (design note, U4).** The spawn wire carries NO
 /// working-directory field at all — `decide_send_action`/`do_spawn`
 /// (`aoide-server::a2a`) take only a prompt and the pre-configured
 /// `spawn_agent` executable, nothing else — so `spec.dir` cannot be pushed
-/// onto the peer through this call; it is not silently dropped so much as
+/// onto the node through this call; it is not silently dropped so much as
 /// never representable on this wire version. A spec wanting a specific
-/// directory on the peer must say so inside its own `command`
-/// (`git -C <absolute path on the peer> …`) — an honest limitation, never
+/// directory on the node must say so inside its own `command`
+/// (`git -C <absolute path on the node> …`) — an honest limitation, never
 /// a guessed `--cwd` the wire has nowhere to carry. Adding a wire field is
 /// a LATER phase's job: the fleet's doors run older binaries this phase
 /// must stay compatible with, so the wire itself is never touched here.
@@ -888,16 +889,16 @@ fn summon_remote(
     failed: &mut Vec<serde_json::Value>,
     changed: &mut Vec<String>,
 ) {
-    let peers = aoide_storage::peer_store::load_peers();
-    let peer = match peers.iter().find(|p| p.name == spec.host) {
+    let nodes = aoide_storage::node_store::load_nodes();
+    let node = match nodes.iter().find(|p| p.name == spec.host) {
         Some(p) if p.verified => p.clone(),
         Some(_) => {
             failed.push(json!({
                 "host": spec.host, "dir": spec.dir, "agent": spec.agent,
                 "disposition": "failed",
                 "reason": format!(
-                    "peer `{}` is registered but not paired — summoning requires a signed \
-                     request from a VERIFIED peer; pair first with `aoide pair \
+                    "node `{}` is registered but not paired — summoning requires a signed \
+                     request from a VERIFIED node; pair first with `aoide pair \
                      <url> --name {}`",
                     spec.host, spec.host
                 ),
@@ -909,7 +910,7 @@ fn summon_remote(
                 "host": spec.host, "dir": spec.dir, "agent": spec.agent,
                 "disposition": "failed",
                 "reason": format!(
-                    "host `{}` is not a registered peer — `aoide peer add {} <url>` (then pair it) first",
+                    "host `{}` is not a registered node — `aoide node add {} <url>` (then pair it) first",
                     spec.host, spec.host
                 ),
             }));
@@ -929,7 +930,7 @@ fn summon_remote(
         return;
     };
 
-    match aoide_client::commands::spawn_on_peer(&peer, &text) {
+    match aoide_client::commands::spawn_on_node(&node, &text) {
         Ok(resp) => {
             let session_id = resp
                 .get("result")
@@ -938,7 +939,7 @@ fn summon_remote(
                 .unwrap_or("")
                 .to_string();
             changed.push(format!(
-                "session {session_id}: summoned on peer `{}` (manifest spec, agent {})",
+                "session {session_id}: summoned on node `{}` (manifest spec, agent {})",
                 spec.host, spec.agent
             ));
             resurrected.push(json!({
@@ -953,13 +954,13 @@ fn summon_remote(
             failed.push(json!({
                 "host": spec.host, "dir": spec.dir, "agent": spec.agent,
                 "disposition": "failed",
-                "reason": format!("summoning on peer `{}`: {e}", spec.host),
+                "reason": format!("summoning on node `{}`: {e}", spec.host),
             }));
         }
     }
 }
 
-/// The text a remote summon injects as the peer's newly spawned session's
+/// The text a remote summon injects as the node's newly spawned session's
 /// first turn — the spec's own `command` VERBATIM when given (unlike
 /// [`clean_spawn_from_spec`]'s LOCAL argv, this never whitespace-splits it:
 /// there is no argv on this wire, only one prompt string, so splitting and
@@ -1075,11 +1076,11 @@ mod tests {
         }
     }
 
-    /// A peer registered via the legacy `peer add` escape, never paired —
-    /// same `verified: false` shape `send.rs`'s own `test_peer` fixture
+    /// A node registered via the legacy `node add` escape, never paired —
+    /// same `verified: false` shape `send.rs`'s own `test_node` fixture
     /// uses, named here for the summon tests' own local-refusal case.
-    fn unpaired_peer(name: &str) -> aoide_storage::peer_store::Peer {
-        aoide_storage::peer_store::Peer {
+    fn unpaired_node(name: &str) -> aoide_storage::node_store::Node {
+        aoide_storage::node_store::Node {
             name: name.to_string(),
             url: "http://127.0.0.1:9/".to_string(),
             autogate: false,
@@ -1094,16 +1095,16 @@ mod tests {
         }
     }
 
-    /// A `verified: true` peer at the given `url` — enough for
-    /// `summon_remote`'s local gate to pass and `spawn_on_peer`'s own
+    /// A `verified: true` node at the given `url` — enough for
+    /// `summon_remote`'s local gate to pass and `spawn_on_node`'s own
     /// signing to proceed (signing only needs THIS instance's own identity,
-    /// never the peer's `pubkey` — `sign_headers_for_peer`'s own doc), so
+    /// never the node's `pubkey` — `sign_headers_for_node`'s own doc), so
     /// no real pairing ceremony is needed to exercise the wire.
-    fn verified_peer(name: &str, url: &str) -> aoide_storage::peer_store::Peer {
-        aoide_storage::peer_store::Peer {
+    fn verified_node(name: &str, url: &str) -> aoide_storage::node_store::Node {
+        aoide_storage::node_store::Node {
             verified: true,
             url: url.to_string(),
-            ..unpaired_peer(name)
+            ..unpaired_node(name)
         }
     }
 
@@ -1457,44 +1458,44 @@ mod tests {
     #[test]
     fn resolve_candidate_preserves_the_ledger_entrys_origin() {
         let entry = aoide_storage::ledger::LedgerEntry {
-            origin: Some("peer:yomi-strix".to_string()),
-            ..ledger_entry("ledger-peer-origin", "claude", "/home/khoa/Aoide", "2026-08-20T01:00:00Z")
+            origin: Some("node:yomi-strix".to_string()),
+            ..ledger_entry("ledger-node-origin", "claude", "/home/khoa/Aoide", "2026-08-20T01:00:00Z")
         };
         let candidate = resolve_candidate(entry);
-        assert_eq!(candidate.entry.origin.as_deref(), Some("peer:yomi-strix"));
+        assert_eq!(candidate.entry.origin.as_deref(), Some("node:yomi-strix"));
     }
 
     /// G6 MUST-FIX (LANE IDENTITY P-ID0, review round 1): THE real
-    /// assertion — a `peer:*` ledger origin is REFUSED, never carried,
+    /// assertion — a `node:*` ledger origin is REFUSED, never carried,
     /// because `state/session-ledger.jsonl` is unsealed and a local
     /// resurrect has no door behind it to authenticate that shape. A
-    /// non-peer (local-class) origin still carries forward normally, and
+    /// non-node (local-class) origin still carries forward normally, and
     /// no ledger origin at all carries nothing — `origin_to_carry` is pure,
     /// so this is provable without a spawn, a registered record, or any
     /// env at all.
     #[test]
-    fn origin_to_carry_refuses_a_peer_shape_and_carries_everything_else() {
-        assert_eq!(origin_to_carry(Some("peer:yomi-strix")), OriginCarry::RefusedPeer("peer:yomi-strix"));
+    fn origin_to_carry_refuses_a_node_shape_and_carries_everything_else() {
+        assert_eq!(origin_to_carry(Some("node:yomi-strix")), OriginCarry::RefusedNode("node:yomi-strix"));
         assert_eq!(origin_to_carry(Some("local")), OriginCarry::Carry("local"));
         assert_eq!(origin_to_carry(None), OriginCarry::Nothing);
     }
 
-    /// G6 (LANE IDENTITY P-ID0), wiring half: a peer-origin ledger entry
+    /// G6 (LANE IDENTITY P-ID0), wiring half: a node-origin ledger entry
     /// must not derail an otherwise-ordinary resurrect (the taught refusal
     /// eprintln fires, but the invocation still succeeds cleanly) —
     /// `resurrect_one`'s `origin_to_carry` match sits right after
     /// `stamp_resumed_from`, on the SAME `AOIDE_TERMINAL=true` fixture that
     /// never actually registers a record (see the undying-transfer test
-    /// above), so this exercises the `RefusedPeer` arm specifically rather
+    /// above), so this exercises the `RefusedNode` arm specifically rather
     /// than only proving it in isolation. The refusal DECISION itself is
-    /// the real assertion above; whether a carried (non-peer) value LANDS
+    /// the real assertion above; whether a carried (non-node) value LANDS
     /// on a real record is `stamp_origin`'s own contract, proven directly
     /// in `session_store.rs`'s `stamp_origin_lands_the_field_and_never_
     /// restages_graph_json` — a real registered windowed spawn is the live
     /// gate's job, per this module's own doc (top of file), never this
     /// crate's.
     #[test]
-    fn a_peer_origin_ledger_entry_never_derails_an_ordinary_resurrect() {
+    fn a_node_origin_ledger_entry_never_derails_an_ordinary_resurrect() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -1510,8 +1511,8 @@ mod tests {
         std::env::set_var("WAYLAND_DISPLAY", "wayland-0");
 
         let entry = aoide_storage::ledger::LedgerEntry {
-            origin: Some("peer:yomi-strix".to_string()),
-            ..ledger_entry("ledger-peer-origin", "claude", &proj_path, "2026-08-20T01:00:00Z")
+            origin: Some("node:yomi-strix".to_string()),
+            ..ledger_entry("ledger-node-origin", "claude", &proj_path, "2026-08-20T01:00:00Z")
         };
         set_ledger(&[entry]);
 
@@ -2033,10 +2034,10 @@ mod tests {
     }
 
     /// U4: a spec whose `host` is not this host's own name is SUMMONED, not
-    /// skipped — but "no peer named that host at all" is the first local
+    /// skipped — but "no node named that host at all" is the first local
     /// refusal `summon_remote` holds, before the wire is ever touched. Lands
     /// in `failed[]` (never `skipped[]` — this spec was tried and refused),
-    /// taught to name `peer add`.
+    /// taught to name `node add`.
     #[test]
     fn bare_mode_remote_summon_fails_taught_against_an_unregistered_host() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -2056,28 +2057,28 @@ mod tests {
         assert_eq!(failed[0]["disposition"], "failed");
         assert_eq!(failed[0]["host"], "some-other-host");
         assert!(
-            failed[0]["reason"].as_str().unwrap().contains("peer add"),
-            "reason must teach `peer add`: {}",
+            failed[0]["reason"].as_str().unwrap().contains("node add"),
+            "reason must teach `node add`: {}",
             failed[0]["reason"]
         );
 
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The second local refusal: a peer registered via the legacy `peer
+    /// The second local refusal: a node registered via the legacy `node
     /// add` escape but never paired (`verified: false`) can never satisfy
     /// the remote door's `Signature`-rung spawn gate — refused LOCALLY,
-    /// same posture `aoide-client::commands::handle_peer_spawn` already
+    /// same posture `aoide-client::commands::handle_node_spawn` already
     /// holds toward its own CLI callers.
     #[test]
-    fn bare_mode_remote_summon_fails_taught_against_an_unverified_peer() {
+    fn bare_mode_remote_summon_fails_taught_against_an_unverified_node() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, cwd) = setup_manifest(
             "resurrect-manifest-remote-unverified",
             vec![manifest_spec("sakaki", ".", "claude", None)],
         );
-        aoide_storage::peer_store::save_peers(&[unpaired_peer("sakaki")]).unwrap();
+        aoide_storage::node_store::save_nodes(&[unpaired_node("sakaki")]).unwrap();
 
         let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
         drop(cwd);
@@ -2095,12 +2096,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// The third local refusal: a verified peer, but nothing to summon it
+    /// The third local refusal: a verified node, but nothing to summon it
     /// WITH — no `command` and no registered default launch for the spec's
-    /// agent. Proven with a genuinely unreachable peer URL (port 9, the
+    /// agent. Proven with a genuinely unreachable node URL (port 9, the
     /// same discard-port fixture `send.rs`'s own remote-delivery tests use)
     /// to prove the wire is never even touched — the refusal must fire
-    /// before `spawn_on_peer` gets a chance to fail for a DIFFERENT reason.
+    /// before `spawn_on_node` gets a chance to fail for a DIFFERENT reason.
     #[test]
     fn bare_mode_remote_summon_fails_taught_with_nothing_to_summon() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
@@ -2109,7 +2110,7 @@ mod tests {
             "resurrect-manifest-remote-no-command",
             vec![manifest_spec("sakaki", ".", "no-such-harness", None)],
         );
-        aoide_storage::peer_store::save_peers(&[verified_peer("sakaki", "http://127.0.0.1:9/")]).unwrap();
+        aoide_storage::node_store::save_nodes(&[verified_node("sakaki", "http://127.0.0.1:9/")]).unwrap();
 
         let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
         drop(cwd);
@@ -2126,21 +2127,21 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A verified, reachable-address peer with nothing listening at all
+    /// A verified, reachable-address node with nothing listening at all
     /// (port 9, same discard-port fixture `send.rs`'s remote-delivery
-    /// tests already rely on) — `spawn_on_peer`'s own connection failure
+    /// tests already rely on) — `spawn_on_node`'s own connection failure
     /// surfaces VERBATIM into `failed[]`, never turned into a hard
     /// `Outcome::error` (per-spec isolation holds even past the local
     /// refusals).
     #[test]
-    fn bare_mode_remote_summon_fails_taught_when_the_peer_is_unreachable() {
+    fn bare_mode_remote_summon_fails_taught_when_the_node_is_unreachable() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR", "XDG_RUNTIME_DIR", "AOIDE_AUDIT_LOG"]);
         let (root, cwd) = setup_manifest(
             "resurrect-manifest-remote-unreachable",
             vec![manifest_spec("sakaki", ".", "claude", Some("git -C /home/khoa/Aoide pull --ff-only"))],
         );
-        aoide_storage::peer_store::save_peers(&[verified_peer("sakaki", "http://127.0.0.1:9/")]).unwrap();
+        aoide_storage::node_store::save_nodes(&[verified_node("sakaki", "http://127.0.0.1:9/")]).unwrap();
 
         let out = session_resurrect(&flag_invocation(&["resurrect"], &[]));
         drop(cwd);

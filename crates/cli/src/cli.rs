@@ -166,13 +166,13 @@ mod tests {
     }
 
     // The collision is with ANY registered group's first segment, not just
-    // `a2a` — `is_command_token` used to fire on `graph`, `peer`, `rice`,
+    // `a2a` — `is_command_token` used to fire on `graph`, `node`, `rice`,
     // `screen`, ... every top-level group name, whenever it happened to be a
     // flag's value. Two more, to prove the fix is general rather than an
     // `a2a`-shaped patch.
     #[test]
     fn agent_value_colliding_with_other_registered_groups_is_still_consumed_as_a_value() {
-        for group in ["graph", "peer", "rice"] {
+        for group in ["graph", "node", "rice"] {
             let (inv, _) = parse(
                 &argv(&["conduct", "--agent", group, "--id", "Y", "--", "true"]),
                 Door::Cli,

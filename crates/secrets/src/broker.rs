@@ -83,12 +83,12 @@
 //!                                                       gets a clean
 //!                                                       "dismissed" refusal)
 //! <- {"ok":false,"error":"unknown pending id `<id>`"}
-//! <- {"ok":false,"error":"<peer-uid-mismatch refusal>"} (task #73 — the
+//! <- {"ok":false,"error":"<node-uid-mismatch refusal>"} (task #73 — the
 //!                                                       dismissing
 //!                                                       connection's own
-//!                                                       peer uid is
+//!                                                       node uid is
 //!                                                       neither the ask's
-//!                                                       stamped peer uid
+//!                                                       stamped node uid
 //!                                                       nor the broker's
 //!                                                       own; the ask stays
 //!                                                       parked, untouched)
@@ -114,7 +114,7 @@
 //! dismiss` are convenience wrappers over the same ops, not the only door
 //! onto them.
 //!
-//! **Kernel-truth peer identity (task #73, this commit).** The paragraph
+//! **Kernel-truth node identity (task #73, this commit).** The paragraph
 //! above is about the wire's `consumer` field, which STAYS self-asserted —
 //! #73 does not change that. What it adds is a SEPARATE, orthogonal fact
 //! this crate did not have before: `handle_conn` reads `SO_PEERCRED`
@@ -122,11 +122,11 @@
 //! it into every op handler on that connection — the connecting process's
 //! REAL uid, verified by the kernel, independent of anything the wire
 //! request itself claims. A parked ask is stamped with the requesting
-//! connection's peer uid at park time (`park::ParkedAsk::peer_uid`'s own
+//! connection's node uid at park time (`park::ParkedAsk::peer_uid`'s own
 //! doc), shown (additively) in `pending`'s reply, and is the ONE fact
 //! [`handle_dismiss`] gates a decision on — see that function's own doc.
 //! Every resolve/park/approve/dismiss/put audit line also carries the
-//! acting connection's peer uid alongside the pre-existing self-asserted
+//! acting connection's node uid alongside the pre-existing self-asserted
 //! name, for the identical reason: a kernel fact recorded next to a
 //! self-asserted one, never conflated with it. A `SO_PEERCRED` read
 //! failure is treated as an UNIDENTIFIED connection (`None`) — never a
@@ -226,8 +226,8 @@
 //! daemon's LIVE `ping`-fetched public key, fresh-starttime pid-reuse
 //! defense included — never anything the wire asserts) and hands the
 //! result in as a parameter, clock-discipline style. A caller whose sealed
-//! session is REMOTE-ORIGIN (`originClass` `peer:*` — a session a remote
-//! peer created) is refused unless the secret's `allowRemoteOrigin` policy
+//! session is REMOTE-ORIGIN (`originClass` `node:*` — a session a remote
+//! node created) is refused unless the secret's `allowRemoteOrigin` policy
 //! bit (default OFF, `secrets allow-remote-origin <name> on` to opt in) is
 //! set; the refusal ([`denied_remote_origin_message`]) names the flag, the
 //! session, and its origin. Sitting BEFORE the TOTP branch means a refused
@@ -247,7 +247,7 @@
 //! axis — and the three policy axes stay distinct: `remote` (may this
 //! secret be served through a NON-LOCAL entry point), `automation` (may a
 //! listed consumer skip TOTP), `allowRemoteOrigin` (may a session a REMOTE
-//! PEER created resolve this secret locally).
+//! NODE created resolve this secret locally).
 //!
 //! **`requireTotp` is wired live (P-V3).** [`resolve_gate`] rejects it
 //! outright ONLY when no `secrets enroll` has ever run on this host
@@ -449,12 +449,12 @@ pub fn serve(secrets_home: &Path, socket_path: &Path) -> std::io::Result<()> {
 fn handle_conn(secrets_home: &Path, events_path: &Path, stream: UnixStream, parked: &ParkRegistry) {
     // #73: read SO_PEERCRED ONCE, at connection start, and thread the same
     // value into every op this connection sends — never re-read per line
-    // (the peer identity of an already-accepted connection cannot change
+    // (the node identity of an already-accepted connection cannot change
     // mid-stream, and re-reading would just be wasted syscalls). `None`
     // when the read fails (`peercred::peer_cred`'s own "unidentified, never
     // a panic" contract) — every handler below already treats an absent
-    // peer uid as "cannot be authorized," never as "trust it."
-    let peer = crate::peercred::peer_cred(&stream);
+    // node uid as "cannot be authorized," never as "trust it."
+    let node = crate::peercred::peer_cred(&stream);
     let mut writer = match stream.try_clone() {
         Ok(w) => w,
         Err(e) => {
@@ -471,7 +471,7 @@ fn handle_conn(secrets_home: &Path, events_path: &Path, stream: UnixStream, park
         if line.trim().is_empty() {
             continue;
         }
-        let reply = handle_line(secrets_home, events_path, &line, parked, &mut writer, peer);
+        let reply = handle_line(secrets_home, events_path, &line, parked, &mut writer, node);
         if write_json_line(&mut writer, &reply).is_err() {
             break;
         }
@@ -507,25 +507,25 @@ fn handle_line(
     line: &str,
     parked: &ParkRegistry,
     interim_out: &mut impl Write,
-    peer: Option<crate::peercred::PeerCred>,
+    node: Option<crate::peercred::PeerCred>,
 ) -> Value {
     let req: Value = match serde_json::from_str(line.trim()) {
         Ok(v) => v,
         Err(_) => return json!({"ok": false, "error": "malformed request: not valid JSON"}),
     };
     match req.get("op").and_then(Value::as_str) {
-        Some("resolve") => handle_resolve(secrets_home, events_path, &req, parked, interim_out, peer),
-        Some("put") => handle_put(secrets_home, events_path, &req, peer),
+        Some("resolve") => handle_resolve(secrets_home, events_path, &req, parked, interim_out, node),
+        Some("put") => handle_put(secrets_home, events_path, &req, node),
         Some("pending") => handle_pending(parked),
-        Some("approve") => handle_approve(secrets_home, events_path, parked, &req, peer),
-        Some("dismiss") => handle_dismiss(secrets_home, events_path, parked, &req, peer),
-        Some("admin") => handle_admin(secrets_home, &req, peer),
+        Some("approve") => handle_approve(secrets_home, events_path, parked, &req, node),
+        Some("dismiss") => handle_dismiss(secrets_home, events_path, parked, &req, node),
+        Some("admin") => handle_admin(secrets_home, &req, node),
         Some(other) => json!({"ok": false, "error": format!("unknown op `{other}`")}),
         None => json!({"ok": false, "error": "malformed request: missing `op`"}),
     }
 }
 
-/// Render a peer uid for a taught error message or an audit line — `None`
+/// Render a node uid for a taught error message or an audit line — `None`
 /// (an unidentified connection, `peercred::peer_cred`'s own doc) prints as
 /// `"unidentified"` rather than a bare blank, so a human reading `audit.log`
 /// or a refusal never mistakes it for uid 0 or an omitted field.
@@ -536,15 +536,15 @@ fn peer_uid_display(peer_uid: Option<u32>) -> String {
 /// Capture a parking ask's [`AskOrigin`] — ONCE, right here, at the SAME
 /// park-time instant `peer_uid` itself is stamped (`AskOrigin`'s own doc on
 /// why this can never be deferred to render time: the pid can exit and be
-/// reused). An unidentified connection (`peer: None`, `peercred::peer_cred`
+/// reused). An unidentified connection (`node: None`, `peercred::peer_cred`
 /// itself already failed) still gets a hostname — this broker's own host is
 /// knowable regardless of who's asking — but no username/pid/comm, since
 /// there is no kernel-truth pid to read either from.
-fn capture_origin(peer: Option<crate::peercred::PeerCred>) -> AskOrigin {
+fn capture_origin(node: Option<crate::peercred::PeerCred>) -> AskOrigin {
     AskOrigin {
-        username: peer.and_then(|p| crate::peercred::username_for_uid(p.uid)),
-        pid: peer.map(|p| p.pid),
-        comm: peer.and_then(|p| crate::peercred::read_comm(p.pid)),
+        username: node.and_then(|p| crate::peercred::username_for_uid(p.uid)),
+        pid: node.map(|p| p.pid),
+        comm: node.and_then(|p| crate::peercred::read_comm(p.pid)),
         hostname: Some(crate::enroll::local_hostname()),
     }
 }
@@ -581,14 +581,14 @@ fn handle_resolve(
     req: &Value,
     parked: &ParkRegistry,
     interim_out: &mut impl Write,
-    peer: Option<crate::peercred::PeerCred>,
+    node: Option<crate::peercred::PeerCred>,
 ) -> Value {
     let secret = req.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
     let consumer = req.get("consumer").and_then(Value::as_str).unwrap_or("").to_string();
     let argv0 = req.get("argv0").and_then(Value::as_str).map(str::to_string);
     let totp = req.get("totp").and_then(Value::as_str).map(str::to_string);
     let wait = req.get("wait").and_then(Value::as_bool).unwrap_or(true);
-    let peer_uid = peer.map(|p| p.uid);
+    let peer_uid = node.map(|p| p.uid);
     // Optional, self-asserted, DISPLAY-ONLY context for why this ask exists
     // — named `ask_reason` (not `reason`) purely to avoid shadowing this
     // function's own many `reason` locals (the DENIAL text each `Denied`/
@@ -606,7 +606,7 @@ fn handle_resolve(
     // (LANE IDENTITY P-ID4) — like the clock, an impure read taken at the
     // edge and handed into the deterministic gate as a parameter.
     let now_unix = aoide_protocol::audit::now_secs();
-    let caller = attested_caller_origin(peer);
+    let caller = attested_caller_origin(node);
     match resolve_gate(
         secrets_home,
         &secret,
@@ -643,14 +643,14 @@ fn handle_resolve(
                 return json!({"ok": false, "error": reason});
             }
             let cap = crate::park::park_cap();
-            // #73: the requesting connection's own kernel-truth peer uid is
+            // #73: the requesting connection's own kernel-truth node uid is
             // stamped onto the ask right here, at park time — the ONE fact
-            // `handle_dismiss` later checks a dismisser's own peer uid
+            // `handle_dismiss` later checks a dismisser's own node uid
             // against (`park::ParkedAsk::peer_uid`'s own doc).
             // Captured NOW, once, never re-read later (`AskOrigin`'s own
             // doc: the pid can exit and be reused long before this ask
             // resolves or a dialog renders it).
-            let origin = capture_origin(peer);
+            let origin = capture_origin(node);
             let Some((id, rx)) =
                 parked.park_if_room(&secret, &consumer, now_unix, cap, peer_uid, ask_reason.as_deref(), origin.clone())
             else {
@@ -828,14 +828,14 @@ fn handle_approve(
     events_path: &Path,
     parked: &ParkRegistry,
     req: &Value,
-    peer: Option<crate::peercred::PeerCred>,
+    node: Option<crate::peercred::PeerCred>,
 ) -> Value {
-    let approver_uid = peer.map(|p| p.uid);
+    let approver_uid = node.map(|p| p.uid);
     let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     if id.is_empty() {
         return json!({"ok": false, "error": "malformed request: `id` is required"});
     }
-    let Some((secret, consumer, _ask_peer_uid)) = parked.peek(&id) else {
+    let Some((secret, consumer, _ask_node_uid)) = parked.peek(&id) else {
         let reason = format!("unknown pending id `{id}`");
         audit_approve(secrets_home, &id, None, false, &reason, approver_uid);
         return json!({"ok": false, "error": reason});
@@ -925,7 +925,7 @@ fn fetch_secret_value(secrets_home: &Path, secret: &str) -> Result<String, Strin
 /// an ask whose own `peer_uid` is also `None` — there is nothing to prove a
 /// match against, so the safe default is refusal, not a pass. An
 /// UNIDENTIFIED ask (`ask_peer_uid: None` — the ORIGINAL `resolve`
-/// connection's own peer cred could not be read at park time) can still be
+/// connection's own node cred could not be read at park time) can still be
 /// dismissed by the broker's own uid (the operator path never depended on
 /// matching the ask's uid to begin with), but by no ordinary caller — again,
 /// nothing to match.
@@ -942,7 +942,7 @@ fn dismiss_authorized(dismisser_uid: Option<u32>, ask_peer_uid: Option<u32>, bro
 /// rather than having to go correlate `audit.log` by hand.
 fn dismiss_refused_message(id: &str, dismisser_uid: Option<u32>, ask_peer_uid: Option<u32>, broker_euid: u32) -> String {
     format!(
-        "dismiss `{id}` refused: this connection's peer uid ({}) is neither the ask's own peer uid ({}) nor \
+        "dismiss `{id}` refused: this connection's node uid ({}) is neither the ask's own node uid ({}) nor \
          the broker's own uid ({broker_euid}) — only the original caller or the broker's own operator (uid \
          {broker_euid}) may dismiss it",
         peer_uid_display(dismisser_uid),
@@ -950,7 +950,7 @@ fn dismiss_refused_message(id: &str, dismisser_uid: Option<u32>, ask_peer_uid: O
     )
 }
 
-/// `dismiss <id>` (P-N2; peer-uid-gated, task #73): resolve a parked ask
+/// `dismiss <id>` (P-N2; node-uid-gated, task #73): resolve a parked ask
 /// with no code at all — the parked connection gets a clean "dismissed"
 /// refusal, the dismisser gets `{"ok":true}`. An unknown id is a taught
 /// error naming it explicitly (task requirement).
@@ -966,9 +966,9 @@ fn handle_dismiss(
     events_path: &Path,
     parked: &ParkRegistry,
     req: &Value,
-    peer: Option<crate::peercred::PeerCred>,
+    node: Option<crate::peercred::PeerCred>,
 ) -> Value {
-    let dismisser_uid = peer.map(|p| p.uid);
+    let dismisser_uid = node.map(|p| p.uid);
     let id = req.get("id").and_then(Value::as_str).unwrap_or("").to_string();
     if id.is_empty() {
         return json!({"ok": false, "error": "malformed request: `id` is required"});
@@ -1029,11 +1029,11 @@ fn handle_dismiss(
 /// `DeniedExists` -> `{"ok":false,"exists":true,"error":...}` (the
 /// machine-readable refusal); `Denied(reason)` -> the ordinary
 /// `{"ok":false,"error":reason}`, unchanged from before this feature.
-fn handle_put(secrets_home: &Path, events_path: &Path, req: &Value, peer: Option<crate::peercred::PeerCred>) -> Value {
+fn handle_put(secrets_home: &Path, events_path: &Path, req: &Value, node: Option<crate::peercred::PeerCred>) -> Value {
     let secret = req.get("secret").and_then(Value::as_str).unwrap_or("").to_string();
     let value = req.get("value").and_then(Value::as_str).unwrap_or("").to_string();
     let overwrite = req.get("overwrite").and_then(Value::as_bool).unwrap_or(false);
-    let peer_uid = peer.map(|p| p.uid);
+    let peer_uid = node.map(|p| p.uid);
 
     if secret.is_empty() {
         return json!({"ok": false, "error": "malformed request: `secret` is required"});
@@ -1063,11 +1063,11 @@ fn handle_put(secrets_home: &Path, events_path: &Path, req: &Value, peer: Option
     reply
 }
 
-/// Task #79's admin-op peer-cred gate: an `{op:"admin"}` request is
+/// Task #79's admin-op node-cred gate: an `{op:"admin"}` request is
 /// accepted ONLY when the CONNECTING process's own uid is the broker's own
 /// effective uid — reuses [`home::admin_identity_error`]'s exact wording
 /// (root's extra "plain `sudo` runs as root" clause included) by treating
-/// the peer's uid as that function's "process euid" argument and the
+/// the node's uid as that function's "process euid" argument and the
 /// broker's own euid as its "home owner" argument, so a refusal here
 /// teaches the IDENTICAL fix the direct-write path's
 /// [`crate::commands::require_admin_identity`] already teaches — this is
@@ -1084,7 +1084,7 @@ fn admin_gate(peer_uid: Option<u32>, secrets_home: &Path, subcommand: &str) -> O
         Some(uid) => crate::home::admin_identity_error(uid, broker_euid, secrets_home, subcommand),
         None => Some(format!(
             "secrets {subcommand} over the broker socket must come from an IDENTIFIED connection — this connection's \
-             peer uid could not be determined (SO_PEERCRED read failed), so it is refused the same way a \
+             node uid could not be determined (SO_PEERCRED read failed), so it is refused the same way a \
              mismatched uid would be. Run: sudo -u aoide-secrets aoide secrets {subcommand} ..."
         )),
     }
@@ -1113,8 +1113,8 @@ fn admin_gate(peer_uid: Option<u32>, secrets_home: &Path, subcommand: &str) -> O
 /// not a human mistyping a terminal command), so an admin op with a
 /// missing/malformed field gets a plain domain error from [`crate::admin`],
 /// never a second usage-error vocabulary grown here.
-fn handle_admin(secrets_home: &Path, req: &Value, peer: Option<crate::peercred::PeerCred>) -> Value {
-    let peer_uid = peer.map(|p| p.uid);
+fn handle_admin(secrets_home: &Path, req: &Value, node: Option<crate::peercred::PeerCred>) -> Value {
+    let peer_uid = node.map(|p| p.uid);
     let Some(subcommand) = req.get("command").and_then(Value::as_str) else {
         return json!({"ok": false, "error": "malformed request: `command` is required"});
     };
@@ -1210,8 +1210,8 @@ fn audit_admin(secrets_home: &Path, subcommand: &str, name: &str, granted: bool,
     let status = if granted { "granted" } else { "denied" };
     let puid = peer_uid_display(peer_uid);
     let message = match reason {
-        Some(r) => format!("admin {subcommand} `{name}` (peer uid {puid}): {status} ({r})"),
-        None => format!("admin {subcommand} `{name}` (peer uid {puid}): {status}"),
+        Some(r) => format!("admin {subcommand} `{name}` (node uid {puid}): {status} ({r})"),
+        None => format!("admin {subcommand} `{name}` (node uid {puid}): {status}"),
     };
     let _ = aoide_protocol::audit(
         &aoide_protocol::default_audit_log(),
@@ -1409,13 +1409,13 @@ fn resolve_gate(
     }
     // The origin gate (LANE IDENTITY P-ID4): after exists/consumers, before
     // TOTP/automation — a caller whose SEALED session is remote-origin
-    // (`peer:*`) is refused unless this secret opted in, so a remote-origin
+    // (`node:*`) is refused unless this secret opted in, so a remote-origin
     // caller can never even reach the park/approve machinery for a secret
     // that hasn't admitted it. Keys ONLY on a POSITIVELY-attested remote
     // origin (module doc's "The origin gate" section states the boundary
     // exactly): `caller == None` — unidentified — falls through untouched.
     if let Some((session_id, origin)) = caller {
-        if origin.starts_with("peer:") && !policy.allow_remote_origin {
+        if aoide_storage::attest::is_node_origin(origin) && !policy.allow_remote_origin {
             return GateOutcome::Denied(denied_remote_origin_message(secret, session_id, origin));
         }
     }
@@ -1467,13 +1467,13 @@ fn denied_remote_origin_message(secret: &str, session_id: &str, origin: &str) ->
     )
 }
 
-/// Resolve the connecting peer's POSITIVELY-attested sealed session (LANE
+/// Resolve the connecting node's POSITIVELY-attested sealed session (LANE
 /// IDENTITY P-ID4): kernel-truth `SO_PEERCRED` pid -> real `/proc`
 /// ancestry -> sealed session record -> seal verified against the daemon's
 /// LIVE public key, all via `aoide_storage::attest::attested_caller` (ONE
 /// implementation, shared with `aoide-conduct`'s send gate — that module's
 /// doc has the DAG argument and the fresh-starttime pid-reuse defense).
-/// `None` on ANY missing link — an unidentified connection (`peer: None`),
+/// `None` on ANY missing link — an unidentified connection (`node: None`),
 /// an unreachable daemon, an unreadable roster, no verifying ancestor —
 /// and `None` always means UNIDENTIFIED: the origin gate ignores it, per
 /// the module doc's stated boundary. In the packaged cross-uid deployment
@@ -1482,8 +1482,8 @@ fn denied_remote_origin_message(secret: &str, session_id: &str, origin: &str) ->
 /// resolves `None` for every caller there — the gate bites wherever the
 /// broker runs as the operator's own uid (`attest`'s module doc carries
 /// the same honesty note from the other side).
-fn attested_caller_origin(peer: Option<crate::peercred::PeerCred>) -> Option<(String, String)> {
-    aoide_storage::attest::attested_caller(peer?.pid)
+fn attested_caller_origin(node: Option<crate::peercred::PeerCred>) -> Option<(String, String)> {
+    aoide_storage::attest::attested_caller(node?.pid)
 }
 
 /// Serializes [`verify_totp_gate`]'s ENTIRE replay-ledger load -> record ->
@@ -1645,11 +1645,11 @@ fn audit_resolve(
     let status = if granted { "granted" } else { "denied" };
     let message = match reason {
         Some(r) => format!(
-            "secret `{secret}` for consumer `{consumer}` (peer uid {}): {status} ({r})",
+            "secret `{secret}` for consumer `{consumer}` (node uid {}): {status} ({r})",
             peer_uid_display(peer_uid)
         ),
         None => {
-            format!("secret `{secret}` for consumer `{consumer}` (peer uid {}): {status}", peer_uid_display(peer_uid))
+            format!("secret `{secret}` for consumer `{consumer}` (node uid {}): {status}", peer_uid_display(peer_uid))
         }
     };
     let _ = aoide_protocol::audit(
@@ -1694,10 +1694,10 @@ fn audit_put(
     let status = if granted { "granted" } else { "denied" };
     let puid = peer_uid_display(peer_uid);
     let message = match (reason, replaced) {
-        (Some(r), _) => format!("put `{secret}` (peer uid {puid}): {status} ({r})"),
-        (None, Some(true)) => format!("put `{secret}` (peer uid {puid}): {status} (replaced existing value)"),
-        (None, Some(false)) => format!("put `{secret}` (peer uid {puid}): {status} (stored new value)"),
-        (None, None) => format!("put `{secret}` (peer uid {puid}): {status}"),
+        (Some(r), _) => format!("put `{secret}` (node uid {puid}): {status} ({r})"),
+        (None, Some(true)) => format!("put `{secret}` (node uid {puid}): {status} (replaced existing value)"),
+        (None, Some(false)) => format!("put `{secret}` (node uid {puid}): {status} (stored new value)"),
+        (None, None) => format!("put `{secret}` (node uid {puid}): {status}"),
     };
     let _ = aoide_protocol::audit(
         &aoide_protocol::default_audit_log(),
@@ -1744,7 +1744,7 @@ fn audit_park(
         eprintln!("[aoide/secrets] could not write the secrets audit log: {e}");
     }
     let message = format!(
-        "secret `{secret}` for consumer `{consumer}` (peer uid {}): parked (id `{id}`, awaiting a TOTP code)",
+        "secret `{secret}` for consumer `{consumer}` (node uid {}): parked (id `{id}`, awaiting a TOTP code)",
         peer_uid_display(peer_uid)
     );
     let _ = aoide_protocol::audit(
@@ -1778,9 +1778,9 @@ fn audit_approve(secrets_home: &Path, id: &str, secret: Option<&str>, granted: b
     let status = if granted { "granted" } else { "denied" };
     let puid = peer_uid_display(peer_uid);
     let message = match secret {
-        Some(s) if !reason.is_empty() => format!("approve `{id}` for secret `{s}` (approver peer uid {puid}): {status} ({reason})"),
-        Some(s) => format!("approve `{id}` for secret `{s}` (approver peer uid {puid}): {status}"),
-        None => format!("approve `{id}` (approver peer uid {puid}): {status} ({reason})"),
+        Some(s) if !reason.is_empty() => format!("approve `{id}` for secret `{s}` (approver node uid {puid}): {status} ({reason})"),
+        Some(s) => format!("approve `{id}` for secret `{s}` (approver node uid {puid}): {status}"),
+        None => format!("approve `{id}` (approver node uid {puid}): {status} ({reason})"),
     };
     let _ = aoide_protocol::audit(
         &aoide_protocol::default_audit_log(),
@@ -1810,9 +1810,9 @@ fn audit_dismiss(secrets_home: &Path, id: &str, secret: &str, granted: bool, rea
     let status = if granted { "dismissed" } else { "denied" };
     let puid = peer_uid_display(peer_uid);
     let message = match reason {
-        Some(r) => format!("dismiss `{id}` (peer uid {puid}): {status} ({r})"),
-        None if !secret.is_empty() => format!("dismiss `{id}` for secret `{secret}` (peer uid {puid}): {status}"),
-        None => format!("dismiss `{id}` (peer uid {puid}): {status}"),
+        Some(r) => format!("dismiss `{id}` (node uid {puid}): {status} ({r})"),
+        None if !secret.is_empty() => format!("dismiss `{id}` for secret `{secret}` (node uid {puid}): {status}"),
+        None => format!("dismiss `{id}` (node uid {puid}): {status}"),
     };
     let _ = aoide_protocol::audit(
         &aoide_protocol::default_audit_log(),
@@ -1896,16 +1896,16 @@ mod tests {
         dir
     }
 
-    /// A peer identity matching the broker's OWN effective uid — task
+    /// A node identity matching the broker's OWN effective uid — task
     /// #73's `dismiss_authorized` always admits the broker's own euid
     /// regardless of an ask's stamped `peer_uid` (invariant: `dismiss_
     /// authorized_always_admits_the_brokers_own_euid`). This is the
     /// cleanup identity every pre-#73 test that dismisses its own parked
-    /// ask (never itself testing peer-uid gating) uses — an `None` peer
+    /// ask (never itself testing node-uid gating) uses — an `None` node
     /// there would now be a genuinely unidentified dismisser, refused by
     /// the fail-closed rule even against an ask whose own `peer_uid` is
     /// also `None`.
-    fn operator_peer() -> Option<crate::peercred::PeerCred> {
+    fn operator_node() -> Option<crate::peercred::PeerCred> {
         Some(crate::peercred::PeerCred { uid: crate::home::effective_uid(), gid: 0, pid: 0 })
     }
 
@@ -2022,13 +2022,13 @@ mod tests {
         seed(&home, &[Policy::new("t", "scratch", "stored-value")]);
         let (granted, result) = gate_outcome_as_result(resolve_gate(
             &home, "t", "m", None, NOW,
-            Some(("remote-orch", "peer:sakaki")),
+            Some(("remote-orch", "node:sakaki")),
         ));
         assert!(!granted);
         let err = result.unwrap_err();
         assert!(err.contains("allowRemoteOrigin"), "the refusal names the flag: {err}");
         assert!(err.contains("remote-orch"), "the refusal names the session: {err}");
-        assert!(err.contains("peer:sakaki"), "the refusal names the origin: {err}");
+        assert!(err.contains("node:sakaki"), "the refusal names the origin: {err}");
         assert!(err.contains("secrets allow-remote-origin t on"), "the refusal teaches the opt-in: {err}");
         std::fs::remove_dir_all(&home).ok();
     }
@@ -2043,14 +2043,14 @@ mod tests {
         seed(&home, &[p]);
         let (granted, result) = gate_outcome_as_result(resolve_gate(
             &home, "t", "m", None, NOW,
-            Some(("remote-orch", "peer:sakaki")),
+            Some(("remote-orch", "node:sakaki")),
         ));
         assert!(granted);
         assert_eq!(result.unwrap(), "stored-value");
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// The gate keys ONLY on a `peer:*` origin: a LOCAL-origin attested
+    /// The gate keys ONLY on a `node:*` origin: a LOCAL-origin attested
     /// caller and an UNIDENTIFIED one (`None` — the module doc's stated
     /// boundary: this gate narrows remote-origin sessions, it does not
     /// authenticate local ones) both resolve exactly as before P-ID4.
@@ -2088,12 +2088,12 @@ mod tests {
 
         let (granted, result) = gate_outcome_as_result(resolve_gate(
             &home, "t", "someone-else", None, NOW,
-            Some(("remote-orch", "peer:sakaki")),
+            Some(("remote-orch", "node:sakaki")),
         ));
         assert!(!granted);
         assert_eq!(result.unwrap_err(), "consumer not authorized for this secret");
 
-        match resolve_gate(&home, "t2", "m", None, NOW, Some(("remote-orch", "peer:sakaki"))) {
+        match resolve_gate(&home, "t2", "m", None, NOW, Some(("remote-orch", "node:sakaki"))) {
             GateOutcome::Denied(reason) => {
                 assert!(reason.contains("allowRemoteOrigin"), "{reason}");
             }
@@ -2133,14 +2133,14 @@ mod tests {
                 session_id: "remote-orch".to_string(),
                 pid: me,
                 pid_starttime: st,
-                origin_class: "peer:sakaki".to_string(),
+                origin_class: "node:sakaki".to_string(),
                 issued_at: 1_700_000_000,
             };
             aoide_storage::records::SessionRecord {
                 session_id: "remote-orch".to_string(),
                 state: "idle".to_string(),
                 pid: Some(me as u32),
-                origin: Some("peer:sakaki".to_string()),
+                origin: Some("node:sakaki".to_string()),
                 seal: Some(aoide_storage::sealed_id::mint_seal(&kp, &sid)),
                 sealed_issued_at: Some(1_700_000_000),
                 ..Default::default()
@@ -2172,23 +2172,23 @@ mod tests {
         });
         std::env::set_var("AOIDE_DAEMON_SOCKET", &sock);
 
-        let peer = Some(crate::peercred::PeerCred {
+        let node = Some(crate::peercred::PeerCred {
             uid: crate::home::effective_uid(),
             gid: 0,
             pid: me,
         });
         let req = r#"{"op":"resolve","secret":"t","consumer":"m"}"#;
-        let reply = handle_line(&home, &home.join("events.jsonl"), req, &ParkRegistry::new(), &mut Vec::new(), peer);
+        let reply = handle_line(&home, &home.join("events.jsonl"), req, &ParkRegistry::new(), &mut Vec::new(), node);
         assert_eq!(reply["ok"], false, "{reply}");
         let err = reply["error"].as_str().unwrap();
         assert!(err.contains("allowRemoteOrigin"), "{err}");
-        assert!(err.contains("peer:sakaki"), "{err}");
+        assert!(err.contains("node:sakaki"), "{err}");
 
         // Pid-reuse defense through the new call path: a roster whose seal
         // was minted over a STALE starttime no longer attests — the caller
         // is UNIDENTIFIED and the same resolve is admitted.
         write_roster(seal_over(starttime + 1));
-        let reply = handle_line(&home, &home.join("events.jsonl"), req, &ParkRegistry::new(), &mut Vec::new(), peer);
+        let reply = handle_line(&home, &home.join("events.jsonl"), req, &ParkRegistry::new(), &mut Vec::new(), node);
         assert_eq!(reply["ok"], true, "{reply}");
         assert_eq!(reply["value"], "stored-value");
 
@@ -3236,7 +3236,7 @@ mod tests {
                 }
                 let id = id.expect("the resolve did not park in time");
 
-                let dismiss_reply = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_peer());
+                let dismiss_reply = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_node());
                 assert_eq!(dismiss_reply["ok"], true, "{dismiss_reply}");
 
                 let resolved = resolve_handle.join().unwrap();
@@ -3354,7 +3354,7 @@ mod tests {
                 assert_eq!(parked.list().len(), 1, "the cap refusal must never grow the queue");
 
                 // Clean up the still-parked first ask so its thread returns.
-                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_peer());
+                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_node());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
                 let _ = first_handle.join().unwrap();
             });
@@ -3408,7 +3408,7 @@ mod tests {
 
             // Resolve it so the connection's second (final) line arrives
             // without waiting out the real timeout.
-            let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_peer());
+            let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_node());
             assert_eq!(dismissed["ok"], true, "{dismissed}");
 
             // Line 2: the final reply — exactly one, and it is NOT interim.
@@ -3504,7 +3504,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    // ── #73: peer-uid-gated dismiss ─────────────────────────────────────
+    // ── #73: node-uid-gated dismiss ─────────────────────────────────────
     //
     // A real socketpair's SO_PEERCRED always reports THIS test process's
     // own euid on either end — there is no way to fabricate a genuinely
@@ -3518,9 +3518,9 @@ mod tests {
     /// `dismiss_authorized` (the pure decision) — every combination the
     /// task requirement names, no I/O.
     #[test]
-    fn dismiss_authorized_matches_the_asks_own_peer_uid() {
+    fn dismiss_authorized_matches_the_asks_own_node_uid() {
         assert!(dismiss_authorized(Some(1000), Some(1000), 0));
-        assert!(!dismiss_authorized(Some(1000), Some(1001), 0), "a different peer uid must be refused");
+        assert!(!dismiss_authorized(Some(1000), Some(1001), 0), "a different node uid must be refused");
     }
 
     #[test]
@@ -3554,14 +3554,14 @@ mod tests {
         assert!(msg.contains("unidentified"), "{msg}");
     }
 
-    /// End-to-end: an ask stamped with one peer uid, dismissed by a
-    /// DIFFERENT (directly-constructed) peer uid, is refused — and the ask
+    /// End-to-end: an ask stamped with one node uid, dismissed by a
+    /// DIFFERENT (directly-constructed) node uid, is refused — and the ask
     /// stays parked, exactly like an invalid `approve` code leaves it
     /// parked (never silently consumed by a failed unauthorized attempt).
     #[test]
-    fn dismiss_by_a_mismatched_peer_uid_is_refused_and_the_ask_stays_parked() {
+    fn dismiss_by_a_mismatched_node_uid_is_refused_and_the_ask_stays_parked() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let home = tmp_home("dismiss-wrong-peer-uid");
+        let home = tmp_home("dismiss-wrong-node-uid");
         let parked = ParkRegistry::new();
         let real_euid = unsafe { libc::geteuid() };
         // Sentinel uids deliberately far from this test process's own real
@@ -3572,14 +3572,14 @@ mod tests {
         let (id, _rx) = parked.park_if_room("t", "m", NOW, usize::MAX, Some(owner_uid), None, AskOrigin::default()).unwrap();
 
         with_redirected_audit_log(&home, || {
-            let wrong_peer = Some(crate::peercred::PeerCred { uid: wrong_uid, gid: 0, pid: 0 });
+            let wrong_node = Some(crate::peercred::PeerCred { uid: wrong_uid, gid: 0, pid: 0 });
             let reply = handle_line(
                 &home,
                 &home.join("events.jsonl"),
                 &format!(r#"{{"op":"dismiss","id":"{id}"}}"#),
                 &parked,
                 &mut Vec::new(),
-                wrong_peer,
+                wrong_node,
             );
             assert_eq!(reply["ok"], false, "{reply}");
             let err = reply["error"].as_str().unwrap();
@@ -3591,26 +3591,26 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// The matching half: dismissing with the SAME peer uid the ask was
+    /// The matching half: dismissing with the SAME node uid the ask was
     /// stamped with succeeds.
     #[test]
-    fn dismiss_by_the_asks_own_matching_peer_uid_succeeds() {
+    fn dismiss_by_the_asks_own_matching_node_uid_succeeds() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let home = tmp_home("dismiss-matching-peer-uid");
+        let home = tmp_home("dismiss-matching-node-uid");
         let parked = ParkRegistry::new();
         let real_euid = unsafe { libc::geteuid() };
         let owner_uid = real_euid.wrapping_add(30_000);
         let (id, _rx) = parked.park_if_room("t", "m", NOW, usize::MAX, Some(owner_uid), None, AskOrigin::default()).unwrap();
 
         with_redirected_audit_log(&home, || {
-            let matching_peer = Some(crate::peercred::PeerCred { uid: owner_uid, gid: 0, pid: 0 });
+            let matching_node = Some(crate::peercred::PeerCred { uid: owner_uid, gid: 0, pid: 0 });
             let reply = handle_line(
                 &home,
                 &home.join("events.jsonl"),
                 &format!(r#"{{"op":"dismiss","id":"{id}"}}"#),
                 &parked,
                 &mut Vec::new(),
-                matching_peer,
+                matching_node,
             );
             assert_eq!(reply["ok"], true, "{reply}");
         });
@@ -3665,20 +3665,20 @@ mod tests {
     /// over the pre-#73 wire shape (`null` when unstamped, the exact
     /// stamped value otherwise).
     #[test]
-    fn pending_list_carries_the_stamped_peer_uid() {
-        let home = tmp_home("pending-peer-uid");
+    fn pending_list_carries_the_stamped_node_uid() {
+        let home = tmp_home("pending-node-uid");
         let parked = ParkRegistry::new();
 
-        // Unstamped (e.g. `park()`'s own unbounded/no-peer-info shape) ->
+        // Unstamped (e.g. `park()`'s own unbounded/no-node-info shape) ->
         // `null`, never a bare-omitted field (additive-but-present, same
         // discipline `argv0`/`reason` already hold elsewhere in this file).
-        let (unstamped_id, _rx1) = parked.park("no-peer", "m", 1);
+        let (unstamped_id, _rx1) = parked.park("no-node", "m", 1);
         let listed = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"pending"}"#, &parked, &mut Vec::new(), None);
         let arr = listed["pending"].as_array().unwrap();
         let entry = arr.iter().find(|e| e["id"] == unstamped_id).unwrap();
         assert!(entry["peerUid"].is_null(), "{entry}");
 
-        let (stamped_id, _rx2) = parked.park_if_room("with-peer", "m", 2, usize::MAX, Some(4242), None, AskOrigin::default()).unwrap();
+        let (stamped_id, _rx2) = parked.park_if_room("with-node", "m", 2, usize::MAX, Some(4242), None, AskOrigin::default()).unwrap();
         let listed = handle_line(&home, &home.join("events.jsonl"), r#"{"op":"pending"}"#, &parked, &mut Vec::new(), None);
         let arr = listed["pending"].as_array().unwrap();
         let entry = arr.iter().find(|e| e["id"] == stamped_id).unwrap();
@@ -3793,7 +3793,7 @@ mod tests {
                 // Clean up: dismiss the still-parked ask so the spawned
                 // thread returns and this test doesn't leak a blocked one.
                 let (id, ..) = parked.list().into_iter().next().unwrap();
-                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_peer());
+                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_node());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
                 let resolved = resolve_handle.join().unwrap();
                 assert_eq!(resolved["ok"], false);
@@ -4128,7 +4128,7 @@ mod tests {
                 assert!(ev["timeoutSecs"].as_u64().is_some(), "{ev}");
 
                 // Clean up: dismiss so the spawned thread returns.
-                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_peer());
+                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_node());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
                 resolve_handle.join().unwrap();
             });
@@ -4206,7 +4206,7 @@ mod tests {
                 }
                 let id = id.expect("the ask did not park in time");
 
-                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_peer());
+                let dismissed = handle_line(&home, &home.join("events.jsonl"), &format!(r#"{{"op":"dismiss","id":"{id}"}}"#), &parked, &mut Vec::new(), operator_node());
                 assert_eq!(dismissed["ok"], true, "{dismissed}");
 
                 let own_lines = own_log_lines(&home);
@@ -4485,7 +4485,7 @@ mod tests {
     /// `policy.json` — proving the wire framing end to end, not just
     /// [`handle_admin`]'s own logic called directly. A real socketpair
     /// reports THIS test process's own euid on both ends, which is exactly
-    /// [`admin_gate`]'s happy path: the connecting peer IS the broker's own
+    /// [`admin_gate`]'s happy path: the connecting node IS the broker's own
     /// process here, so no uid needs to be faked for this test to exercise
     /// the real gate honestly.
     #[test]
@@ -4528,7 +4528,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// Task #79 item 6b (wrong-uid refusal): a connection whose peer uid
+    /// Task #79 item 6b (wrong-uid refusal): a connection whose node uid
     /// does NOT match the broker's own effective uid gets [`admin_gate`]'s
     /// refusal, and `policy.json` is never touched — the scratch broker's
     /// OWN euid is this test process's real euid, so the mismatch is
@@ -4536,7 +4536,7 @@ mod tests {
     /// tests above already establish (a real socketpair can't produce a
     /// genuinely different uid in-test).
     #[test]
-    fn admin_op_from_a_mismatched_peer_uid_is_refused_and_policy_json_is_untouched() {
+    fn admin_op_from_a_mismatched_node_uid_is_refused_and_policy_json_is_untouched() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("admin-wrong-uid");
         let real_euid = unsafe { libc::geteuid() };
@@ -4544,8 +4544,8 @@ mod tests {
 
         with_redirected_audit_log(&home, || {
             let req = json!({"op": "admin", "command": "add", "name": "t", "backend": "scratch", "key": "k"});
-            let wrong_peer = Some(crate::peercred::PeerCred { uid: wrong_uid, gid: 0, pid: 0 });
-            let reply = handle_admin(&home, &req, wrong_peer);
+            let wrong_node = Some(crate::peercred::PeerCred { uid: wrong_uid, gid: 0, pid: 0 });
+            let reply = handle_admin(&home, &req, wrong_node);
             assert_eq!(reply["ok"], false, "{reply}");
             let err = reply["error"].as_str().unwrap();
             assert!(err.contains(&wrong_uid.to_string()), "{err}");
@@ -4565,8 +4565,8 @@ mod tests {
         let home = tmp_home("admin-root");
         with_redirected_audit_log(&home, || {
             let req = json!({"op": "admin", "command": "add", "name": "t", "backend": "scratch", "key": "k"});
-            let root_peer = Some(crate::peercred::PeerCred { uid: 0, gid: 0, pid: 0 });
-            let reply = handle_admin(&home, &req, root_peer);
+            let root_node = Some(crate::peercred::PeerCred { uid: 0, gid: 0, pid: 0 });
+            let reply = handle_admin(&home, &req, root_node);
             assert_eq!(reply["ok"], false, "{reply}");
             let err = reply["error"].as_str().unwrap();
             assert!(err.contains("root (uid 0)"), "{err}");
@@ -4674,7 +4674,7 @@ mod tests {
         let (elapsed, reply, granted, result) = with_redirected_audit_log(&home, || {
             let req = json!({"op": "admin", "command": "migrate", "name": "t", "target": "scratch"});
             let start = std::time::Instant::now();
-            let reply = handle_admin(&home, &req, operator_peer());
+            let reply = handle_admin(&home, &req, operator_node());
             let elapsed = start.elapsed();
             // A second, unrelated put right after — the SAME "lock genuinely
             // freed, not just this caller giving up" proof the two

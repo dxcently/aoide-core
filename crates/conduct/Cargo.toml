@@ -17,14 +17,14 @@ aoide-storage = { workspace = true }
 # Originally added Phase 5 for `screen send --agent`'s reuse of this
 # crate's A2A drive path — that tenant moved out with `screen` at P-A1 of
 # the binary-split workstream, and the a2a-agent family it drove was
-# deleted outright afterward (peers superseded it). The edge STAYS
+# deleted outright afterward (nodes superseded it). The edge STAYS
 # regardless: two tenants now — `who` (messaging workstream C2, landed) —
-# `graph::who::who` calls `aoide_client::commands::pull_peer_live` for its
-# live per-peer probe — and `resurrect`'s manifest remote-summon path (U4,
+# `graph::who::who` calls `aoide_client::commands::pull_node_live` for its
+# live per-node probe — and `resurrect`'s manifest remote-summon path (U4,
 # command-defrag lane U) — `graph::resurrect::summon_remote` calls
-# `aoide_client::commands::spawn_on_peer` to summon a manifest spec whose
-# `host` names a different, registered peer through the same signed
-# peer-spawn wire `aoide peer spawn` drives, never a re-implementation.
+# `aoide_client::commands::spawn_on_node` to summon a manifest spec whose
+# `host` names a different, registered node through the same signed
+# node-spawn wire `aoide node spawn` drives, never a re-implementation.
 # Bends the charter table's "conduct/client are independent leaves under
 # cli" a little either way — see the messaging workstream plan for why this
 # edge doesn't cycle (client has no dependency back on conduct).

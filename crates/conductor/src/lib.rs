@@ -27,7 +27,7 @@
 //!
 //! The seven panels: DAG (the visual graph), SESSION (the terminal roster),
 //! PROJECTS, LOG, STATUS, ROSTER (presence — this box plus every registered
-//! peer, messaging/presence plan P-C4; selection + compose P-C5), PENDING
+//! node, messaging/presence plan P-C4; selection + compose P-C5), PENDING
 //! (held `graph send`/A2A entries, approve/deny, P-C5). The event stream is
 //! still the audit log (the LOG panel tails it); live state is still
 //! stage-file mtimes, polled each tick (~500 ms via the crossterm poll

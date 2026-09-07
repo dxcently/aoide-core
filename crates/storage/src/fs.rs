@@ -106,6 +106,30 @@ pub fn migrate_root_once() {
     if std::env::var("AOIDE_AUDIT_LOG").map(|v| v.is_empty()).unwrap_or(true) {
         migrate_file(&old_root.join("log"), &new_root.join("log"));
     }
+
+    migrate_node_state_names();
+}
+
+/// The peer -> node vocabulary rename (User ruling, 2026-09-07): the four
+/// state files/dirs that carried the old noun rename in place, under
+/// whatever [`state_dir`] resolves to on this host — independent of the
+/// pre-L-C2 root move above, so it runs whether or not that move applies.
+/// Same no-clobber discipline as [`migrate_dir`]/[`migrate_file`]: a file
+/// already written under its new name is left alone, and the old one is
+/// never deleted out from under a box that hasn't opened the new binary
+/// yet.
+fn migrate_node_state_names() {
+    let state = state_dir();
+    migrate_file(&state.join("peers.json"), &state.join("nodes.json"));
+    migrate_dir(&state.join("peer-cache"), &state.join("node-cache"));
+    migrate_file(
+        &state.join("peer-pairing-inbound.json"),
+        &state.join("node-pairing-inbound.json"),
+    );
+    migrate_file(
+        &state.join("peer-pairing-outbound.json"),
+        &state.join("node-pairing-outbound.json"),
+    );
 }
 
 /// Move `old` → `new` wholesale: a no-op unless `old` exists AND `new` is
@@ -316,7 +340,7 @@ static MIGRATE_CONDUCTING_STAGE_ONCE: std::sync::Once = std::sync::Once::new();
 /// (a `graph session start` landing mid-move) are not specially guarded
 /// beyond this: at most one host runs this migration, once, at the first
 /// stage-path resolution of its lifetime — the same "known limitation,
-/// acceptable at boot, not a steady-state hazard" class `peer_store`'s own
+/// acceptable at boot, not a steady-state hazard" class `node_store`'s own
 /// process-local locks already document.
 fn migrate_conducting_stage(new_dir: &std::path::Path) {
     let old_dir = stage_dir();
@@ -388,7 +412,7 @@ fn migrate_conducting_stage(new_dir: &std::path::Path) {
 ///
 /// Under [`state_dir`], not [`stage_dir`]: a capture is a DURABLE artifact a
 /// caller asked for and keeps around (like `state/usage.json`,
-/// `state/peers.json`) — never song-scoped, never reset by a `rice
+/// `state/nodes.json`) — never song-scoped, never reset by a `rice
 /// mode`/stage-reseed the way live rehearsal state is. One-line rationale:
 /// lean state, not stage — captures persist, stage doesn't.
 pub fn captures_dir() -> std::path::PathBuf {
@@ -810,7 +834,7 @@ pub fn with_stage_lock<T>(f: impl FnOnce() -> T) -> T {
 }
 
 /// Does `/proc/<pid>` still exist? (the liveness probe [`sweep_stale_temps`] uses
-/// to tell an interrupted writer's stranded temp from a live peer's in-flight one).
+/// to tell an interrupted writer's stranded temp from a live node's in-flight one).
 fn pid_is_alive(pid: u32) -> bool {
     std::path::Path::new("/proc").join(pid.to_string()).exists()
 }
@@ -821,7 +845,7 @@ fn pid_is_alive(pid: u32) -> bool {
 /// its own temp — a stale `graph.tmp.464255` sat on disk from a prior day — so the
 /// next successful writer of the SAME file sweeps it. Best-effort and total: any
 /// read/parse/remove miss is ignored, and our OWN in-flight temp (live pid) plus
-/// every other file are left untouched, so a concurrent peer's write is safe.
+/// every other file are left untouched, so a concurrent node's write is safe.
 fn sweep_stale_temps(path: &std::path::Path) {
     let Some(dir) = path.parent() else {
         return;
@@ -1337,7 +1361,7 @@ mod tests {
         // A power-cut / SIGKILL between create and rename leaves a stranded
         // `<stem>.tmp.<pid>` (a real `graph.tmp.464255` was found on disk). The
         // next successful write of the same file sweeps a dead pid's temp but
-        // spares a live peer's in-flight one.
+        // spares a live node's in-flight one.
         let dir = std::env::temp_dir().join(format!("aoide-tmpsweep-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::create_dir_all(&dir);
@@ -1345,13 +1369,13 @@ mod tests {
 
         let leaked = dir.join(format!("graph.tmp.{}", u32::MAX)); // pid above pid_max — never alive
         std::fs::write(&leaked, "half-written").unwrap();
-        let live_peer = dir.join("graph.tmp.1"); // pid 1 (init) is always alive
-        std::fs::write(&live_peer, "in-flight").unwrap();
+        let live_node = dir.join("graph.tmp.1"); // pid 1 (init) is always alive
+        std::fs::write(&live_node, "in-flight").unwrap();
 
         atomic_write(&target, "{}").unwrap();
 
         assert!(!leaked.exists(), "a dead pid's leaked temp is swept on the next write");
-        assert!(live_peer.exists(), "a live pid's in-flight temp is left untouched");
+        assert!(live_node.exists(), "a live pid's in-flight temp is left untouched");
         assert!(target.exists());
 
         let _ = std::fs::remove_dir_all(&dir);
@@ -2021,5 +2045,71 @@ mod tests {
         std::env::remove_var("AOIDE_ROOT");
         let _ = std::fs::remove_dir_all(&home);
         let _ = std::fs::remove_dir_all(&custom_root);
+    }
+
+    /// The peer -> node state-file rename rides the same [`migrate_root_once`]
+    /// entry point, but at [`state_dir`] itself rather than the pre-L-C2
+    /// root — it must fire even when there is no pre-L-C2 tree to move.
+    #[test]
+    fn migrate_root_once_renames_the_old_peer_state_files() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = MigrationEnvGuard::capture_and_clear();
+        let home = std::env::temp_dir().join(format!("aoide-migrate-node-names-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+
+        let state = home.join(".aoide").join("state");
+        std::fs::create_dir_all(state.join("peer-cache")).unwrap();
+        std::fs::write(state.join("peers.json"), "old-registry").unwrap();
+        std::fs::write(state.join("peer-cache").join("box-b.json"), "cached-probe").unwrap();
+        std::fs::write(state.join("peer-pairing-inbound.json"), "inbound").unwrap();
+        std::fs::write(state.join("peer-pairing-outbound.json"), "outbound").unwrap();
+
+        migrate_root_once();
+
+        assert_eq!(std::fs::read_to_string(state.join("nodes.json")).unwrap(), "old-registry");
+        assert_eq!(
+            std::fs::read_to_string(state.join("node-cache").join("box-b.json")).unwrap(),
+            "cached-probe"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.join("node-pairing-inbound.json")).unwrap(),
+            "inbound"
+        );
+        assert_eq!(
+            std::fs::read_to_string(state.join("node-pairing-outbound.json")).unwrap(),
+            "outbound"
+        );
+        assert!(!state.join("peers.json").exists());
+        assert!(!state.join("peer-cache").exists());
+        assert!(!state.join("peer-pairing-inbound.json").exists());
+        assert!(!state.join("peer-pairing-outbound.json").exists());
+
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn migrate_root_once_never_clobbers_an_existing_nodes_json() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = MigrationEnvGuard::capture_and_clear();
+        let home = std::env::temp_dir().join(format!("aoide-migrate-node-names-no-clobber-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::env::set_var("HOME", &home);
+
+        let state = home.join(".aoide").join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join("peers.json"), "stale").unwrap();
+        std::fs::write(state.join("nodes.json"), "fresh").unwrap();
+
+        migrate_root_once();
+
+        assert_eq!(std::fs::read_to_string(state.join("nodes.json")).unwrap(), "fresh");
+        assert_eq!(
+            std::fs::read_to_string(state.join("peers.json")).unwrap(),
+            "stale",
+            "the old file is left alone, not deleted, when the new one already exists"
+        );
+
+        let _ = std::fs::remove_dir_all(&home);
     }
 }

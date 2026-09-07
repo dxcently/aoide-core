@@ -135,7 +135,7 @@ pub struct RegistrySyncOk {
 /// songbook's current slot counts. Tests that deliberately assert the REAL
 /// generator's field shapes for the real committed songs still call a real
 /// `nix eval` and stay `#[ignore]`d for the sandbox (matching
-/// `crates/cli/tests/peer_connectivity.rs`'s precedent for the same
+/// `crates/cli/tests/node_connectivity.rs`'s precedent for the same
 /// sandbox constraint).
 ///
 /// Opt-in only, read once per call, and validated exactly like the real `nix
@@ -400,7 +400,7 @@ fn eval_songbook_from_templates(
 ///
 /// A missing or corrupt `existing_path` is treated as "nothing to overlay"
 /// (the same "tolerate as empty" posture `undying::load_undying`/
-/// `peer_store`'s own loaders hold for their files) — this is a best-effort
+/// `node_store`'s own loaders hold for their files) — this is a best-effort
 /// preservation layer over what's already on disk, not a durable store of
 /// its own; the baseline and the layer-3 patch are what makes every call
 /// correct regardless of what this step finds.

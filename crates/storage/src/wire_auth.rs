@@ -1,5 +1,5 @@
-//! Per-request signed wire authentication for paired peers (P-P4,
-//! `docs/architecture/PAIRING.md`'s "Wire authentication (paired peers)"
+//! Per-request signed wire authentication for paired nodes (P-P4,
+//! `docs/architecture/PAIRING.md`'s "Wire authentication (paired nodes)"
 //! section): the canonical string every signed A2A POST binds itself to,
 //! the header names carrying it, and the sign/verify wrappers around
 //! [`crate::identity::Keypair`] that keep every `ed25519_dalek` type
@@ -49,7 +49,7 @@
 //! **nonce cache** does NOT live here — it's ephemeral, in-memory,
 //! per-`a2a serve`-PROCESS runtime state with no durable file behind it at
 //! all, unlike everything else this crate persists
-//! (`state/peer-pairing-*.json`, `state/peers.json`, …); it lives in
+//! (`state/node-pairing-*.json`, `state/nodes.json`, …); it lives in
 //! `aoide-server::a2a` instead, next to the verification flow that's its
 //! only consumer — see that module's own doc comment for the process-
 //! locality note.
@@ -59,13 +59,13 @@ use ed25519_dalek::Signature;
 use sha2::{Digest, Sha256};
 
 /// The signer's claimed self name — the same
-/// [`crate::peer_store::valid_peer_name`] vocabulary as every other
-/// peer-name field on this wire. Attribution only (#63 P-ID5): the verifier
+/// [`crate::node_store::valid_node_name`] vocabulary as every other
+/// node-name field on this wire. Attribution only (#63 P-ID5): the verifier
 /// resolves the caller by the stored pubkey that verifies the signature,
 /// never by this value, which is checked for wire-format validity, audited
 /// (drift included), and consulted solely as the exact-name tiebreak among
 /// verified records sharing the verifying pubkey.
-pub const HEADER_PEER: &str = "X-Aoide-Peer";
+pub const HEADER_NODE: &str = "X-Aoide-Node";
 /// ISO-8601 UTC, [`crate::time::parse_iso_utc`]-shaped — the moment the
 /// SIGNER minted this request, checked against the verifier's own "now"
 /// within [`signature_skew_secs`].
@@ -121,7 +121,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 /// Decode a hex string to raw bytes — `None` on an odd length or any
 /// non-hex-digit character, never a panic (every caller here feeds it
-/// untrusted wire input: a header value or a peer's stored `pubkeyHex`).
+/// untrusted wire input: a header value or a node's stored `pubkeyHex`).
 fn hex_decode(s: &str) -> Option<Vec<u8>> {
     let s = s.trim();
     if s.is_empty() || s.len() % 2 != 0 {

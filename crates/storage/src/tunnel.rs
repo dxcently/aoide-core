@@ -10,8 +10,8 @@
 //! same record, and `conduct -> client -> storage` is the crate DAG
 //! (`client/AGENTS.md`, "the `conduct -> client` edge is load-bearing") —
 //! a shape both ends need sits at the lowest crate that reaches both,
-//! exactly the split `peer_store` (storage) / `commands` (client) already
-//! holds for peer transport.
+//! exactly the split `node_store` (storage) / `commands` (client) already
+//! holds for node transport.
 //!
 //! **The runtime-dir convention is RE-DERIVED here, never imported
 //! upward.** `aoide_conduct::graph::conduct_socket_path` resolves
@@ -24,12 +24,12 @@
 //! convention re-derived, not imported" doc note.
 //!
 //! **Path preservation is load-bearing (§0.4 of the ssh-transport plan).**
-//! `sign_headers_for_peer` (`aoide-client`) signs a canonical string built
-//! from the URL's PATH ONLY (`peer_store::url_path`), never its host or
+//! `sign_headers_for_node` (`aoide-client`) signs a canonical string built
+//! from the URL's PATH ONLY (`node_store::url_path`), never its host or
 //! port — so rewriting a dial url's authority to `127.0.0.1:<local port>`
 //! changes no byte of what gets signed, PROVIDED the path is copied
 //! verbatim from the logical url rather than reinvented. [`dial_url`]
-//! below calls [`crate::peer_store::url_path`] directly for exactly this
+//! below calls [`crate::node_store::url_path`] directly for exactly this
 //! reason; a dropped or hardcoded path here would make every signed call
 //! through the tunnel fail on the far end with an opaque `-32007`.
 //!
@@ -56,7 +56,7 @@ pub struct TunnelRecord {
     #[serde(rename = "sessionId")]
     pub session_id: String,
     pub key: String,
-    /// The `--via`/`Peer.via` target this tunnel was opened for, rendered
+    /// The `--via`/`Node.via` target this tunnel was opened for, rendered
     /// back through [`Via`]'s `Display` — kept for display/debugging, never
     /// re-parsed to resolve the tunnel (the pid + local port are what prove
     /// liveness).
@@ -74,7 +74,7 @@ pub struct TunnelRecord {
 }
 
 /// A parsed `ssh://[user@]host[:port]` transport marker — the `--via` flag's
-/// value, or a `Peer.via` recorded at pair time (P-S4). Pure data, no I/O.
+/// value, or a `Node.via` recorded at pair time (P-S4). Pure data, no I/O.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Via {
     pub user: Option<String>,
@@ -96,7 +96,7 @@ impl std::fmt::Display for Via {
     }
 }
 
-/// Parse a `--via`/`Peer.via` transport marker. Only the `ssh` scheme is
+/// Parse a `--via`/`Node.via` transport marker. Only the `ssh` scheme is
 /// ever accepted — this doubles as the "refuse `http://`" guard, since any
 /// other scheme (including one that merely LOOKS like a url) fails the same
 /// check. The user segment is optional (`open_or_reuse`, P-S3, falls back
@@ -178,10 +178,10 @@ pub fn default_via(ip: &str, user: &str) -> Via {
     }
 }
 
-/// Rewrite a logical peer url's authority to `127.0.0.1:<local_port>`,
+/// Rewrite a logical node url's authority to `127.0.0.1:<local_port>`,
 /// preserving its scheme and its PATH VERBATIM — see this module's own doc
 /// for why the path half is load-bearing (§0.4). Delegates the path
-/// extraction to [`crate::peer_store::url_path`] rather than re-deriving
+/// extraction to [`crate::node_store::url_path`] rather than re-deriving
 /// it, so a dial url's path and a signature's canonical-string path can
 /// never drift apart from two independent implementations of the same cut.
 /// A string with no `scheme://` at all is REFUSED rather than defaulted —
@@ -195,17 +195,17 @@ pub fn dial_url(logical_url: &str, local_port: u16) -> Result<String, String> {
     if scheme.is_empty() {
         return Err(format!("`{logical_url}` has an empty scheme — cannot rewrite its authority for a tunnel dial"));
     }
-    let path = crate::peer_store::url_path(trimmed);
+    let path = crate::node_store::url_path(trimmed);
     Ok(format!("{scheme}://127.0.0.1:{local_port}{path}"))
 }
 
 /// Is `id` safe to join onto a filesystem path with no further checking? A
-/// looser guard than [`crate::peer_store::valid_peer_name`] (session ids
+/// looser guard than [`crate::node_store::valid_node_name`] (session ids
 /// are not operator-typed nicknames — the default shape is
 /// `conduct-<pid>-<unix ts>`, and `aoide conduct --id <id>` lets an operator
 /// override it) — but empty, any path separator, a `..` traversal segment,
 /// a NUL byte, or a leading `.` are refused outright, the same defense
-/// `handle_peer_remove` (`aoide-client`) applies before a delete.
+/// `handle_node_remove` (`aoide-client`) applies before a delete.
 fn is_safe_id(id: &str) -> bool {
     !id.is_empty()
         && !id.contains('/')
@@ -236,16 +236,16 @@ fn runtime_dir() -> PathBuf {
 /// P-S3's kill-by-record aimed at whichever pair got there second. The
 /// directory boundary is the unambiguous separator. Refuses either
 /// component before any path join is attempted — `key` through
-/// [`crate::peer_store::valid_peer_name`] (it names a peer or a `--via`
+/// [`crate::node_store::valid_node_name`] (it names a node or a `--via`
 /// target, the same nickname shape everywhere else on the wire), and
 /// `session_id` through [`is_safe_id`] (a looser but still traversal-proof
 /// guard — see that function's own doc for why it can't reuse
-/// `valid_peer_name` verbatim).
+/// `valid_node_name` verbatim).
 pub fn record_path(session_id: &str, key: &str) -> Result<PathBuf, String> {
     if !is_safe_id(session_id) {
         return Err(format!("`{session_id}` is not a valid session id for a tunnel record"));
     }
-    if !crate::peer_store::valid_peer_name(key) {
+    if !crate::node_store::valid_node_name(key) {
         return Err(format!("`{key}` is not a valid tunnel key"));
     }
     Ok(runtime_dir().join("tunnel").join(session_id).join(format!("{key}.json")))
@@ -263,7 +263,7 @@ pub fn save(record: &TunnelRecord) -> Result<(), String> {
 
 /// Load the tunnel record for `(session_id, key)`, tolerating a
 /// missing/corrupt file or an invalid id/key pair as `None` — the same
-/// tolerate-missing-as-empty discipline `peer_store::load_peers`/
+/// tolerate-missing-as-empty discipline `node_store::load_nodes`/
 /// `undying::load_undying` hold, so a caller never has to distinguish "no
 /// tunnel yet" from "the file is unreadable."
 pub fn load(session_id: &str, key: &str) -> Option<TunnelRecord> {
@@ -454,7 +454,7 @@ mod tests {
         // a second, independently-written cut of the same url.
         for logical in ["http://h:8710/rpc", "http://h:8710/", "http://h:8710", "http://h:8710/a/b/c"]
         {
-            let expected_path = crate::peer_store::url_path(logical);
+            let expected_path = crate::node_store::url_path(logical);
             let dial = dial_url(logical, 5555).unwrap();
             assert!(
                 dial.ends_with(&expected_path) && dial == format!("http://127.0.0.1:5555{expected_path}"),

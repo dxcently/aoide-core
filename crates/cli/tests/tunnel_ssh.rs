@@ -1,5 +1,5 @@
 //! Real ssh-forwarding proof for the ssh-transport lane's P-S3 phase (the
-//! ssh child owned by `aoide_client::tunnel`) — the `peer_connectivity.rs`
+//! ssh child owned by `aoide_client::tunnel`) — the `node_connectivity.rs`
 //! precedent (that file's own module doc, lines 24-33): a genuine `ssh -N
 //! -L` forward to `localhost`, carrying real bytes through a real
 //! throwaway TCP listener, never a mock.
@@ -25,7 +25,7 @@ fn open_or_reuse_forwards_real_bytes_to_a_local_throwaway_listener_over_real_ssh
     std::fs::create_dir_all(&root).unwrap();
     std::env::set_var("XDG_RUNTIME_DIR", &root);
 
-    // A throwaway TCP listener standing in for a peer's real A2A door —
+    // A throwaway TCP listener standing in for a node's real A2A door —
     // echoes back whatever it reads, so the assertion below proves bytes
     // actually crossed the ssh forward, not merely that a TCP connect
     // succeeded.

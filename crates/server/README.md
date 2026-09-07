@@ -125,7 +125,7 @@ the inbound half of the two-door contract (the outbound half is
   (the plan file's User-answered threat-model question) the seal's
   secrecy rests on process liveness plus Yama `ptrace_scope`, not file
   permissions, since a same-uid attacker can read any file the operator
-  owns, including `state/identity/`'s own on-disk peer-wire key.
+  owns, including `state/identity/`'s own on-disk node-wire key.
   `daemon::mint_seal(session_id, pid, origin_class)` builds a
   `SealedIdentity` (reading `pid_starttime` via `aoide_conduct::
   graph::pid_starttime`, no second `/proc` parse) and signs it under that
@@ -143,8 +143,8 @@ the inbound half of the two-door contract (the outbound half is
 - **The dispatch socket's own accept gets a cross-uid floor, and two
   attribution leaks close (LANE IDENTITY P-ID3).** `daemon::accept_loop`
   reads `aoide_secrets::peercred::peer_cred` on every accepted connection
-  and refuses one whose peer uid doesn't match this daemon's own euid,
-  fail-closed on an unidentified peer — the same `admin_gate` shape the
+  and refuses one whose node uid doesn't match this daemon's own euid,
+  fail-closed on an unidentified node — the same `admin_gate` shape the
   secrets broker already holds, restated here for this THIRD socket
   (`daemon::cross_uid_gate`, `shellbridge::cross_uid_gate` in
   `aoide-conduct`). Cross-uid only: every legitimate connector already
@@ -209,14 +209,14 @@ the inbound half of the two-door contract (the outbound half is
   the ceremony's whole point is establishing a credential where none
   exists yet, so gating either on one would be circular. `pair_poll` is
   self-authenticating instead (below) — neither door-gated nor fully open.
-  None grants anything beyond a `pubkey`/`verified` peer record, and that
+  None grants anything beyond a `pubkey`/`verified` node record, and that
   record commits only on BOTH ends' own separate human confirmation — the
-  `allows` set is stamped by `aoide_storage::peer_store::upsert_paired_peer`
-  itself, the moment a peer first becomes verified (P-P3, PAIRING.md
+  `allows` set is stamped by `aoide_storage::node_store::upsert_paired_node`
+  itself, the moment a node first becomes verified (P-P3, PAIRING.md
   decision 5), from the grant the CLI half resolved (`[pairing] defaultGrant`
   or `--allow`) — never by these methods directly, and never off the wire. `pair_request`
   validates every field (64-hex pubkey, 64-hex commitment, a
-  `valid_peer_name` name, a non-empty `://`-bearing url) before calling
+  `valid_node_name` name, a non-empty `://`-bearing url) before calling
   `aoide_storage::pairing::park_inbound` — malformed input never reaches
   the parked-state file, and a park past the configured cap is refused
   with a distinct `-32000`. It also reads the OPTIONAL `selfVia` param
@@ -242,8 +242,8 @@ the inbound half of the two-door contract (the outbound half is
   used — it carries a SELF-CONTAINED signature (`{id, timestampIso,
   nonceHex, signatureHex}`, verified inline against the parked entry's own
   `pubkey_hex` via `aoide_storage::wire_auth::verify_signature_hex`, never
-  through P-P4's `verify_signed_request` — no `Peer` record exists yet for
-  that to key off) and NEVER writes a peer record. It only READS
+  through P-P4's `verify_signed_request` — no `Node` record exists yet for
+  that to key off) and NEVER writes a node record. It only READS
   `InboundPairingRequest::approved` (set PURELY LOCALLY, from
   `aoide-client::commands::approve_inbound`, never from a wire handler) and
   returns `{"status":"pending"}` uniformly for an unknown id, a
@@ -252,7 +252,7 @@ the inbound half of the two-door contract (the outbound half is
   (the existing-oracle discipline, mirroring `message/send`'s own
   `contextId` amendment above). Only a verified, approved poll gets
   `{"status":"approved","pubkeyHex":"<B's own pubkey>"}`. The requester's
-  own peer record commits later, entirely inside `aoide-client`, once that
+  own node record commits later, entirely inside `aoide-client`, once that
   instance's own operator polls and confirms the SAS. All three audit
   via the existing `Door::A2a` audit sink (`a2a.pairRequest`/
   `a2a.pairReveal`/`a2a.pairPoll`), same as every other A2A method —
@@ -283,44 +283,44 @@ the inbound half of the two-door contract (the outbound half is
   `message_send`'s `SendAction::Spawn` arm no longer consults
   `token_authorized` (the door-wide bearer, 2026-08-19's own amendment) at
   all: it requires `spawn_admitted`, which accepts ONLY a
-  `PeerRung::Signature` resolution to a peer that is BOTH `verified` and
-  carries `"spawn"` in `allows` (`peer_may_spawn`, pure and directly
-  unit-tested against `Peer` fixtures — no test in this file drives
+  `NodeRung::Signature` resolution to a node that is BOTH `verified` and
+  carries `"spawn"` in `allows` (`node_may_spawn`, pure and directly
+  unit-tested against `Node` fixtures — no test in this file drives
   `do_spawn`'s real OS-level process spawn, same house rule every other
   Spawn-arm test already follows). That resolution comes from
   `verify_signed_request` (P-P4) — called once per connection in
   `handle_connection`, before any dispatch — which resolves the caller BY
   KEY (#63 P-ID5): the request's `X-Aoide-Timestamp`/`X-Aoide-Nonce`/
   `X-Aoide-Signature` headers are verified by trying the signature against
-  every verified peer's stored public key, and the record whose key
-  verifies IS the caller; `X-Aoide-Peer` is attribution only — a
+  every verified node's stored public key, and the record whose key
+  verifies IS the caller; `X-Aoide-Node` is attribution only — a
   claimed-vs-resolved mismatch audits as attribution drift, and its one
   identity-adjacent role is the exact-name tiebreak among verified records
   sharing the verifying pubkey (CONTRACTS.md §6's P-P4 amendment has the
   full canonical-string/header shape, check order, collision semantics,
   and pinned vectors). The KEY-RESOLVED name threads down as
-  `signed_peer_name`; when present, `message_send` resolves EXCLUSIVELY
-  against it, never falling back to `aoide_storage::peer_store::
-  resolve_peer`'s own two-rung ladder (a peer's own `token_file` —
-  `PeerRung::Token` — else the TCP origin against a peer's `url` —
-  `PeerRung::Addr`, the SAME identification the door's
-  `is_autogated_peer_addr`/`is_autogated_peer_token` already fold, just
-  unfiltered by `autogate` and narrowed to one named peer) even on a
+  `signed_node_name`; when present, `message_send` resolves EXCLUSIVELY
+  against it, never falling back to `aoide_storage::node_store::
+  resolve_node`'s own two-rung ladder (a node's own `token_file` —
+  `NodeRung::Token` — else the TCP origin against a node's `url` —
+  `NodeRung::Addr`, the SAME identification the door's
+  `is_autogated_node_addr`/`is_autogated_node_token` already fold, just
+  unfiltered by `autogate` and narrowed to one named node) even on a
   registry-lookup miss. Neither the `Addr` nor the (now-insufficient)
   `Token` resolution reaches Spawn any more — a bare TCP-source-IP-vs-`url`
   match carries no possession proof, and a bare shared-secret token is
-  replayable and identical across every request the true peer or an
-  impersonator ever sends; both rungs still resolve a peer identity for
+  replayable and identical across every request the true node or an
+  impersonator ever sends; both rungs still resolve a node identity for
   attribution/origin-stamping purposes below, just never for Spawn. A
-  caller resolved via `Token` to a genuinely paired peer gets a taught
+  caller resolved via `Token` to a genuinely paired node gets a taught
   `-32006` telling it plainly to sign requests (its aoide is too old, or
-  is failing to sign); a `Signature`-resolved peer missing the `spawn`
-  capability gets the exact `peer allow` fix; every other shape gets the
-  original "pair first, then allow" message. The resolved peer's name also
+  is failing to sign); a `Signature`-resolved node missing the `spawn`
+  capability gets the exact `node allow` fix; every other shape gets the
+  original "pair first, then allow" message. The resolved node's name also
   threads two ways past the gate: `do_spawn` calls `stamp_spawn_origin`
   (LANE IDENTITY P-ID0, G16/G5, review round 1) to stamp
-  `SessionRecord.origin = "peer:<name>"` DIRECTLY on the just-spawned record
-  once it registers — this door is the ONLY place a `peer:*` value may
+  `SessionRecord.origin = "node:<name>"` DIRECTLY on the just-spawned record
+  once it registers — this door is the ONLY place a `node:*` value may
   originate, not the child's own env, since any same-uid process can set an
   env var on itself before invoking `aoide conduct` directly
   (`aoide-conduct`'s `session_conduct` refuses exactly that shape from its
@@ -335,11 +335,11 @@ the inbound half of the two-door contract (the outbound half is
   silently, and the poll never retries unboundedly past it. Neither of
   these closes the FILE: a hand-crafted `sessions.json`/ledger line is
   still a readable, unflagged string on disk — sealing that is P-ID1/P-ID2,
-  still open. The Inject arm's own `resolved_peer` (a SEPARATE, ungated
+  still open. The Inject arm's own `resolved_node` (a SEPARATE, ungated
   identity lookup — attribution, never a gate) rides `do_inject`'s existing
   `--from` flag onto a QUEUED `pending.json` entry only (an
   immediately-delivered payload's bytes stay untouched, so an
-  already-autogated peer's delivery is byte-identical to before this
+  already-autogated node's delivery is byte-identical to before this
   phase).
 - `discovery` — the discovery advertisement's SEND half (P-P6 + task
   #120, `docs/architecture/PAIRING.md`'s "Discovery
@@ -349,7 +349,7 @@ the inbound half of the two-door contract (the outbound half is
   SENDS when `a2a::resolve_discovery_advertise`'s launch-time force
   (`--discovery-advertise`/`AOIDE_DISCOVERY_ADVERTISE`, mirroring
   `resolve_bind_port`'s own precedence) OR the runtime switch
-  (`aoide_storage::advertise::enabled`, flipped by `aoide peer advertise
+  (`aoide_storage::advertise::enabled`, flipped by `aoide node advertise
   on|off`, read fresh every tick) says on — both off by default: silent
   ticks, no socket, nothing on the wire. A sending tick (~30s, jittered)
   binds a fresh ephemeral UDP socket with `SO_BROADCAST`, sends one
@@ -361,7 +361,7 @@ the inbound half of the two-door contract (the outbound half is
   plain `thread::spawn` for connection handlers — that one is reserved for
   a NEW socket-based door, not a background worker thread) — a refused OS
   thread costs discovery only, never the door. The RECEIVE half
-  (`peer discover`/`aoide pair`'s hostname-target sweep) lives in
+  (`node discover`/`aoide pair`'s hostname-target sweep) lives in
   `aoide-client::discover` instead; this crate stays inbound/serve-only.
 - `commands` — this crate's CLI commands: `daemon`, `shellbridge` (registration
   only — the files stay in `conduct`), `a2a serve`, `events tail` (P-D3,

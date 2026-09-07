@@ -160,17 +160,17 @@ mod tests {
         // `session` — the undying picker (U3, command-defrag lane U) — a
         // parent command alongside `session.*` the same way bare `graph`
         // sits alongside `graph.link`: reached 74. Bumped by 1 more for
-        // `peer.pair.watch` (P-P5): reached 75. Bumped by 3 for `melete
+        // `node.pair.watch` (P-P5): reached 75. Bumped by 3 for `melete
         // status`/`melete graph`/`melete call` (M2, task #14) — the Melete
         // MCP client, `aoide_client::mcp_client` — reached 78. Bumped by 1
-        // for `peer.advertise` (task #120) — the discovery advertise
-        // switch — reached 79. Bumped by 1 for `peer.list` (task #120 P2)
-        // — the one-glance mesh roster (this host + registered peers +
+        // for `node.advertise` (task #120) — the discovery advertise
+        // switch — reached 79. Bumped by 1 for `node.list` (task #120 P2)
+        // — the one-glance mesh roster (this host + registered nodes +
         // advertising instances, sessions under each), registered from
         // `aoide-conduct` because it folds `who`'s probe core — reached 80.
         // Bumped by 1 for bare `pair` (task #120 P3) — the interactive
         // pairing picker, one sweep + a select menu driving the SAME
-        // `run_pair_request` ceremony core `peer invite` uses — reached 81.
+        // `run_pair_request` ceremony core `node invite` uses — reached 81.
         // Bumped by 1 for `secrets allow-remote-origin` (LANE IDENTITY
         // P-ID4) — the per-secret remote-origin admission bit the broker's
         // origin gate enforces (deny by default; the first real consumer
@@ -194,15 +194,15 @@ mod tests {
         // Net: 82 - 1 + 1 - 1 = 81.
         //
         // P-PV2 (the User's locked spec, three grill rounds) collapses the
-        // pairing command surface, net 81 -> 80: `peer.invite` (-1) and
-        // `peer.pair.request` (-1) DIE outright, hard cutover, no aliases —
-        // folded into ONE `peer.pair` (+1, positional `<target>`, SMART
+        // pairing command surface, net 81 -> 80: `node.invite` (-1) and
+        // `node.pair.request` (-1) DIE outright, hard cutover, no aliases —
+        // folded into ONE `node.pair` (+1, positional `<target>`, SMART
         // TARGET dispatch: a URL dials directly, anything else resolves by
         // discovery sweep — reuses the same `run_pair_request` core both
-        // dead commands called). `peer.pair.pending` RENAMES to
-        // `peer.pending` (net 0, path change only) — its rows drop the SAS/
+        // dead commands called). `node.pair.pending` RENAMES to
+        // `node.pending` (net 0, path change only) — its rows drop the SAS/
         // confirmation code (never shown outside the out-of-band compare
-        // the approve step preserves). `peer.pair.approve`'s `<id>` becomes
+        // the approve step preserves). `node.pair.approve`'s `<id>` becomes
         // optional when exactly one request is pending (no new path).
         // Net: 81 - 1 - 1 + 1 = 80.
         //
@@ -213,27 +213,32 @@ mod tests {
         // reached 82.
         //
         // Task #135 P3' collapses the pairing surface AGAIN, net 82 -> 79
-        // (the User: "the command set can just be aoide pair"): `peer.pair`,
-        // `peer.pair.approve`, `peer.pair.reject`, `peer.pair.watch` and
-        // `peer.pending` all DIE — hard cutover, no aliases, same as
-        // `peer.invite` before them. Bare `pair` (already registered)
+        // (the User: "the command set can just be aoide pair"): `node.pair`,
+        // `node.pair.approve`, `node.pair.reject`, `node.pair.watch` and
+        // `node.pending` all DIE — hard cutover, no aliases, same as
+        // `node.invite` before them. Bare `pair` (already registered)
         // becomes the ONE command, routed by what already exists (approve an
         // inbound match, resume an outbound one, else request), plus
-        // `pair.reject` (+1) and `pair.watch` (+1). The `peer` family keeps
+        // `pair.reject` (+1) and `pair.watch` (+1). The `node` family keeps
         // the ROSTER (add/list/allow/hub/spawn/pull/status/discover/
         // advertise); `pair` mints the verified records those operate on.
         // Net: 82 - 5 + 2 = 79.
         //
         // Task #135 P4 adds `mesh` (+1) — a read-only drift report
         // comparing every declared `[mesh.<name>]` in config.toml against
-        // the live peer registry (`aoide_client::mesh`); writes neither
+        // the live node registry (`aoide_client::mesh`); writes neither
         // side. Net: 79 + 1 = 80.
         //
         // Task #135 P5 adds `mesh.pair` (+1) — the converge: the same
-        // `mesh::drift` selects the declared peers with no verified record
+        // `mesh::drift` selects the declared nodes with no verified record
         // (missing/unverified) and drives `commands::run_pair_request` over
-        // each, one ordinary pairwise ceremony apiece. A verified peer is
+        // each, one ordinary pairwise ceremony apiece. A verified node is
         // never modified, so a second run is all-skipped. Net: 80 + 1 = 81.
+        //
+        // The peer -> node vocabulary rename (User ruling, 2026-09-07)
+        // renames all ten `peer.*` paths to `node.*` in place — hard
+        // cutover, no aliases, same shape `node.invite`'s own retirement
+        // set. Net: 81 (unchanged).
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -263,20 +268,20 @@ mod tests {
             "melete.status",
             "mesh",
             "mesh.pair",
+            "node.add",
+            "node.advertise",
+            "node.allow",
+            "node.discover",
+            "node.hub",
+            "node.list",
+            "node.pull",
+            "node.remove",
+            "node.spawn",
+            "node.status",
             "onboard",
             "pair",
             "pair.reject",
             "pair.watch",
-            "peer.add",
-            "peer.advertise",
-            "peer.allow",
-            "peer.discover",
-            "peer.hub",
-            "peer.list",
-            "peer.pull",
-            "peer.remove",
-            "peer.spawn",
-            "peer.status",
             "project.add",
             "project.list",
             "project.remove",

@@ -44,13 +44,13 @@ depends on it.
 The command paths (count: the golden list in `src/registry.rs`, asserted
 as an exact set — core's headless-capable, agent-orchestration surface: the
 project/session graph (including `resurrect`, its ledger-backed
-session revival), A2A, peers (including the `peer hub` designation,
+session revival), A2A, nodes (including the `node hub` designation,
 P-D5, the `aoide pair [<name|url|id>]`/`pair reject`/`pair watch`
-one-command pairing ceremony, P-P2/P-P5/P-PV2/task #135 P3', the `peer allow <name> <cap> on|off`
+one-command pairing ceremony, P-P2/P-P5/P-PV2/task #135 P3', the `node allow <name> <cap> on|off`
 closed-capability grant/revoke command backing the A2A spawn arm's hard
-gate, P-P3, `peer spawn <name> -- <text…>`, P-P5b, the signed
-spawn-shaped `message/send` that actually reaches that gate, and `peer
-discover [--secs N]`/`peer advertise on|off`, P-P6 + task #120, the LAN
+gate, P-P3, `node spawn <name> -- <text…>`, P-P5b, the signed
+spawn-shaped `message/send` that actually reaches that gate, and `node
+discover [--secs N]`/`node advertise on|off`, P-P6 + task #120, the LAN
 discovery advertisement's read-only sweep (`pair`'s own hostname arm
 is the sugar-over-the-ceremony half, P-PV2), and this instance's
 own advertise switch), presence, the

@@ -883,14 +883,14 @@ fn handle_config(_inv: &Invocation) -> Outcome {
         // did — reads as if the file declared a value it never wrote.
         let grant = match &mesh.grant {
             Some(list) => crate::config::render_value(
-                &crate::config::ValueKind::ClosedList(crate::peer_store::PEER_CAPABILITIES),
+                &crate::config::ValueKind::ClosedList(crate::node_store::NODE_CAPABILITIES),
                 list,
             ),
             None => "absent (no override declared here — not the same as pairing.defaultGrant)".to_string(),
         };
         lines.push(format!(
-            "mesh.{name}  peers={}  grant={}  sameOperator={}   (file-declared; `aoide mesh` reads it)",
-            mesh.peers.len(),
+            "mesh.{name}  nodes={}  grant={}  sameOperator={}   (file-declared; `aoide mesh` reads it)",
+            mesh.nodes.len(),
             grant,
             mesh.same_operator,
         ));

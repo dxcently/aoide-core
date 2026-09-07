@@ -12,17 +12,17 @@
 
 use crate::records::SessionRecord;
 
-/// This box's display name: `AOIDE_A2A_PEER_NAME` env → the OS hostname
+/// This box's display name: `AOIDE_A2A_NODE_NAME` env → the OS hostname
 /// (`libc::gethostname`) → the literal `"aoide"` if even that fails.
 ///
-/// Mirrors the env/hostname half of `aoide_server::a2a::resolve_peer_name`'s
-/// precedence (that function also checks a `--peer-name` CLI flag ahead of
+/// Mirrors the env/hostname half of `aoide_server::a2a::resolve_node_name`'s
+/// precedence (that function also checks a `--node-name` CLI flag ahead of
 /// these two; storage has no `Invocation` to read a flag off, so this starts
 /// one step later in the same chain). Never panics: a `gethostname` failure,
 /// truncation, or non-UTF8 all fall through to the next link instead of
 /// unwrapping.
 pub fn local_host_name() -> String {
-    std::env::var("AOIDE_A2A_PEER_NAME")
+    std::env::var("AOIDE_A2A_NODE_NAME")
         .ok()
         .filter(|s| !s.is_empty())
         .or_else(os_hostname)

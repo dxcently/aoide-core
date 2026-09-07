@@ -70,7 +70,7 @@ use std::process::{Command as Process, Stdio};
 /// second registered command: the registry, `schema --json`, and every
 /// golden snapshot see only the canonical path. Add a row here for a new
 /// shorthand, never a second `register()` call for the same command.
-const ALIASES: &[(&[&str], &[&str])] = &[(&["peer", "rm"], &["peer", "remove"])];
+const ALIASES: &[(&[&str], &[&str])] = &[(&["node", "rm"], &["node", "remove"])];
 
 /// Rewrite a leading alias prefix of `positionals` to its canonical form, in
 /// place. A no-op when no alias prefix matches (the common case).
@@ -140,7 +140,7 @@ pub fn parse(argv: &[String], door: Door, bin_name: &str, registry: &Registry) -
             } else {
                 // The registry decides whether this flag takes a value: a
                 // declared-bool flag NEVER consumes the next token (#111 —
-                // `peer add --no-verify alice` used to swallow `alice` as
+                // `node add --no-verify alice` used to swallow `alice` as
                 // no-verify's value). Only a valued (or undeclared — rejected
                 // by name later anyway) flag peeks ahead.
                 match declared_flag_kind(name, &positionals, registry) {
@@ -453,7 +453,7 @@ enum DeclaredFlag {
     /// Consequence for aliases: an alias-spelled invocation of a command
     /// whose declared BOOL flag precedes positionals falls into this arm
     /// and re-swallows the next token (the exact #111 shape) — harmless for
-    /// today's one flagless alias (`peer rm`), but any future alias for a
+    /// today's one flagless alias (`node rm`), but any future alias for a
     /// bool-flagged command must resolve aliases BEFORE the flag loop or
     /// teach this judge the alias table.
     Undeclared,
@@ -592,7 +592,7 @@ fn group_blurb(group: &str) -> Option<&'static str> {
         "project" => "project anchor roots for the session DAG",
         "screen" => "screen capture, OCR, and pointer control",
         "a2a" => "Agent-to-Agent server and agent registry",
-        "peer" => "same-network host federation",
+        "node" => "same-network host federation",
         "livery" => "the design-token engine: resolve, lint, and emit a song's livery",
         "cover" => "cover-art staging",
         "mcp" => "the per-session stdio MCP façade",
@@ -696,7 +696,7 @@ fn usage_root(registry: &Registry, bin_name: &str) -> Outcome {
 /// must never shadow (module doc's step 3). A built-in always wins, and a
 /// TYPO of a built-in head still falls through to `parse`'s own
 /// `unknown_command_outcome`/did-you-mean rather than a silent PATH probe
-/// pre-empting it. Today's one alias head (`peer`) is already a registered
+/// pre-empting it. Today's one alias head (`node`) is already a registered
 /// head on its own, so including `ALIASES` here is free insurance against a
 /// future alias whose head is not itself a command.
 fn reserved_heads(registry: &Registry) -> std::collections::HashSet<&'static str> {
@@ -960,9 +960,9 @@ mod tests {
             available: || true,
         });
         r.insert(Command {
-            path: &["peer", "remove"],
-            summary: "Deregister a peer.",
-            args: &[Arg { name: "name", ty: "string", required: true, description: "Peer name." }],
+            path: &["node", "remove"],
+            summary: "Deregister a node.",
+            args: &[Arg { name: "name", ty: "string", required: true, description: "Node name." }],
             flags: &[JSON_FLAG],
             gated: false,
             implemented: true,
@@ -974,13 +974,13 @@ mod tests {
         });
         // The #111 filed shape: a command with positional args plus a
         // declared-bool flag AND a declared-valued flag, mirroring the real
-        // `peer add <name> <url> [--no-verify] [--via …]`.
+        // `node add <name> <url> [--no-verify] [--via …]`.
         r.insert(Command {
-            path: &["peer", "add"],
-            summary: "Register a peer.",
+            path: &["node", "add"],
+            summary: "Register a node.",
             args: &[
-                Arg { name: "name", ty: "string", required: true, description: "Peer name." },
-                Arg { name: "url", ty: "string", required: true, description: "Peer URL." },
+                Arg { name: "name", ty: "string", required: true, description: "Node name." },
+                Arg { name: "url", ty: "string", required: true, description: "Node URL." },
             ],
             flags: &[
                 JSON_FLAG,
@@ -1117,17 +1117,17 @@ mod tests {
         assert_eq!(inv.args, vec!["aoide", "extra"]);
     }
 
-    /// `peer rm <name>` is an ergonomic alias for `peer remove <name>`,
+    /// `node rm <name>` is an ergonomic alias for `node remove <name>`,
     /// resolved at the parser level (`ALIASES`/`resolve_aliases`) — the
     /// invocation it produces must be byte-identical to typing the canonical
-    /// path out, and the trailing arg (the peer name) must survive the
+    /// path out, and the trailing arg (the node name) must survive the
     /// rewrite untouched.
     #[test]
-    fn peer_rm_is_a_parser_level_alias_for_peer_remove() {
+    fn node_rm_is_a_parser_level_alias_for_node_remove() {
         let reg = test_registry();
-        let (aliased, _) = parse(&argv(&["peer", "rm", "alice"]), Door::Cli, "aoide", &reg).unwrap();
-        let (canonical, _) = parse(&argv(&["peer", "remove", "alice"]), Door::Cli, "aoide", &reg).unwrap();
-        assert_eq!(aliased.path, vec!["peer", "remove"], "the alias resolves to the CANONICAL path, never a `peer.rm` path of its own");
+        let (aliased, _) = parse(&argv(&["node", "rm", "alice"]), Door::Cli, "aoide", &reg).unwrap();
+        let (canonical, _) = parse(&argv(&["node", "remove", "alice"]), Door::Cli, "aoide", &reg).unwrap();
+        assert_eq!(aliased.path, vec!["node", "remove"], "the alias resolves to the CANONICAL path, never a `node.rm` path of its own");
         assert_eq!(aliased.path, canonical.path);
         assert_eq!(aliased.args, canonical.args);
         assert_eq!(aliased.args, vec!["alice"]);
@@ -1135,20 +1135,20 @@ mod tests {
 
     /// Regression (#111, filed off the M3 review): a declared-BOOL flag given
     /// before the positional args swallowed the following token as its value —
-    /// `peer add --no-verify alice url` parsed as flags={no-verify:"alice"},
+    /// `node add --no-verify alice url` parsed as flags={no-verify:"alice"},
     /// args=["url"], silently dropping a positional. The registry declares the
     /// flag's type, so the parser must never let a bool consume a value token.
     #[test]
     fn a_bool_flag_before_positionals_never_swallows_the_next_token() {
         let reg = test_registry();
         let (inv, _) = parse(
-            &argv(&["peer", "add", "--no-verify", "alice", "http://h:7466"]),
+            &argv(&["node", "add", "--no-verify", "alice", "http://h:7466"]),
             Door::Cli,
             "aoide",
             &reg,
         )
         .unwrap();
-        assert_eq!(inv.path, vec!["peer", "add"]);
+        assert_eq!(inv.path, vec!["node", "add"]);
         assert_eq!(inv.args, vec!["alice", "http://h:7466"], "both positionals survive");
         assert_eq!(inv.flags.get("no-verify").map(String::as_str), Some("true"));
     }
@@ -1160,7 +1160,7 @@ mod tests {
         let reg = test_registry();
 
         let (inv, _) = parse(
-            &argv(&["peer", "add", "alice", "http://h:7466", "--no-verify"]),
+            &argv(&["node", "add", "alice", "http://h:7466", "--no-verify"]),
             Door::Cli,
             "aoide",
             &reg,
@@ -1170,7 +1170,7 @@ mod tests {
         assert_eq!(inv.flags.get("no-verify").map(String::as_str), Some("true"));
 
         let (inv, _) = parse(
-            &argv(&["peer", "add", "alice", "--no-verify", "http://h:7466"]),
+            &argv(&["node", "add", "alice", "--no-verify", "http://h:7466"]),
             Door::Cli,
             "aoide",
             &reg,
@@ -1187,13 +1187,13 @@ mod tests {
     fn a_bool_flag_before_the_path_is_complete_leaves_the_segment_alone() {
         let reg = test_registry();
         let (inv, _) = parse(
-            &argv(&["peer", "--no-verify", "add", "alice", "http://h:7466"]),
+            &argv(&["node", "--no-verify", "add", "alice", "http://h:7466"]),
             Door::Cli,
             "aoide",
             &reg,
         )
         .unwrap();
-        assert_eq!(inv.path, vec!["peer", "add"]);
+        assert_eq!(inv.path, vec!["node", "add"]);
         assert_eq!(inv.args, vec!["alice", "http://h:7466"]);
         assert_eq!(inv.flags.get("no-verify").map(String::as_str), Some("true"));
     }
@@ -1204,7 +1204,7 @@ mod tests {
     fn a_valued_flag_before_positionals_still_consumes_its_value() {
         let reg = test_registry();
         let (inv, _) = parse(
-            &argv(&["peer", "add", "--via", "ssh://h:22", "alice", "http://h:7466"]),
+            &argv(&["node", "add", "--via", "ssh://h:22", "alice", "http://h:7466"]),
             Door::Cli,
             "aoide",
             &reg,

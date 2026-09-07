@@ -4,7 +4,7 @@
 //! atomic write (temp file + rename), not a dependency on
 //! `aoide-storage::fs::atomic_write` — this crate stays off `aoide-storage`
 //! on purpose (`policy.rs`'s own module doc: this crate doesn't reach into
-//! storage even for a smaller win, reusing `valid_peer_name`; the same
+//! storage even for a smaller win, reusing `valid_node_name`; the same
 //! standoffishness applies here — atomic rename is ~5 lines to hand-roll
 //! and saves a cross-crate dependency for a one-file concern).
 //!

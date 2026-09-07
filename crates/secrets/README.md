@@ -65,13 +65,13 @@ a value (see "Remote reachability" below). **LANE IDENTITY P-ID4 adds the
 third policy axis, and it is LIVE**: `allowRemoteOrigin` (default `false`
 — deny) — `secrets allow-remote-origin <name> on|off` — refuses a resolve
 whose CALLER SESSION is positively attested as remote-origin (a sealed
-`peer:*` originClass, resolved from the connection's `SO_PEERCRED` pid
+`node:*` originClass, resolved from the connection's `SO_PEERCRED` pid
 through `aoide_storage::attest::attested_caller`: kernel ancestry + the
 daemon-sealed session credential, never anything the wire asserts) unless
 the secret opts in. The three axes never conflate: `remote` = transport
 (may the secret be SERVED non-locally), `automation` = code (may a listed
 consumer skip TOTP), `allowRemoteOrigin` = caller provenance (may a
-session a REMOTE PEER created resolve it locally). See "The origin gate"
+session a REMOTE NODE created resolve it locally). See "The origin gate"
 below for the gate order and the exact boundary. **P-N2 (this commit) parks a
 `requireTotp` resolve with no code instead of refusing it outright**: the
 requesting connection now WAITS (default 300s, `AOIDE_SECRETS_PARK_TIMEOUT`
@@ -300,7 +300,7 @@ below) into something richer.
                                                        a clean "dismissed"
                                                        refusal)
 <- {"ok":false,"error":"unknown pending id `<id>`"}
-<- {"ok":false,"error":"<peer-uid-mismatch refusal>"} (task #73 — see "Peer
+<- {"ok":false,"error":"<node-uid-mismatch refusal>"} (task #73 — see "Node
                                                        identity" below; the
                                                        ask stays parked)
 
@@ -313,7 +313,7 @@ below) into something richer.
                                                       same discipline every
                                                       CLI `Outcome` already
                                                       holds)
-<- {"ok":false,"error":"<message>"}                  (peer-cred refusal, or
+<- {"ok":false,"error":"<message>"}                  (node-cred refusal, or
                                                       a domain denial — "no
                                                       policy for secret x",
                                                       an I/O diagnosis)
@@ -336,7 +336,7 @@ gate, never caller identity — **task #73 does not change this.** What #73
 adds is a separate, orthogonal fact this crate did not have before: the
 connecting process's real uid, read via `SO_PEERCRED` (kernel-truth, not
 self-asserted) and recorded alongside the self-asserted `consumer` name,
-never in place of it — see "Peer identity (`SO_PEERCRED`, task #73)" below.
+never in place of it — see "Node identity (`SO_PEERCRED`, task #73)" below.
 `argv0` (the wrapped command's own argv[0], sent by `secrets exec`) exists
 purely so the broker's audit lines can name it — the broker never runs it.
 **`reason` (P3) is free-text, self-asserted, DISPLAY-ONLY context for why
@@ -367,7 +367,7 @@ P-V3. The `exists` flag on a denied `put` is what a consumer of this wire
 checks — never string-matching the `error` text — to tell "already has a
 value" apart from every other denial.
 
-## Peer identity (`SO_PEERCRED`, task #73)
+## Node identity (`SO_PEERCRED`, task #73)
 
 Every `handle_conn`-served connection reads its own kernel-truth caller
 identity ONCE, at connection start, via `SO_PEERCRED`
@@ -381,26 +381,26 @@ on it below fails CLOSED on that case, never open.
 
 **This does not authenticate `consumer`.** The self-asserted honesty note
 above is unchanged: nothing on the wire proves a caller's claimed
-`consumer` name. What peer identity adds is a SEPARATE fact recorded
+`consumer` name. What node identity adds is a SEPARATE fact recorded
 alongside it:
 
-- **Parked asks are stamped with their requesting connection's peer uid**
+- **Parked asks are stamped with their requesting connection's node uid**
   at park time (`park::ParkedAsk::peer_uid`), shown ADDITIVELY in
   `pending`'s reply as `peerUid` (`null` when unidentified — an old client
   ignoring the field is unaffected, same wire-compatibility discipline
   every other additive field here holds).
-- **`dismiss` is peer-uid-gated.** An ordinary caller may only dismiss an
-  ask whose STAMPED `peerUid` matches its OWN connection's peer uid — the
+- **`dismiss` is node-uid-gated.** An ordinary caller may only dismiss an
+  ask whose STAMPED `peerUid` matches its OWN connection's node uid — the
   broker's own effective uid (the operator/admin path — the same "this
   process's uid decides" precedent `home::admin_identity_check` holds for
   the direct-home admin commands) may always dismiss any ask, regardless of
   who parked it. A refused dismiss names BOTH uids and leaves the ask
   exactly where it was, dismissable by its rightful owner or the broker's
   own operator. `approve` stays OPEN to any local caller reaching the
-  socket — the TOTP code is its gate, not identity; peer identity does not
+  socket — the TOTP code is its gate, not identity; node identity does not
   change that.
 - **Every audit line for resolve/park/approve/dismiss/put now carries the
-  acting connection's peer uid** alongside the pre-existing self-asserted
+  acting connection's node uid** alongside the pre-existing self-asserted
   consumer name — a human reading `audit.log` sees both: what the caller
   CLAIMED to be, and who the kernel says actually connected.
 
@@ -420,7 +420,7 @@ canonical copy — a wire change lands here (and in `broker.rs`'s module
 doc) first, `CONTRACTS.md` follows in the same commit. **`client::
 resolve_bounded` (task #84) is the first exported library entry point for
 exactly this kind of direct machine speaker**: `aoide-server`'s A2A door
-and `aoide-client`'s outbound peer client both call it — never a socket
+and `aoide-client`'s outbound node client both call it — never a socket
 write of their own — to resolve their bearer token as consumers
 `a2a-door`/`a2a-client` respectively, fresh on every verification/request,
 with a short bounded read timeout (`wait:false` on the wire, so a
@@ -454,14 +454,14 @@ narrowed by this phase to exactly that one remaining case).
 -> {"op":"admin","command":"migrate","name":"<name>","target":"<backend>"}
 ```
 
-**The peer-cred gate is strict where `dismiss`'s is permissive: ONLY the
+**The node-cred gate is strict where `dismiss`'s is permissive: ONLY the
 broker's own effective uid may send `{"op":"admin"}`, full stop.** Unlike
 `dismiss` (any caller may dismiss its OWN ask), an admin mutation touches
 `policy.json` for every consumer of a secret at once — the same bar the
 direct-write path's `require_admin_identity` already holds. `broker::
 admin_gate` reuses `home::admin_identity_error`'s exact wording (root's
 "plain `sudo` runs as root" clause included) by treating the connecting
-peer's uid as that function's "process euid" argument — a refusal here
+node's uid as that function's "process euid" argument — a refusal here
 teaches the IDENTICAL fix the direct path already teaches. Root (uid 0) is
 refused exactly like the direct path refuses it — plain `sudo` is still
 wrong, `sudo -u aoide-secrets` is still right. An unidentified connection
@@ -472,7 +472,7 @@ default `dismiss` holds.
 write.** `commands.rs`'s `admin_dispatch` falls back to the direct-write
 path ONLY when the socket connect itself fails with `ENOENT`/
 `ConnectionRefused` (nothing listening) — every OTHER outcome, including
-the broker's own `{"ok":false}` denial (a wrong peer uid, a domain error, a
+the broker's own `{"ok":false}` denial (a wrong node uid, a domain error, a
 poisoned `policy.json`), is reported straight through as the command's
 result. A live-but-sick daemon (a permission error, a saturated accept
 backlog) is therefore never bypassed into a TOCTOU race against a direct
@@ -698,8 +698,8 @@ caller never parks), keyed on the CALLER's kernel-attested provenance —
 session record -> seal verified against the daemon's LIVE `ping`-fetched
 public key, fresh-starttime pid-reuse defense included) and hands the
 answer into the gate as a parameter, clock-discipline style. A caller
-whose sealed session is remote-origin (`originClass` `peer:*` — a session
-a remote peer created) is refused with a taught message naming the flag,
+whose sealed session is remote-origin (`originClass` `node:*` — a session
+a remote node created) is refused with a taught message naming the flag,
 the session, and its origin, unless the secret opted in; the refusal
 audits name-only. `secrets allow-remote-origin <name> on|off` flips the
 bit, same admin gate and idempotency discipline as `expose`.
@@ -2159,7 +2159,7 @@ Daemon/socket/CLI (P-V2, extended P-V3):
   `AdminOutcome{message,changed}` or `Err(String)` out, no `Invocation`, no
   `Outcome`, no wire `Value` — the SAME function serves `commands.rs`'s
   direct-write fallback and `broker::handle_admin`'s socket path, never two
-  copies. Makes no admin-identity decision of its own; the euid/peer-cred
+  copies. Makes no admin-identity decision of its own; the euid/node-cred
   gate belongs entirely to whichever caller invokes it.
 
 ## What it consumes

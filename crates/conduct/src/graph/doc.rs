@@ -147,31 +147,31 @@ pub fn build_graph(
         }
     }
 
-    // Fold registered PEERS into the DAG (CONTRACTS.md §7): each a ROOT node
-    // `kind:"peer"`, `id:"peer:<name>"` — no edges (they anchor to nothing),
-    // so the existing spawned/anchors machinery is untouched. A peer's own
+    // Fold registered NODES into the DAG (CONTRACTS.md §7): each a ROOT node
+    // `kind:"node"`, `id:"node:<name>"` — no edges (they anchor to nothing),
+    // so the existing spawned/anchors machinery is untouched. A node's own
     // ALREADY-RESOLVED graph document nests as `children` on its node,
     // verbatim, never flattened into this document's own `nodes`/`edges` —
-    // so a peer's ids can never collide with local ones or another peer's,
+    // so a node's ids can never collide with local ones or another node's,
     // and no new edge vocabulary is needed. Only a FRESH (non-stale, within
-    // `PEER_CACHE_TTL_SECS`) cache contributes `children`; a stale or
-    // never-pulled peer still surfaces (so `peer add` is visible
+    // `NODE_CACHE_TTL_SECS`) cache contributes `children`; a stale or
+    // never-pulled node still surfaces (so `node add` is visible
     // immediately) with an explicit `state` and no children — never a
-    // crash, never a silently-dropped peer. Additive and tolerate-missing:
-    // an absent/empty registry (`state/peers.json`) adds nothing and this
+    // crash, never a silently-dropped node. Additive and tolerate-missing:
+    // an absent/empty registry (`state/nodes.json`) adds nothing and this
     // whole block is a no-op.
     let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-    for peer in aoide_storage::peer_store::load_peers() {
+    for mesh_node in aoide_storage::node_store::load_nodes() {
         let mut node = json!({
-            "id": format!("peer:{}", peer.name),
-            "kind": "peer",
-            "name": peer.name,
-            "url": peer.url,
+            "id": format!("node:{}", mesh_node.name),
+            "kind": "node",
+            "name": mesh_node.name,
+            "url": mesh_node.url,
         });
-        let cache = aoide_storage::peer_store::load_peer_cache(&peer.name);
+        let cache = aoide_storage::node_store::load_node_cache(&mesh_node.name);
         let fresh = cache
             .as_ref()
-            .map(|c| aoide_storage::peer_store::is_cache_fresh(c, now_epoch))
+            .map(|c| aoide_storage::node_store::is_cache_fresh(c, now_epoch))
             .unwrap_or(false);
         if let Some(entry) = &cache {
             if let Some(fa) = &entry.fetched_at {
@@ -934,18 +934,18 @@ mod tests {
         assert!(node_b.get("needsSudo").is_none());
     }
     #[test]
-    fn build_graph_folds_a_fresh_peer_as_a_root_node_with_nested_children() {
-        // CONTRACTS.md §7: a registered peer with a FRESH (non-stale,
-        // within-TTL) pulled cache folds in as a `kind:"peer"` root node
+    fn build_graph_folds_a_fresh_node_as_a_root_node_with_nested_children() {
+        // CONTRACTS.md §7: a registered node with a FRESH (non-stale,
+        // within-TTL) pulled cache folds in as a `kind:"node"` root node
         // whose own resolved graph nests as `children` — never flattened
         // into this document's own top-level `nodes`/`edges`.
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
-        let dir = std::env::temp_dir().join(format!("aoide-peer-fold-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aoide-node-fold-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("AOIDE_STATE_DIR", &dir);
 
-        aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+        aoide_storage::node_store::save_nodes(&[aoide_storage::node_store::Node {
             name: "yomi-strix".into(),
             url: "http://yomi-strix:8710/".into(),
             autogate: false,
@@ -959,16 +959,16 @@ mod tests {
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
-        let peer_graph = json!({
+        let node_graph = json!({
             "schemaVersion": "0",
             "nodes": [{ "id": "project:remote", "kind": "project", "name": "remote", "path": "/x" }],
             "edges": [],
         });
-        aoide_storage::peer_store::save_peer_cache(&aoide_storage::peer_store::PeerCacheEntry {
+        aoide_storage::node_store::save_node_cache(&aoide_storage::node_store::NodeCacheEntry {
             schema_version: "0".into(),
             name: "yomi-strix".into(),
             instance: Some(json!({ "name": "yomi-strix", "url": "http://yomi-strix:8710/" })),
-            graph: Some(peer_graph.clone()),
+            graph: Some(node_graph.clone()),
             fetched_at: Some(aoide_storage::time::now_iso_utc()),
             stale: false,
             last_error: None,
@@ -977,18 +977,18 @@ mod tests {
 
         let doc = build_graph(&[], &[], &[]);
         let nodes = doc["nodes"].as_array().unwrap();
-        let peer = nodes
+        let node = nodes
             .iter()
-            .find(|n| n["id"] == "peer:yomi-strix")
-            .expect("peer node folded in");
-        assert_eq!(peer["kind"], "peer");
-        assert_eq!(peer["name"], "yomi-strix");
-        assert_eq!(peer["url"], "http://yomi-strix:8710/");
-        assert_eq!(peer["state"], "fresh");
-        assert_eq!(peer["children"]["nodes"], peer_graph["nodes"].clone());
-        // A fresh peer contributes no TOP-LEVEL nodes/edges of its own — its
+            .find(|n| n["id"] == "node:yomi-strix")
+            .expect("mesh node folded in");
+        assert_eq!(node["kind"], "node");
+        assert_eq!(node["name"], "yomi-strix");
+        assert_eq!(node["url"], "http://yomi-strix:8710/");
+        assert_eq!(node["state"], "fresh");
+        assert_eq!(node["children"]["nodes"], node_graph["nodes"].clone());
+        // A fresh node contributes no TOP-LEVEL nodes/edges of its own — its
         // subtree is nested, never merged into this document's flat lists,
-        // so a peer's ids can never collide with a local session/project id.
+        // so a node's ids can never collide with a local session/project id.
         assert!(nodes.iter().all(|n| n["id"] != "project:remote"));
         assert!(doc["edges"].as_array().unwrap().is_empty());
 
@@ -999,19 +999,19 @@ mod tests {
         }
     }
     #[test]
-    fn build_graph_shows_a_stale_or_never_pulled_peer_with_no_children() {
-        // A registered peer is visible IMMEDIATELY on `peer add`, before any
+    fn build_graph_shows_a_stale_or_never_pulled_node_with_no_children() {
+        // A registered node is visible IMMEDIATELY on `node add`, before any
         // pull ever succeeds — and stays visible (never silently dropped)
         // once a pull goes stale. Either way: an explicit `state`, no
         // `children`, never a crash.
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
-        let dir = std::env::temp_dir().join(format!("aoide-peer-fold-stale-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("aoide-node-fold-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::env::set_var("AOIDE_STATE_DIR", &dir);
 
         // Never pulled: no cache file at all.
-        aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+        aoide_storage::node_store::save_nodes(&[aoide_storage::node_store::Node {
             name: "never-pulled".into(),
             url: "http://never:8710/".into(),
             autogate: false,
@@ -1027,13 +1027,13 @@ mod tests {
         .unwrap();
         let doc = build_graph(&[], &[], &[]);
         let nodes = doc["nodes"].as_array().unwrap();
-        let node = nodes.iter().find(|n| n["id"] == "peer:never-pulled").unwrap();
+        let node = nodes.iter().find(|n| n["id"] == "node:never-pulled").unwrap();
         assert_eq!(node["state"], "stale");
         assert!(node.get("children").is_none());
 
         // Explicitly stale (a failed pull) — still visible, still no children,
-        // and carries the last error for `peer status` to surface.
-        aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+        // and carries the last error for `node status` to surface.
+        aoide_storage::node_store::save_nodes(&[aoide_storage::node_store::Node {
             name: "flaky".into(),
             url: "http://flaky:8710/".into(),
             autogate: false,
@@ -1047,7 +1047,7 @@ mod tests {
             added_at: "2026-08-14T00:00:00Z".into(),
         }])
         .unwrap();
-        aoide_storage::peer_store::save_peer_cache(&aoide_storage::peer_store::PeerCacheEntry {
+        aoide_storage::node_store::save_node_cache(&aoide_storage::node_store::NodeCacheEntry {
             schema_version: "0".into(),
             name: "flaky".into(),
             instance: None,
@@ -1059,14 +1059,14 @@ mod tests {
         .unwrap();
         let doc = build_graph(&[], &[], &[]);
         let nodes = doc["nodes"].as_array().unwrap();
-        let node = nodes.iter().find(|n| n["id"] == "peer:flaky").unwrap();
+        let node = nodes.iter().find(|n| n["id"] == "node:flaky").unwrap();
         assert_eq!(node["state"], "stale");
         assert_eq!(node["error"], "connection refused");
         assert!(node.get("children").is_none());
 
         // An expired-TTL (but not explicitly marked stale) cache is ALSO
         // reported stale by the fold.
-        aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+        aoide_storage::node_store::save_nodes(&[aoide_storage::node_store::Node {
             name: "expired".into(),
             url: "http://expired:8710/".into(),
             autogate: false,
@@ -1082,10 +1082,10 @@ mod tests {
         .unwrap();
         let ancient = aoide_storage::time::iso_utc_from_epoch(
             aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap()
-                - aoide_storage::peer_store::PEER_CACHE_TTL_SECS as i64
+                - aoide_storage::node_store::NODE_CACHE_TTL_SECS as i64
                 - 1,
         );
-        aoide_storage::peer_store::save_peer_cache(&aoide_storage::peer_store::PeerCacheEntry {
+        aoide_storage::node_store::save_node_cache(&aoide_storage::node_store::NodeCacheEntry {
             schema_version: "0".into(),
             name: "expired".into(),
             instance: Some(json!({})),
@@ -1097,7 +1097,7 @@ mod tests {
         .unwrap();
         let doc = build_graph(&[], &[], &[]);
         let nodes = doc["nodes"].as_array().unwrap();
-        let node = nodes.iter().find(|n| n["id"] == "peer:expired").unwrap();
+        let node = nodes.iter().find(|n| n["id"] == "node:expired").unwrap();
         assert_eq!(node["state"], "stale");
         assert!(node.get("children").is_none());
 

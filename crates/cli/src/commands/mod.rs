@@ -22,7 +22,7 @@ use crate::registry::Registry;
 /// guide, schema, content(stub), make(stub), update(stub), onboard (P-I2:
 /// the first-boot flow, real as of this commit),
 /// mcp serve, daemon, graph + conduct, adapter melete, conductor, a2a
-/// serve, peer add/remove/pull/status (CONTRACTS.md §7,
+/// serve, node add/remove/pull/status (CONTRACTS.md §7,
 /// same-network federation), usage, hooks install,
 /// soundcheck (the mechanical-integrity command's WORKING-tree half,
 /// `aoide-upkeep`; report-only, forever — see its own module doc for the
@@ -35,16 +35,16 @@ use crate::registry::Registry;
 /// command, P-D3, `docs/architecture/AOIDED.md`'s "L1" section), identity
 /// (this instance's ed25519 identity show command, P-P1 of the pairing
 /// workstream), melete status/graph/call (the Melete MCP client, M2, task
-/// #14), peer advertise/list (task #120), pair/pair reject/pair watch (the
+/// #14), node advertise/list (task #120), pair/pair reject/pair watch (the
 /// pairing ceremony's whole CLI face — P-P2 built it, P-PV2 and task #135
 /// P3' each collapsed it further, ending in ONE smart command: bare `pair`
 /// resolves/approves/starts, `pair reject`, `pair watch`; see
 /// `docs/architecture/PAIRING.md`), config + config set (task #135 P-C —
 /// the portable runtime config file, `$AOIDE_ROOT/config.toml`), mesh +
 /// mesh pair (task #135 P4/P5 — the read compares every declared
-/// `[mesh.<name>]` against the live peer registry and reports drift without
+/// `[mesh.<name>]` against the live node registry and reports drift without
 /// writing either side; the converge closes that drift by running the
-/// ordinary `pair` ceremony against every declared peer with no verified
+/// ordinary `pair` ceremony against every declared node with no verified
 /// record, and never touches a verified one).
 ///
 /// P-A5 (binary-split workstream) removed the register lines for the
@@ -52,8 +52,8 @@ use crate::registry::Registry;
 /// shellbridge/quickshell/screen/herald/take — from this list; those
 /// command paths now live ONLY in `crates/lyra/src/commands/mod.rs::all()`
 /// (docs/architecture/PACKAGE-LAYOUT.md, CONTRACTS.md §3). P-PV2 (the
-/// User's locked spec) collapsed `peer invite`/`peer pair request` into
-/// ONE smart-target `peer pair` and renamed `peer pair pending` to `peer
+/// User's locked spec) collapsed `node invite`/`node pair request` into
+/// ONE smart-target `node pair` and renamed `node pair pending` to `node
 /// pending`.
 ///
 /// The exact command-path set lives in `registry.rs`'s golden snapshot
@@ -72,7 +72,7 @@ pub fn all() -> Registry {
     aoide_client::commands::register_post_graph(&mut r); // adapter melete
     aoide_conductor::commands::register(&mut r); // conductor
     aoide_server::commands::register_a2a_serve(&mut r); // a2a serve
-    aoide_client::commands::register_peers(&mut r); // peer add/remove/pull/status — same-network federation (CONTRACTS.md §7, appended newest)
+    aoide_client::commands::register_nodes(&mut r); // node add/remove/pull/status — same-network federation (CONTRACTS.md §7, appended newest)
     aoide_storage::commands::register(&mut r); // usage — local token/cost rollup (CONTRACTS.md §4)
     aoide_conduct::commands::hooks::register(&mut r); // hooks install — the hook-installer command
     aoide_upkeep::commands::register(&mut r); // soundcheck — mechanical-integrity WORKING-tree sweep, report-only
@@ -80,10 +80,10 @@ pub fn all() -> Registry {
     aoide_secrets::commands::register(&mut r); // secrets serve/exec/add/rm/grant/revoke — the secrets broker (Workstream SECRETS P-V2, appended newest)
     aoide_server::commands::register_events(&mut r); // events tail — aoided's own feed follow command (P-D3, appended newest)
     aoide_storage::commands::register_identity(&mut r); // identity — this instance's ed25519 identity show command (pairing workstream P-P1, appended newest)
-    aoide_client::commands::register_peer_discovery(&mut r); // peer discover/advertise — LAN discovery's CLI half (P-P6 + task #120, appended newest)
+    aoide_client::commands::register_node_discovery(&mut r); // node discover/advertise — LAN discovery's CLI half (P-P6 + task #120, appended newest)
     aoide_client::mcp_client::register_melete(&mut r); // melete status/graph/call — the Melete MCP client (M2, task #14, appended newest)
-    aoide_conduct::commands::peer_list::register(&mut r); // peer list — the one-glance mesh roster over the roster core's probe (formerly who's) + one discovery sweep (task #120 P2, appended newest)
-    aoide_client::commands::register_pair(&mut r); // pair + pair reject/watch — the pairing ceremony's whole CLI face, one smart command (task #135 P3', superseding the peer pair family — hard cutover)
+    aoide_conduct::commands::node_list::register(&mut r); // node list — the one-glance mesh roster over the roster core's probe (formerly who's) + one discovery sweep (task #120 P2, appended newest)
+    aoide_client::commands::register_pair(&mut r); // pair + pair reject/watch — the pairing ceremony's whole CLI face, one smart command (task #135 P3', superseding the node pair family — hard cutover)
     aoide_storage::commands::register_config(&mut r); // config, config set — the portable runtime config file (task #135 P-C, appended newest)
     aoide_client::mesh::register(&mut r); // mesh + mesh pair — the declared-mesh-vs-live-registry drift report and the converge that closes it (task #135 P4/P5, appended newest)
 

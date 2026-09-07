@@ -18,6 +18,7 @@ use super::session_store::{
 use super::window::{discover_window_address, resolve_registration_parent};
 use aoide_protocol::Invocation;
 use aoide_protocol::output::Outcome;
+use aoide_storage::attest::is_node_origin;
 use aoide_storage::fs::{session_logs_dir, with_stage_lock};
 use serde_json::json;
 use std::os::unix::io::{AsRawFd, FromRawFd, OwnedFd, RawFd};
@@ -1192,17 +1193,17 @@ pub fn session_conduct(inv: &Invocation) -> Outcome {
     // Origin, LOCAL-CLASS ONLY (P-P3, `docs/architecture/PAIRING.md`
     // decision 7; tightened at LANE IDENTITY P-ID0, G16/G5): inherited
     // process env is exactly what a same-uid process can set on ITSELF
-    // before invoking `aoide conduct` directly, so a `peer:*` shape read
+    // before invoking `aoide conduct` directly, so a `node:*` shape read
     // here is unauthenticated and must never be trusted — that shape now
     // comes ONLY from `aoide-server::a2a::do_spawn` stamping the record
-    // directly at the door where the peer name IS authenticated
+    // directly at the door where the node name IS authenticated
     // (`stamp_spawn_origin` in `crates/server/src/a2a.rs`), never threaded
     // through this env var. A taught refusal, not a panic: a hostile
-    // `AOIDE_SESSION_ORIGIN=peer:X` simply fails to stamp.
+    // `AOIDE_SESSION_ORIGIN=node:X` simply fails to stamp.
     if let Ok(origin) = std::env::var("AOIDE_SESSION_ORIGIN") {
-        if origin.starts_with("peer:") {
+        if is_node_origin(&origin) {
             eprintln!(
-                "aoide conduct: refusing to stamp origin `{origin}` from AOIDE_SESSION_ORIGIN — a peer:* origin may only be stamped by the a2a door itself"
+                "aoide conduct: refusing to stamp origin `{origin}` from AOIDE_SESSION_ORIGIN — a node:* origin may only be stamped by the a2a door itself"
             );
         } else if !origin.is_empty() {
             stamp_origin(&id, &origin);
@@ -2323,12 +2324,12 @@ mod tests {
     }
 
     #[test]
-    fn conduct_registration_refuses_a_peer_origin_from_the_env_var() {
+    fn conduct_registration_refuses_a_node_origin_from_the_env_var() {
         // LANE IDENTITY P-ID0 (G16/G5): `AOIDE_SESSION_ORIGIN` is inherited
         // process env — a same-uid process can set it on ITSELF before
-        // invoking `aoide conduct` directly, so a `peer:*` shape read here
+        // invoking `aoide conduct` directly, so a `node:*` shape read here
         // must never be trusted. `session_conduct` now refuses exactly this
-        // shape rather than stamping it; a genuine peer origin is stamped
+        // shape rather than stamping it; a genuine node origin is stamped
         // by `aoide-server::a2a::do_spawn` calling `stamp_origin` directly
         // on the record (proven in that crate's own test, which this crate
         // cannot see).
@@ -2343,21 +2344,21 @@ mod tests {
         std::env::set_var("AOIDE_STATE_DIR", &state);
         std::env::set_var("XDG_RUNTIME_DIR", &root);
 
-        std::env::set_var("AOIDE_SESSION_ORIGIN", "peer:yomi-strix");
+        std::env::set_var("AOIDE_SESSION_ORIGIN", "node:yomi-strix");
         let out = session_conduct(&conduct_invocation(
             &["sh", "-c", "true"],
-            &[("id", "conduct-origin-peer")],
+            &[("id", "conduct-origin-node")],
         ));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();
-        let rec = s.sessions.iter().find(|r| r.session_id == "conduct-origin-peer").unwrap();
+        let rec = s.sessions.iter().find(|r| r.session_id == "conduct-origin-node").unwrap();
         assert_eq!(
             rec.origin, None,
-            "a peer:* shape read off inherited env must be refused, never stamped"
+            "a node:* shape read off inherited env must be refused, never stamped"
         );
 
-        // A non-peer env value is local-class and still stamps — the
-        // refusal is specific to the `peer:` shape, not to the env read
+        // A non-node env value is local-class and still stamps — the
+        // refusal is specific to the `node:` shape, not to the env read
         // entirely.
         std::env::set_var("AOIDE_SESSION_ORIGIN", "local");
         let out_local = session_conduct(&conduct_invocation(

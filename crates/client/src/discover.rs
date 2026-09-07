@@ -1,4 +1,4 @@
-//! `peer discover`/`peer invite`'s shared UDP sweep (P-P6 + task #120,
+//! `node discover`/`node invite`'s shared UDP sweep (P-P6 + task #120,
 //! `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
 //! section): bind `0.0.0.0:aoide_storage::advertise::PORT`, listen for a
 //! bounded window, validate + dedupe every line heard
@@ -12,11 +12,11 @@
 //! datagrams alike, so there is no group membership, no interface
 //! pinning, and no multicast-capability probing anywhere in this module.
 //!
-//! **Discovery is read-only.** This module never writes `state/peers.json`
-//! — it doesn't even import `peer_store` for writing anything, only
+//! **Discovery is read-only.** This module never writes `state/nodes.json`
+//! — it doesn't even import `node_store` for writing anything, only
 //! `aoide_storage::advertise` for the wire format. The pairing ceremony
 //! (`commands::run_pair_request`, shared by `pair`'s url arm and its
-//! hostname arm) is the only thing in this crate that ever commits a peer
+//! hostname arm) is the only thing in this crate that ever commits a node
 //! record.
 //!
 //! **No resident listener.** Every call to [`run_sweep`] is one bounded,
@@ -29,7 +29,7 @@
 //! over one already-validated [`aoide_storage::advertise::Advertisement`],
 //! so the dedupe/freshest-wins/bounded-cache logic is unit-testable with
 //! no socket at all; [`run_sweep`] is the thin real-I/O wrapper around it.
-//! [`resolve_invite_target`] is the same shape one layer up: `peer
+//! [`resolve_invite_target`] is the same shape one layer up: `node
 //! invite`'s zero/one/many-match resolution against an already-swept
 //! [`SweepResult`], pure so its refusal shapes are testable without a real
 //! network sweep.
@@ -40,7 +40,7 @@ use std::time::{Duration, Instant};
 
 use aoide_storage::advertise::{self, Advertisement};
 
-/// The default `--secs` window for `peer discover`/`peer invite` when the
+/// The default `--secs` window for `node discover`/`node invite` when the
 /// caller doesn't override it (PAIRING.md: "listens briefly (default a few
 /// seconds)"; the brief: "default ~4").
 pub const DEFAULT_SWEEP_SECS: u64 = 4;
@@ -62,7 +62,7 @@ pub const MAX_HEARD: usize = 64;
 /// `host` is the advertiser's CLAIM, kept for display and for composing an
 /// `ssh://user@host` marker by name instead of by lease; `src_addr` is the
 /// one field on `Heard` that tells the truth about where the packet
-/// actually came from, and the address `peer invite` actually uses).
+/// actually came from, and the address `node invite` actually uses).
 #[derive(Debug, Clone, PartialEq)]
 pub struct Heard {
     pub advertisement: Advertisement,
@@ -174,8 +174,8 @@ pub fn run_sweep(secs: u64) -> std::io::Result<SweepResult> {
     Ok(SweepResult { heard, dropped })
 }
 
-/// Render one [`run_sweep`] I/O failure as the taught error line `peer
-/// discover`/`peer invite` print — one function, so the two handlers never
+/// Render one [`run_sweep`] I/O failure as the taught error line `node
+/// discover`/`node invite` print — one function, so the two handlers never
 /// drift apart. The case worth teaching is the fixed port already held
 /// (another sweep in flight — sweeps bind the ONE well-known port, by
 /// design): the bare errno reads as noise, so name the condition instead
@@ -184,7 +184,7 @@ pub fn describe_sweep_error(e: &std::io::Error) -> String {
     if e.kind() == std::io::ErrorKind::AddrInUse {
         format!(
             "listening for discovery advertisements: UDP port {} is already bound ({e}) — \
-             another `peer discover`/`peer invite` sweep is likely in flight on this box; \
+             another `node discover`/`node invite` sweep is likely in flight on this box; \
              retry when it finishes",
             advertise::PORT
         )
@@ -205,7 +205,7 @@ pub enum InviteResolveError {
 }
 
 /// Resolve `<name>` against an already-swept [`SweepResult`] — pure, so
-/// `peer invite`'s zero/one/many-match refusal logic is testable with no
+/// `node invite`'s zero/one/many-match refusal logic is testable with no
 /// real socket. Dedupe is by (name, source address) (`run_sweep`'s own
 /// fold), so two entries sharing a `name` here are genuinely two different
 /// boxes claiming the same nickname — PAIRING.md's own "ambiguous... =
@@ -223,7 +223,7 @@ pub fn resolve_invite_target(heard: &[Heard], name: &str) -> Result<Heard, Invit
     }
 }
 
-/// Whether `peer invite`'s resolved target is THIS instance — the
+/// Whether `node invite`'s resolved target is THIS instance — the
 /// self-invite guard, checked two independent ways, either sufficient:
 /// (1) the heard advertisement's `name` equals this instance's own
 /// advertised name (the exact value this box's own `a2a serve` puts on
@@ -387,8 +387,8 @@ mod tests {
     /// not a mocked socket.
     ///
     /// **#126: takes `env_lock` for its whole body**, the SAME lock
-    /// `commands.rs`'s own `peer discover` sweep tests already hold via
-    /// `with_peer_state` — all three tests bind the ONE fixed
+    /// `commands.rs`'s own `node discover` sweep tests already hold via
+    /// `with_node_state` — all three tests bind the ONE fixed
     /// `advertise::PORT` (there is no ephemeral-port form of this test: it
     /// exists specifically to prove a REAL line sent to the REAL advertised
     /// port is heard, `run_sweep`'s own doc). Without this, `cargo test`'s
@@ -450,7 +450,7 @@ mod tests {
     }
 
     #[test]
-    fn is_self_target_false_for_a_genuine_other_peer() {
+    fn is_self_target_false_for_a_genuine_other_node() {
         assert!(!is_self_target(&heard("box-a", "192.168.1.202"), "yomi-strix"));
     }
 

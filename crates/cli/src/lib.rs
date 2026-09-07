@@ -96,7 +96,7 @@ pub fn run_cli(argv: &[String]) -> i32 {
             }
             let (bind, port) = a2a::resolve_bind_port(inv);
             let spawn_agent = a2a::resolve_spawn_agent(inv);
-            let peer_name = a2a::resolve_peer_name(inv);
+            let node_name = a2a::resolve_node_name(inv);
             let token_file = a2a::resolve_token_file(inv);
             let expected_token = a2a::read_expected_token(&token_file).unwrap_or_default();
             let bearer_secret = a2a::resolve_bearer_secret(inv);
@@ -110,7 +110,7 @@ pub fn run_cli(argv: &[String]) -> i32 {
                 port,
                 &audit_log,
                 &spawn_agent,
-                &peer_name,
+                &node_name,
                 &expected_token,
                 &bearer_secret,
                 &secrets_socket,

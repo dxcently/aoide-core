@@ -150,7 +150,7 @@ struct HeadFile {
 
 /// Read one take by number. `None` on a missing file, invalid JSON, or a
 /// path that fails to parse as a `TakeRecord` — the same tolerate-missing
-/// discipline `peer_store::load_peers` / `mode::load_mode_marker` use for
+/// discipline `node_store::load_nodes` / `mode::load_mode_marker` use for
 /// any other stage-adjacent file: an absent take is "not there", never an
 /// error this deep in the store.
 pub fn load_take(song: &str, draft: Option<&str>, n: u32) -> Option<TakeRecord> {

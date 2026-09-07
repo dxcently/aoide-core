@@ -1137,7 +1137,7 @@ mod tests {
         // A genuine socket drop is NOT a timeout → the listener must reconnect.
         assert!(!is_read_timeout(&Error::new(
             ErrorKind::ConnectionReset,
-            "peer reset"
+            "node reset"
         )));
         assert!(!is_read_timeout(&Error::new(
             ErrorKind::BrokenPipe,

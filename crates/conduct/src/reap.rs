@@ -3425,23 +3425,23 @@ mod tests {
         let dead_pid = 999_999_999u32;
 
         // Orphan: session gone, pid dead, settled. Swept.
-        let orphan_path = write_record("gone-session", "peer-a", dead_pid);
+        let orphan_path = write_record("gone-session", "node-a", dead_pid);
         backdate(&orphan_path);
         // Live: session still on the roster, pid ALSO reads dead — spared
         // regardless, because the roster check runs before any pid probe.
-        let live_path = write_record("alive-session", "peer-b", dead_pid);
+        let live_path = write_record("alive-session", "node-b", dead_pid);
         backdate(&live_path);
         // Infant: session gone, pid dead, but bound a moment ago — inside the
         // settle window between the forward answering and `open_or_reuse`
         // finishing its write. Spared.
-        let _infant_path = write_record("gone-infant", "peer-c", dead_pid);
+        let _infant_path = write_record("gone-infant", "node-c", dead_pid);
         // Orphan with a LIVE pid that is not actually an `ssh` child (this
         // test process itself): `kill_if_still_our_ssh` must no-op on it
         // (never signal a process that isn't its own ssh), and the record is
         // still unlinked — the safety pin proving the guarded kill and the
         // unconditional unlink are two separate steps.
         let my_pid = std::process::id();
-        let alive_nonssh_path = write_record("gone-alive-pid", "peer-d", my_pid);
+        let alive_nonssh_path = write_record("gone-alive-pid", "node-d", my_pid);
         backdate(&alive_nonssh_path);
 
         let live: HashSet<&str> = ["alive-session"].into_iter().collect();
@@ -3454,8 +3454,8 @@ mod tests {
         assert_eq!(
             candidate_ids,
             vec![
-                "gone-alive-pid/peer-d".to_string(),
-                "gone-session/peer-a".to_string(),
+                "gone-alive-pid/node-d".to_string(),
+                "gone-session/node-a".to_string(),
             ],
             "the GATHER phase alone already excludes the live and infant records",
         );
@@ -3465,25 +3465,25 @@ mod tests {
         assert_eq!(
             swept,
             vec![
-                "gone-alive-pid/peer-d".to_string(),
-                "gone-session/peer-a".to_string(),
+                "gone-alive-pid/node-d".to_string(),
+                "gone-session/node-a".to_string(),
             ],
             "only the dead-pid orphan and the alive-but-not-ours orphan are swept",
         );
         assert!(
-            aoide_storage::tunnel::load("gone-session", "peer-a").is_none(),
+            aoide_storage::tunnel::load("gone-session", "node-a").is_none(),
             "the roster-less, settled, dead-pid record is unlinked",
         );
         assert!(
-            aoide_storage::tunnel::load("gone-alive-pid", "peer-d").is_none(),
+            aoide_storage::tunnel::load("gone-alive-pid", "node-d").is_none(),
             "the roster-less, settled, alive-but-foreign-pid record is unlinked too",
         );
         assert!(
-            aoide_storage::tunnel::load("alive-session", "peer-b").is_some(),
+            aoide_storage::tunnel::load("alive-session", "node-b").is_some(),
             "a live session's tunnel is spared even when its pid probe reads dead",
         );
         assert!(
-            aoide_storage::tunnel::load("gone-infant", "peer-c").is_some(),
+            aoide_storage::tunnel::load("gone-infant", "node-c").is_some(),
             "an infant record inside the settle window is spared",
         );
         // This test process is very much still alive — the whole point of
@@ -3548,7 +3548,7 @@ mod tests {
         let rec = aoide_storage::tunnel::TunnelRecord {
             schema_version: aoide_storage::tunnel::TUNNEL_VERSION.to_string(),
             session_id: "gone-survivor".to_string(),
-            key: "peer-z".to_string(),
+            key: "node-z".to_string(),
             ssh_target: "ssh://user@host".to_string(),
             local_port,
             remote_host: "127.0.0.1".to_string(),
@@ -3561,7 +3561,7 @@ mod tests {
         let swept = sweep_orphan_tunnels(vec![rec]);
         assert!(swept.is_empty(), "a still-alive, still-ours candidate must not be reported swept: {swept:?}");
         assert!(
-            aoide_storage::tunnel::load("gone-survivor", "peer-z").is_some(),
+            aoide_storage::tunnel::load("gone-survivor", "node-z").is_some(),
             "the survivor's record must stay on disk for the next sweep pass to retry"
         );
         assert!(proc_exists(pid), "the fixture traps SIGTERM on purpose — it must still be alive");
@@ -3574,10 +3574,10 @@ mod tests {
 
         // A second sweep pass, now that the child is actually gone, finally
         // collects it — the kept record really is retryable, not stuck.
-        let rec2 = aoide_storage::tunnel::load("gone-survivor", "peer-z").unwrap();
+        let rec2 = aoide_storage::tunnel::load("gone-survivor", "node-z").unwrap();
         let swept2 = sweep_orphan_tunnels(vec![rec2]);
-        assert_eq!(swept2, vec!["gone-survivor/peer-z".to_string()]);
-        assert!(aoide_storage::tunnel::load("gone-survivor", "peer-z").is_none());
+        assert_eq!(swept2, vec!["gone-survivor/node-z".to_string()]);
+        assert!(aoide_storage::tunnel::load("gone-survivor", "node-z").is_none());
 
         let _ = std::fs::remove_dir_all(&runtime);
     }
@@ -3666,9 +3666,9 @@ mod tests {
             aoide_storage::tunnel::record_path(session_id, key).unwrap()
         };
 
-        let done_tunnel = write_record("done-sess", "peer-x");
+        let done_tunnel = write_record("done-sess", "node-x");
         backdate(&done_tunnel);
-        let live_tunnel = write_record("live-sess", "peer-y");
+        let live_tunnel = write_record("live-sess", "node-y");
         backdate(&live_tunnel);
 
         let out = reap(&crate::graph::testutil::invocation(&["session", "reap"], &[]));
@@ -3682,15 +3682,15 @@ mod tests {
             .collect();
         assert_eq!(
             orphan_tunnels,
-            vec!["done-sess/peer-x".to_string()],
+            vec!["done-sess/node-x".to_string()],
             "a done-but-unpruned session's settled tunnel is swept; a live one's is not"
         );
         assert!(
-            aoide_storage::tunnel::load("done-sess", "peer-x").is_none(),
+            aoide_storage::tunnel::load("done-sess", "node-x").is_none(),
             "the done session's tunnel record is gone"
         );
         assert!(
-            aoide_storage::tunnel::load("live-sess", "peer-y").is_some(),
+            aoide_storage::tunnel::load("live-sess", "node-y").is_some(),
             "the live session's tunnel record is untouched"
         );
         let s2: SessionsFile = load_stage(&sessions_path()).unwrap();

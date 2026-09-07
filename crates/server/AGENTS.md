@@ -115,7 +115,7 @@
 - **`daemon::seal_keypair` mints exactly ONE keypair per process, in a
   `OnceLock`, and it must NEVER be written to disk (LANE IDENTITY P-ID1,
   OQ1-A).** This is the daemon's own in-memory seal-signing key, deliberately
-  a DIFFERENT keypair from `state/identity/`'s on-disk peer-wire key — a
+  a DIFFERENT keypair from `state/identity/`'s on-disk node-wire key — a
   same-uid attacker can read that on-disk file, so a seal signed with it
   would not be secret against the exact adversary this lane's thesis names.
   Don't "simplify" by reusing `identity::load_or_mint`'s key here, and
@@ -205,12 +205,12 @@
   grants NOTHING by itself (no `allows`, no spawn/bearer gate, P-P3's lane
   untouched), every REQUIRED field is validated BEFORE anything is parked
   or resolved (`valid_pubkey_hex`/`valid_nonce_hex`/`valid_commit_hex`/
-  `valid_peer_name`/`valid_peer_url`) — `selfVia` (task #131) is the one
+  `valid_node_name`/`valid_node_url`) — `selfVia` (task #131) is the one
   deliberate exception: OPTIONAL, and read with no validator at all
   (absent/wrong-type/empty all fold to `None`), since it is never
   load-bearing enough to refuse the whole request over; don't add one "for
   consistency" — a malformed claim is `approve_inbound`'s problem alone,
-  much later, the same as a malformed `Peer.via` anywhere else. The
+  much later, the same as a malformed `Node.via` anywhere else. The
   commitment check
   (`aoide_storage::pairing::reveal_inbound`) binds a reveal to its own
   earlier request with no signature needed yet (an active MITM cannot
@@ -227,7 +227,7 @@
   next bullet.
 - **`pair_poll` verifies its OWN signature inline against the parked
   entry's stored `pubkey_hex` — never through `verify_signed_request`
-  (P-P4), and never writes a peer record.** No verified `Peer` record
+  (P-P4), and never writes a node record.** No verified `Node` record
   exists on the approver's side until the very id being polled is
   approved, so P-P4's header scheme (which requires one) cannot gate this
   method — `pair_poll` decodes `{id, timestampIso, nonceHex,
@@ -268,49 +268,49 @@
   a socket call through here to "unify" the two writers; the cap-truncate
   race that creates is already accepted (module doc, CONTRACTS.md §6).
 - **`message_send`'s Spawn arm gates on `spawn_admitted`, which requires a
-  resolved, paired, spawn-allowed peer identified via its OWN PER-REQUEST
+  resolved, paired, spawn-allowed node identified via its OWN PER-REQUEST
   SIGNATURE — never a bare token, and never the address rung (P-P3
   decision 6, narrowed again by P-P4, `docs/architecture/PAIRING.md`'s
   wire-authentication section, CONTRACTS.md §6).** `handle_connection`
   calls `verify_signed_request` exactly once per connection, strictly
   before either dispatch path, and threads its result down as
-  `signed_peer_name: Option<&str>` through `route`/`stream_task`/
+  `signed_node_name: Option<&str>` through `route`/`stream_task`/
   `RequestCtx` into `message_send`. The name it threads is the
   KEY-RESOLVED one (#63 P-ID5): `verify_signed_request` finds the record
   BY the stored pubkey that verifies the signature — never by the
-  `X-Aoide-Peer` header, which is attribution only (a claimed-vs-resolved
+  `X-Aoide-Node` header, which is attribution only (a claimed-vs-resolved
   mismatch audits as `attribution-drift` via `attribution_drift_detail`,
   and the resolved name wins everywhere downstream). Don't reintroduce a
   name-based lookup into the verifier, and keep the no-match refusal a
-  single code path with a single message — unknown key, unverified peer,
+  single code path with a single message — unknown key, unverified node,
   keyless record, and bad signature must stay indistinguishable (no
   existence oracle over the registry); collision semantics (shared-pubkey
   records: exact-claimed-name tiebreak, else ambiguous refusal) are pinned
   in CONTRACTS.md §6. When `Some(name)`, `message_send`
-  resolves EXCLUSIVELY against that name (`PeerRung::Signature`) — no
-  fallback to `aoide_storage::peer_store::resolve_peer`'s addr/token
+  resolves EXCLUSIVELY against that name (`NodeRung::Signature`) — no
+  fallback to `aoide_storage::node_store::resolve_node`'s addr/token
   ladder even on a registry-lookup miss, since a request
-  `verify_signed_request` already proved came from a specific peer must
+  `verify_signed_request` already proved came from a specific node must
   never be silently re-resolved as if it came from whoever's address or
   token happens to match instead. Only when the request carries no
-  signature headers at all does `resolve_peer` run its own two-rung
-  ladder (a presented token against a peer's own `token_file` first —
-  `PeerRung::Token` — else the TCP origin against that peer's `url` —
-  `PeerRung::Addr`). `spawn_admitted` accepts ONLY a `PeerRung::Signature`
-  resolution, deferring the peer-side check to `peer_may_spawn(peer)`
+  signature headers at all does `resolve_node` run its own two-rung
+  ladder (a presented token against a node's own `token_file` first —
+  `NodeRung::Token` — else the TCP origin against that node's `url` —
+  `NodeRung::Addr`). `spawn_admitted` accepts ONLY a `NodeRung::Signature`
+  resolution, deferring the node-side check to `node_may_spawn(node)`
   (`verified && allows.contains("spawn")`) only in that case — neither the
   address rung nor the (now-insufficient) token rung reaches `do_spawn`
-  any more. Both unsigned rungs still resolve a peer identity fine for
+  any more. Both unsigned rungs still resolve a node identity fine for
   every OTHER purpose (Inject's `from` attribution, autogate) — they are
   excluded from Spawn specifically, since neither one is cryptographically
   bound to the one request presenting it: a bare source-address match
   carries no possession proof at all, and a bare shared-secret token is
-  replayable and identical across every request the true peer or an
+  replayable and identical across every request the true node or an
   impersonator ever sends. `spawn_refusal` gives a SHAPE-SPECIFIC message
-  for the code `-32006` still returns uniformly: a genuinely paired peer
+  for the code `-32006` still returns uniformly: a genuinely paired node
   resolved via the Token rung is told its aoide is too old to sign
-  requests (upgrade the caller, don't re-pair); a Signature-resolved peer
-  whose `allows` lacks `spawn` is told the exact `peer allow` fix; every
+  requests (upgrade the caller, don't re-pair); a Signature-resolved node
+  whose `allows` lacks `spawn` is told the exact `node allow` fix; every
   other shape gets the original "pair first, then allow" message, now
   naming the signature requirement too. The door-wide bearer that gates
   every OTHER arm (read commands, the uniform-response guard, Inject's
@@ -321,15 +321,15 @@
   test in this file drives `do_spawn`'s real OS-level process spawn (an
   established precedent, `spawn_inject_prompts_success_branch_
   files_the_opening_turn_into_the_inbox`'s own doc comment) — the gate
-  itself is proven via the pure `peer_may_spawn`/`spawn_admitted`/
+  itself is proven via the pure `node_may_spawn`/`spawn_admitted`/
   `spawn_refusal` predicates, `verify_signed_request`'s own dedicated test
   section, and `message_send`'s REFUSAL branches only. **P-P5b's own
-  `peer_spawn_signed_and_allowed_is_admitted_up_to_the_do_spawn_boundary`
+  `node_spawn_signed_and_allowed_is_admitted_up_to_the_do_spawn_boundary`
   holds the SAME line**: it drives a REAL ed25519 signature (via
   `aoide_client::wire::build_message_send_body`, the dev-dependency edge)
   through the REAL `verify_signed_request` → `spawn_admitted`, proving
   admission all the way to (never through) the `do_spawn` call — the
-  refusal-side sibling (`peer_spawn_revoked_is_refused_...`) IS safe to
+  refusal-side sibling (`node_spawn_revoked_is_refused_...`) IS safe to
   drive through the real `message_send` because a refusal never reaches
   `do_spawn`. Don't "complete" the admitted-side test by calling
   `message_send`/`do_spawn` themselves — that would be exactly the real
@@ -342,42 +342,42 @@
   signed request is a POST), but the "binds method" claim above is now
   structurally true, not merely coincidentally true.
 - **`message_send`'s Inject arm feeds `should_deliver_now` through
-  `origin_for_inject` first (P-S6, CONTRACTS.md §6's "Peer authentication
+  `origin_for_inject` first (P-S6, CONTRACTS.md §6's "Node authentication
   today" standing paragraph) — a VERIFIED signature strips
-  `PeerOrigin::Loopback`'s automatic auto-deliver pass, whatever the
-  connection's own address looks like, UNLESS that peer's own signature
+  `ConnOrigin::Loopback`'s automatic auto-deliver pass, whatever the
+  connection's own address looks like, UNLESS that node's own signature
   rung is itself autogate-marked.** An ssh `-L` forward (or any other
-  loopback-terminating proxy) delivers a tunneled peer's packets from its
+  loopback-terminating proxy) delivers a tunneled node's packets from its
   own end's sshd, so `classify_origin` sees loopback for a tunneled request
   exactly like a genuinely local caller — `origin_for_inject(origin,
-  signed_peer_name.is_some() && !sig_autogate)` closes that gap by coercing
-  the origin fed to `should_deliver_now` to `PeerOrigin::Unknown` for a
-  signed, NON-autogate peer (reusing that variant's existing fail-safe arm,
+  signed_node_name.is_some() && !sig_autogate)` closes that gap by coercing
+  the origin fed to `should_deliver_now` to `ConnOrigin::Unknown` for a
+  signed, NON-autogate node (reusing that variant's existing fail-safe arm,
   the same move `effective_origin` already makes for an invalid door-wide
-  token — no fourth `PeerOrigin` kind). **The `!sig_autogate` guard is not
-  optional plumbing — `should_deliver_now(PeerOrigin::Unknown, _)` ignores
+  token — no fourth `ConnOrigin` kind). **The `!sig_autogate` guard is not
+  optional plumbing — `should_deliver_now(ConnOrigin::Unknown, _)` ignores
   `autogate_match` entirely (unconditional `false`, see that function's own
-  match arm and `uniform_response_guard_never_fires_for_a_per_peer_
+  match arm and `uniform_response_guard_never_fires_for_a_per_node_
   autogated_token`'s doc comment for the existing pin), so coercing an
-  autogate-marked signed peer's origin to `Unknown` would make it
+  autogate-marked signed node's origin to `Unknown` would make it
   UN-deliverable, the opposite of the restoration this phase owes.** An
   UNSIGNED request is completely untouched: `origin_for_inject` is the
   identity function when its `signed` argument is `false`, so a genuinely
   local caller's loopback trust is exactly as before this phase. The
   like-for-like half: `autogate_match` folds in a THIRD signal,
-  `sig_autogate` — `resolved_peer` matched via `PeerRung::Signature` whose
-  own `Peer.autogate` is `true` — alongside the existing
-  `ip_autogate`/`token_autogate`, computed AFTER `resolved_peer` now (moved
+  `sig_autogate` — `resolved_node` matched via `NodeRung::Signature` whose
+  own `Node.autogate` is `true` — alongside the existing
+  `ip_autogate`/`token_autogate`, computed AFTER `resolved_node` now (moved
   down from before it) so this fold can read it; an operator who already
-  marked a peer auto-deliver keeps that behavior once it starts signing,
+  marked a node auto-deliver keeps that behavior once it starts signing,
   riding the ordinary Loopback/Remote arms (which DO consult
   `autogate_match`) instead of the coercion. Don't gate this on
   `token_configured`/`TokenState` — that's `effective_origin`'s own,
   separate question (an invalid DOOR-WIDE bearer); this narrowing fires on
-  `signed_peer_name`/`sig_autogate` alone, unconditionally. Tests:
-  `signed_inject_from_a_non_autogate_peer_on_a_loopback_connection_is_held_pending`
+  `signed_node_name`/`sig_autogate` alone, unconditionally. Tests:
+  `signed_inject_from_a_non_autogate_node_on_a_loopback_connection_is_held_pending`
   is the actual regression pin (the exact hole a tunnel would otherwise
-  open); `signed_inject_from_an_autogate_peer_on_a_loopback_connection_still_auto_delivers`
+  open); `signed_inject_from_an_autogate_node_on_a_loopback_connection_still_auto_delivers`
   is the restoration; `origin_for_inject_is_the_identity_function_when_unsigned`
   and `origin_for_inject_downgrades_loopback_once_the_request_is_signed`
   pin the pure predicate directly.
@@ -385,11 +385,11 @@
   QUEUED path only — never an immediately-delivered payload's bytes.**
   `session_send`'s own `from` mechanism also prefixes DELIVERED text
   (`provenance_prefix`, "from `<sender>`: "), so stamping a resolved
-  peer's identity unconditionally would change what an already-autogated
-  peer's delivered message looks like — a regression
-  `autogated_peer_delivers_despite_being_non_loopback` pins against.
+  node's identity unconditionally would change what an already-autogated
+  node's delivered message looks like — a regression
+  `autogated_node_delivers_despite_being_non_loopback` pins against.
   `message_send`'s Inject arm computes `from` as `None` whenever
-  `deliver_now` is `true`, `Some("peer:<name>")` only when it's `false`
+  `deliver_now` is `true`, `Some("node:<name>")` only when it's `false`
   (queuing). Don't lift that `!deliver_now` guard without re-reading why
   it's there.
 - **`do_inject` stamps the `from` flag EXPLICIT-EMPTY when its own `from`
@@ -399,7 +399,7 @@
   absent, and `do_inject` calls `session_send` DIRECTLY, in-process — the
   "calling process" for a remote A2A inject is `aoide a2a serve` itself, a
   long-lived process whose own ambient env has nothing to do with whichever
-  remote peer just sent the message. `from.unwrap_or_default()` (an empty
+  remote node just sent the message. `from.unwrap_or_default()` (an empty
   `String` when `None`) is `resolve_sender`'s own documented "explicit no
   attribution" form (`--from ""`) — it skips the env fallback outright,
   rather than merely overwriting whatever the env currently holds, so this
@@ -417,7 +417,7 @@
   and `do_inject` both only reach the gate with `--yes` already forced or
   the ancestry never resolving a live session.
 - **`NONCE_CACHE` (P-P4) is process-local, in-memory, and deliberately NOT
-  a `HashSet` — a bounded `VecDeque<(peer, nonce)>` capped at
+  a `HashSet` — a bounded `VecDeque<(node, nonce)>` capped at
   `NONCE_CACHE_CAP` with FIFO eviction, so it never needs a second
   data structure to know which entry is oldest.** It lives in THIS crate
   (`a2a.rs`), not `aoide-storage::wire_auth` — the module doc there states
@@ -429,14 +429,14 @@
   every cheaper check (including the signature itself) already passed —
   don't move the `nonce_is_replay` call earlier "to fail faster"; a forged
   or garbage nonce must never consume a cache slot. The cache keys on the
-  VERIFYING PUBKEY, never a peer name (#63 P-ID5): `X-Aoide-Peer` is
+  VERIFYING PUBKEY, never a node name (#63 P-ID5): `X-Aoide-Node` is
   outside the canonical string, so a name-keyed cache would let a captured
   request replay under a shared-key twin's name — don't "simplify" the key
   back to a name. `handle_connection`
   calls `verify_signed_request` exactly ONCE per connection, strictly
   before both the streaming and the plain-JSON-RPC dispatch branches —
   don't duplicate that call inside `route`/`stream_task`/`handle_jsonrpc`;
-  they only ever receive the already-computed `signed_peer_name`.
+  they only ever receive the already-computed `signed_node_name`.
 - **`a2a::self_url(bind, port)` is the ONE formula the AgentCard's `url`
   field and `route`'s own `aoide/graphSummary` handling call — never a
   second inline `format!("http://{bind}:{port}/")` (P-P6).** Before this
@@ -456,7 +456,7 @@
   and held unchanged. Whether a tick SENDS is `resolve_discovery_
   advertise`'s launch-time force OR'd with the runtime switch
   (`aoide_storage::advertise::enabled`), read INSIDE the thread each tick
-  — keep the read per-tick, so `aoide peer advertise on|off` lands
+  — keep the read per-tick, so `aoide node advertise on|off` lands
   without a restart, and don't gate a SECOND call site on the same
   env/flag "for redundancy": a duplicate advertiser thread would just
   double the send rate and complicate the "both off means silence"

@@ -100,7 +100,7 @@
 //!   `broker::resolve_gate`'s origin gate enforces LIVE (unlike `expose`,
 //!   this one changes behavior the moment it flips): off (the default)
 //!   refuses a resolve whose caller session is positively attested as
-//!   remote-origin (sealed `peer:*`), on admits it. Same admin gate, same
+//!   remote-origin (sealed `node:*`), on admits it. Same admin gate, same
 //!   idempotency discipline as `expose`; the three axes' split is stated
 //!   in `crate::policy::Policy::allow_remote_origin`'s own doc.
 //! - `pending`/`approve`/`dismiss` (P-N2) — the parked-resolve completion
@@ -386,7 +386,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["secrets", "allow-remote-origin"],
-        summary: "Flip an EXISTING secret's remote-origin admission bit on or off (LANE IDENTITY P-ID4). Off (the default) refuses a resolve whose CALLER SESSION is positively attested as remote-origin (a sealed `peer:*` originClass — a session a remote peer created); on admits it. Distinct from `expose` (remote = may the secret be served through a non-local entry point) and `automate` (may listed consumers skip TOTP) — this gates WHO locally asks, by kernel-attested provenance. Unidentified callers are untouched by this gate. Idempotent: re-setting the same state reports \"unchanged\" and writes nothing.",
+        summary: "Flip an EXISTING secret's remote-origin admission bit on or off (LANE IDENTITY P-ID4). Off (the default) refuses a resolve whose CALLER SESSION is positively attested as remote-origin (a sealed `node:*` originClass — a session a remote node created); on admits it. Distinct from `expose` (remote = may the secret be served through a non-local entry point) and `automate` (may listed consumers skip TOTP) — this gates WHO locally asks, by kernel-attested provenance. Unidentified callers are untouched by this gate. Idempotent: re-setting the same state reports \"unchanged\" and writes nothing.",
         args: [
             arg!("name", "string", true, "The secret's nickname — must already have a policy (`secrets add` first)."),
             arg!("state", "string", true, "`on` or `off`.")

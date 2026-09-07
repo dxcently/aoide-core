@@ -37,7 +37,7 @@ never the inbound/serve half (that's `aoide-server`).
   Melete's own MCP connector (Melete's stated "only machine surface").
   Speaks MCP (JSON-RPC 2.0 over HTTP POST — `initialize`/`tools/list`/
   `tools/call`) over `commands::post_json` (widened `pub(crate)` for this),
-  the SAME curl transport `peer` already uses — zero new Cargo dependency,
+  the SAME curl transport `node` already uses — zero new Cargo dependency,
   TLS comes free with curl. `melete status` runs `initialize` and reports
   reachability plus `serverInfo`/`protocolVersion`; `melete graph` calls
   the `graph_view` tool and writes the snapshot to `state/melete-graph.json`
@@ -47,8 +47,8 @@ never the inbound/serve half (that's `aoide-server`).
   deliberately no per-tool commands, so a change to Melete's own tool list
   never needs a matching aoide release. The connector's endpoint/token ride
   `AOIDE_MELETE_URL`/`AOIDE_MELETE_TOKEN` (env-only, read fresh per call,
-  the token never touching argv or disk) rather than `peer_store` — Melete
-  is a third-party MCP service, never an aoide peer, so the AgentCard-
+  the token never touching argv or disk) rather than `node_store` — Melete
+  is a third-party MCP service, never an aoide node, so the AgentCard-
   verified/signed federation shape doesn't fit; unconfigured is a
   structured, taught `Outcome::error` naming both vars, never an invented
   credential. All three commands are `Door::Cli`-only, matching
@@ -60,7 +60,7 @@ never the inbound/serve half (that's `aoide-server`).
   `aoide_protocol::wire::mcp`'s server-side result structs) and, failing a
   plain-JSON parse, as an SSE-framed (`data: `-line) body — Melete is
   assumed to be a streamable-HTTP MCP server, so either shape must parse.
-- `peer` — peer-federation client half (CONTRACTS.md §7), joined at P-P2 by
+- `node` — node-federation client half (CONTRACTS.md §7), joined at P-P2 by
   the pairing ceremony's own wire builders/parsers:
   `build_pair_request_body`/`parse_pair_request_response` (the requester's
   `aoide/pairRequest` call, carrying a `commitHex`, never a `nonceHex` —
@@ -100,15 +100,15 @@ never the inbound/serve half (that's `aoide-server`).
   the self-invite guard: true when the heard name is this instance's own
   or the datagram came from loopback (a broadcast always loops back to
   its own sender). Known gap: a serve advertising under a custom
-  `--peer-name` flag escapes the name arm (`own_name` here derives from
+  `--node-name` flag escapes the name arm (`own_name` here derives from
   env/hostname only) and the self-heard broadcast arrives on the
   physical interface, so such a self-invite proceeds — confusion, not
   compromise; the SAS ceremony backstops it. `resolve_invite_target(heard, name)` is the same
   shape one layer up: `pair`'s hostname arm's zero/one/many-match
   resolution against an already-swept result, also pure, and returns the
   whole `Heard` so `src_addr` reaches that arm for free. Three consumers
-  drive `run_sweep`: `handle_peer_discover`, `pair_via_hostname`, and
-  `aoide-conduct::graph`'s `peer list` (task #120 P2 — one ~2s sweep
+  drive `run_sweep`: `handle_node_discover`, `pair_via_hostname`, and
+  `aoide-conduct::graph`'s `node list` (task #120 P2 — one ~2s sweep
   merged into the mesh roster's advertising marks and `◆` candidate
   rows; `is_self_target` is its self-row guard too), all read-only,
   never a second sweep implementation. This crate's
@@ -127,7 +127,7 @@ never the inbound/serve half (that's `aoide-server`).
   P-S3): once confirmed gone, the record is REPLACED by a freshly opened
   one at the same `(session_id, key)`, on a freshly reserved local port
   (the `TcpListener::bind("127.0.0.1:0")` read-back-drop idiom
-  `cli/tests/peer_connectivity.rs::free_port` already established). A live,
+  `cli/tests/node_connectivity.rs::free_port` already established). A live,
   still-ours OLD pid that SURVIVES that bounded kill instead REFUSES the
   reopen with a taught error rather than being overwritten — opening a
   second forward to the same target while the first is untracked would
@@ -187,13 +187,13 @@ never the inbound/serve half (that's `aoide-server`).
   not in the dev shell — never gets the chance) — the one
   `#[ignore]`'d real-ssh proof lives at `cli/tests/tunnel_ssh.rs` instead,
   the same "real bytes, not a mock, but sandboxed-build-unsafe" shape
-  `peer_connectivity.rs` already holds.
+  `node_connectivity.rs` already holds.
 - **Response byte cap (#114)** — `run_curl_with_timeout` is the ONE curl
-  spawn point every fetch in this crate funnels through (`post_json`'s peer
-  POSTs, `peer add`'s AgentCard GET, `mcp_client`'s Melete calls); before
+  spawn point every fetch in this crate funnels through (`post_json`'s node
+  POSTs, `node add`'s AgentCard GET, `mcp_client`'s Melete calls); before
   this fix it buffered a response of ANY size via `wait_with_output`
   before ever looking at it. `MAX_RESPONSE_BYTES` (20 MiB — 10x the
-  investigated legitimate ceiling: `peer pull`'s `aoide/graphSummary`
+  investigated legitimate ceiling: `node pull`'s `aoide/graphSummary`
   response, which tops out in the low single-digit megabytes even for a
   very large multi-host graph, since `title`/`say` fields are already
   truncated before they reach a graph document) is enforced TWICE: curl's
@@ -204,7 +204,7 @@ never the inbound/serve half (that's `aoide-server`).
   in the read loop itself, killing the child the moment the running total
   crosses the limit rather than waiting for it to finish. An over-cap
   response refuses with a taught error naming the cap; every existing
-  caller's own peer/url context still wraps it, unchanged.
+  caller's own node/url context still wraps it, unchanged.
 - **Dial resolution (P-S4, ssh-transport lane)** — the tunnel seam every
   outbound POST resolves through BEFORE it ever reaches `commands::
   post_json` (`aoide-client`'s one HTTP transport, unchanged by this
@@ -213,38 +213,38 @@ never the inbound/serve half (that's `aoide-server`).
   guarantee, pinned per call site); `via: Some` opens/reuses `tunnel::
   open_or_reuse` and rewrites the authority to `127.0.0.1:<local port>`
   via `aoide_storage::tunnel::dial_url`, which preserves the PATH
-  verbatim — the reason `sign_headers_for_peer`'s canonical string (signed
-  over `peer_store::url_path(&peer.url)`, computed independently and
+  verbatim — the reason `sign_headers_for_node`'s canonical string (signed
+  over `node_store::url_path(&node.url)`, computed independently and
   never touching the dial url) still verifies on the far end.
-  `post_json_to_peer(peer, …)` resolves `peer.via` (keyed by `peer.name`);
+  `post_json_to_node(node, …)` resolves `node.via` (keyed by `node.name`);
   `post_json_via(logical_url, via, tunnel_key, …)` is the same funnel for
-  the ceremony dials that have no `Peer` record yet
+  the ceremony dials that have no `Node` record yet
   (`aoide/pairRequest`/`pairReveal` in `run_pair_request`,
   `aoide/pairPoll` in `approve_outbound` — Design A, task #119, keyed off
   `entry.via` when the outbound entry recorded one) — keyed by the
-  ceremony's own local nickname. `spawn_on_peer_via(peer, text, via_override)` is
-  `spawn_on_peer`'s own body plus an explicit override that beats
-  `peer.via` (`peer spawn --via`); `spawn_on_peer` itself stays a thin
+  ceremony's own local nickname. `spawn_on_node_via(node, text, via_override)` is
+  `spawn_on_node`'s own body plus an explicit override that beats
+  `node.via` (`node spawn --via`); `spawn_on_node` itself stays a thin
   `via_override: None` wrapper so `aoide-conduct`'s existing call site
   needs no change. `--via` (`ssh://[user@]host[:port]`,
-  `aoide_storage::tunnel::parse_via`) is a FLAG on `peer.add`/
-  `pair`/`peer.spawn` — never a new command
+  `aoide_storage::tunnel::parse_via`) is a FLAG on `node.add`/
+  `pair`/`node.spawn` — never a new command
   path — parsed by the shared `parse_via_flag` (absent is `None`,
   malformed is a usage error, the same `parse_secs_flag` stance).
-  **`peer add`'s AgentCard verification (its ONE network call) dials
+  **`node add`'s AgentCard verification (its ONE network call) dials
   through `resolve_dial_url` too when `--via` is given** — the review
   finding this needed fixing for: the exact scenario `--via` exists for (a
   loopback-bound door reachable only through the tunnel) used to fail
-  verification, before the peer was ever registered, making the flag dead
+  verification, before the node was ever registered, making the flag dead
   weight on `add`. The fetch target is the REWRITTEN url (its path —
   `/.well-known/agent-card.json` — preserved verbatim by the same funnel);
-  the recorded `Peer.url` stays the LOGICAL url either way. No signing is
+  the recorded `Node.url` stays the LOGICAL url either way. No signing is
   involved (a card fetch is a plain GET), so there is no canonical-string
-  path to keep in sync here, unlike the signed peer calls this funnel also
-  serves. **`peer add --no-verify` skips this fetch entirely** — for a peer
+  path to keep in sync here, unlike the signed node calls this funnel also
+  serves. **`node add --no-verify` skips this fetch entirely** — for a node
   that serves no AgentCard at all (a plain A2A client endpoint, e.g. an
   inbound-only harness that never stood up the discovery surface this GET
-  expects). The peer is recorded exactly as the verified path records it:
+  expects). The node is recorded exactly as the verified path records it:
   `verified` was already hardcoded `false` on this path regardless of the
   fetch (a card fetch is reachability, never identity — that only ever
   comes from `aoide pair`), so skipping it changes nothing about what gets
@@ -253,7 +253,7 @@ never the inbound/serve half (that's `aoide-server`).
   `AOIDE_SESSION_ID` when a conducted session set it, else a
   process-scoped `pid-<pid>` fallback (K3). This crate only resolves and
   passes that key through — it never closes a tunnel itself, on purpose:
-  `pull_peer_live`/`send_message_to_peer`/`spawn_on_peer` are called from
+  `pull_node_live`/`send_message_to_node`/`spawn_on_node` are called from
   `aoide-conduct` command handlers this crate cannot wrap, and a partial
   close covering only the client-owned handlers would make the same
   function behave inconsistently by caller. The real lifecycle lives one
@@ -267,13 +267,13 @@ never the inbound/serve half (that's `aoide-server`).
   time any reap pass runs, so the SAME sweep collects it through its
   ordinary dead-pid arm. Both key shapes converge on one sweep; neither is
   a special case of it.
-  Every tunneled request reaches the far door as `PeerOrigin::Loopback`
+  Every tunneled request reaches the far door as `ConnOrigin::Loopback`
   (`aoide-server::a2a::classify_origin`), which carries an unconditional
   delivery free pass for an UNSIGNED request. `aoide-server::a2a` narrows
   that free pass for a request carrying a verified per-request signature
-  (`origin_for_inject`, CONTRACTS.md §6) — a signed caller is a remote peer
+  (`origin_for_inject`, CONTRACTS.md §6) — a signed caller is a remote node
   by construction and never rides Loopback's trust, so tunneled delivery is
-  safe against a real, non-autogate peer, not merely possible.
+  safe against a real, non-autogate node, not merely possible.
 - `mesh` (task #135 P4/P5) — `aoide mesh` and `aoide mesh pair`, the read
   and the converge over a declared `[mesh.<name>]`
   (`aoide_storage::config::Mesh`, validated but not a `config
@@ -282,13 +282,13 @@ never the inbound/serve half (that's `aoide-server`).
   a self-contained file, own handler, own tests, appended last into
   `commands::all()`).
 
-  **The read.** `aoide mesh` compares the declaration against the live peer
-  registry (`aoide_storage::peer_store::load_peers`) and reports where they
+  **The read.** `aoide mesh` compares the declaration against the live node
+  registry (`aoide_storage::node_store::load_nodes`) and reports where they
   diverge. The compare itself, `drift`, is pure — no I/O, no clock, no env
   — so every ruling (which class a mismatch falls into, that `allows`
-  divergence is never one of them, that an undeclared peer is reported, not
+  divergence is never one of them, that an undeclared node is reported, not
   accused) is a plain unit test; `handle_mesh` is the only impure edge,
-  resolving `config::load()`/`peer_store::load_peers()`/`display::
+  resolving `config::load()`/`node_store::load_nodes()`/`display::
   local_host_name()` and handing the results in. Writes nothing — a report
   over two read-only sources, never a third place either could drift from.
   Drift is never itself a command failure: every class is surfaced in the
@@ -305,27 +305,27 @@ never the inbound/serve half (that's `aoide-server`).
   at `http://127.0.0.1:<default_a2a_port()>/` through the declared hop
   (`resolve_dial_url` discards a logical url's host whenever a `via` is
   set, so the loopback url is both correct and the record shape a paired
-  peer already carries). Zero ceremony logic lives in this module. A
+  node already carries). Zero ceremony logic lives in this module. A
   `via-mismatch` comes back `skipped` — a converge NEVER modifies an
-  existing verified peer — which is what makes a second run all-`skipped`.
+  existing verified node — which is what makes a second run all-`skipped`.
   What the converge adds over N typed `aoide pair`s is the selection, ONE
   pre-flight confirm for the whole run (`--yes` skips it, exactly as it
   skips `pair`'s sweep proceed-prompt; the far operators still type codes),
   the mesh's declared `grant` handed through as `PairFinish::grant`, and
   one report in one vocabulary: completed / parked / UNREACHABLE / skipped.
-  `classify` folds each peer's envelope plus what `pairing::list_outbound`
+  `classify` folds each node's envelope plus what `pairing::list_outbound`
   says about it afterward — never a `data.reason` string — so `UNREACHABLE`
   is exactly "nothing committed and nothing parked" and structurally
   carries no resumable id.
 - `commands` — this crate's CLI commands:
-  `peer add/remove/pull/status/hub/allow/spawn/discover`,
+  `node add/remove/pull/status/hub/allow/spawn/discover`,
   `aoide pair` + `pair.reject`/`pair.watch` (P-P2, P-PV2, task #135 P3',
   CONTRACTS.md §6/§7 —
-  `handle_peer_allow` (`peer allow <name> <cap> on|off`, P-P3, `docs/
+  `handle_node_allow` (`node allow <name> <cap> on|off`, P-P3, `docs/
   architecture/PAIRING.md` decision 5) is a thin wire around
-  `aoide_storage::peer_store::set_peer_allow` — idempotent, refuses an
-  unknown peer or an unknown capability with distinct taught errors, no
-  network call (this instance's own `state/peers.json` is authoritative
+  `aoide_storage::node_store::set_node_allow` — idempotent, refuses an
+  unknown node or an unknown capability with distinct taught errors, no
+  network call (this instance's own `state/nodes.json` is authoritative
   for its own `allows` grants) —
   `poll_outbound_once`/`commit_outbound` are the requester's half as TWO
   named seams (task #135 P2), with `approve_outbound` reduced to calling
@@ -354,14 +354,14 @@ never the inbound/serve half (that's `aoide-server`).
   commit directions share (task #135 P1): what a FIRST verification stamps
   is `config.toml`'s `[pairing] defaultGrant` (`["read"]` by default), or
   the `--allow read,spawn` typed on that one `aoide pair` — parsed by
-  `aoide_storage::config::parse_value` over `PEER_CAPABILITIES`, the same
+  `aoide_storage::config::parse_value` over `NODE_CAPABILITIES`, the same
   validator and the same closed vocabulary `config set` uses, never a second
   list. Comma-separated, not a repeated flag, because `Invocation::flags` is
   a map and a second `--allow` would silently overwrite the first. A config
   that does not load REFUSES the commit instead of falling back, and the
   refusal happens BEFORE the code gate so nobody types a code this side will
   decline to commit. `grant_note` exists because a `--allow` on a RE-pairing
-  legitimately does nothing (`upsert_paired_peer` never re-grants), and that
+  legitimately does nothing (`upsert_paired_node` never re-grants), and that
   must not be silent —
   `default_self_url`/`default_self_via` are this group's own local helpers
   (their own doc comments in `commands.rs` state what each derives and how
@@ -371,7 +371,7 @@ never the inbound/serve half (that's `aoide-server`).
   the commitment and its reveal as two sequential POSTs in one invocation
   before ever computing a SAS. `approve_inbound_leg`/`resume_outbound_leg`
   (task #135 P3' — the two legs `pair_continue_or_request` routes a
-  matched target to, replacing the old single `handle_peer_pair_approve`)
+  matched target to, replacing the old single `handle_node_pair_approve`)
   dispatch by direction (Design A, task #119 — REPLACES the old
   `aoide/pairApprove` reverse callback): on an INBOUND entry
   (`approve_inbound_leg` → `approve_inbound`) it refuses an unrevealed one outright, then gates on
@@ -384,7 +384,7 @@ never the inbound/serve half (that's `aoide-server`).
   reject performs, audited as `auto-deny-on-code-mismatch`; `--code
   NNN-NNN` is the scripted spelling, and `--yes` maps to the taught
   refusal, never a bypass), then commits a
-  local peer record and marks the entry approved PURELY LOCALLY — no wire
+  local node record and marks the entry approved PURELY LOCALLY — no wire
   call at all, so an unreachable/loopback-only requester never blocks the
   approver's own half. **The commit's `url`/`via` depend on the parked
   entry's `self_via` (task #131).** Present — the requester claimed a
@@ -399,7 +399,7 @@ never the inbound/serve half (that's `aoide-server`).
   box's own `AOIDE_A2A_PORT`, which names nothing about the requester;
   `port_from_url` only ever falls back to `default_a2a_port()` when
   `entry.url` itself carries no parseable port) — and `via` set to the
-  claim itself, via `set_peer_via` in the SAME write as `upsert_paired_peer`
+  claim itself, via `set_node_via` in the SAME write as `upsert_paired_node`
   (the sibling-writer shape `approve_outbound`'s own equivalent call,
   below, already holds). Absent — an old requester, or one with nothing to
   claim — the commit is exactly what it always was: `entry.url` verbatim,
@@ -506,7 +506,7 @@ never the inbound/serve half (that's `aoide-server`).
   line on either direction; an inbound APPROVAL's reply code (the
   approver's own, `derive_reply_sas`) is instead handed onward three
   ways, in order: `notify_reply_code` fires a best-effort desktop
-  notification (`notify-send` as bare argv — the untrusted peer name
+  notification (`notify-send` as bare argv — the untrusted node name
   rides as an argument, never a shell string — skipped under `--json`),
   `show_reply_code` raises the stay-open display dialog (`lyra pair
   show`: code large, Copy + Done, no reject; `zenity --info` fallback),
@@ -519,7 +519,7 @@ never the inbound/serve half (that's `aoide-server`).
   `pair_via_hostname` reaches it too — reused, never copied.**
   `pair_via_url` still owns every bit of
   `<url>`/`--name`/`--self-url`/`--self-via`/`--via` parsing and the
-  `valid_peer_name` check (a CLI-typed name needs it); `pair_via_hostname`
+  `valid_node_name` check (a CLI-typed name needs it); `pair_via_hostname`
   calls straight into `run_pair_request` with a `name` already lifted off
   an already-validated, already-confirmed discovery advertisement, needing
   no second name check, and a `url` composed from the OBSERVED
@@ -537,16 +537,16 @@ never the inbound/serve half (that's `aoide-server`).
   else → `pair_continue_or_request`, which checks the pending queues
   before ever falling to `pair_via_hostname`), refusing a second
   positional outright rather than reading only the first — never a second
-  command path; `peer invite`/`peer pair request` died outright at
-  P-PV2, and `peer pair`/`peer pair approve`/`peer pair reject`/
-  `peer pair watch`/`peer pending` died outright at task #135 P3' — hard
+  command path; `node invite`/`node pair request` died outright at
+  P-PV2, and `node pair`/`node pair approve`/`node pair reject`/
+  `node pair watch`/`node pending` died outright at task #135 P3' — hard
   cutover, no aliases either time.
   `dial_via`/`record_via` are related but distinct: `record_via` is
   UNCONDITIONAL — the advertisement's observed address plus its claimed
   login, string-rendered via `default_via`, even when that login is empty
   — parked onto `OutboundPairingRequest.via` for LATER commit
-  (`approve_outbound`) onto the peer record this ceremony creates, so that
-  peer has an automatic transport marker for its own FUTURE calls.
+  (`approve_outbound`) onto the node record this ceremony creates, so that
+  node has an automatic transport marker for its own FUTURE calls.
   `dial_via` (task #131 — previously `None` unless an explicit `--via` was
   given, forcing every plain ceremony to dial directly) now rides the SAME
   derived default too, UNLESS the advertisement carried no ssh claim at
@@ -560,7 +560,7 @@ never the inbound/serve half (that's `aoide-server`).
   routed toward `toward`>`, reusing `crate::tunnel::local_login`'s
   `$USER`/`$LOGNAME` chain for the login half, `None` when neither env var
   is set) or an explicit `--self-via`, carried on the wire beside
-  `self_url` ([`crate::peer::build_pair_request_body`] below) so the
+  `self_url` ([`crate::node::build_pair_request_body`] below) so the
   approver — which can only ever OBSERVE this request arriving over the
   tunnel, i.e. loopback — has something to record a working `via` from at
   ITS OWN `aoide pair` commit time (`approve_inbound_leg` →
@@ -568,18 +568,18 @@ never the inbound/serve half (that's `aoide-server`).
   **The HOST half is deliberately NOT `aoide_storage::display::
   local_host_name`'s claimed hostname (review finding, task #131) — a live
   LAN check found hostnames resolving only through the router's DHCP-DNS,
-  exactly the fragility K1's own "never a claimed host" rule (`Peer.via`)
+  exactly the fragility K1's own "never a claimed host" rule (`Node.via`)
   exists to avoid.** `outbound_ip_toward(toward)` opens a UDP socket,
   `connect`s it to `toward` (no packet sent — `connect` on a UDP socket
   only resolves a route) and reads back the LOCAL address the kernel chose
-  — on an ordinary LAN, the address the peer can actually reach this box
+  — on an ordinary LAN, the address the node can actually reach this box
   at — falling back to the claimed hostname only when that lookup itself
   fails. `toward` is the address actually being dialed: `pair_with_heard`
   passes `hit.src_addr` (the observed source, already the real target);
   `pair_via_url` passes `via`'s own host when dialing through
   a tunnel (the ssh target, not the logical `url`, which the tunnel may
   make unreachable directly), else the `url`'s own host.
-  `handle_peer_discover`/`pair_via_hostname` (`peer
+  `handle_node_discover`/`pair_via_hostname` (`node
   discover [--secs N]`/`aoide pair <name> [--secs N] [--yes]`) are thin
   wrappers around `discover::run_sweep`/`discover::resolve_invite_target`
   above — `confirm_invite` is this pair's own local helper, still the
@@ -591,9 +591,9 @@ never the inbound/serve half (that's `aoide-server`).
   by side, so an operator sees claim and observation before anything
   dials. `pair_via_hostname` refuses before dialing anything when
   `discover::is_self_target` says the resolved target is this instance's
-  own advertisement — `peer discover`'s own JSON `heard` rows carry
+  own advertisement — `node discover`'s own JSON `heard` rows carry
   `srcAddr` alongside the claimed fields for the same reason.
-  `handle_peer_advertise` (`peer advertise on|off`, task #120) flips
+  `handle_node_advertise` (`node advertise on|off`, task #120) flips
   `aoide_storage::advertise::set_enabled` — idempotent, reports changed
   vs already-so; the emitting `a2a serve` reads the switch every tick,
   so the message names the ~40s pickup and that nothing emits without a
@@ -602,7 +602,7 @@ never the inbound/serve half (that's `aoide-server`).
   is given, registered as bare `pair` in `register_pair`) is the friendly
   interactive entry: CLI-door + real-tty only (`pick::interactive`, the
   same gate bare `session` holds; non-tty/non-CLI/`--json` fall to
-  `pending_listing` — the JSON-friendly machine face the old `peer
+  `pending_listing` — the JSON-friendly machine face the old `node
   pending` folded into at task #135 P3'), one bounded ~2s sweep
   (`PAIR_SWEEP_SECS`), self-advertisements filtered via `is_self_target`,
   then `pick::choose` over ONE menu spanning both pending requests (pick
@@ -610,23 +610,23 @@ never the inbound/serve half (that's `aoide-server`).
   `resume_outbound_leg`) and the sweep's candidates (pick one to request
   — the pick IS the proceed-confirmation, so no second `confirm_invite`
   y/N rides on top) and goes straight through `pair_with_heard`; hearing
-  nothing and nothing pending teaches `peer advertise on` and the manual
+  nothing and nothing pending teaches `node advertise on` and the manual
   `aoide pair <url>` path.
-  `adapter melete` (`peer hub
-  <name> [--clear]`, P-D5, designates at most one registered peer as the
+  `adapter melete` (`node hub
+  <name> [--clear]`, P-D5, designates at most one registered node as the
   hub `aoide_storage::addr::resolve_with_hub` prefers as a last-resort
-  remote target — `peer_store::set_hub`/`clear_hub` hold the invariants,
+  remote target — `node_store::set_hub`/`clear_hub` hold the invariants,
   this handler just reports which of set/moved/cleared/no-op happened);
   also exposes two
   non-command functions that are the `conduct → client` edge's crossing
-  points: `pull_peer_live` (the roster core's live per-peer probe, reached
+  points: `pull_node_live` (the roster core's live per-node probe, reached
   via bare `session`/`--hosts` — read-only) and
-  `send_message_to_peer` (`send --to <peer>/<query>`'s delivery,
+  `send_message_to_node` (`send --to <node>/<query>`'s delivery,
   workstream C3 — POSTs `message/send` with an explicit `contextId` naming
   the resolved remote session). **Outbound bearer presentation (task
-  #84)**: `peer add --bearer-secret <name>` records a per-peer
-  `Peer.bearerSecret` (`aoide-storage`'s `peer_store`); every outbound
-  peer POST (`pull_one_peer`, `pull_peer_live`, `send_message_to_peer`)
+  #84)**: `node add --bearer-secret <name>` records a per-node
+  `Node.bearerSecret` (`aoide-storage`'s `node_store`); every outbound
+  node POST (`pull_one_node`, `pull_node_live`, `send_message_to_node`)
   resolves it FRESH through `aoide_secrets::client::resolve_bounded` as
   consumer `a2a-client` and presents it as `Authorization: Bearer <value>`
   — absent (the default) still sends no bearer at all, today's exact
@@ -639,18 +639,18 @@ never the inbound/serve half (that's `aoide-server`).
   and the broker socket, rather than silently sending no bearer.
   **Outbound signed-request headers (P-P4,
   `docs/architecture/PAIRING.md`'s wire-authentication section,
-  CONTRACTS.md §6's own amendment)**: `sign_headers_for_peer` is the ONE
+  CONTRACTS.md §6's own amendment)**: `sign_headers_for_node` is the ONE
   production caller that builds the four `X-Aoide-*` headers — for a
-  `peer.verified` target it loads this instance's own P-P1 identity
+  `node.verified` target it loads this instance's own P-P1 identity
   (`aoide_storage::identity::load_or_mint`), mints a nonce
   (`aoide_storage::pairing::random_hex(16)`, the same mint the pairing
   ceremony already uses), signs
   `aoide_storage::wire_auth::canonical_string(HTTP_METHOD,
-  aoide_storage::peer_store::url_path(&peer.url), timestamp, nonce, body)`
-  with `aoide_storage::wire_auth::sign_hex`, and sends `X-Aoide-Peer` as
+  aoide_storage::node_store::url_path(&node.url), timestamp, nonce, body)`
+  with `aoide_storage::wire_auth::sign_hex`, and sends `X-Aoide-Node` as
   this instance's own SELF name (`aoide_storage::display::
   local_host_name()`, the same value the pairing wire's `pairRequest.name`
-  sends — never `peer.name`, this side's local nickname for the
+  sends — never `node.name`, this side's local nickname for the
   counterpart). The header is attribution only (#63 P-ID5): the far end
   resolves the caller BY the stored pubkey that verifies the signature,
   audits any claimed-vs-resolved name mismatch as attribution drift, and
@@ -659,46 +659,46 @@ never the inbound/serve half (that's `aoide-server`).
   ONE named constant `post_json`'s own `-X` argument reads too — before
   this fix the two carried independent `"POST"` literals that merely
   happened to agree; now there is exactly one value to drift from. An
-  unverified/unpaired peer gets an empty header list — byte-identical to
-  the pre-P-P4 transport. Wired into all four real peer-POST call sites
-  (`pull_one_peer`, `pull_peer_live`, `send_message_to_peer`,
-  `handle_peer_spawn` — P-P5b, the FIRST of the four to ever sign a
+  unverified/unpaired node gets an empty header list — byte-identical to
+  the pre-P-P4 transport. Wired into all four real node-POST call sites
+  (`pull_one_node`, `pull_node_live`, `send_message_to_node`,
+  `handle_node_spawn` — P-P5b, the FIRST of the four to ever sign a
   `contextId`-less, spawn-shaped body); the pairing ceremony's own three
   wire calls stay unauthenticated by design and always pass an empty
   slice. `post_json` threads `extra_headers` as plain `-H "<name>:
   <value>"` curl argv literals in EITHER the bearer or no-bearer branch —
   unlike the bearer token, nothing in a signature header is a secret worth
   hiding from `/proc/<pid>/cmdline`.
-- **`spawn_on_peer(peer, text) -> Result<Value, String>`** is the wire-level
+- **`spawn_on_node(node, text) -> Result<Value, String>`** is the wire-level
   seam for a spawn-shaped `message/send` — builds
   `crate::wire::build_message_send_body(text, messageId, None)` (`contextId`
   omitted, `<text>` riding as the prompt `aoide-server::a2a::do_spawn` types
   into the newly spawned session's first turn), signs it via
-  `sign_headers_for_peer` above, and posts it. Mirrors
-  `send_message_to_peer`/`pull_peer_live`'s own `Result`-not-`Outcome`
+  `sign_headers_for_node` above, and posts it. Mirrors
+  `send_message_to_node`/`pull_node_live`'s own `Result`-not-`Outcome`
   shape (the caller builds its own `Outcome`/audit line). Two callers:
-  **`handle_peer_spawn` (P-P5b, `peer spawn <name> [--yes] -- <text…>`)**
+  **`handle_node_spawn` (P-P5b, `node spawn <name> [--yes] -- <text…>`)**
   makes PAIRING.md's spawn gate reachable from the CLI — gates LOCALLY on
-  exactly one question (is `name` a registered, `verified` peer at all — an
-  unsigned request could never satisfy the remote's `PeerRung::Signature`
-  -only requirement regardless), refusing with a taught error naming `peer
+  exactly one question (is `name` a registered, `verified` node at all — an
+  unsigned request could never satisfy the remote's `NodeRung::Signature`
+  -only requirement regardless), refusing with a taught error naming `node
   pair`, then confirms (`--yes` skips only this LOCAL `y`/`N`
   prompt, `confirm_spawn`, mirroring `confirm_invite`'s idiom) before calling
-  `spawn_on_peer` and shaping the `Outcome`. **`aoide-conduct`'s manifest
+  `spawn_on_node` and shaping the `Outcome`. **`aoide-conduct`'s manifest
   remote-summon path** (U4, command-defrag lane U — `graph::resurrect::
   summon_remote`, the `conduct` → `client` edge documented in `conduct`'s
-  own `Cargo.toml`) calls `spawn_on_peer` directly, no confirm: a manifest
+  own `Cargo.toml`) calls `spawn_on_node` directly, no confirm: a manifest
   spec is itself the operator's standing declaration. Either way, every
   OTHER refusal (`allows` lacking `spawn`, an unsigned-but-paired caller,
-  clock skew, an unreachable peer) is the remote door's — or the
-  transport's — own call, surfaced verbatim as `spawn_on_peer`'s `Err`;
+  clock skew, an unreachable node) is the remote door's — or the
+  transport's — own call, surfaced verbatim as `spawn_on_node`'s `Err`;
   neither caller re-derives or second-guesses it.
 
 ## What it consumes
 
-`aoide-protocol` and `aoide-storage` (the peer registry and pull cache
+`aoide-protocol` and `aoide-storage` (the node registry and pull cache
 persist through `storage`), and `aoide-secrets` (task #84 — outbound
-per-peer bearer resolve, `aoide_secrets::client::resolve_bounded`, reused
+per-node bearer resolve, `aoide_secrets::client::resolve_bounded`, reused
 rather than a second wire client written here).
 
 ## How it composes
@@ -708,9 +708,9 @@ test), and `cli` depend on it. **The `conduct → client` edge is intentional,
 not technical debt**: `conduct`'s roster core (workstream C2, landed;
 reached via bare `session`/`--hosts` — the standalone `who` command it
 originally backed is retired, session-surface redesign, command-defrag lane
-X, 2026-08-28) calls this crate's `commands::pull_peer_live` for its live
-per-peer probe, `send --to`'s remote branch (workstream C3, landed)
-calls `commands::send_message_to_peer` to deliver, and (P-D6) every
+X, 2026-08-28) calls this crate's `commands::pull_node_live` for its live
+per-node probe, `send --to`'s remote branch (workstream C3, landed)
+calls `commands::send_message_to_node` to deliver, and (P-D6) every
 session-write handler (`session start/phase/end/hook`, `session reap`)
 calls `daemon::daemon_dispatch` first — the edge stays even though the
 original reason (`screen/send.rs`) moved out to the `screen` crate at P-A1

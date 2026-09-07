@@ -24,7 +24,7 @@ mod doc;
 // `aoide-conduct` -> `aoide` crate boundary root's shim re-exports onward.
 pub(crate) mod identity;
 mod model;
-mod peer_list;
+mod node_list;
 mod pending;
 mod permit;
 mod resurrect;
@@ -64,7 +64,7 @@ pub use self::permit::{answer_summons, session_permit, summons_card_id};
 pub use self::send::{pending_path, session_hook, session_send};
 pub use self::session_store::{session_end, session_phase, session_start};
 // LANE IDENTITY P-ID0 (G16/G5): `aoide-server`'s `a2a::do_spawn` is the
-// authenticated-peer-origin writer — it stamps `peer:<name>` directly on
+// authenticated-node-origin writer — it stamps `node:<name>` directly on
 // the record it just spawned, rather than threading the value through the
 // child's own (forgeable) env. `stamp_origin`'s own doc comment names both
 // legitimate callers.
@@ -102,13 +102,13 @@ pub use self::manage::{link, project_add, project_list, project_remove, prune, v
 // alongside it — P-C4's conductor ROSTER panel is its second consumer
 // (`who.rs`'s doc comment on `glyph`), reused rather than redrawn.
 pub use self::who::{glyph, session_roster};
-// `aoide peer list` (task #120 P2): the one-glance mesh roster — this host,
-// every registered peer, every advertising instance heard in one bounded
+// `aoide node list` (task #120 P2): the one-glance mesh roster — this host,
+// every registered node, every advertising instance heard in one bounded
 // sweep, each with its running sessions. Lives beside the roster core
 // because it IS `who.rs`'s probe/classification core under a wider fold
-// (`peer_list.rs`'s module doc) — `peer status` (aoide-client) keeps the
-// deep per-peer view.
-pub use self::peer_list::peer_list;
+// (`node_list.rs`'s module doc) — `node status` (aoide-client) keeps the
+// deep per-node view.
+pub use self::node_list::node_list;
 pub use self::window::{focus_session, focus_window, run_hypr_window_listener, FocusError};
 
 // Storage/time passthroughs root's `a2a.rs` / `commands/{a2a,usage}.rs` still

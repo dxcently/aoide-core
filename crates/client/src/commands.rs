@@ -1,19 +1,19 @@
-//! The client domain's CLI commands: `peer add|remove|allow|hub|pull|
+//! The client domain's CLI commands: `node add|remove|allow|hub|pull|
 //! status` and `pair` + `pair reject|watch` +
-//! `peer discover|advertise` (CONTRACTS.md §7, same-network federation and
+//! `node discover|advertise` (CONTRACTS.md §7, same-network federation and
 //! its pairing ceremony) and `adapter melete` (the neutral-event consumer).
 //!
 //! Moved from the root package's `src/commands/a2a.rs` + the client half of
 //! `src/commands/infra.rs` (Phase 9 restructure,
 //! docs/architecture/PACKAGE-LAYOUT.md): a domain's CLI commands live with the
-//! domain. The root package's `commands::all()` calls [`register_peers`]
+//! domain. The root package's `commands::all()` calls [`register_nodes`]
 //! directly after `aoide_server::commands::register_a2a_serve` and
 //! [`register_post_graph`] directly before `aoide_conductor::commands::register`,
 //! so `schema --json` order never shifts.
 //!
-//! A peer is another aoide instance, addressed by URL and verified via its
-//! AgentCard before registration (`aoide_storage::peer_store`); registered
-//! peers fold into the session DAG as `kind:"peer"` nodes
+//! A node is another aoide instance, addressed by URL and verified via its
+//! AgentCard before registration (`aoide_storage::node_store`); registered
+//! nodes fold into the session DAG as `kind:"node"` nodes
 //! (`graph/doc.rs::build_graph`).
 
 use aoide_protocol::output::Outcome;
@@ -39,14 +39,14 @@ fn run_curl(extra: &[&str], stdin_body: Option<&str>) -> Result<(u16, String), S
 }
 
 /// Hard byte cap every curl fetch in this crate is bounded by (#114) —
-/// without it, a misbehaving or hostile far side (a compromised peer, a
+/// without it, a misbehaving or hostile far side (a compromised node, a
 /// captive-portal proxy, `--no-verify` pointed at an arbitrary URL) could
 /// hand back an unbounded body and grow this process's memory without
 /// limit, since [`run_curl_with_timeout`] used to buffer the ENTIRE
 /// response before ever looking at it.
 ///
 /// **Investigated legitimate ceiling**: the biggest real payload any call
-/// site here fetches is `peer pull`'s `aoide/graphSummary` response, which
+/// site here fetches is `node pull`'s `aoide/graphSummary` response, which
 /// wraps `build_graph`'s node/edge list (`aoide_conduct::graph::doc::
 /// build_graph`) verbatim. Each session node carries a few dozen
 /// small/bounded fields (id, cwd, state, title, `say`) — `title`/`say` are
@@ -60,12 +60,12 @@ fn run_curl(extra: &[&str], stdin_body: Option<&str>) -> Result<(u16, String), S
 const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024; // 20 MiB
 
 /// `run_curl`'s parameterised core: same transport, an explicit `--max-time`
-/// instead of the hardcoded `15`. Split out for `pull_peer_live` (the
+/// instead of the hardcoded `15`. Split out for `pull_node_live` (the
 /// roster core's presence probe, workstream C2 — reached via bare
-/// `session`/`--hosts`) which needs a much shorter per-peer bound
+/// `session`/`--hosts`) which needs a much shorter per-node bound
 /// (~2s) than every other curl call site here — those all keep calling
 /// [`run_curl`] unchanged, so this refactor is a pure internal split, not a
-/// behavior change for `peer pull`/`peer add`/etc.
+/// behavior change for `node pull`/`node add`/etc.
 ///
 /// **#114: bounded by [`MAX_RESPONSE_BYTES`] two ways.** `--max-filesize`
 /// (curl's own flag) refuses BEFORE download when the far side declares an
@@ -76,7 +76,7 @@ const MAX_RESPONSE_BYTES: usize = 20 * 1024 * 1024; // 20 MiB
 /// in a bounded loop rather than handed to `wait_with_output` (which
 /// buffers the whole response before this function ever sees a single
 /// byte of it), and the child is killed the moment the running total
-/// crosses the cap — every real fetch in this crate (`post_json`'s peer
+/// crosses the cap — every real fetch in this crate (`post_json`'s node
 /// POSTs, the AgentCard GET, `mcp_client`'s Melete calls) routes through
 /// this one function, so there is exactly one place this needed wiring.
 fn run_curl_with_timeout(
@@ -141,17 +141,17 @@ fn run_curl_with_timeout(
 //
 // The client half of the same secrets-broker resolve consumer `aoide-server`
 // gained on the inbound side (`a2a.rs`'s `resolve_inbound_bearer`): a
-// registered peer whose `Peer.bearer_secret` (`aoide_storage::peer_store`)
+// registered node whose `Node.bearer_secret` (`aoide_storage::node_store`)
 // is set gets that secret resolved fresh, through the SAME
 // `aoide_secrets::client::resolve_bounded` this crate now depends on (see
 // this crate's `Cargo.toml` comment), and presented as `Authorization:
-// Bearer <value>` on every outbound `peer pull`/`peer status`'s live probe/
-// `graph send --to` request to that one peer. Before this task, aoide's
+// Bearer <value>` on every outbound `node pull`/`node status`'s live probe/
+// `graph send --to` request to that one node. Before this task, aoide's
 // outbound A2A requests sent no Authorization header at all — see
 // CONTRACTS.md §6/§7 for the settled shape.
 
 /// The self-asserted consumer name this client presents to the secrets
-/// broker when resolving an outbound peer bearer — see
+/// broker when resolving an outbound node bearer — see
 /// `crates/secrets/AGENTS.md`'s honesty note (consumer identity is
 /// self-asserted; #63's seal authenticates the session and its origin
 /// class, never this string): nothing on the wire authenticates this string,
@@ -164,23 +164,23 @@ const BEARER_CONSUMER_CLIENT: &str = "a2a-client";
 /// HAZARD reasoning `aoide-server`'s `a2a.rs::BEARER_RESOLVE_TIMEOUT` states
 /// for the inbound side, mirrored here: a misconfigured `requireTotp`
 /// secret with no `automation`-open exemption for [`BEARER_CONSUMER_CLIENT`]
-/// must never hang an outbound peer call. `aoide_secrets::client::
+/// must never hang an outbound node call. `aoide_secrets::client::
 /// resolve_bounded`'s own `wait:false` on the wire means the deployed,
 /// automation-open happy path never reaches this timeout at all.
 const BEARER_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 
-/// Resolve `peer.bearer_secret`, if set, fresh through the local secrets
-/// broker — `Ok(None)` when the peer has no bearer configured (today's
+/// Resolve `node.bearer_secret`, if set, fresh through the local secrets
+/// broker — `Ok(None)` when the node has no bearer configured (today's
 /// unchanged, no-Authorization-header behavior); `Ok(Some(value))` on a
 /// granted resolve; `Err` with a taught message naming the secret, the
-/// peer, and the broker socket on ANY failure (unreachable broker, denied,
+/// node, and the broker socket on ANY failure (unreachable broker, denied,
 /// or the bounded timeout elapsing) — the outbound call this feeds is
 /// refused outright rather than silently sent unauthenticated. **NO
 /// CACHING**: a fresh resolve runs on every call to this function; nothing
 /// it returns is stored anywhere beyond the caller's own local `Option<String>`
 /// for the span of the one outbound request it feeds.
-fn resolve_peer_bearer(peer: &aoide_storage::peer_store::Peer) -> Result<Option<String>, String> {
-    let Some(secret) = peer.bearer_secret.as_deref().filter(|s| !s.is_empty()) else {
+fn resolve_node_bearer(node: &aoide_storage::node_store::Node) -> Result<Option<String>, String> {
+    let Some(secret) = node.bearer_secret.as_deref().filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
     let socket = aoide_secrets::socket::socket_path();
@@ -188,8 +188,8 @@ fn resolve_peer_bearer(peer: &aoide_storage::peer_store::Peer) -> Result<Option<
         .map(Some)
         .map_err(|e| {
             format!(
-                "resolving outbound bearer secret `{secret}` for peer `{}` via the secrets broker at {}: {e}",
-                peer.name,
+                "resolving outbound bearer secret `{secret}` for node `{}` via the secrets broker at {}: {e}",
+                node.name,
                 socket.display(),
             )
         })
@@ -199,7 +199,7 @@ fn resolve_peer_bearer(peer: &aoide_storage::peer_store::Peer) -> Result<Option<
 /// only created when a bearer is ALSO being sent on the same call, since
 /// curl's `-H @-` (reading the `Authorization` header from stdin, see
 /// [`post_json`]'s doc) claims stdin for the header instead of the body.
-/// Removed on drop. Holds no secret — only the peer-directed message text/
+/// Removed on drop. Holds no secret — only the node-directed message text/
 /// JSON-RPC envelope, which is not sensitive — unlike the bearer value
 /// itself, which never touches disk in either code path below.
 struct ScratchBodyFile(std::path::PathBuf);
@@ -226,9 +226,9 @@ impl Drop for ScratchBodyFile {
     }
 }
 
-/// The ONE HTTP method every real peer-POST call site in this file ever
+/// The ONE HTTP method every real node-POST call site in this file ever
 /// uses — a single named source [`post_json`]'s own `-X` argument AND
-/// [`sign_headers_for_peer`]'s signed canonical string both read, so the
+/// [`sign_headers_for_node`]'s signed canonical string both read, so the
 /// two can never drift apart (P-P4 review finding: the canonical string's
 /// `method` field used to be a SEPARATE hardcoded `"POST"` literal at each
 /// of those two sites — two independent literals that happened to agree,
@@ -242,8 +242,8 @@ impl Drop for ScratchBodyFile {
 const HTTP_METHOD: &str = "POST";
 
 /// One outbound JSON-RPC POST — the single body+optional-bearer transport
-/// every `peer` command that calls a registered peer's A2A door now shares
-/// (`pull_one_peer`, `pull_peer_live`, `send_message_to_peer`, `handle_peer_spawn`).
+/// every `node` command that calls a registered node's A2A door now shares
+/// (`pull_one_node`, `pull_node_live`, `send_message_to_node`, `handle_node_spawn`).
 /// Widened to `pub(crate)` (M2, task #14) so `mcp_client`'s Melete calls
 /// reuse this SAME transport rather than hand-rolling a second one — still
 /// not exported past this crate.
@@ -266,12 +266,12 @@ const HTTP_METHOD: &str = "POST";
 ///
 /// `extra_headers` (P-P4) rides as plain `-H "<name>: <value>"` argv
 /// literals in EITHER branch, never the stdin-hiding trick the bearer gets
-/// — every P-P4 signed-request header (peer name, timestamp, nonce,
+/// — every P-P4 signed-request header (node name, timestamp, nonce,
 /// signature) is PUBLIC, verifiable wire material, not a secret; there is
 /// nothing in it worth hiding from `/proc/<pid>/cmdline` the way a bearer
-/// token is. [`sign_headers_for_peer`] is the one production caller that
+/// token is. [`sign_headers_for_node`] is the one production caller that
 /// ever passes a non-empty slice here; every other call site (unpaired
-/// peers, the pairing-ceremony wire methods themselves) passes `&[]`,
+/// nodes, the pairing-ceremony wire methods themselves) passes `&[]`,
 /// making this parameter's addition byte-identical-when-empty by
 /// construction.
 pub(crate) fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_headers: &[(String, String)], timeout_secs: u64) -> Result<(u16, String), String> {
@@ -305,7 +305,7 @@ pub(crate) fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_heade
 // `aoide_client::tunnel::open_or_reuse` (P-S3) opens/reuses the ssh child;
 // `aoide_storage::tunnel::dial_url` (P-S2) rewrites the dial url's authority
 // while preserving its PATH verbatim — §0.4's identity guarantee
-// [`sign_headers_for_peer`]'s canonical string depends on. Everything below
+// [`sign_headers_for_node`]'s canonical string depends on. Everything below
 // is additive in front of `post_json`, which itself is UNCHANGED by this
 // phase.
 
@@ -326,11 +326,11 @@ pub(crate) fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_heade
 /// fallback is ALSO left open here, even though nothing will ever reuse
 /// that exact key again (a pid is never repeated by a later invocation) —
 /// closing it at this command's own exit was considered (K3's own "closed
-/// on the command's own exit" shape) and deliberately NOT done: `pull_peer_live`/
-/// `send_message_to_peer`/`spawn_on_peer` are called from `aoide-conduct`
+/// on the command's own exit" shape) and deliberately NOT done: `pull_node_live`/
+/// `send_message_to_node`/`spawn_on_node` are called from `aoide-conduct`
 /// command handlers (`who.rs`/`send.rs`/`resurrect.rs`), not from a
 /// client-owned CLI handler this phase can wrap — closing only at the
-/// four client-owned handlers (`peer add|invite|pair request|spawn`) while
+/// four client-owned handlers (`node add|invite|pair request|spawn`) while
 /// leaving those three call sites unclosed would make the SAME function
 /// behave inconsistently depending on which crate called it. A single,
 /// uniform "every tunnel this phase opens stays open" story is more honest
@@ -350,12 +350,12 @@ fn tunnel_session_id() -> String {
 /// forward reads FROM once inside (`aoide_client::tunnel::open_or_reuse`'s
 /// own `remote_host`/`remote_port` parameters name this same split).
 /// Extracted from `logical_url`'s own authority via
-/// [`aoide_storage::peer_store::url_host`]; falls back to the scheme's
+/// [`aoide_storage::node_store::url_host`]; falls back to the scheme's
 /// conventional default (`80`/`443`) only when the url carries no explicit
-/// port — every real peer url in this system names its door port
+/// port — every real node url in this system names its door port
 /// explicitly, so this is a generous fallback, never the common case.
 fn remote_port_from_url(logical_url: &str) -> Result<u16, String> {
-    let host = aoide_storage::peer_store::url_host(logical_url)
+    let host = aoide_storage::node_store::url_host(logical_url)
         .ok_or_else(|| format!("`{logical_url}` is not a url — cannot resolve a tunnel target port"))?;
     if let Some((_, port)) = host.rsplit_once(':') {
         return port
@@ -377,7 +377,7 @@ fn remote_port_from_url(logical_url: &str) -> Result<u16, String> {
 /// rewrites `logical_url`'s authority to `127.0.0.1:<local port>` via
 /// [`aoide_storage::tunnel::dial_url`], which preserves the PATH verbatim —
 /// never re-derived here, so a dial url's path and
-/// [`sign_headers_for_peer`]'s canonical-string path can never drift apart
+/// [`sign_headers_for_node`]'s canonical-string path can never drift apart
 /// from two independent cuts of the same url.
 fn resolve_dial_url(
     logical_url: &str,
@@ -394,46 +394,46 @@ fn resolve_dial_url(
 }
 
 /// [`post_json`] wrapped with dial resolution for a PAIRED
-/// [`aoide_storage::peer_store::Peer`] — resolves `peer.via` (parsed via
+/// [`aoide_storage::node_store::Node`] — resolves `node.via` (parsed via
 /// [`aoide_storage::tunnel::parse_via`]) into a dial url keyed by
-/// `peer.name` itself (already `valid_peer_name`-shaped — every registered
-/// peer's own nickname, the identical shape [`aoide_storage::tunnel::
+/// `node.name` itself (already `valid_node_name`-shaped — every registered
+/// node's own nickname, the identical shape [`aoide_storage::tunnel::
 /// record_path`] requires of a tunnel `key`) BEFORE calling [`post_json`],
-/// changing nothing about what `post_json` itself does. With no `peer.via`
-/// (today's every real peer), [`resolve_dial_url`] is the identity
-/// function — the url handed to `post_json` is `peer.url`, BYTE-IDENTICAL
+/// changing nothing about what `post_json` itself does. With no `node.via`
+/// (today's every real node), [`resolve_dial_url`] is the identity
+/// function — the url handed to `post_json` is `node.url`, BYTE-IDENTICAL
 /// to every call site's own behavior before this function existed (pinned
-/// per call site by this module's tests). An unparseable `peer.via` (a
-/// hand-edited `peers.json`) is a hard `Err`, never a silent direct-dial
+/// per call site by this module's tests). An unparseable `node.via` (a
+/// hand-edited `nodes.json`) is a hard `Err`, never a silent direct-dial
 /// fallback — the same "malformed input refuses, never guesses" stance
 /// [`aoide_storage::tunnel::parse_via`] itself holds.
-fn post_json_to_peer(
-    peer: &aoide_storage::peer_store::Peer,
+fn post_json_to_node(
+    node: &aoide_storage::node_store::Node,
     body: &str,
     bearer: Option<&str>,
     extra_headers: &[(String, String)],
     timeout_secs: u64,
 ) -> Result<(u16, String), String> {
-    let via = peer
+    let via = node
         .via
         .as_deref()
         .map(aoide_storage::tunnel::parse_via)
         .transpose()
-        .map_err(|e| format!("peer `{}`'s recorded via: {e}", peer.name))?;
-    let dial_url = resolve_dial_url(&peer.url, via.as_ref(), &peer.name)?;
+        .map_err(|e| format!("node `{}`'s recorded via: {e}", node.name))?;
+    let dial_url = resolve_dial_url(&node.url, via.as_ref(), &node.name)?;
     post_json(&dial_url, body, bearer, extra_headers, timeout_secs)
 }
 
-/// [`post_json_to_peer`]'s own body, plus an explicit `via_override` that
-/// BEATS `peer.via` when present — [`spawn_on_peer_via`]'s only caller
-/// (`peer spawn --via …`), the one call site an operator can override the
+/// [`post_json_to_node`]'s own body, plus an explicit `via_override` that
+/// BEATS `node.via` when present — [`spawn_on_node_via`]'s only caller
+/// (`node spawn --via …`), the one call site an operator can override the
 /// recorded transport marker from at call time. `via_override: None` makes
-/// this byte-identical to [`post_json_to_peer`] (resolves `peer.via`
-/// exactly the same way), which is why [`post_json_to_peer`] itself is
+/// this byte-identical to [`post_json_to_node`] (resolves `node.via`
+/// exactly the same way), which is why [`post_json_to_node`] itself is
 /// NOT reimplemented in terms of this — the common, override-free path
 /// stays the simpler function.
-fn post_json_to_peer_with_via_override(
-    peer: &aoide_storage::peer_store::Peer,
+fn post_json_to_node_with_via_override(
+    node: &aoide_storage::node_store::Node,
     body: &str,
     bearer: Option<&str>,
     extra_headers: &[(String, String)],
@@ -441,14 +441,14 @@ fn post_json_to_peer_with_via_override(
     via_override: Option<&aoide_storage::tunnel::Via>,
 ) -> Result<(u16, String), String> {
     if let Some(via) = via_override {
-        let dial_url = resolve_dial_url(&peer.url, Some(via), &peer.name)?;
+        let dial_url = resolve_dial_url(&node.url, Some(via), &node.name)?;
         return post_json(&dial_url, body, bearer, extra_headers, timeout_secs);
     }
-    post_json_to_peer(peer, body, bearer, extra_headers, timeout_secs)
+    post_json_to_node(node, body, bearer, extra_headers, timeout_secs)
 }
 
 /// [`post_json`] wrapped with dial resolution for a CEREMONY call — no
-/// `Peer` record exists yet to read a marker off of ([`run_pair_request`]'s
+/// `Node` record exists yet to read a marker off of ([`run_pair_request`]'s
 /// `aoide/pairRequest`/`aoide/pairReveal`, [`approve_outbound`]'s
 /// `aoide/pairPoll`), so `via`/`tunnel_key` are the CALLER's
 /// own resolution (an explicit `--via` flag; never auto-derived here).
@@ -470,8 +470,8 @@ fn post_json_via(
 }
 
 /// Parse the `--via` flag shared by every CLI command that accepts the
-/// ssh-transport marker (`peer.add`, `peer.invite`, `pair`,
-/// `peer.spawn`, P-S4): absent is `Ok(None)` (today's direct-dial default,
+/// ssh-transport marker (`node.add`, `node.invite`, `pair`,
+/// `node.spawn`, P-S4): absent is `Ok(None)` (today's direct-dial default,
 /// unchanged); present-but-unparsable is `Err` with
 /// [`aoide_storage::tunnel::parse_via`]'s own taught message. A malformed
 /// `--via` is a USAGE error, never a silent fallback to a direct dial —
@@ -484,9 +484,9 @@ fn parse_via_flag(inv: &Invocation) -> Result<Option<aoide_storage::tunnel::Via>
     }
 }
 
-/// Build the four P-P4 signature headers for one outbound POST to `peer`,
-/// or `vec![]` when `peer.verified` is `false` — an unpaired/unverified
-/// peer keeps today's door-wide-bearer-only path exactly as before this
+/// Build the four P-P4 signature headers for one outbound POST to `node`,
+/// or `vec![]` when `node.verified` is `false` — an unpaired/unverified
+/// node keeps today's door-wide-bearer-only path exactly as before this
 /// task, unchanged (`docs/architecture/PAIRING.md`, decision 6, "Unpaired
 /// callers keep today's door-wide bearer path"). This is the ONE production
 /// call site [`post_json`]'s doc comment names as the non-empty-slice
@@ -496,7 +496,7 @@ fn parse_via_flag(inv: &Invocation) -> Result<Option<aoide_storage::tunnel::Via>
 /// mint the pairing ceremony itself already uses, reused rather than a
 /// second nonce generator), stamps the current instant
 /// (`aoide_storage::time::now_iso_utc`), computes the wire PATH via
-/// `aoide_storage::peer_store::url_path(&peer.url)` (never re-derived ad
+/// `aoide_storage::node_store::url_path(&node.url)` (never re-derived ad
 /// hoc — this is the exact string the server's own `HttpRequest.path` will
 /// carry, so client and server MUST agree byte-for-byte or every signature
 /// fails to verify), and signs
@@ -507,10 +507,10 @@ fn parse_via_flag(inv: &Invocation) -> Result<Option<aoide_storage::tunnel::Via>
 /// merely happened to agree; the canonical string's `method` field is now
 /// the exact value the request is actually sent with, not a re-typed
 /// guess) — with THIS instance's own identity
-/// (`aoide_storage::identity::load_or_mint()`) — never the peer's.
+/// (`aoide_storage::identity::load_or_mint()`) — never the node's.
 ///
-/// `X-Aoide-Peer` carries THIS instance's own SELF name
-/// (`aoide_storage::display::local_host_name()`) — never `peer.name`, which
+/// `X-Aoide-Node` carries THIS instance's own SELF name
+/// (`aoide_storage::display::local_host_name()`) — never `node.name`, which
 /// is only this side's local nickname for the counterpart and carries no
 /// meaning to the far end. Each instance identifies itself by its own self
 /// name on every wire call that claims an identity: the pairing ceremony's
@@ -519,37 +519,37 @@ fn parse_via_flag(inv: &Invocation) -> Result<Option<aoide_storage::tunnel::Via>
 /// say "this is who I am," so both carry the same value. The name is
 /// ATTRIBUTION, not identity (#63 P-ID5): the far end resolves the caller
 /// BY THE KEY THAT SIGNED (`aoide-server::a2a::verify_signed_request` tries
-/// the signature against every verified peer's stored pubkey and takes the
+/// the signature against every verified node's stored pubkey and takes the
 /// record whose key verifies — CONTRACTS.md §6 "Inbound verification"), so
 /// a stale or mismatched name here never breaks authentication; the far end
 /// audits the mismatch as attribution drift and proceeds under its own
 /// record's name. The name's one identity-adjacent role on the far end is
 /// the exact-name tiebreak when two of its records share this instance's
 /// pubkey — one more reason this header stays the stable self name.
-/// `--name`/`peer.name` stay purely a local label this instance uses to
+/// `--name`/`node.name` stay purely a local label this instance uses to
 /// refer to the counterpart, never an identity claim that crosses the wire.
 ///
 /// Returns `Err` only on a genuine identity-load failure (a corrupt or
 /// unwritable `state/identity/` — the same failure shape
 /// `identity::load_or_mint` already surfaces for every other caller); a
-/// verified peer with no loadable identity refuses the whole outbound call
+/// verified node with no loadable identity refuses the whole outbound call
 /// rather than silently falling back to an unsigned request, since an
-/// unsigned request to a peer that has since upgraded to require signed
+/// unsigned request to a node that has since upgraded to require signed
 /// spawn admission would otherwise fail opaquely on the far end instead of
 /// here, where the real cause is known.
-fn sign_headers_for_peer(peer: &aoide_storage::peer_store::Peer, body: &str) -> Result<Vec<(String, String)>, String> {
-    if !peer.verified {
+fn sign_headers_for_node(node: &aoide_storage::node_store::Node, body: &str) -> Result<Vec<(String, String)>, String> {
+    if !node.verified {
         return Ok(Vec::new());
     }
     let (keypair, _) = aoide_storage::identity::load_or_mint()
-        .map_err(|e| format!("loading this instance's identity to sign a request to peer `{}`: {e}", peer.name))?;
-    let path = aoide_storage::peer_store::url_path(&peer.url);
+        .map_err(|e| format!("loading this instance's identity to sign a request to node `{}`: {e}", node.name))?;
+    let path = aoide_storage::node_store::url_path(&node.url);
     let timestamp = aoide_storage::time::now_iso_utc();
     let nonce = aoide_storage::pairing::random_hex(16);
     let canonical = aoide_storage::wire_auth::canonical_string(HTTP_METHOD, &path, &timestamp, &nonce, body.as_bytes());
     let signature = aoide_storage::wire_auth::sign_hex(&keypair, canonical.as_bytes());
     Ok(vec![
-        (aoide_storage::wire_auth::HEADER_PEER.to_string(), aoide_storage::display::local_host_name()),
+        (aoide_storage::wire_auth::HEADER_NODE.to_string(), aoide_storage::display::local_host_name()),
         (aoide_storage::wire_auth::HEADER_TIMESTAMP.to_string(), timestamp),
         (aoide_storage::wire_auth::HEADER_NONCE.to_string(), nonce),
         (aoide_storage::wire_auth::HEADER_SIGNATURE.to_string(), signature),
@@ -558,8 +558,8 @@ fn sign_headers_for_peer(peer: &aoide_storage::peer_store::Peer, body: &str) -> 
 
 /// Build a SIGNED `aoide/pairPoll` body for pairing request `id` (Design A,
 /// task #119 — `approve_outbound`'s own poll step; REPLACES the old
-/// `aoide/pairApprove` reverse callback). Unlike [`sign_headers_for_peer`],
-/// this can be called with NO [`aoide_storage::peer_store::Peer`] record at
+/// `aoide/pairApprove` reverse callback). Unlike [`sign_headers_for_node`],
+/// this can be called with NO [`aoide_storage::node_store::Node`] record at
 /// all — none exists yet at poll time, that's the whole bootstrapping
 /// problem P-P4's header scheme can't solve here
 /// (`aoide-server::a2a::pair_poll`'s own doc). Signs
@@ -576,7 +576,7 @@ fn build_signed_pair_poll_body(id: &str) -> Result<String, String> {
     let nonce = aoide_storage::pairing::random_hex(16);
     let canonical = aoide_storage::wire_auth::canonical_string("PAIRPOLL", id, &timestamp, &nonce, &[]);
     let signature = aoide_storage::wire_auth::sign_hex(&keypair, canonical.as_bytes());
-    let body = crate::peer::build_pair_poll_body(id, &timestamp, &nonce, &signature);
+    let body = crate::node::build_pair_poll_body(id, &timestamp, &nonce, &signature);
     Ok(serde_json::to_string(&body).unwrap_or_default())
 }
 
@@ -590,26 +590,26 @@ fn gen_message_id() -> String {
     format!("aoide-{}-{}", std::process::id(), nanos)
 }
 
-// ── The seven `peer` commands (CONTRACTS.md §7: same-network federation) ───────
+// ── The seven `node` commands (CONTRACTS.md §7: same-network federation) ───────
 //
-// A peer is ANOTHER aoide instance, addressed by URL (topology-agnostic —
+// A node is ANOTHER aoide instance, addressed by URL (topology-agnostic —
 // the protocol never cares whether that URL happens to resolve on the same
-// loopback host, a LAN, or a tailnet; it's just a URL). `peer add` verifies
-// by fetching the peer's AgentCard first, before registering anything;
-// `peer pull` calls the NEW `aoide/graphSummary` method
+// loopback host, a LAN, or a tailnet; it's just a URL). `node add` verifies
+// by fetching the node's AgentCard first, before registering anything;
+// `node pull` calls the NEW `aoide/graphSummary` method
 // (`aoide-server::a2a::graph_summary`) and caches the result; `build_graph`
-// (`aoide-conduct`) folds a fresh cache in as a `peer:<name>` root node. The
-// registry lives in `state/peers.json` (`aoide_storage::peer_store`) —
+// (`aoide-conduct`) folds a fresh cache in as a `node:<name>` root node. The
+// registry lives in `state/nodes.json` (`aoide_storage::node_store`) —
 // external registry-style state, not song-scoped rehearsal state.
 
-/// `peer add <name> <url> [--autogate]` — verify the peer by fetching its
+/// `node add <name> <url> [--autogate]` — verify the node by fetching its
 /// AgentCard first, then register `name` → `url`. A duplicate `name` is
-/// rejected cleanly — CONTRACTS.md §7's explicit stance (a peer's local
+/// rejected cleanly — CONTRACTS.md §7's explicit stance (a node's local
 /// nickname should never be silently repointed at a different URL by a
 /// second `add`).
-fn handle_peer_add(inv: &Invocation) -> Outcome {
-    let cmd = "peer.add";
-    const USAGE: &str = "usage: aoide peer add <name> <url> [--autogate] [--no-verify] [--via ssh://[user@]host[:port]] [--json]";
+fn handle_node_add(inv: &Invocation) -> Outcome {
+    let cmd = "node.add";
+    const USAGE: &str = "usage: aoide node add <name> <url> [--autogate] [--no-verify] [--via ssh://[user@]host[:port]] [--json]";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(n) => n.to_string(),
         None => return Outcome::usage(cmd, USAGE),
@@ -624,15 +624,15 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
         Ok(v) => v,
         Err(e) => return Outcome::usage(cmd, format!("{USAGE} — {e}")),
     };
-    // `name` is joined straight into `state/peer-cache/<name>.json`
-    // (`peer_store::peer_cache_path`) — reject a traversal shape here,
+    // `name` is joined straight into `state/node-cache/<name>.json`
+    // (`node_store::node_cache_path`) — reject a traversal shape here,
     // before it's ever registered, same guard `rice compose` applies to a
     // song name.
-    if !aoide_storage::peer_store::valid_peer_name(&name) {
+    if !aoide_storage::node_store::valid_node_name(&name) {
         return Outcome::error(
             cmd,
             format!(
-                "`{name}` is not a valid peer nickname: must match `^[a-z0-9][a-z0-9-]*$` \
+                "`{name}` is not a valid node nickname: must match `^[a-z0-9][a-z0-9-]*$` \
                  (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
             ),
         )
@@ -643,32 +643,32 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
     let token_file = inv.flags.get("token-file").cloned().filter(|s| !s.is_empty());
     let bearer_secret = inv.flags.get("bearer-secret").cloned().filter(|s| !s.is_empty());
 
-    let mut peers = aoide_storage::peer_store::load_peers();
-    if peers.iter().any(|p| p.name == name) {
-        return Outcome::error(cmd, format!("peer `{name}` is already registered — remove it first to re-add"))
+    let mut nodes = aoide_storage::node_store::load_nodes();
+    if nodes.iter().any(|p| p.name == name) {
+        return Outcome::error(cmd, format!("node `{name}` is already registered — remove it first to re-add"))
             .with_data(json!({ "reason": "duplicate-name", "name": name }));
     }
 
-    // Verify: fetch the peer's AgentCard BEFORE registering anything — a
-    // peer that fails this fetch never gets added. This is the ONLY
-    // network call `peer add` ever makes, so it must dial through the
+    // Verify: fetch the node's AgentCard BEFORE registering anything — a
+    // node that fails this fetch never gets added. This is the ONLY
+    // network call `node add` ever makes, so it must dial through the
     // tunnel exactly like every other cross-box call when `--via` is
     // given (review finding, P-S4 follow-up): a loopback-bound door
     // reachable ONLY through the tunnel — precisely the scenario `--via`
-    // exists for — used to fail verification here before the peer was
+    // exists for — used to fail verification here before the node was
     // ever registered, making the flag dead weight on `add`. `card_url`
-    // stays the LOGICAL url for display and for the peer record below;
+    // stays the LOGICAL url for display and for the node record below;
     // `resolve_dial_url` (this module's own P-S4 funnel) rewrites the
     // fetch target's authority when a via is present, preserving its
     // `.well-known/agent-card.json` path verbatim — no signing is
     // involved either way (a card fetch is a plain GET, never a signed
     // request), so there is no canonical-string path to keep in sync
-    // here, unlike the signed peer calls this funnel also serves.
+    // here, unlike the signed node calls this funnel also serves.
     //
-    // `--no-verify` skips this entire block — for a peer that serves no
+    // `--no-verify` skips this entire block — for a node that serves no
     // AgentCard at all (a plain A2A client endpoint, e.g. an inbound-only
     // harness like Melete that never stood up the discovery surface this
-    // fetch expects). The peer is still recorded exactly as the verified
+    // fetch expects). The node is still recorded exactly as the verified
     // path records it below: `verified` was already hardcoded `false` on
     // this path regardless (a card fetch is reachability, never identity
     // — that only ever comes from `pair`), so skipping the fetch
@@ -679,28 +679,28 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
         let fetch_url = match resolve_dial_url(&card_url, via.as_ref(), &name) {
             Ok(u) => u,
             Err(e) => {
-                return Outcome::error(cmd, format!("opening a tunnel to verify peer AgentCard at {card_url}: {e}"))
+                return Outcome::error(cmd, format!("opening a tunnel to verify node AgentCard at {card_url}: {e}"))
                     .with_data(json!({ "reason": "tunnel-failed", "url": card_url }))
             }
         };
         let (code, body) = match run_curl(&["--", &fetch_url], None) {
             Ok(v) => v,
             Err(e) => {
-                return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: {e}"))
+                return Outcome::error(cmd, format!("verifying node AgentCard at {card_url}: {e}"))
                     .with_data(json!({ "reason": "fetch-failed", "url": card_url }))
             }
         };
         if code != 200 {
-            return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: HTTP {code}"))
+            return Outcome::error(cmd, format!("verifying node AgentCard at {card_url}: HTTP {code}"))
                 .with_data(json!({ "reason": "fetch-http-error", "url": card_url, "httpCode": code }));
         }
         if serde_json::from_str::<Value>(&body).is_err() {
-            return Outcome::error(cmd, format!("verifying peer AgentCard at {card_url}: unparseable response"))
+            return Outcome::error(cmd, format!("verifying node AgentCard at {card_url}: unparseable response"))
                 .with_data(json!({ "reason": "card-unparseable", "url": card_url }));
         }
     }
 
-    let peer = aoide_storage::peer_store::Peer {
+    let node = aoide_storage::node_store::Node {
         name: name.clone(),
         url: url.clone(),
         autogate,
@@ -713,85 +713,85 @@ fn handle_peer_add(inv: &Invocation) -> Outcome {
         via: via.as_ref().map(|v| v.to_string()),
         added_at: aoide_storage::time::now_iso_utc(),
     };
-    aoide_storage::peer_store::insert_peer(&mut peers, peer.clone());
-    if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
-        return Outcome::error(cmd, format!("writing the peer registry: {e}"))
+    aoide_storage::node_store::insert_node(&mut nodes, node.clone());
+    if let Err(e) = aoide_storage::node_store::save_nodes(&nodes) {
+        return Outcome::error(cmd, format!("writing the node registry: {e}"))
             .with_data(json!({ "reason": "registry-write-failed" }));
     }
     Outcome::ok(
         cmd,
         format!(
-            "registered peer `{name}` → {url}{} ({} total)",
+            "registered node `{name}` → {url}{} ({} total)",
             if autogate { " (autogate)" } else { "" },
-            peers.len()
+            nodes.len()
         ),
     )
-    .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
-    .with_data(json!({ "peer": peer, "count": peers.len() }))
+    .changed(vec![aoide_storage::node_store::nodes_path().to_string_lossy().into_owned()])
+    .with_data(json!({ "node": node, "count": nodes.len() }))
 }
 
-/// `peer remove <name>` — deregister; a MISSING name is a clean error, not
+/// `node remove <name>` — deregister; a MISSING name is a clean error, not
 /// idempotent-silent (following `rice draft drop <name>`'s precedent: a
 /// missing target is a real mistake worth surfacing — CONTRACTS.md §7 calls
-/// this stance out explicitly). Also drops the peer's cache file, if any,
-/// so a re-added-under-the-same-name peer never starts from a stale
+/// this stance out explicitly). Also drops the node's cache file, if any,
+/// so a re-added-under-the-same-name node never starts from a stale
 /// leftover.
-fn handle_peer_remove(inv: &Invocation) -> Outcome {
-    let cmd = "peer.remove";
+fn handle_node_remove(inv: &Invocation) -> Outcome {
+    let cmd = "node.remove";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(n) => n.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide peer remove <name> [--json]"),
+        None => return Outcome::usage(cmd, "usage: aoide node remove <name> [--json]"),
     };
-    // Defense in depth (mirrors `handle_peer_add`'s own guard): `name` is
-    // about to reach `peer_cache_path(&name)` below via `remove_file`, a
+    // Defense in depth (mirrors `handle_node_add`'s own guard): `name` is
+    // about to reach `node_cache_path(&name)` below via `remove_file`, a
     // DELETE — refuse a traversal shape even if it somehow got past `add`
-    // (e.g. a hand-edited `state/peers.json`) before it ever reaches that
+    // (e.g. a hand-edited `state/nodes.json`) before it ever reaches that
     // path join.
-    if !aoide_storage::peer_store::valid_peer_name(&name) {
+    if !aoide_storage::node_store::valid_node_name(&name) {
         return Outcome::error(
             cmd,
             format!(
-                "`{name}` is not a valid peer nickname: must match `^[a-z0-9][a-z0-9-]*$` \
+                "`{name}` is not a valid node nickname: must match `^[a-z0-9][a-z0-9-]*$` \
                  (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
             ),
         )
         .with_data(json!({ "reason": "invalid-name", "name": name }));
     }
-    let mut peers = aoide_storage::peer_store::load_peers();
-    if !aoide_storage::peer_store::remove_peer(&mut peers, &name) {
-        return Outcome::error(cmd, format!("no peer named `{name}`"))
-            .with_data(json!({ "reason": "unknown-peer", "name": name }));
+    let mut nodes = aoide_storage::node_store::load_nodes();
+    if !aoide_storage::node_store::remove_node(&mut nodes, &name) {
+        return Outcome::error(cmd, format!("no node named `{name}`"))
+            .with_data(json!({ "reason": "unknown-node", "name": name }));
     }
-    if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
-        return Outcome::error(cmd, format!("writing the peer registry: {e}"))
+    if let Err(e) = aoide_storage::node_store::save_nodes(&nodes) {
+        return Outcome::error(cmd, format!("writing the node registry: {e}"))
             .with_data(json!({ "reason": "registry-write-failed" }));
     }
-    let _ = std::fs::remove_file(aoide_storage::peer_store::peer_cache_path(&name));
-    Outcome::ok(cmd, format!("removed peer `{name}` ({} remaining)", peers.len()))
-        .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
-        .with_data(json!({ "removed": true, "name": name, "count": peers.len() }))
+    let _ = std::fs::remove_file(aoide_storage::node_store::node_cache_path(&name));
+    Outcome::ok(cmd, format!("removed node `{name}` ({} remaining)", nodes.len()))
+        .changed(vec![aoide_storage::node_store::nodes_path().to_string_lossy().into_owned()])
+        .with_data(json!({ "removed": true, "name": name, "count": nodes.len() }))
 }
 
-/// `peer hub <name> [--clear]` — designate `name` as THE hub (at most one;
+/// `node hub <name> [--clear]` — designate `name` as THE hub (at most one;
 /// setting a new hub moves it, clearing the previous holder in the same
 /// write) or, with `--clear`, remove the hub designation from `name` if it
 /// currently holds it (P-D5, `docs/architecture/AOIDED.md`'s "The hub
-/// option"). Both directions are idempotent — `peer_store::set_hub`/
+/// option"). Both directions are idempotent — `node_store::set_hub`/
 /// `clear_hub` report exactly what changed (set/moved/cleared/no-op) and
 /// this handler's message says so plainly rather than a bare "ok"; a no-op
 /// never touches disk (nothing to write back).
-/// `peer allow <name> <cap> on|off` (P-P3, `docs/architecture/PAIRING.md`
+/// `node allow <name> <cap> on|off` (P-P3, `docs/architecture/PAIRING.md`
 /// decision 5): flip one capability in `name`'s `allows` set —
-/// `aoide_storage::peer_store::set_peer_allow` holds the closed-set
+/// `aoide_storage::node_store::set_node_allow` holds the closed-set
 /// validation and the idempotence invariant; this handler just reports
-/// exactly what changed (enabled/disabled/no-op), mirroring `handle_peer_hub`'s
+/// exactly what changed (enabled/disabled/no-op), mirroring `handle_node_hub`'s
 /// "report the change, never a bare ok" discipline one field over. Refuses
-/// an unknown peer AND an unknown capability — the capability check runs
-/// FIRST (`set_peer_allow`'s own ordering), so a typo'd capability against a
-/// typo'd name still names the capability problem, not the peer one.
-fn handle_peer_allow(inv: &Invocation) -> Outcome {
-    let cmd = "peer.allow";
-    const USAGE: &str = "usage: aoide peer allow <name> <cap> on|off";
+/// an unknown node AND an unknown capability — the capability check runs
+/// FIRST (`set_node_allow`'s own ordering), so a typo'd capability against a
+/// typo'd name still names the capability problem, not the node one.
+fn handle_node_allow(inv: &Invocation) -> Outcome {
+    let cmd = "node.allow";
+    const USAGE: &str = "usage: aoide node allow <name> <cap> on|off";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(n) => n.to_string(),
         None => return Outcome::usage(cmd, USAGE),
@@ -806,29 +806,29 @@ fn handle_peer_allow(inv: &Invocation) -> Outcome {
         _ => return Outcome::usage(cmd, USAGE),
     };
 
-    let mut peers = aoide_storage::peer_store::load_peers();
-    let change = match aoide_storage::peer_store::set_peer_allow(&mut peers, &name, &cap, on) {
+    let mut nodes = aoide_storage::node_store::load_nodes();
+    let change = match aoide_storage::node_store::set_node_allow(&mut nodes, &name, &cap, on) {
         Ok(c) => c,
-        Err(aoide_storage::peer_store::AllowError::UnknownCapability) => {
+        Err(aoide_storage::node_store::AllowError::UnknownCapability) => {
             return Outcome::error(
                 cmd,
                 format!(
                     "unknown capability `{cap}` — valid capabilities: {}",
-                    aoide_storage::peer_store::PEER_CAPABILITIES.join(", ")
+                    aoide_storage::node_store::NODE_CAPABILITIES.join(", ")
                 ),
             )
             .with_data(json!({ "reason": "unknown-capability", "cap": cap }));
         }
-        Err(aoide_storage::peer_store::AllowError::UnknownPeer) => {
-            return Outcome::error(cmd, format!("no peer named `{name}`"))
-                .with_data(json!({ "reason": "unknown-peer", "name": name }));
+        Err(aoide_storage::node_store::AllowError::UnknownNode) => {
+            return Outcome::error(cmd, format!("no node named `{name}`"))
+                .with_data(json!({ "reason": "unknown-node", "name": name }));
         }
     };
 
-    use aoide_storage::peer_store::AllowChange;
+    use aoide_storage::node_store::AllowChange;
     let (msg, tag) = match &change {
-        AllowChange::Enabled => (format!("`{cap}` is now allowed for peer `{name}`"), "enabled"),
-        AllowChange::Disabled => (format!("`{cap}` is no longer allowed for peer `{name}`"), "disabled"),
+        AllowChange::Enabled => (format!("`{cap}` is now allowed for node `{name}`"), "enabled"),
+        AllowChange::Disabled => (format!("`{cap}` is no longer allowed for node `{name}`"), "disabled"),
         AllowChange::NoOp if on => (format!("`{name}` already allows `{cap}`"), "no-op"),
         AllowChange::NoOp => (format!("`{name}` already does not allow `{cap}`"), "no-op"),
     };
@@ -837,37 +837,37 @@ fn handle_peer_allow(inv: &Invocation) -> Outcome {
     if matches!(change, AllowChange::NoOp) {
         return Outcome::ok(cmd, msg).with_data(data);
     }
-    if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
-        return Outcome::error(cmd, format!("writing the peer registry: {e}"))
+    if let Err(e) = aoide_storage::node_store::save_nodes(&nodes) {
+        return Outcome::error(cmd, format!("writing the node registry: {e}"))
             .with_data(json!({ "reason": "registry-write-failed" }));
     }
     Outcome::ok(cmd, msg)
-        .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
+        .changed(vec![aoide_storage::node_store::nodes_path().to_string_lossy().into_owned()])
         .with_data(data)
 }
 
-fn handle_peer_hub(inv: &Invocation) -> Outcome {
-    let cmd = "peer.hub";
+fn handle_node_hub(inv: &Invocation) -> Outcome {
+    let cmd = "node.hub";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(n) => n.to_string(),
-        None => return Outcome::usage(cmd, "usage: aoide peer hub <name> [--clear] [--json]"),
+        None => return Outcome::usage(cmd, "usage: aoide node hub <name> [--clear] [--json]"),
     };
     let clear = inv.flag_present("clear");
-    let mut peers = aoide_storage::peer_store::load_peers();
+    let mut nodes = aoide_storage::node_store::load_nodes();
 
     let change = if clear {
-        aoide_storage::peer_store::clear_hub(&mut peers, &name)
+        aoide_storage::node_store::clear_hub(&mut nodes, &name)
     } else {
-        aoide_storage::peer_store::set_hub(&mut peers, &name)
+        aoide_storage::node_store::set_hub(&mut nodes, &name)
     };
     let change = match change {
         Ok(c) => c,
-        Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "unknown-peer", "name": name })),
+        Err(e) => return Outcome::error(cmd, e).with_data(json!({ "reason": "unknown-node", "name": name })),
     };
 
-    use aoide_storage::peer_store::HubChange;
+    use aoide_storage::node_store::HubChange;
     let (msg, tag) = match &change {
-        HubChange::Set => (format!("peer `{name}` is now the hub"), "set"),
+        HubChange::Set => (format!("node `{name}` is now the hub"), "set"),
         HubChange::Moved { from } => (format!("hub moved from `{from}` to `{name}`"), "moved"),
         HubChange::Cleared => (format!("cleared the hub designation from `{name}`"), "cleared"),
         HubChange::NoOp if clear => (format!("`{name}` was not the hub — nothing to clear"), "no-op"),
@@ -878,69 +878,69 @@ fn handle_peer_hub(inv: &Invocation) -> Outcome {
     if matches!(change, HubChange::NoOp) {
         return Outcome::ok(cmd, msg).with_data(data);
     }
-    if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
-        return Outcome::error(cmd, format!("writing the peer registry: {e}"))
+    if let Err(e) = aoide_storage::node_store::save_nodes(&nodes) {
+        return Outcome::error(cmd, format!("writing the node registry: {e}"))
             .with_data(json!({ "reason": "registry-write-failed" }));
     }
     Outcome::ok(cmd, msg)
-        .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
+        .changed(vec![aoide_storage::node_store::nodes_path().to_string_lossy().into_owned()])
         .with_data(data)
 }
 
-/// Pull ONE peer: POST `aoide/graphSummary`, parse, write the cache. On ANY
+/// Pull ONE node: POST `aoide/graphSummary`, parse, write the cache. On ANY
 /// failure (unreachable, timeout, non-200, malformed) — mark the cache
 /// STALE with the failure reason rather than deleting it or propagating the
-/// error to the caller, so one peer being down never breaks `peer pull` for
-/// the others (`handle_peer_pull` below iterates every selected peer through
+/// error to the caller, so one node being down never breaks `node pull` for
+/// the others (`handle_node_pull` below iterates every selected node through
 /// this regardless of an individual failure). Returns a small JSON summary
 /// row for the aggregate Outcome's `data.results`.
-fn pull_one_peer(peer: &aoide_storage::peer_store::Peer) -> Value {
+fn pull_one_node(node: &aoide_storage::node_store::Node) -> Value {
     let now = aoide_storage::time::now_iso_utc();
-    let body = crate::peer::build_graph_summary_request();
+    let body = crate::node::build_graph_summary_request();
     let body_str = serde_json::to_string(&body).unwrap_or_default();
 
-    let attempt: Result<aoide_storage::peer_store::PeerCacheEntry, String> = (|| {
-        let bearer = resolve_peer_bearer(peer)?;
-        let extra_headers = sign_headers_for_peer(peer, &body_str)?;
-        let (code, resp_body) = post_json_to_peer(peer, &body_str, bearer.as_deref(), &extra_headers, 15)?;
+    let attempt: Result<aoide_storage::node_store::NodeCacheEntry, String> = (|| {
+        let bearer = resolve_node_bearer(node)?;
+        let extra_headers = sign_headers_for_node(node, &body_str)?;
+        let (code, resp_body) = post_json_to_node(node, &body_str, bearer.as_deref(), &extra_headers, 15)?;
         if code != 200 {
             return Err(format!("HTTP {code}"));
         }
         let resp: Value =
             serde_json::from_str(&resp_body).map_err(|e| format!("unparseable response: {e}"))?;
-        crate::peer::parse_graph_summary_response(&resp, &peer.name, &now)
+        crate::node::parse_graph_summary_response(&resp, &node.name, &now)
     })();
 
     match attempt {
         Ok(entry) => {
-            let write_err = aoide_storage::peer_store::save_peer_cache(&entry).err();
+            let write_err = aoide_storage::node_store::save_node_cache(&entry).err();
             match write_err {
-                None => json!({ "name": peer.name, "ok": true, "fetchedAt": now }),
-                Some(e) => json!({ "name": peer.name, "ok": false, "error": format!("cache write failed: {e}") }),
+                None => json!({ "name": node.name, "ok": true, "fetchedAt": now }),
+                Some(e) => json!({ "name": node.name, "ok": false, "error": format!("cache write failed: {e}") }),
             }
         }
         Err(e) => {
             // Preserve whatever was already cached (the last GOOD pull) —
             // only flip `stale`/`lastError`; never delete, never blank the
-            // peer out of the fold over a transient outage.
-            let mut entry = aoide_storage::peer_store::load_peer_cache(&peer.name).unwrap_or_else(|| {
-                aoide_storage::peer_store::PeerCacheEntry {
+            // node out of the fold over a transient outage.
+            let mut entry = aoide_storage::node_store::load_node_cache(&node.name).unwrap_or_else(|| {
+                aoide_storage::node_store::NodeCacheEntry {
                     schema_version: "0".to_string(),
-                    name: peer.name.clone(),
+                    name: node.name.clone(),
                     ..Default::default()
                 }
             });
             entry.stale = true;
             entry.last_error = Some(e.clone());
-            let _ = aoide_storage::peer_store::save_peer_cache(&entry);
-            json!({ "name": peer.name, "ok": false, "error": e })
+            let _ = aoide_storage::node_store::save_node_cache(&entry);
+            json!({ "name": node.name, "ok": false, "error": e })
         }
     }
 }
 
-/// Pull ONE peer's `aoide/graphSummary` LIVE, with an explicit per-call
-/// `timeout_secs`, WITHOUT writing `state/peer-cache/<name>.json` — the
-/// read-only sibling of [`pull_one_peer`] (which persists on every
+/// Pull ONE node's `aoide/graphSummary` LIVE, with an explicit per-call
+/// `timeout_secs`, WITHOUT writing `state/node-cache/<name>.json` — the
+/// read-only sibling of [`pull_one_node`] (which persists on every
 /// outcome). The roster core's presence probe (conduct crate, workstream
 /// C2 — reached via bare `session`/`--hosts`; the standalone `who` command
 /// it originally backed is retired, session-surface redesign, command-defrag
@@ -949,52 +949,52 @@ fn pull_one_peer(peer: &aoide_storage::peer_store::Peer) -> Value {
 /// the `conduct → client` edge stays) but must never treat a presence query
 /// as a cache-refreshing side effect. `build_graph`'s fold (`aoide-conduct`)
 /// is the ONLY writer of that cache; the roster core only ever READS it, as
-/// the fallback for a peer this call fails to reach. Returns just the peer's
+/// the fallback for a node this call fails to reach. Returns just the node's
 /// resolved `graph` document (`{nodes, edges}`) — the roster core has no use
-/// for the envelope's `instance` field `pull_one_peer` also captures.
-pub fn pull_peer_live(peer: &aoide_storage::peer_store::Peer, timeout_secs: u64) -> Result<Value, String> {
-    let body = crate::peer::build_graph_summary_request();
+/// for the envelope's `instance` field `pull_one_node` also captures.
+pub fn pull_node_live(node: &aoide_storage::node_store::Node, timeout_secs: u64) -> Result<Value, String> {
+    let body = crate::node::build_graph_summary_request();
     let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let bearer = resolve_peer_bearer(peer)?;
-    let extra_headers = sign_headers_for_peer(peer, &body_str)?;
-    let (code, resp_body) = post_json_to_peer(peer, &body_str, bearer.as_deref(), &extra_headers, timeout_secs)?;
+    let bearer = resolve_node_bearer(node)?;
+    let extra_headers = sign_headers_for_node(node, &body_str)?;
+    let (code, resp_body) = post_json_to_node(node, &body_str, bearer.as_deref(), &extra_headers, timeout_secs)?;
     if code != 200 {
         return Err(format!("HTTP {code}"));
     }
     let resp: Value =
         serde_json::from_str(&resp_body).map_err(|e| format!("unparseable response: {e}"))?;
     let now = aoide_storage::time::now_iso_utc();
-    let entry = crate::peer::parse_graph_summary_response(&resp, &peer.name, &now)?;
+    let entry = crate::node::parse_graph_summary_response(&resp, &node.name, &now)?;
     Ok(entry.graph.unwrap_or_else(|| json!({ "nodes": [], "edges": [] })))
 }
 
-/// POST a `message/send` to a PEER with an explicit `contextId` naming the
-/// REMOTE session to inject into. `graph send --to <peer>/<query>` (`aoide-conduct`,
-/// workstream C3) resolves `query` against the peer's cached graph to that
+/// POST a `message/send` to a NODE with an explicit `contextId` naming the
+/// REMOTE session to inject into. `graph send --to <node>/<query>` (`aoide-conduct`,
+/// workstream C3) resolves `query` against the node's cached graph to that
 /// one remote sessionId, then drives THIS function — the transport lives
-/// here (not duplicated in `conduct`) for the same reason [`pull_peer_live`]
+/// here (not duplicated in `conduct`) for the same reason [`pull_node_live`]
 /// does, see the crate's `Cargo.toml`/`AGENTS.md` on the `conduct → client`
 /// edge.
 ///
 /// Same `run_curl` transport and 15s timeout every other `message/send`
 /// call site in this file uses — this is a real delivery, not the roster
 /// core's short-timeout presence probe, so it does NOT reuse
-/// [`pull_peer_live`]'s tighter bound. Returns the parsed JSON-RPC response
+/// [`pull_node_live`]'s tighter bound. Returns the parsed JSON-RPC response
 /// on a 200 with no `error` member; any transport/HTTP/JSON-RPC failure is
 /// `Err` with a plain message the caller (`aoide-conduct`) can surface and
-/// audit directly — mirrors [`pull_peer_live`]'s `Result`-not-`Outcome`
+/// audit directly — mirrors [`pull_node_live`]'s `Result`-not-`Outcome`
 /// shape so the caller builds its own `Outcome`/audit line, never this one.
-pub fn send_message_to_peer(
-    peer: &aoide_storage::peer_store::Peer,
+pub fn send_message_to_node(
+    node: &aoide_storage::node_store::Node,
     text: &str,
     context_id: &str,
 ) -> Result<Value, String> {
     let message_id = gen_message_id();
     let body = crate::wire::build_message_send_body(text, &message_id, Some(context_id));
     let body_str = serde_json::to_string(&body).unwrap_or_default();
-    let bearer = resolve_peer_bearer(peer)?;
-    let extra_headers = sign_headers_for_peer(peer, &body_str)?;
-    let (code, resp) = post_json_to_peer(peer, &body_str, bearer.as_deref(), &extra_headers, 15)?;
+    let bearer = resolve_node_bearer(node)?;
+    let extra_headers = sign_headers_for_node(node, &body_str)?;
+    let (code, resp) = post_json_to_node(node, &body_str, bearer.as_deref(), &extra_headers, 15)?;
     if code != 200 {
         return Err(format!("HTTP {code}"));
     }
@@ -1007,12 +1007,12 @@ pub fn send_message_to_peer(
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("(no message)");
-        return Err(format!("peer returned an error: {detail}"));
+        return Err(format!("node returned an error: {detail}"));
     }
     Ok(parsed)
 }
 
-/// Prompt `y/N` before spawning on a peer — a LOCAL UX confirmation only
+/// Prompt `y/N` before spawning on a node — a LOCAL UX confirmation only
 /// (mirrors `confirm_invite`'s exact idiom), never a security gate: the
 /// remote door's own paired+signature+allows∋spawn check (PAIRING.md
 /// decision 6) is the sole authority either way. Retrofit onto
@@ -1022,15 +1022,15 @@ pub fn send_message_to_peer(
 /// question text itself is unchanged, `confirm` owns the `[y/N]` decoration
 /// now instead of this function.
 fn confirm_spawn(name: &str, text: &str) -> Result<bool, String> {
-    aoide_protocol::pick::confirm(&format!("spawn a new session on peer `{name}` — first turn: {text:?} — proceed?"))
+    aoide_protocol::pick::confirm(&format!("spawn a new session on node `{name}` — first turn: {text:?} — proceed?"))
 }
 
-/// `peer spawn <name> [--yes] -- <text…>` (P-P5b, making PAIRING.md's
+/// `node spawn <name> [--yes] -- <text…>` (P-P5b, making PAIRING.md's
 /// headline spawn gate actually reachable from the CLI — before this command,
-/// every client→peer function sent either a read (`aoide/graphSummary`) or
-/// an Inject (`send_message_to_peer`, always carrying a `contextId`); NONE
+/// every client→node function sent either a read (`aoide/graphSummary`) or
+/// an Inject (`send_message_to_node`, always carrying a `contextId`); NONE
 /// emitted a spawn-shaped `message/send` — `context_id: None` — to a
-/// paired peer, so the server's `do_spawn` arm, fully built and
+/// paired node, so the server's `do_spawn` arm, fully built and
 /// fail-closed since P-P3/P-P4, could only ever be reached by a
 /// hand-crafted signed curl).
 ///
@@ -1042,27 +1042,27 @@ fn confirm_spawn(name: &str, text: &str) -> Result<bool, String> {
 /// `spawn_asked`; the message's `parts[].text` becomes the PROMPT
 /// `do_spawn` types as the newly spawned session's first turn
 /// (`spawn_inject_prompt`) — `<text…>` here is that prompt, NOT a
-/// remote-chosen executable: which agent runs is the PEER's own configured
+/// remote-chosen executable: which agent runs is the NODE's own configured
 /// `aoide.a2a.spawnAgent`, never client-supplied (`do_spawn`'s own doc
 /// comment on `SessionRef`'s security model). Built via
 /// `crate::wire::build_message_send_body(text, message_id, None)` — the
 /// SAME builder every other `message/send` call site in this file uses, so
 /// this is a proven shape, not a new invention.
 ///
-/// **Signing**: [`sign_headers_for_peer`] — this is the FIRST production
+/// **Signing**: [`sign_headers_for_node`] — this is the FIRST production
 /// call site that ever signs a SPAWN-shaped POST (`context_id: None`);
-/// every earlier call site (`pull_one_peer`, `pull_peer_live`,
-/// `send_message_to_peer`) sends a read or an Inject. `peer.verified ==
+/// every earlier call site (`pull_one_node`, `pull_node_live`,
+/// `send_message_to_node`) sends a read or an Inject. `node.verified ==
 /// false` still yields an empty header slice exactly as it does for those
 /// three (unchanged behavior) — which is precisely why this function
-/// refuses an unpaired/unknown peer LOCALLY first (below): an unsigned
+/// refuses an unpaired/unknown node LOCALLY first (below): an unsigned
 /// spawn request can never satisfy the remote door's
-/// `PeerRung::Signature`-only gate (P-P4), so sending it anyway would only
+/// `NodeRung::Signature`-only gate (P-P4), so sending it anyway would only
 /// earn a confusing round trip and a generic refusal.
 ///
 /// **The client NEVER gates on `allows` — only on "is this a VERIFIED
-/// local peer at all."** The local check below exists SOLELY to catch the
-/// obviously-doomed case (no verified peer → no identity to sign with →
+/// local node at all."** The local check below exists SOLELY to catch the
+/// obviously-doomed case (no verified node → no identity to sign with →
 /// the remote can never resolve a `Signature` rung) with a clear, LOCAL
 /// taught error naming `pair`. Every OTHER refusal shape —
 /// `allows` lacking `spawn`, clock skew, a revoked pairing — is the remote
@@ -1070,55 +1070,55 @@ fn confirm_spawn(name: &str, text: &str) -> Result<bool, String> {
 /// whatever JSON-RPC error the door returns VERBATIM (taught), per
 /// PAIRING.md decision 6: "the remote door's paired+signature+
 /// allows∋spawn gate is the authority."
-/// The wire-level twin of [`send_message_to_peer`] for the SPAWN shape:
+/// The wire-level twin of [`send_message_to_node`] for the SPAWN shape:
 /// `context_id: None` routes `aoide-server::a2a::do_spawn` to spawn the
-/// peer's own configured `aoide.a2a.spawnAgent` and inject `text` as that
+/// node's own configured `aoide.a2a.spawnAgent` and inject `text` as that
 /// session's first turn (`spawn_inject_prompt`) — never a client-chosen
-/// agent or argv (see [`handle_peer_spawn`]'s own doc on the security
+/// agent or argv (see [`handle_node_spawn`]'s own doc on the security
 /// model this enforces). Extracted so this is the ONE place that builds and
-/// sends a spawn-shaped `message/send`: [`handle_peer_spawn`] (the CLI's
+/// sends a spawn-shaped `message/send`: [`handle_node_spawn`] (the CLI's
 /// confirm-then-send wrapper, unchanged in shape) AND `aoide-conduct`'s
 /// manifest remote-summon path (U4, command-defrag lane U — a manifest spec
-/// whose `host` names a registered peer drives this directly, with no
+/// whose `host` names a registered node drives this directly, with no
 /// confirm: the manifest is itself the operator's standing declaration, the
 /// same posture U2's local clean-spawn already takes toward a spec's own
 /// `command`) call into. Returns the parsed JSON-RPC response on a 200 with
 /// no `error` member; any transport/HTTP/JSON-RPC failure is `Err` with a
 /// plain message the caller surfaces and audits directly — the same
-/// `Result`-not-`Outcome` shape [`send_message_to_peer`]/[`pull_peer_live`]
+/// `Result`-not-`Outcome` shape [`send_message_to_node`]/[`pull_node_live`]
 /// hold, for the same reason (the caller builds its own `Outcome`).
-pub fn spawn_on_peer(
-    peer: &aoide_storage::peer_store::Peer,
+pub fn spawn_on_node(
+    node: &aoide_storage::node_store::Node,
     text: &str,
-) -> Result<Value, SpawnPeerError> {
-    spawn_on_peer_via(peer, text, None)
+) -> Result<Value, SpawnNodeError> {
+    spawn_on_node_via(node, text, None)
 }
 
-/// [`spawn_on_peer`]'s own body, PLUS an optional `--via` OVERRIDE
-/// (P-S4) — `handle_peer_spawn` is the one production caller that ever
-/// passes `Some` (an explicit `peer spawn --via …`, which beats a
-/// recorded `peer.via`); every other caller (`aoide-conduct`'s manifest
-/// remote-summon path, this function's own `spawn_on_peer` above) passes
-/// `None`, making `spawn_on_peer` itself byte-identical-in-behavior to
+/// [`spawn_on_node`]'s own body, PLUS an optional `--via` OVERRIDE
+/// (P-S4) — `handle_node_spawn` is the one production caller that ever
+/// passes `Some` (an explicit `node spawn --via …`, which beats a
+/// recorded `node.via`); every other caller (`aoide-conduct`'s manifest
+/// remote-summon path, this function's own `spawn_on_node` above) passes
+/// `None`, making `spawn_on_node` itself byte-identical-in-behavior to
 /// before this override existed. Extracted rather than adding the
-/// parameter to `spawn_on_peer` directly so `aoide-conduct`'s existing
+/// parameter to `spawn_on_node` directly so `aoide-conduct`'s existing
 /// call site (`graph::resurrect.rs`) needs no change.
-pub fn spawn_on_peer_via(
-    peer: &aoide_storage::peer_store::Peer,
+pub fn spawn_on_node_via(
+    node: &aoide_storage::node_store::Node,
     text: &str,
     via_override: Option<&aoide_storage::tunnel::Via>,
-) -> Result<Value, SpawnPeerError> {
+) -> Result<Value, SpawnNodeError> {
     let message_id = gen_message_id();
     let body = crate::wire::build_message_send_body(text, &message_id, None);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
     let bearer =
-        resolve_peer_bearer(peer).map_err(|e| SpawnPeerError::new("bearer-resolve-failed", e))?;
+        resolve_node_bearer(node).map_err(|e| SpawnNodeError::new("bearer-resolve-failed", e))?;
     let extra_headers =
-        sign_headers_for_peer(peer, &body_str).map_err(|e| SpawnPeerError::new("signing-failed", e))?;
-    let (code, resp) = post_json_to_peer_with_via_override(peer, &body_str, bearer.as_deref(), &extra_headers, 15, via_override)
-        .map_err(|e| SpawnPeerError::new("send-failed", e))?;
+        sign_headers_for_node(node, &body_str).map_err(|e| SpawnNodeError::new("signing-failed", e))?;
+    let (code, resp) = post_json_to_node_with_via_override(node, &body_str, bearer.as_deref(), &extra_headers, 15, via_override)
+        .map_err(|e| SpawnNodeError::new("send-failed", e))?;
     if code != 200 {
-        return Err(SpawnPeerError {
+        return Err(SpawnNodeError {
             reason: "send-http-error",
             message: format!("HTTP {code}"),
             http_code: Some(code),
@@ -1126,9 +1126,9 @@ pub fn spawn_on_peer_via(
         });
     }
     let parsed: Value = serde_json::from_str(&resp)
-        .map_err(|e| SpawnPeerError::new("unparseable-response", format!("unparseable response: {e}")))?;
+        .map_err(|e| SpawnNodeError::new("unparseable-response", format!("unparseable response: {e}")))?;
     // A JSON-RPC error still returns HTTP 200 (same discipline as
-    // `send_message_to_peer`) — the remote door's refusal (paired-but-
+    // `send_message_to_node`) — the remote door's refusal (paired-but-
     // unsigned, allows lacking spawn, skew, …) surfaces VERBATIM, never
     // translated or second-guessed.
     if let Some(err) = parsed.get("error") {
@@ -1136,42 +1136,42 @@ pub fn spawn_on_peer_via(
             .get("message")
             .and_then(Value::as_str)
             .unwrap_or("(no message)");
-        return Err(SpawnPeerError::new(
-            "peer-refused",
-            format!("peer returned an error: {detail}"),
+        return Err(SpawnNodeError::new(
+            "node-refused",
+            format!("node returned an error: {detail}"),
         ));
     }
     Ok(parsed)
 }
 
-/// [`spawn_on_peer`]'s error: the wire stage that failed (`reason`, the same
-/// vocabulary `handle_peer_spawn`'s structured `data` always carried —
+/// [`spawn_on_node`]'s error: the wire stage that failed (`reason`, the same
+/// vocabulary `handle_node_spawn`'s structured `data` always carried —
 /// bearer-resolve-failed · signing-failed · send-failed · send-http-error ·
-/// unparseable-response · peer-refused) plus the human message; HTTP
+/// unparseable-response · node-refused) plus the human message; HTTP
 /// failures keep their code and raw body for programmatic consumers.
 #[derive(Debug)]
-pub struct SpawnPeerError {
+pub struct SpawnNodeError {
     pub reason: &'static str,
     pub message: String,
     pub http_code: Option<u16>,
     pub body: Option<String>,
 }
 
-impl SpawnPeerError {
+impl SpawnNodeError {
     fn new(reason: &'static str, message: String) -> Self {
         Self { reason, message, http_code: None, body: None }
     }
 }
 
-impl std::fmt::Display for SpawnPeerError {
+impl std::fmt::Display for SpawnNodeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.message)
     }
 }
 
-fn handle_peer_spawn(inv: &Invocation) -> Outcome {
-    let cmd = "peer.spawn";
-    const USAGE: &str = "usage: aoide peer spawn <name> [--yes] [--via ssh://[user@]host[:port]] -- <text…>";
+fn handle_node_spawn(inv: &Invocation) -> Outcome {
+    let cmd = "node.spawn";
+    const USAGE: &str = "usage: aoide node spawn <name> [--yes] [--via ssh://[user@]host[:port]] -- <text…>";
     let name = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
         Some(n) => n.to_string(),
         None => return Outcome::usage(cmd, USAGE),
@@ -1180,7 +1180,7 @@ fn handle_peer_spawn(inv: &Invocation) -> Outcome {
     if text.trim().is_empty() {
         return Outcome::usage(cmd, USAGE);
     }
-    // --via beats a recorded Peer.via (spawn_on_peer_via's own doc) — an
+    // --via beats a recorded Node.via (spawn_on_node_via's own doc) — an
     // invalid --via is a usage error, never a silent fallback to the
     // recorded marker (parse_via_flag's own stance).
     let via_override = match parse_via_flag(inv) {
@@ -1188,117 +1188,117 @@ fn handle_peer_spawn(inv: &Invocation) -> Outcome {
         Err(e) => return Outcome::usage(cmd, format!("{USAGE} — {e}")),
     };
 
-    let peers = aoide_storage::peer_store::load_peers();
-    let peer = match peers.iter().find(|p| p.name == name) {
+    let nodes = aoide_storage::node_store::load_nodes();
+    let node = match nodes.iter().find(|p| p.name == name) {
         Some(p) if p.verified => p.clone(),
         Some(_) => {
             return Outcome::error(
                 cmd,
                 format!(
-                    "peer `{name}` is registered but not paired — spawn requires a signed request \
-                     from a VERIFIED peer (docs/architecture/PAIRING.md decision 6); pair first with \
+                    "node `{name}` is registered but not paired — spawn requires a signed request \
+                     from a VERIFIED node (docs/architecture/PAIRING.md decision 6); pair first with \
                      `aoide pair <url> --name {name}`"
                 ),
             )
-            .with_data(json!({ "reason": "unpaired-peer", "name": name }));
+            .with_data(json!({ "reason": "unpaired-node", "name": name }));
         }
         None => {
             return Outcome::error(
                 cmd,
                 format!(
-                    "no peer named `{name}` — spawn requires a paired peer; register and pair it \
+                    "no node named `{name}` — spawn requires a paired node; register and pair it \
                      first with `aoide pair <url> --name {name}`"
                 ),
             )
-            .with_data(json!({ "reason": "unknown-peer", "name": name }));
+            .with_data(json!({ "reason": "unknown-node", "name": name }));
         }
     };
 
     if !inv.flag_present("yes") {
-        match confirm_spawn(&peer.name, &text) {
+        match confirm_spawn(&node.name, &text) {
             Ok(true) => {}
             Ok(false) => {
-                return Outcome::ok(cmd, format!("not confirmed — nothing sent to `{}`", peer.name))
-                    .with_data(json!({ "confirmed": false, "name": peer.name }))
+                return Outcome::ok(cmd, format!("not confirmed — nothing sent to `{}`", node.name))
+                    .with_data(json!({ "confirmed": false, "name": node.name }))
             }
             Err(e) => return Outcome::error(cmd, e),
         }
     }
 
-    match spawn_on_peer_via(&peer, &text, via_override.as_ref()) {
+    match spawn_on_node_via(&node, &text, via_override.as_ref()) {
         Ok(parsed) => {
             let session_id = parsed
                 .get("result")
                 .and_then(|r| r.get("id"))
                 .and_then(Value::as_str)
                 .unwrap_or("");
-            Outcome::ok(cmd, format!("spawned on `{}` — remote session `{session_id}`", peer.name))
-                .with_data(json!({ "name": peer.name, "url": peer.url, "sessionId": session_id, "response": parsed }))
+            Outcome::ok(cmd, format!("spawned on `{}` — remote session `{session_id}`", node.name))
+                .with_data(json!({ "name": node.name, "url": node.url, "sessionId": session_id, "response": parsed }))
         }
         Err(e) => {
-            let mut data = json!({ "reason": e.reason, "name": peer.name, "url": peer.url });
+            let mut data = json!({ "reason": e.reason, "name": node.name, "url": node.url });
             if let Some(code) = e.http_code {
                 data["httpCode"] = json!(code);
             }
             if let Some(body) = &e.body {
                 data["body"] = json!(body);
             }
-            Outcome::error(cmd, format!("spawning on `{}` at {}: {e}", peer.name, peer.url))
+            Outcome::error(cmd, format!("spawning on `{}` at {}: {e}", node.name, node.url))
                 .with_data(data)
         }
     }
 }
 
-/// `peer pull [<name>]` — pull `aoide/graphSummary` from one (or, with no
-/// name, EVERY) registered peer. One peer being down must never break the
-/// command for the others — see [`pull_one_peer`].
-fn handle_peer_pull(inv: &Invocation) -> Outcome {
-    let cmd = "peer.pull";
-    let peers = aoide_storage::peer_store::load_peers();
+/// `node pull [<name>]` — pull `aoide/graphSummary` from one (or, with no
+/// name, EVERY) registered node. One node being down must never break the
+/// command for the others — see [`pull_one_node`].
+fn handle_node_pull(inv: &Invocation) -> Outcome {
+    let cmd = "node.pull";
+    let nodes = aoide_storage::node_store::load_nodes();
     let target = inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty());
-    let selected: Vec<aoide_storage::peer_store::Peer> = match target {
-        Some(name) => match peers.iter().find(|p| p.name == name) {
+    let selected: Vec<aoide_storage::node_store::Node> = match target {
+        Some(name) => match nodes.iter().find(|p| p.name == name) {
             Some(p) => vec![p.clone()],
             None => {
-                return Outcome::error(cmd, format!("no peer named `{name}`"))
-                    .with_data(json!({ "reason": "unknown-peer", "name": name }))
+                return Outcome::error(cmd, format!("no node named `{name}`"))
+                    .with_data(json!({ "reason": "unknown-node", "name": name }))
             }
         },
-        None => peers,
+        None => nodes,
     };
     if selected.is_empty() {
-        return Outcome::ok(cmd, "no peers registered — nothing to pull").with_data(json!({ "results": [] }));
+        return Outcome::ok(cmd, "no nodes registered — nothing to pull").with_data(json!({ "results": [] }));
     }
 
-    let results: Vec<Value> = selected.iter().map(pull_one_peer).collect();
+    let results: Vec<Value> = selected.iter().map(pull_one_node).collect();
     let ok_count = results.iter().filter(|r| r["ok"] == true).count();
-    Outcome::ok(cmd, format!("pulled {ok_count}/{} peer(s) successfully", selected.len()))
+    Outcome::ok(cmd, format!("pulled {ok_count}/{} node(s) successfully", selected.len()))
         .with_data(json!({ "results": results }))
 }
 
-/// `peer status` — each registered peer's full registry row (name/url/
+/// `node status` — each registered node's full registry row (name/url/
 /// autogate/tokenFile/bearerSecret/hub/pubkey/verified/allows/addedAt — the
-/// same shape `peer list` used to be the only place emitting, folded in
-/// here so `peer list` has nothing left to say `peer status --json` doesn't
+/// same shape `node list` used to be the only place emitting, folded in
+/// here so `node list` has nothing left to say `node status --json` doesn't
 /// already say, command-defrag lane task #101) plus its last-pull outcome
 /// and staleness (`fresh` within
-/// [`aoide_storage::peer_store::PEER_CACHE_TTL_SECS`], `stale` past it or
+/// [`aoide_storage::node_store::NODE_CACHE_TTL_SECS`], `stale` past it or
 /// explicitly marked so, `never-pulled` with no cache file at all) — the
 /// same three-way classification `build_graph`'s fold uses
 /// (`aoide-conduct::graph::doc`), so this and the DAG never disagree. The
-/// human-readable message stays the terse per-peer-count summary; the full
-/// row rides `--json`'s `data.peers` only.
-fn handle_peer_status(_inv: &Invocation) -> Outcome {
-    let cmd = "peer.status";
-    let peers = aoide_storage::peer_store::load_peers();
+/// human-readable message stays the terse per-node-count summary; the full
+/// row rides `--json`'s `data.nodes` only.
+fn handle_node_status(_inv: &Invocation) -> Outcome {
+    let cmd = "node.status";
+    let nodes = aoide_storage::node_store::load_nodes();
     let now_epoch =
         aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap_or(0);
-    let rows: Vec<Value> = peers
+    let rows: Vec<Value> = nodes
         .iter()
         .map(|p| {
-            let cache = aoide_storage::peer_store::load_peer_cache(&p.name);
+            let cache = aoide_storage::node_store::load_node_cache(&p.name);
             let (state, fetched_at, error) = match &cache {
-                Some(entry) if aoide_storage::peer_store::is_cache_fresh(entry, now_epoch) => {
+                Some(entry) if aoide_storage::node_store::is_cache_fresh(entry, now_epoch) => {
                     ("fresh", entry.fetched_at.clone(), None)
                 }
                 Some(entry) => ("stale", entry.fetched_at.clone(), entry.last_error.clone()),
@@ -1314,121 +1314,121 @@ fn handle_peer_status(_inv: &Invocation) -> Outcome {
         })
         .collect();
     let msg = if rows.is_empty() {
-        "no peers registered".to_string()
+        "no nodes registered".to_string()
     } else {
-        format!("{} peer(s) registered", rows.len())
+        format!("{} node(s) registered", rows.len())
     };
-    Outcome::ok(cmd, msg).with_data(json!({ "peers": rows }))
+    Outcome::ok(cmd, msg).with_data(json!({ "nodes": rows }))
 }
 
-/// The seven `peer` commands (CONTRACTS.md §7; `hub` is P-D5, `allow` is P-P3),
+/// The seven `node` commands (CONTRACTS.md §7; `hub` is P-D5, `allow` is P-P3),
 /// registered as their own group.
-pub fn register_peers(r: &mut Registry) {
+pub fn register_nodes(r: &mut Registry) {
     r.insert(cmd!(
-        path: ["peer", "add"],
-        summary: "Register a peer aoide instance (verified by AgentCard fetch first) as a federation node in the session DAG.",
+        path: ["node", "add"],
+        summary: "Register a node aoide instance (verified by AgentCard fetch first) as a federation node in the session DAG.",
         args: [
-            arg!("name", "string", true, "A local nickname for this peer."),
-            arg!("url", "string", true, "The peer's A2A door URL (e.g. http://host:8710/)."),
+            arg!("name", "string", true, "A local nickname for this node."),
+            arg!("url", "string", true, "The node's A2A door URL (e.g. http://host:8710/)."),
         ],
         flags: [
-            flag!("autogate", "bool", "Trust this peer: its inbound message/send auto-delivers without the pending queue."),
-            flag!("no-verify", "bool", "Skip the AgentCard fetch entirely and register the peer unverified — for a peer that serves no AgentCard (a plain A2A client endpoint). `verified` stays false either way; a card fetch was never identity, only reachability."),
-            flag!("token-file", "string", "Path to a file holding the shared secret this peer must present (Authorization: Bearer <token>) to be identified as this peer — required for --autogate to survive a proxy/tunnel, where every caller's address looks the same."),
-            flag!("bearer-secret", "string", "Name of a secret, resolved fresh on every outbound call through the local secrets broker, THIS instance presents as Authorization: Bearer <value> when calling this peer's own A2A door. Absent = no bearer sent (today's behavior)."),
-            flag!("via", "string", "An ssh://[user@]host[:port] transport marker — cross-box calls to this peer dial through an internal ssh tunnel to this target instead of the peer's own url directly. Absent = direct dial (today's behavior)."),
+            flag!("autogate", "bool", "Trust this node: its inbound message/send auto-delivers without the pending queue."),
+            flag!("no-verify", "bool", "Skip the AgentCard fetch entirely and register the node unverified — for a node that serves no AgentCard (a plain A2A client endpoint). `verified` stays false either way; a card fetch was never identity, only reachability."),
+            flag!("token-file", "string", "Path to a file holding the shared secret this node must present (Authorization: Bearer <token>) to be identified as this node — required for --autogate to survive a proxy/tunnel, where every caller's address looks the same."),
+            flag!("bearer-secret", "string", "Name of a secret, resolved fresh on every outbound call through the local secrets broker, THIS instance presents as Authorization: Bearer <value> when calling this node's own A2A door. Absent = no bearer sent (today's behavior)."),
+            flag!("via", "string", "An ssh://[user@]host[:port] transport marker — cross-box calls to this node dial through an internal ssh tunnel to this target instead of the node's own url directly. Absent = direct dial (today's behavior)."),
         ],
         gated: false,
         implemented: true,
-        handler: handle_peer_add,
+        handler: handle_node_add,
     ));
     r.insert(cmd!(
-        path: ["peer", "remove"],
-        summary: "Unregister a peer (a missing name is an error, not a silent no-op).",
-        args: [arg!("name", "string", true, "The registered peer's name.")],
+        path: ["node", "remove"],
+        summary: "Unregister a node (a missing name is an error, not a silent no-op).",
+        args: [arg!("name", "string", true, "The registered node's name.")],
         flags: [],
         gated: false,
         implemented: true,
-        handler: handle_peer_remove,
+        handler: handle_node_remove,
     ));
     r.insert(cmd!(
-        path: ["peer", "pull"],
-        summary: "Pull aoide/graphSummary from one (or, with no name, every) registered peer and refresh its cache.",
-        args: [arg!("name", "string", false, "Pull only this peer; omit to pull every registered peer.")],
+        path: ["node", "pull"],
+        summary: "Pull aoide/graphSummary from one (or, with no name, every) registered node and refresh its cache.",
+        args: [arg!("name", "string", false, "Pull only this node; omit to pull every registered node.")],
         flags: [],
         gated: false,
         implemented: true,
-        handler: handle_peer_pull,
+        handler: handle_node_pull,
     ));
     r.insert(cmd!(
-        path: ["peer", "status"],
-        summary: "Report each registered peer's last-pull outcome and cache staleness.",
+        path: ["node", "status"],
+        summary: "Report each registered node's last-pull outcome and cache staleness.",
         args: [],
         flags: [],
         gated: false,
         implemented: true,
-        handler: handle_peer_status,
+        handler: handle_node_status,
     ));
     r.insert(cmd!(
-        path: ["peer", "hub"],
-        summary: "Designate a peer as THE hub (at most one) that address resolution prefers as a last-resort remote target; --clear removes the designation.",
-        args: [arg!("name", "string", true, "The registered peer's name.")],
+        path: ["node", "hub"],
+        summary: "Designate a node as THE hub (at most one) that address resolution prefers as a last-resort remote target; --clear removes the designation.",
+        args: [arg!("name", "string", true, "The registered node's name.")],
         flags: [
-            flag!("clear", "bool", "Remove the hub designation from this peer instead of setting it."),
+            flag!("clear", "bool", "Remove the hub designation from this node instead of setting it."),
         ],
         gated: false,
         implemented: true,
-        handler: handle_peer_hub,
+        handler: handle_node_hub,
     ));
     r.insert(cmd!(
-        path: ["peer", "allow"],
-        summary: "Flip one capability in a peer's `allows` set (P-P3, PAIRING.md decision 5) — idempotent, reports exactly what changed.",
+        path: ["node", "allow"],
+        summary: "Flip one capability in a node's `allows` set (P-P3, PAIRING.md decision 5) — idempotent, reports exactly what changed.",
         args: [
-            arg!("name", "string", true, "The registered peer's name."),
+            arg!("name", "string", true, "The registered node's name."),
             arg!("cap", "string", true, "The capability — one of the closed set: read, spawn."),
             arg!("state", "string", true, "`on` or `off`."),
         ],
         flags: [],
         gated: false,
         implemented: true,
-        handler: handle_peer_allow,
-        examples: ["peer allow yomi-strix spawn on", "peer allow yomi-strix spawn off"],
+        handler: handle_node_allow,
+        examples: ["node allow yomi-strix spawn on", "node allow yomi-strix spawn off"],
     ));
     r.insert(cmd!(
-        path: ["peer", "spawn"],
-        summary: "Spawn a session on a PAIRED peer's own configured agent — POSTs a signed, spawn-shaped message/send (contextId omitted) to the peer's A2A door; the peer's own paired+signature+allows∋spawn gate is the sole authority (docs/architecture/PAIRING.md decision 6), never gated locally beyond requiring a verified peer.",
+        path: ["node", "spawn"],
+        summary: "Spawn a session on a PAIRED node's own configured agent — POSTs a signed, spawn-shaped message/send (contextId omitted) to the node's A2A door; the node's own paired+signature+allows∋spawn gate is the sole authority (docs/architecture/PAIRING.md decision 6), never gated locally beyond requiring a verified node.",
         args: [
-            arg!("name", "string", true, "The registered, PAIRED peer's name."),
+            arg!("name", "string", true, "The registered, PAIRED node's name."),
             arg!("text", "string", true, "The first turn typed into the newly spawned session — put it after `--` so its own words/flags pass through verbatim."),
         ],
         flags: [
             flag!("yes", "bool", "Skip the local y/N confirmation (scripted use) — a LOCAL UX gate only; the remote door's own gate is unaffected."),
-            flag!("via", "string", "An ssh://[user@]host[:port] transport marker for THIS call, overriding any via recorded on the peer. Absent = the peer's own recorded via, if any (today's behavior when neither is set)."),
+            flag!("via", "string", "An ssh://[user@]host[:port] transport marker for THIS call, overriding any via recorded on the node. Absent = the node's own recorded via, if any (today's behavior when neither is set)."),
         ],
         gated: false,
         implemented: true,
-        handler: handle_peer_spawn,
-        examples: ["peer spawn yomi-strix -- status check please"],
+        handler: handle_node_spawn,
+        examples: ["node spawn yomi-strix -- status check please"],
     ));
 }
 
 // ── The `pair`/`pair reject`/`pair watch` commands (P-P2 through task #135
 // ── P3', CONTRACTS.md §6 — the pairing ceremony's wire + CLI ceremony) ────
 //
-// `peer add`/`pair` are two SEPARATE paths onto the same registry
-// (`docs/architecture/PAIRING.md`'s "Settled decisions" #2): `peer add` is
-// the legacy escape for an UNPAIRED peer (a hand-set URL, never verified by
+// `node add`/`pair` are two SEPARATE paths onto the same registry
+// (`docs/architecture/PAIRING.md`'s "Settled decisions" #2): `node add` is
+// the legacy escape for an UNPAIRED node (a hand-set URL, never verified by
 // key), `pair` is the ONE ceremony that mints a `pubkey`/`verified`
-// peer record on BOTH ends — request/reveal/park/approve/reject over the
+// node record on BOTH ends — request/reveal/park/approve/reject over the
 // A2A door (`aoide-server::a2a::pair_request`/`pair_reveal`/`pair_poll`),
 // SAS derivation + display (`aoide_storage::pairing::derive_sas`), commit via
-// `aoide_storage::peer_store::upsert_paired_peer` — which ALSO stamps the
-// peer's `allows` the first time it becomes verified (P-P3, PAIRING.md
+// `aoide_storage::node_store::upsert_paired_node` — which ALSO stamps the
+// node's `allows` the first time it becomes verified (P-P3, PAIRING.md
 // decision 5). That grant is `config.toml`'s `[pairing] defaultGrant`
 // (`["read"]` unless an operator widened it), or the `--allow` typed on this
 // one commit; `resolve_grant` is the single place either is read. Editing a
-// LIVE grant afterward is `peer allow <name> <cap> on|off`'s own separate
-// command (registered in `register_peers` above), never a second write site
+// LIVE grant afterward is `node allow <name> <cap> on|off`'s own separate
+// command (registered in `register_nodes` above), never a second write site
 // here — and a re-pairing never re-grants, so a revoked capability survives
 // a key rotation.
 //
@@ -1459,7 +1459,7 @@ pub fn register_peers(r: &mut Registry) {
 /// `None` reads `config.toml`'s `[pairing] defaultGrant`
 /// (`aoide_storage::config`, whose own default is `["read"]`).
 ///
-/// **Resolution lives here, not in the store.** `upsert_paired_peer` takes
+/// **Resolution lives here, not in the store.** `upsert_paired_node` takes
 /// the finished list; a store function reading the config would be a second
 /// resolution path, and it would have to swallow a malformed grants file at
 /// the one moment that must fail loudly (`config`'s own module doc: "this one
@@ -1481,7 +1481,7 @@ fn resolve_grant(grant: Option<&[String]>) -> Result<Vec<String>, String> {
 /// Read `--allow` off the invocation, per the SAME closed vocabulary and the
 /// SAME parser `config set pairing.defaultGrant` already uses
 /// (`aoide_storage::config::parse_value` over
-/// [`aoide_storage::peer_store::PEER_CAPABILITIES`]) — never a second list to
+/// [`aoide_storage::node_store::NODE_CAPABILITIES`]) — never a second list to
 /// drift. Comma-separated rather than a repeated flag because
 /// `Invocation::flags` is a map, one value per name: a second `--allow` would
 /// silently overwrite the first, which is the wrong failure for a grants
@@ -1492,19 +1492,19 @@ fn parse_allow_flag(inv: &Invocation) -> Result<Option<Vec<String>>, String> {
     let Some(raw) = inv.flags.get("allow") else {
         return Ok(None);
     };
-    let kind = aoide_storage::config::ValueKind::ClosedList(aoide_storage::peer_store::PEER_CAPABILITIES);
+    let kind = aoide_storage::config::ValueKind::ClosedList(aoide_storage::node_store::NODE_CAPABILITIES);
     aoide_storage::config::parse_value(&kind, raw).map(Some).map_err(|e| format!("--allow: {e}"))
 }
 
 /// What a commit says about `allows`. A grant lands ONLY on a first
-/// verification — `upsert_paired_peer` leaves an already-verified peer's set
+/// verification — `upsert_paired_node` leaves an already-verified node's set
 /// exactly as it was, so a revoked capability stays revoked across a key
 /// rotation. An `--allow` that silently did nothing is precisely the surprise
 /// this clause exists to prevent, so the re-pair case says so and names the
 /// command that does change a live grant.
 fn grant_note(first_pairing: bool, allows: &[String]) -> String {
     match (first_pairing, allows.is_empty()) {
-        (false, _) => ", grant unchanged (`peer allow` edits a live one)".to_string(),
+        (false, _) => ", grant unchanged (`node allow` edits a live one)".to_string(),
         (true, true) => ", granted nothing".to_string(),
         (true, false) => format!(", granted {}", allows.join(", ")),
     }
@@ -1641,7 +1641,7 @@ fn record_outbound_try(cmd: &str, id: &str, now_epoch: i64) -> Result<u32, Outco
 /// [`auto_deny_inbound`]'s exact mirror on the REQUESTER'S own leg (the
 /// mutual-code redesign, R1): the third cumulative reply-code mismatch is a
 /// clean [`aoide_storage::pairing::take_outbound`] — nothing of THIS
-/// instance's own commits. B is left holding a verified peer that answers
+/// instance's own commits. B is left holding a verified node that answers
 /// nothing, which is PAIRING.md's own documented commit-asymmetry outcome
 /// ("resolved by an ordinary expiring re-pair") — the taught error says
 /// exactly that and names the re-pair, rather than inventing a special
@@ -1654,21 +1654,21 @@ fn auto_abort_outbound(cmd: &str, id: &str, name: &str, now_epoch: i64) -> Outco
         cmd,
         format!(
             "{MAX_CODE_TRIES} reply-code mismatches — auto-aborted pairing request `{id}` to `{name}`: \
-             nothing committed on this end; `{name}` is left holding a verified peer that answers nothing until \
+             nothing committed on this end; `{name}` is left holding a verified node that answers nothing until \
              an ordinary expiring re-pair resolves it"
         ),
     )
     .with_data(json!({ "reason": "auto-abort-on-code-mismatch", "id": id, "name": name, "tries": MAX_CODE_TRIES, "rejected": true, "direction": "outbound" }))
 }
 
-/// This instance's own default advertised A2A door URL — `--peer-name`'s
-/// sibling precedence chain (`aoide_server::a2a::resolve_peer_name`) but
+/// This instance's own default advertised A2A door URL — `--node-name`'s
+/// sibling precedence chain (`aoide_server::a2a::resolve_node_name`) but
 /// resolved HERE, since this crate cannot depend on `aoide-server`: the
 /// port comes from `AOIDE_A2A_PORT` (the same env the `aoide-a2a` systemd
 /// unit sets, mirroring `a2a::resolve_bind_port`'s own precedence) or the
 /// house default `8710`; the host is `aoide_storage::display::
 /// local_host_name` (already the shared fallback chain `a2a::
-/// resolve_peer_name` itself delegates to). `--self-url` overrides this
+/// resolve_node_name` itself delegates to). `--self-url` overrides this
 /// outright — the one flag `pair`'s url arm needs when the door binds
 /// somewhere this default can't guess (a non-default port, a reverse
 /// proxy/tunnel hostname).
@@ -1729,11 +1729,11 @@ fn outbound_ip_toward(toward: &str) -> Option<std::net::IpAddr> {
 }
 
 /// The house A2A door port this box assumes for itself AND for a
-/// discovered peer: `AOIDE_A2A_PORT` (the same env the `aoide-a2a`
+/// discovered node: `AOIDE_A2A_PORT` (the same env the `aoide-a2a`
 /// systemd unit sets) or the house default `8710`. `pair`'s hostname
 /// arm composes its dial target with this (task #120 — the advertisement
-/// carries no door URL, so there is no per-peer port to read off the
-/// wire); a peer on a non-default port takes the explicit `pair
+/// carries no door URL, so there is no per-node port to read off the
+/// wire); a node on a non-default port takes the explicit `pair
 /// <url>` path instead.
 pub(crate) fn default_a2a_port() -> u16 {
     std::env::var("AOIDE_A2A_PORT")
@@ -1743,19 +1743,19 @@ pub(crate) fn default_a2a_port() -> u16 {
 }
 
 /// The port a `scheme://host[:port][/path]` url's own authority carries —
-/// lightweight, reusing [`aoide_storage::peer_store::url_host`]'s existing
+/// lightweight, reusing [`aoide_storage::node_store::url_host`]'s existing
 /// authority extraction rather than pulling in a full URL parser for one
 /// field. `None` on an unparseable url, a bare host with no `:port`
 /// segment at all, or a port that doesn't fit `u16` — every one of those
 /// is a caller's fallback case, never a panic.
 fn port_from_url(url: &str) -> Option<u16> {
-    let authority = aoide_storage::peer_store::url_host(url)?;
+    let authority = aoide_storage::node_store::url_host(url)?;
     let (_, port_str) = authority.rsplit_once(':')?;
     port_str.parse::<u16>().ok()
 }
 
 /// `pair <target>`'s EXPLICIT-DIAL arm (`target` is a URL) — the old
-/// `peer pair request <url>` handler's own body, unchanged: mints this
+/// `node pair request <url>` handler's own body, unchanged: mints this
 /// instance's identity if it doesn't exist yet
 /// (`aoide_storage::identity::load_or_mint`), mints a fresh nonce, POSTs
 /// `aoide/pairRequest` carrying a COMMITMENT to that nonce (never the nonce
@@ -1776,7 +1776,7 @@ fn port_from_url(url: &str) -> Option<u16> {
 fn pair_via_url(cmd: &str, inv: &Invocation, url: &str, usage: &str) -> Outcome {
     let name = match inv.flags.get("name").cloned().filter(|s| !s.is_empty()) {
         Some(n) => n,
-        None => match aoide_storage::peer_store::default_peer_name_from_url(url) {
+        None => match aoide_storage::node_store::default_node_name_from_url(url) {
             Some(n) => n,
             None => {
                 return Outcome::error(cmd, "could not derive a nickname from the URL — pass --name explicitly")
@@ -1784,11 +1784,11 @@ fn pair_via_url(cmd: &str, inv: &Invocation, url: &str, usage: &str) -> Outcome 
             }
         },
     };
-    if !aoide_storage::peer_store::valid_peer_name(&name) {
+    if !aoide_storage::node_store::valid_node_name(&name) {
         return Outcome::error(
             cmd,
             format!(
-                "`{name}` is not a valid peer nickname: must match `^[a-z0-9][a-z0-9-]*$` \
+                "`{name}` is not a valid node nickname: must match `^[a-z0-9][a-z0-9-]*$` \
                  (lowercase letters, digits, hyphens; no leading hyphen, no `/`, no `..`)"
             ),
         )
@@ -1815,7 +1815,7 @@ fn pair_via_url(cmd: &str, inv: &Invocation, url: &str, usage: &str) -> Outcome 
     // which the tunnel may make unreachable directly.
     let toward = match via.as_ref() {
         Some(v) => v.host.clone(),
-        None => aoide_storage::peer_store::url_host(url).unwrap_or_else(|| url.to_string()),
+        None => aoide_storage::node_store::url_host(url).unwrap_or_else(|| url.to_string()),
     };
     let self_via = inv
         .flags
@@ -1842,11 +1842,11 @@ fn pair_via_url(cmd: &str, inv: &Invocation, url: &str, usage: &str) -> Outcome 
 /// validated above) AND [`pair_with_heard`] (`pair <hostname>`/bare
 /// `pair` — a `url`/`name` already lifted straight off an
 /// already-validated, already-confirmed discovery advertisement, so it
-/// needs no SECOND `valid_peer_name` check here). Extracted so the
+/// needs no SECOND `valid_node_name` check here). Extracted so the
 /// hostname arm reaches the SAME ceremony code the url arm does — never a
 /// copy (PAIRING.md: "sugar over the ceremony, nothing more").
 /// Everything from here down is unchanged from the pre-P-PV2 shape of
-/// `handle_peer_pair_request`: mint-or-load this instance's identity, mint
+/// `handle_node_pair_request`: mint-or-load this instance's identity, mint
 /// a fresh nonce, POST `aoide/pairRequest` carrying a COMMITMENT to that
 /// nonce (never the nonce itself), then immediately POST `aoide/pairReveal`
 /// with the nonce the commitment already fixed; only once both calls
@@ -1858,16 +1858,16 @@ fn pair_via_url(cmd: &str, inv: &Invocation, url: &str, usage: &str) -> Outcome 
 /// a plain `pair <url>` (no observed address to derive a
 /// default from) and, for the hostname arm/bare `pair`, an explicit
 /// `--via` or else [`pair_with_heard`]'s own src_addr-derived default
-/// (P-PV1: loopback-only doors, task #131 — a discovered peer's door is
+/// (P-PV1: loopback-only doors, task #131 — a discovered node's door is
 /// reached only through its ssh tunnel, so the ceremony's OWN dial needs
 /// that same default, not only the record). `record_via` is the string
 /// parked into [`aoide_storage::pairing::OutboundPairingRequest::via`] for
-/// LATER commit onto the resulting peer record, in the SEPARATE `pair
+/// LATER commit onto the resulting node record, in the SEPARATE `pair
 /// <id>` invocation that actually writes it (`approve_outbound`).
 /// `self_via` (P-PV1) is this instance's OWN reach-back hop claim —
-/// `ssh://<local login>@<local address routed toward the peer>` by default
+/// `ssh://<local login>@<local address routed toward the node>` by default
 /// ([`default_self_via`] — the HOST half is the local outbound address the
-/// kernel picks for a route toward the peer, never a claimed OS hostname;
+/// kernel picks for a route toward the node, never a claimed OS hostname;
 /// that function's own doc has the full reasoning), overridable by
 /// `--self-via` — carried on the wire beside `self_url` so the far end,
 /// which can only ever OBSERVE this request arriving over the tunnel (i.e.
@@ -1900,9 +1900,9 @@ pub(crate) fn run_pair_request(
     // this side's local nickname for the approver, recorded at
     // `remember_outbound` below; sending it here instead made the approver
     // file the requester under the requester's-nickname-for-the-approver
-    // (the live yomi↔sakaki ceremony's phantom-peer defect, 2026-08-26).
+    // (the live yomi↔sakaki ceremony's phantom-node defect, 2026-08-26).
     let self_name = aoide_storage::display::local_host_name();
-    let body = crate::peer::build_pair_request_body(&own_pubkey, &self_name, &commit, &self_url, self_via);
+    let body = crate::node::build_pair_request_body(&own_pubkey, &self_name, &commit, &self_url, self_via);
     let body_str = serde_json::to_string(&body).unwrap_or_default();
     let (code, resp_body) = match post_json_via(url, dial_via, name, &body_str, None, &[], 15) {
         Ok(v) => v,
@@ -1922,18 +1922,18 @@ pub(crate) fn run_pair_request(
                 .with_data(json!({ "reason": "unparseable", "url": url }))
         }
     };
-    let ack = match crate::peer::parse_pair_request_response(&resp) {
+    let ack = match crate::node::parse_pair_request_response(&resp) {
         Ok(a) => a,
         Err(e) => {
-            return Outcome::error(cmd, format!("the peer refused the pairing request: {e}"))
+            return Outcome::error(cmd, format!("the node refused the pairing request: {e}"))
                 .with_data(json!({ "reason": "refused", "url": url }))
         }
     };
 
     // Reveal — the commitment's second half (module doc). A failure here
-    // (network, refusal, or a commitment mismatch the peer detected) means
+    // (network, refusal, or a commitment mismatch the node detected) means
     // the ceremony never completes; nothing is parked on this side either.
-    let reveal_body = crate::peer::build_pair_reveal_body(&ack.id, &own_nonce);
+    let reveal_body = crate::node::build_pair_reveal_body(&ack.id, &own_nonce);
     let reveal_body_str = serde_json::to_string(&reveal_body).unwrap_or_default();
     let (reveal_code, reveal_resp_body) = match post_json_via(url, dial_via, name, &reveal_body_str, None, &[], 15) {
         Ok(v) => v,
@@ -1947,7 +1947,7 @@ pub(crate) fn run_pair_request(
             .with_data(json!({ "reason": "reveal-http-error", "url": url, "id": ack.id, "httpCode": reveal_code }));
     }
     let reveal_resp: Value = serde_json::from_str(&reveal_resp_body).unwrap_or(Value::Null);
-    if let Err(e) = crate::peer::check_pair_reveal_response(&reveal_resp) {
+    if let Err(e) = crate::node::check_pair_reveal_response(&reveal_resp) {
         return Outcome::error(cmd, e).with_data(json!({ "reason": "reveal-refused", "url": url, "id": ack.id }));
     }
 
@@ -2003,7 +2003,7 @@ pub(crate) struct PairFinish {
     /// for anything that cannot sit on a human.
     pub wait_secs: u64,
     /// `--yes` — skip THIS side's own PRE-REQUEST confirmations (the
-    /// sweep's proceed prompt, the already-verified-peer re-pair confirm).
+    /// sweep's proceed prompt, the already-verified-node re-pair confirm).
     /// **Narrowed by the mutual-code redesign (R1): it no longer reaches
     /// the final gate.** The final commit is always a [`CodeGate`], built by
     /// [`outbound_gate_from`] — `--yes` with no `--code` and no tty still
@@ -2133,7 +2133,7 @@ pub(crate) fn refuse_detached_grant(cmd: &str, finish: &PairFinish) -> Option<Ou
 }
 
 /// Block until the approver releases `id`, then confirm and commit — the
-/// whole requester half in one command (task #135 P2, the User's ask: "`peer
+/// whole requester half in one command (task #135 P2, the User's ask: "`node
 /// pair <target>` BLOCKS until done, timeout = nobody there").
 ///
 /// Every terminal answer returns immediately: only [`PollOutcome::Pending`]
@@ -2315,8 +2315,8 @@ fn pending_listing(cmd: &str) -> Outcome {
 /// shape delivered an `aoide/pairApprove` callback to the requester's own
 /// door FIRST, which meant a requester whose door was loopback-only
 /// ([[doors-loopback-only]]) could never be reached, and the ceremony could
-/// never complete. Now: commit THIS instance's own peer record
-/// (`upsert_paired_peer`), then mark the parked entry
+/// never complete. Now: commit THIS instance's own node record
+/// (`upsert_paired_node`), then mark the parked entry
 /// [`aoide_storage::pairing::InboundPairingRequest::approved`]
 /// (`mark_inbound_approved`) and leave it PARKED — never taken — so the
 /// requester's own `aoide/pairPoll` (over the SAME forward dial the request/
@@ -2326,7 +2326,7 @@ fn pending_listing(cmd: &str) -> Outcome {
 /// commit AND a correctly-signed poll from the ORIGINAL requester happen.
 ///
 /// Idempotent: re-running this against an already-approved entry is a no-op
-/// success (no second code prompt, no second `upsert_paired_peer`) — the
+/// success (no second code prompt, no second `upsert_paired_node`) — the
 /// operator may have run it twice, or the popup arm may re-offer a stale
 /// row before its own state catches up.
 ///
@@ -2373,7 +2373,7 @@ pub(crate) fn approve_inbound(
             None => format!("already approved `{name}` — waiting for their own `aoide pair {id}` to complete their side"),
         };
         return Outcome::ok(cmd, message)
-            .with_data(json!({ "confirmed": true, "id": id, "peer": entry.name, "alreadyApproved": true, "replySas": reply_sas }));
+            .with_data(json!({ "confirmed": true, "id": id, "node": entry.name, "alreadyApproved": true, "replySas": reply_sas }));
     }
 
     // Resolved BEFORE the code gate, not beside the commit that uses it: a
@@ -2480,17 +2480,17 @@ pub(crate) fn approve_inbound(
     // "loopback", per §0.7 — not a usable source) — but P-PV1 (task #131)
     // gives it a CLAIMED one: when the wire's `selfVia` rode this entry
     // (`entry.self_via`), the requester's own door is reachable only
-    // through that hop, the same convention the sakaki/chiyo/osaka peer
+    // through that hop, the same convention the sakaki/chiyo/osaka node
     // rows already hold by hand — `url` becomes the loopback-as-seen-from-
     // the-far-side door (`http://127.0.0.1:<AOIDE_A2A_PORT or 8710>/`,
     // never `entry.url`'s requester-observed host, which the approver can
     // never dial directly through the tunnel) and `via` becomes the claim
     // itself, committed in the SAME write as the pairing commit below
-    // (`set_peer_via`'s own doc on why it's a sibling writer beside
-    // `upsert_paired_peer`). No claim on the entry (an old requester, or
+    // (`set_node_via`'s own doc on why it's a sibling writer beside
+    // `upsert_paired_node`). No claim on the entry (an old requester, or
     // one with nothing to claim) commits EXACTLY today's shape: `entry.url`
     // verbatim, `via` left `None` — the same "absent by default" a fresh
-    // `Peer` already carries.
+    // `Node` already carries.
     //
     // The PORT in the loopback rewrite is the REQUESTER's own door port,
     // parsed off `entry.url` (their own `self_url`, already encoding
@@ -2506,22 +2506,22 @@ pub(crate) fn approve_inbound(
         }
         None => entry.url.clone(),
     };
-    let mut peers = aoide_storage::peer_store::load_peers();
-    let first_pairing = !peers.iter().any(|p| p.name == entry.name && p.verified);
-    let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &record_url, &entry.pubkey_hex, now, &allows);
+    let mut nodes = aoide_storage::node_store::load_nodes();
+    let first_pairing = !nodes.iter().any(|p| p.name == entry.name && p.verified);
+    let change = aoide_storage::node_store::upsert_paired_node(&mut nodes, &entry.name, &record_url, &entry.pubkey_hex, now, &allows);
     if let Some(via) = entry.self_via.as_deref() {
-        if let Err(e) = aoide_storage::peer_store::set_peer_via(&mut peers, &entry.name, Some(via)) {
-            return Outcome::error(cmd, format!("recording the peer's transport marker: {e}"));
+        if let Err(e) = aoide_storage::node_store::set_node_via(&mut nodes, &entry.name, Some(via)) {
+            return Outcome::error(cmd, format!("recording the node's transport marker: {e}"));
         }
     }
-    if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
-        return Outcome::error(cmd, format!("writing the peer registry: {e}"));
+    if let Err(e) = aoide_storage::node_store::save_nodes(&nodes) {
+        return Outcome::error(cmd, format!("writing the node registry: {e}"));
     }
     // Design A: mark approved, never take — the entry stays parked for the
     // requester's own poll to find (module doc above).
     let _ = aoide_storage::pairing::mark_inbound_approved(id, now_epoch);
 
-    use aoide_storage::peer_store::PairChange;
+    use aoide_storage::node_store::PairChange;
     let word = match change {
         PairChange::Inserted => "paired with",
         PairChange::Updated => "re-paired with",
@@ -2536,8 +2536,8 @@ pub(crate) fn approve_inbound(
             entry.name,
         ),
     )
-    .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
-    .with_data(json!({ "confirmed": true, "sas": sas, "replySas": reply_sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "inbound", "grant": allows, "grantStamped": first_pairing }))
+    .changed(vec![aoide_storage::node_store::nodes_path().to_string_lossy().into_owned()])
+    .with_data(json!({ "confirmed": true, "sas": sas, "replySas": reply_sas, "node": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "inbound", "grant": allows, "grantStamped": first_pairing }))
 }
 
 /// The REQUESTER's poll-then-confirm-then-commit half of `pair
@@ -2551,7 +2551,7 @@ pub(crate) fn approve_inbound(
 /// `aoide/pairApprove` callback the approver's door would dial in to
 /// deliver — unreachable when THIS instance's own door is loopback-only
 /// ([[doors-loopback-only]]). A [`PollOutcome::Pending`] answer refuses here
-/// with the SAME "still awaiting the peer's own approval" message the old
+/// with the SAME "still awaiting the node's own approval" message the old
 /// callback-wait refusal gave — an ordinary, expected outcome while the
 /// operators are still comparing codes out loud, and the ONE arm a blocking
 /// caller retries instead of returning.
@@ -2585,13 +2585,13 @@ pub(crate) fn approve_outbound(
             return Outcome::error(
                 cmd,
                 format!(
-                    "pairing request `{id}` to `{}` is still awaiting the peer's own approval — nothing to confirm yet; \
+                    "pairing request `{id}` to `{}` is still awaiting the node's own approval — nothing to confirm yet; \
                      try again once they've run `aoide pair {id}` on their side, or \
                      `aoide pair reject {id}` to abort",
                     entry.name
                 ),
             )
-            .with_data(json!({ "reason": "awaiting-peer-approval", "id": id }))
+            .with_data(json!({ "reason": "awaiting-node-approval", "id": id }))
         }
     };
 
@@ -2662,13 +2662,13 @@ pub(crate) fn poll_outbound_once(cmd: &str, id: &str, entry: &aoide_storage::pai
         );
     }
     let parsed: Value = serde_json::from_str(&resp_body).unwrap_or(Value::Null);
-    let status = match crate::peer::parse_pair_poll_response(&parsed) {
+    let status = match crate::node::parse_pair_poll_response(&parsed) {
         Ok(s) => s,
         Err(e) => return PollOutcome::Refused(Outcome::error(cmd, e).with_data(json!({ "reason": "poll-refused", "id": id }))),
     };
     let polled_pubkey = match status {
-        crate::peer::PairPollStatus::Pending => return PollOutcome::Pending,
-        crate::peer::PairPollStatus::Approved { pubkey_hex } => pubkey_hex,
+        crate::node::PairPollStatus::Pending => return PollOutcome::Pending,
+        crate::node::PairPollStatus::Approved { pubkey_hex } => pubkey_hex,
     };
     // The SAS/transcript binding (review-bounce Finding 2, preserved):
     // a released pubkey that does not match what THIS instance learned
@@ -2679,7 +2679,7 @@ pub(crate) fn poll_outbound_once(cmd: &str, id: &str, entry: &aoide_storage::pai
         Err(aoide_storage::pairing::ConfirmMarkError::Mismatch) => PollOutcome::Refused(
             Outcome::error(
                 cmd,
-                format!("the peer's released identity does not match what this instance learned at request time for `{}` — refusing to bind a substituted reveal", entry.name),
+                format!("the node's released identity does not match what this instance learned at request time for `{}` — refusing to bind a substituted reveal", entry.name),
             )
             .with_data(json!({ "reason": "reveal-mismatch", "id": id })),
         ),
@@ -2794,46 +2794,46 @@ pub(crate) fn commit_outbound(
         },
     }
 
-    let mut peers = aoide_storage::peer_store::load_peers();
-    let first_pairing = !peers.iter().any(|p| p.name == entry.name && p.verified);
-    let change = aoide_storage::peer_store::upsert_paired_peer(&mut peers, &entry.name, &entry.url, &entry.pubkey_hex, now, allows);
+    let mut nodes = aoide_storage::node_store::load_nodes();
+    let first_pairing = !nodes.iter().any(|p| p.name == entry.name && p.verified);
+    let change = aoide_storage::node_store::upsert_paired_node(&mut nodes, &entry.name, &entry.url, &entry.pubkey_hex, now, allows);
     // P-S4: the via this ceremony resolved back at `pair` request
     // time (K1's src_addr-derived default, or an explicit `--via`) rode
-    // the parked entry here — commit it onto the peer record in the SAME
+    // the parked entry here — commit it onto the node record in the SAME
     // write as the pairing commit above, via the sibling writer
-    // (`set_peer_via`'s own doc on why it's separate from
-    // `upsert_paired_peer`'s signature). ONLY when `entry.via` is `Some`
+    // (`set_node_via`'s own doc on why it's separate from
+    // `upsert_paired_node`'s signature). ONLY when `entry.via` is `Some`
     // (review fix, P-S4 follow-up) — a plain re-pair with no `--via` must
     // LEAVE a previously-recorded via (e.g. one earlier `pair` set)
     // exactly as it was, the same "untouched unless this call names a change"
-    // stance `upsert_paired_peer` itself already holds for `autogate`/
+    // stance `upsert_paired_node` itself already holds for `autogate`/
     // `tokenFile`/`bearerSecret`/`hub`/`allows` on re-pairing; calling
-    // `set_peer_via` unconditionally with `None` would silently WIPE that
+    // `set_node_via` unconditionally with `None` would silently WIPE that
     // marker as a side effect of an unrelated re-pair, never a deliberate
     // clear.
     if let Some(via) = entry.via.as_deref() {
-        if let Err(e) = aoide_storage::peer_store::set_peer_via(&mut peers, &entry.name, Some(via)) {
-            return Outcome::error(cmd, format!("recording the peer's transport marker: {e}"));
+        if let Err(e) = aoide_storage::node_store::set_node_via(&mut nodes, &entry.name, Some(via)) {
+            return Outcome::error(cmd, format!("recording the node's transport marker: {e}"));
         }
     }
-    if let Err(e) = aoide_storage::peer_store::save_peers(&peers) {
-        return Outcome::error(cmd, format!("writing the peer registry: {e}"));
+    if let Err(e) = aoide_storage::node_store::save_nodes(&nodes) {
+        return Outcome::error(cmd, format!("writing the node registry: {e}"));
     }
     let _ = aoide_storage::pairing::take_outbound(id, now_epoch);
 
-    use aoide_storage::peer_store::PairChange;
+    use aoide_storage::node_store::PairChange;
     let word = match change {
         PairChange::Inserted => "paired with",
         PairChange::Updated => "re-paired with",
     };
     Outcome::ok(cmd, format!("{word} `{}` (reply code {reply_sas}) — verified{}", entry.name, grant_note(first_pairing, allows)))
-        .changed(vec![aoide_storage::peer_store::peers_path().to_string_lossy().into_owned()])
-        .with_data(json!({ "confirmed": true, "replySas": reply_sas, "peer": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "outbound", "grant": allows, "grantStamped": first_pairing }))
+        .changed(vec![aoide_storage::node_store::nodes_path().to_string_lossy().into_owned()])
+        .with_data(json!({ "confirmed": true, "replySas": reply_sas, "node": entry.name, "pubkeyHex": entry.pubkey_hex, "direction": "outbound", "grant": allows, "grantStamped": first_pairing }))
 }
 
 /// `pair reject <id|name>` — a clean refusal: removes the parked entry
 /// (whichever direction it's in — an OUTBOUND id at EITHER state is the
-/// ceremony's own missing ABORT command, review-bounce Finding 2), no peer
+/// ceremony's own missing ABORT command, review-bounce Finding 2), no node
 /// record on either end. Never notifies the other side (no wire call); an
 /// inbound rejection's counterpart outbound entry simply expires on its own
 /// timeout (PAIRING.md names no explicit reject-notification requirement,
@@ -2873,7 +2873,7 @@ fn handle_pair_reject(inv: &Invocation) -> Outcome {
 /// `pair_watch`'s own popup arm (a `--yes`-shaped CLI invocation is the
 /// wrong shape for a dialog's "Reject request" button, which knows only
 /// the id) can call it directly with no [`Invocation`] to construct.
-/// Whichever direction the id is parked in, removes it — no peer record
+/// Whichever direction the id is parked in, removes it — no node record
 /// on either end, no wire notification to the other side (module doc on
 /// [`handle_pair_reject`]).
 pub(crate) fn reject_by_id(cmd: &str, id: &str) -> Outcome {
@@ -2881,7 +2881,7 @@ pub(crate) fn reject_by_id(cmd: &str, id: &str) -> Outcome {
 
     match aoide_storage::pairing::take_inbound(id, now_epoch) {
         Ok(Some(entry)) => {
-            return Outcome::ok(cmd, format!("rejected pairing request `{id}` from `{}` — no peer record written", entry.name))
+            return Outcome::ok(cmd, format!("rejected pairing request `{id}` from `{}` — no node record written", entry.name))
                 .with_data(json!({ "rejected": true, "id": id, "name": entry.name, "direction": "inbound" }))
         }
         Ok(None) => {}
@@ -2889,7 +2889,7 @@ pub(crate) fn reject_by_id(cmd: &str, id: &str) -> Outcome {
     }
 
     match aoide_storage::pairing::take_outbound(id, now_epoch) {
-        Ok(Some(entry)) => Outcome::ok(cmd, format!("aborted outbound pairing request `{id}` to `{}` — no peer record written", entry.name))
+        Ok(Some(entry)) => Outcome::ok(cmd, format!("aborted outbound pairing request `{id}` to `{}` — no node record written", entry.name))
             .with_data(json!({ "rejected": true, "id": id, "name": entry.name, "direction": "outbound" })),
         Ok(None) => Outcome::error(cmd, format!("no pending pairing request with id `{id}` (unknown, already resolved, or expired)"))
             .with_data(json!({ "reason": "unknown-id", "id": id })),
@@ -2926,7 +2926,7 @@ fn handle_pair_watch(inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, "watching pairing events")
 }
 
-/// `peer discover [--secs N] [--json]` (P-P6 + task #120,
+/// `node discover [--secs N] [--json]` (P-P6 + task #120,
 /// `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
 /// section): listens on the fixed UDP port for `--secs` seconds (default
 /// `discover::DEFAULT_SWEEP_SECS`, ~4) and prints every DISTINCT
@@ -2936,19 +2936,19 @@ fn handle_pair_watch(inv: &Invocation) -> Outcome {
 /// advertisement's own CLAIM; `srcAddr` is the packet's actual source
 /// address, an OBSERVATION this process made directly (P-S1) — shown side
 /// by side precisely so an operator can see them disagree. **Read-only**
-/// — this command never writes `state/peers.json`; the pairing ceremony
-/// is the only thing that ever registers a peer. Malformed advertisements
+/// — this command never writes `state/nodes.json`; the pairing ceremony
+/// is the only thing that ever registers a node. Malformed advertisements
 /// are dropped and counted, never echoed raw (house rule 4) — `dropped`
 /// in the JSON data is a bare total, nothing more specific about what was
 /// wrong with any one of them.
-fn handle_peer_discover(inv: &Invocation) -> Outcome {
-    let cmd = "peer.discover";
+fn handle_node_discover(inv: &Invocation) -> Outcome {
+    let cmd = "node.discover";
     let secs = match parse_secs_flag(inv) {
         Ok(n) => n,
         Err(()) => {
             return Outcome::usage(
                 cmd,
-                "usage: aoide peer discover [--secs N] [--json] — --secs must be a positive integer",
+                "usage: aoide node discover [--secs N] [--json] — --secs must be a positive integer",
             )
         }
     };
@@ -3006,7 +3006,7 @@ fn parse_secs_flag_with_default(inv: &Invocation, default: u64) -> Result<u64, (
     }
 }
 
-/// `peer discover`'s own default window ([`crate::discover::DEFAULT_SWEEP_SECS`],
+/// `node discover`'s own default window ([`crate::discover::DEFAULT_SWEEP_SECS`],
 /// ~4s) — unrelated to and unchanged by P-PV2; [`pair_via_hostname`] holds
 /// its own, much longer, default instead ([`PAIR_TARGET_SWEEP_SECS`]).
 fn parse_secs_flag(inv: &Invocation) -> Result<u64, ()> {
@@ -3014,7 +3014,7 @@ fn parse_secs_flag(inv: &Invocation) -> Result<u64, ()> {
 }
 
 /// Prompt `y/N` on stderr before running the pairing ceremony against a
-/// discovered peer — a LOCAL UX confirmation only (the same hand-rolled
+/// discovered node — a LOCAL UX confirmation only (the same hand-rolled
 /// stdin idiom this family's OTHER confirms shared before their P-I1
 /// retrofit onto `aoide_protocol::pick::confirm`), never a security gate:
 /// the ceremony's own typed-code confirmation (both operators, both ends,
@@ -3034,16 +3034,16 @@ fn confirm_invite(name: &str, host: &str, user: &str, src_addr: &str) -> Result<
     Ok(read > 0 && matches!(line.trim().to_ascii_lowercase().as_str(), "y" | "yes"))
 }
 
-/// [`handle_peer_pair`]'s own default sweep window when `<target>` reads as
+/// [`handle_node_pair`]'s own default sweep window when `<target>` reads as
 /// a hostname (P-PV2, the User's locked spec) — deliberately NOT
-/// [`crate::discover::DEFAULT_SWEEP_SECS`] (`peer discover`'s own ~4s,
+/// [`crate::discover::DEFAULT_SWEEP_SECS`] (`node discover`'s own ~4s,
 /// unrelated and unchanged): a real LAN's advertise cadence is a ~30-40s
-/// tick (`handle_peer_advertise`'s own doc), so 4s reliably missed it in
+/// tick (`handle_node_advertise`'s own doc), so 4s reliably missed it in
 /// practice — task #129's known miss. 45s comfortably spans one tick.
 const PAIR_TARGET_SWEEP_SECS: u64 = 45;
 
 /// `pair <target>`'s HOSTNAME arm (`target` is not a URL) — the old
-/// `peer invite <name>` handler's own body, unchanged apart from the
+/// `node invite <name>` handler's own body, unchanged apart from the
 /// sweep default (above): runs its OWN discover sweep (never reuses a
 /// previous one — an advertisement is only ever as fresh as the sweep that
 /// heard it), resolves `target` against the heard set
@@ -3067,7 +3067,7 @@ const PAIR_TARGET_SWEEP_SECS: u64 = 45;
 /// tried to pair with yourself" case owed here because this is where the
 /// target is chosen (a broadcast always loops back to its own sender).
 /// `--yes` skips only the LOCAL proceed-confirm (`confirm_invite`), exactly
-/// `peer spawn`'s own `--yes` idiom — the ceremony's OWN SAS confirmation
+/// `node spawn`'s own `--yes` idiom — the ceremony's OWN SAS confirmation
 /// (both operators, both ends) is untouched and still runs.
 fn pair_via_hostname(cmd: &str, inv: &Invocation, target: &str, usage: &str) -> Outcome {
     let secs = match parse_secs_flag_with_default(inv, PAIR_TARGET_SWEEP_SECS) {
@@ -3158,7 +3158,7 @@ fn pair_via_hostname(cmd: &str, inv: &Invocation, target: &str, usage: &str) -> 
 /// url arm ([`pair_via_url`]) calls — reused, never forked.
 ///
 /// P-PV1's settled default (task #131 — loopback-only doors, superseding
-/// K1): the peer this ceremony creates gets an automatic `via` derived from
+/// K1): the node this ceremony creates gets an automatic `via` derived from
 /// the advertisement's OBSERVED source address plus its claimed ssh login
 /// (task #120 — the one thing the wire exists to carry), so its own FUTURE
 /// calls (pull/spawn/send) can reach it through an ssh tunnel — recorded at
@@ -3190,7 +3190,7 @@ fn pair_with_heard(
 /// The pure decision [`pair_with_heard`] otherwise buries inline (P-PV1,
 /// task #131) — split out so it is unit-testable with no dial, no tempdir,
 /// no ssh: what `via` the ceremony's OWN two POSTs dial through, and what
-/// `via` gets parked for LATER commit onto the resulting peer record.
+/// `via` gets parked for LATER commit onto the resulting node record.
 /// `record_via` is unconditional — the advertisement's observed address
 /// plus its claimed login, string-rendered, exactly as it always has been,
 /// even when that login is empty (`aoide_storage::tunnel::default_via`'s
@@ -3210,7 +3210,7 @@ fn resolve_pair_vias(
     (dial_via, record_via)
 }
 
-/// `peer advertise on|off` (task #120): flip this instance's discovery
+/// `node advertise on|off` (task #120): flip this instance's discovery
 /// advertise switch (`aoide_storage::advertise::set_enabled`,
 /// `state/advertise.json`). Idempotent, and says which of the two it was —
 /// "flipped" names both states, "already" names the one it stays in. The
@@ -3218,9 +3218,9 @@ fn resolve_pair_vias(
 /// tick (~30-40s), so no restart is involved — but no `a2a serve` running
 /// means nothing is emitting either way, which the message teaches rather
 /// than assumes.
-fn handle_peer_advertise(inv: &Invocation) -> Outcome {
-    let cmd = "peer.advertise";
-    const USAGE: &str = "usage: aoide peer advertise on|off";
+fn handle_node_advertise(inv: &Invocation) -> Outcome {
+    let cmd = "node.advertise";
+    const USAGE: &str = "usage: aoide node advertise on|off";
     let on = match inv.args.first().map(|s| s.trim()) {
         Some("on") => true,
         Some("off") => false,
@@ -3246,39 +3246,39 @@ fn handle_peer_advertise(inv: &Invocation) -> Outcome {
     Outcome::ok(cmd, message).with_data(json!({ "enabled": on, "changed": previous != on }))
 }
 
-/// `peer discover`/`peer advertise` (P-P6 + task #120,
+/// `node discover`/`node advertise` (P-P6 + task #120,
 /// `docs/architecture/PAIRING.md`'s "Discovery (advertise-but-locked)"
 /// section) — discovery is sugar OVER the ceremony `pair` owns, never a
 /// parallel mechanism. `pair <hostname>`'s own hostname arm
 /// ([`pair_via_hostname`], P-PV2) is the sugar-over-the-ceremony command —
-/// `peer invite` died in the same phase, hard cutover, no alias, and the
-/// whole `peer pair` family followed it in task #135 P3'.
-pub fn register_peer_discovery(r: &mut Registry) {
+/// `node invite` died in the same phase, hard cutover, no alias, and the
+/// whole `node pair` family followed it in task #135 P3'.
+pub fn register_node_discovery(r: &mut Registry) {
     r.insert(cmd!(
-        path: ["peer", "discover"],
-        summary: "Listen for discovery advertisements on the LAN (UDP broadcast, fixed port) and print every distinct instance heard (name, claimed ssh hop user@host, and the observed source address) — read-only, never writes state/peers.json.",
+        path: ["node", "discover"],
+        summary: "Listen for discovery advertisements on the LAN (UDP broadcast, fixed port) and print every distinct instance heard (name, claimed ssh hop user@host, and the observed source address) — read-only, never writes state/nodes.json.",
         args: [],
         flags: [flag!("secs", "int", "How many seconds to listen (default ~4).")],
         gated: false,
         implemented: true,
-        handler: handle_peer_discover,
+        handler: handle_node_discover,
     ));
     r.insert(cmd!(
-        path: ["peer", "advertise"],
+        path: ["node", "advertise"],
         summary: "Switch this instance's discovery advertising on or off (state/advertise.json; default off) — a running a2a serve reads the switch every tick and emits name + ssh hop info only, never a door URL or key.",
         args: [arg!("state", "string", true, "`on` or `off`.")],
         flags: [],
         gated: false,
         implemented: true,
-        handler: handle_peer_advertise,
-        examples: ["peer advertise on", "peer advertise off"],
+        handler: handle_node_advertise,
+        examples: ["node advertise on", "node advertise off"],
     ));
 }
 
 /// Bare `pair`'s sweep window (task #120 P3): one bounded listen, ~2s —
-/// the same short window `peer list`'s roster sweep settled on (a friendly
+/// the same short window `node list`'s roster sweep settled on (a friendly
 /// entry command should answer fast; a quiet LAN that needs longer has
-/// `peer discover --secs N`).
+/// `node discover --secs N`).
 const PAIR_SWEEP_SECS: u64 = 2;
 
 /// `aoide pair [<target>]` — the pairing ceremony's ONE entry point (task
@@ -3288,7 +3288,7 @@ const PAIR_SWEEP_SECS: u64 = 2;
 /// ([`pair_via_url`], the scalpel, ungated). Anything else:
 /// [`pair_continue_or_request`], the smart leg.
 ///
-/// The arity guard is inherited from `peer pair` (review finding, P-PV2
+/// The arity guard is inherited from `node pair` (review finding, P-PV2
 /// follow-up): a second positional is never valid syntax, and old
 /// muscle-memory spellings (`pair request <url>`) must refuse loudly
 /// rather than sweep for an advertiser literally named "request".
@@ -3314,7 +3314,7 @@ fn handle_pair(inv: &Invocation) -> Outcome {
 /// APPROVES (the old approve's inbound arm), an outbound match RESUMES
 /// (poll → confirm → commit), and only when nothing is pending does this
 /// become a NEW request (the hostname sweep arm), gated by
-/// [`confirm_repair_if_verified`] when the name is already a verified peer.
+/// [`confirm_repair_if_verified`] when the name is already a verified node.
 ///
 /// A hijack worry falls to the gate, not the routing: a stranger parking a
 /// request under a known name only steers `pair <name>` into the
@@ -3354,7 +3354,7 @@ fn pair_continue_or_request(cmd: &str, inv: &Invocation, target: &str, usage: &s
 }
 
 /// The APPROVER's leg of `pair <target>` — gate selection verbatim from the
-/// old `peer pair approve` inbound arm ([`CodeGate`]): `--code`
+/// old `node pair approve` inbound arm ([`CodeGate`]): `--code`
 /// scripted, a typed prompt on a real CLI tty, a taught refusal anywhere no
 /// code can be collected. `--yes` deliberately maps to that refusal too —
 /// it is never a bypass of the typed code, which is the gate that secures
@@ -3382,7 +3382,7 @@ fn approve_inbound_leg(
 }
 
 /// The REQUESTER's leg of `pair <target>` on an entry this instance already
-/// parked — the old outbound `peer pair approve`, plus the wait: a nonzero
+/// parked — the old outbound `node pair approve`, plus the wait: a nonzero
 /// `--wait` blocks through [`wait_and_commit`] exactly as a fresh request
 /// does, so "come back later" and "start one now" are the same command
 /// either way. `--wait 0` is the scripted single-shot the old approve was:
@@ -3420,15 +3420,15 @@ fn resume_outbound_leg(
     wait_and_commit(cmd, &entry.id, &entry.name, &sas, &finish)
 }
 
-/// `pair <name>` when `<name>` is ALREADY a verified peer and no ceremony
+/// `pair <name>` when `<name>` is ALREADY a verified node and no ceremony
 /// is pending: under the smart command this is the thing an operator types
-/// just to poke at a peer, and a re-pair replaces key material — so it is
+/// just to poke at a node, and a re-pair replaces key material — so it is
 /// confirmed (interactive y/N; `--yes` scripted) rather than fired. Only
 /// this NAME leg is gated: the explicit URL dial stays ungated, the
 /// scalpel it always was, and `Err` here is the finished Outcome to return
 /// (a decline is an Ok "nothing sent", not an error).
 fn confirm_repair_if_verified(cmd: &str, inv: &Invocation, name: &str) -> Result<(), Outcome> {
-    if !aoide_storage::peer_store::load_peers().iter().any(|p| p.name == name && p.verified) {
+    if !aoide_storage::node_store::load_nodes().iter().any(|p| p.name == name && p.verified) {
         return Ok(());
     }
     if inv.flag_present("yes") {
@@ -3437,11 +3437,11 @@ fn confirm_repair_if_verified(cmd: &str, inv: &Invocation, name: &str) -> Result
     if !aoide_protocol::pick::interactive(inv.door) {
         return Err(Outcome::error(
             cmd,
-            format!("`{name}` is already a verified peer — re-pairing replaces its key material; re-run with --yes to proceed"),
+            format!("`{name}` is already a verified node — re-pairing replaces its key material; re-run with --yes to proceed"),
         )
         .with_data(json!({ "reason": "already-paired", "name": name })));
     }
-    match aoide_protocol::pick::confirm(&format!("`{name}` is already a verified peer — re-pair (replaces its key material)?")) {
+    match aoide_protocol::pick::confirm(&format!("`{name}` is already a verified node — re-pair (replaces its key material)?")) {
         Ok(true) => Ok(()),
         Ok(false) => Err(Outcome::ok(cmd, "not re-paired — nothing sent").with_data(json!({ "confirmed": false, "name": name }))),
         Err(e) => Err(Outcome::error(cmd, e)),
@@ -3450,7 +3450,7 @@ fn confirm_repair_if_verified(cmd: &str, inv: &Invocation, name: &str) -> Result
 
 /// Bare `pair` — the ceremony's overview, shaped by the door. Non-tty,
 /// `--json`, or a non-CLI door: [`pending_listing`], both directions — the
-/// machine face agents drive (the old `peer pending`, which died into
+/// machine face agents drive (the old `node pending`, which died into
 /// this). A real CLI tty: one menu over everything actionable — pending
 /// requests first (pick one to approve or resume it), then a
 /// [`PAIR_SWEEP_SECS`]s advertisement sweep's candidates (pick one to
@@ -3491,7 +3491,7 @@ fn pair_overview(cmd: &str, inv: &Invocation) -> Outcome {
             cmd,
             format!(
                 "nothing pending, and no advertising instances heard in {PAIR_SWEEP_SECS}s ({} malformed dropped) — on the OTHER box, \
-                 switch advertising on with `aoide peer advertise on` (a running `a2a serve` emits it within ~40s) \
+                 switch advertising on with `aoide node advertise on` (a running `a2a serve` emits it within ~40s) \
                  and run `aoide pair` here again; or dial explicitly with \
                  `aoide pair <url> [--via ssh://[user@]host]`",
                 swept.dropped
@@ -3559,26 +3559,26 @@ fn pair_overview(cmd: &str, inv: &Invocation) -> Outcome {
 }
 
 /// The `pair` family — the pairing ceremony's whole CLI face (task #135
-/// P3', superseding P-PV2's `peer pair`/`peer pending`/`peer pair
+/// P3', superseding P-PV2's `node pair`/`node pending`/`node pair
 /// approve|reject|watch`, which DIED in this collapse — hard cutover, no
-/// aliases, the same way `peer invite` died before them). The split it
-/// leaves behind: `pair` MINTS verified peer records; `peer` operates on
+/// aliases, the same way `node invite` died before them). The split it
+/// leaves behind: `pair` MINTS verified node records; `node` operates on
 /// the roster those records live in (list/allow/hub/spawn/add/discover/
 /// advertise).
 pub fn register_pair(r: &mut Registry) {
     r.insert(cmd!(
         path: ["pair"],
         summary: "Make this instance and a target paired — one command for the whole ceremony, routed by what already exists: a pending inbound request from the target is approved (typed pairing code; --code scripted), a pending outbound one is resumed (poll, then typed reply code; --code scripted), and nothing pending starts a new request (a URL dials directly, a name sweeps for its advertisement) then blocks up to --wait seconds for the far approval. Bare `pair` is the overview: an interactive menu over pending requests and heard advertisers on a real CLI tty, the pending listing (JSON-friendly) anywhere else.",
-        args: [arg!("target", "string", false, "A peer name/hostname, a pending request id, or a URL (e.g. http://host:8710/) to dial directly. Omitted: the overview/menu.")],
+        args: [arg!("target", "string", false, "A node name/hostname, a pending request id, or a URL (e.g. http://host:8710/) to dial directly. Omitted: the overview/menu.")],
         flags: [
             flag!("code", "string", "The typed code, scripted: on an INBOUND request, the pairing code read from the requester's screen; on an OUTBOUND one, the reply code read from the approver's screen. A wrong code counts one persisted try; the 3rd cumulative mismatch auto-denies an inbound request or auto-aborts an outbound one."),
             flag!("wait", "int", "Seconds to block for the far operator (default 600). On a new request: park, then poll until approved or the wait runs out. On a resume: the same poll loop. --wait 0 parks a new request and returns immediately, or polls a resumed one exactly once."),
-            flag!("allow", "string", "The capabilities this commit grants the peer, comma-separated (read, spawn) — overriding config.toml's `[pairing] defaultGrant`, and empty (--allow \"\") to grant nothing. First verification only: re-pairing an already-verified peer never re-grants, so use `peer allow` to change a live grant."),
+            flag!("allow", "string", "The capabilities this commit grants the node, comma-separated (read, spawn) — overriding config.toml's `[pairing] defaultGrant`, and empty (--allow \"\") to grant nothing. First verification only: re-pairing an already-verified node never re-grants, so use `node allow` to change a live grant."),
             flag!("yes", "bool", "Skip THIS side's own non-code confirmations — the sweep proceed prompt and the already-paired re-pair confirm. The final code gate, on either leg, still needs a real terminal prompt or --code; --yes alone there is a taught refusal, never a bypass."),
             flag!("name", "string", "URL target only: a local nickname for the other instance; defaults to a sanitized form of the URL's host."),
-            flag!("via", "string", "An ssh://[user@]host[:port] transport marker — both the ceremony's own dial AND the resulting peer's recorded via. Absent = direct dial."),
-            flag!("self-url", "string", "This instance's own advertised A2A door URL, recorded on the far side's peer record; defaults to http://<host>:<AOIDE_A2A_PORT or 8710>/."),
-            flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire so an approver that only observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<the local address routed toward the peer>."),
+            flag!("via", "string", "An ssh://[user@]host[:port] transport marker — both the ceremony's own dial AND the resulting node's recorded via. Absent = direct dial."),
+            flag!("self-url", "string", "This instance's own advertised A2A door URL, recorded on the far side's node record; defaults to http://<host>:<AOIDE_A2A_PORT or 8710>/."),
+            flag!("self-via", "string", "This instance's own ssh://[user@]host reach-back hop claim, sent on the wire so an approver that only observes this request over a tunnel (loopback) can still record a working via; defaults to ssh://<local user>@<the local address routed toward the node>."),
             flag!("secs", "int", "Name target only: how many seconds to sweep for the advertisement (default 45)."),
         ],
         gated: false,
@@ -3588,7 +3588,7 @@ pub fn register_pair(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["pair", "reject"],
-        summary: "Refuse (inbound) or abort (outbound) a pending pairing request, by id or by a name matching exactly one — a clean removal, no peer record on either end, no wire call.",
+        summary: "Refuse (inbound) or abort (outbound) a pending pairing request, by id or by a name matching exactly one — a clean removal, no node record on either end, no wire call.",
         args: [arg!("target", "string", true, "The pending request's id, or a name matching exactly one pending request (see bare `pair`).")],
         flags: [],
         gated: false,
@@ -3639,8 +3639,8 @@ pub fn register_post_graph(r: &mut Registry) {
 mod tests {
     use super::*;
 
-    fn fixture_peer(bearer_secret: Option<&str>) -> aoide_storage::peer_store::Peer {
-        aoide_storage::peer_store::Peer {
+    fn fixture_node(bearer_secret: Option<&str>) -> aoide_storage::node_store::Node {
+        aoide_storage::node_store::Node {
             name: "yomi-strix".to_string(),
             url: "http://yomi-strix:8710/".to_string(),
             autogate: false,
@@ -3704,7 +3704,7 @@ mod tests {
     }
 
     /// Review finding (high): `default_self_via`'s HOST half must be the
-    /// local outbound address toward the peer, never a claimed OS
+    /// local outbound address toward the node, never a claimed OS
     /// hostname (a LAN check found hostnames resolving only through the
     /// router's DHCP-DNS — resolution by luck). Dialing `127.0.0.1`
     /// deterministically routes back to `127.0.0.1` on any box, with no
@@ -3723,7 +3723,7 @@ mod tests {
     /// above already proved it does, with no real network involved either
     /// way.
     #[test]
-    fn default_self_via_formats_login_at_the_outbound_address_toward_the_peer() {
+    fn default_self_via_formats_login_at_the_outbound_address_toward_the_node() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_user = std::env::var("USER").ok();
         let saved_logname = std::env::var("LOGNAME").ok();
@@ -3746,10 +3746,10 @@ mod tests {
         }
     }
 
-    // ── `handle_peer_allow` (P-P3) — pure file I/O, so unlike most `peer`
-    // ── commands (network-touching, tested at `cli/tests/peer_connectivity.rs`'s
+    // ── `handle_node_allow` (P-P3) — pure file I/O, so unlike most `node`
+    // ── commands (network-touching, tested at `cli/tests/node_connectivity.rs`'s
     // ── `#[ignore]`'d integration layer) this one is directly unit-testable,
-    // ── same reasoning `handle_peer_hub`'s own storage-layer tests already
+    // ── same reasoning `handle_node_hub`'s own storage-layer tests already
     // ── rest on. ─────────────────────────────────────────────────────────────
 
     /// `AOIDE_ROOT` and `AOIDE_CONFIG` are sandboxed alongside the state dir
@@ -3759,13 +3759,13 @@ mod tests {
     /// widened `defaultGrant` — or on a malformed file that has nothing to do
     /// with the code under test. Inside the sandbox the file is absent, so
     /// every `grant: None` path resolves the built-in `["read"]`.
-    fn with_peer_state<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+    fn with_node_state<T>(tag: &str, f: impl FnOnce() -> T) -> T {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_root = std::env::var("AOIDE_ROOT").ok();
         let saved_config = std::env::var("AOIDE_CONFIG").ok();
         let dir = std::env::temp_dir().join(format!(
-            "aoide-client-peer-allow-{tag}-{}-{}",
+            "aoide-client-node-allow-{tag}-{}-{}",
             std::process::id(),
             std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
         ));
@@ -3792,7 +3792,7 @@ mod tests {
 
     fn allow_inv(args: &[&str]) -> Invocation {
         Invocation {
-            path: vec!["peer".to_string(), "allow".to_string()],
+            path: vec!["node".to_string(), "allow".to_string()],
             args: args.iter().map(|s| s.to_string()).collect(),
             flags: Default::default(),
             door: aoide_protocol::Door::Cli,
@@ -3800,50 +3800,50 @@ mod tests {
     }
 
     #[test]
-    fn peer_allow_enables_and_disables_idempotently_and_reports_exactly_what_changed() {
-        with_peer_state("toggle", || {
-            aoide_storage::peer_store::save_peers(&[fixture_peer(None)]).unwrap();
+    fn node_allow_enables_and_disables_idempotently_and_reports_exactly_what_changed() {
+        with_node_state("toggle", || {
+            aoide_storage::node_store::save_nodes(&[fixture_node(None)]).unwrap();
 
-            let on = handle_peer_allow(&allow_inv(&["yomi-strix", "spawn", "on"]));
+            let on = handle_node_allow(&allow_inv(&["yomi-strix", "spawn", "on"]));
             assert_eq!(on.status, aoide_protocol::output::Status::Ok, "{on:?}");
             assert!(!on.changed.is_empty());
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers[0].allows, vec!["spawn".to_string()]);
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes[0].allows, vec!["spawn".to_string()]);
 
             // Re-enabling is a reported no-op — nothing written, nothing duplicated.
-            let on_again = handle_peer_allow(&allow_inv(&["yomi-strix", "spawn", "on"]));
+            let on_again = handle_node_allow(&allow_inv(&["yomi-strix", "spawn", "on"]));
             assert_eq!(on_again.status, aoide_protocol::output::Status::Ok);
             assert!(on_again.changed.is_empty(), "a no-op never touches disk");
 
-            let off = handle_peer_allow(&allow_inv(&["yomi-strix", "spawn", "off"]));
+            let off = handle_node_allow(&allow_inv(&["yomi-strix", "spawn", "off"]));
             assert_eq!(off.status, aoide_protocol::output::Status::Ok, "{off:?}");
-            assert!(aoide_storage::peer_store::load_peers()[0].allows.is_empty());
+            assert!(aoide_storage::node_store::load_nodes()[0].allows.is_empty());
 
-            let off_again = handle_peer_allow(&allow_inv(&["yomi-strix", "spawn", "off"]));
+            let off_again = handle_node_allow(&allow_inv(&["yomi-strix", "spawn", "off"]));
             assert!(off_again.changed.is_empty(), "disabling an already-absent cap is also a no-op");
         });
     }
 
-    // ── `sign_headers_for_peer` (P-P4) — outbound signing. ───────────────────
+    // ── `sign_headers_for_node` (P-P4) — outbound signing. ───────────────────
 
     #[test]
-    fn sign_headers_for_peer_is_empty_for_an_unverified_peer() {
-        with_peer_state("sign-unverified", || {
-            let peer = fixture_peer(None);
-            assert!(!peer.verified);
-            let headers = sign_headers_for_peer(&peer, "{}").unwrap();
-            assert!(headers.is_empty(), "an unpaired/unverified peer gets no signature headers: {headers:?}");
+    fn sign_headers_for_node_is_empty_for_an_unverified_node() {
+        with_node_state("sign-unverified", || {
+            let node = fixture_node(None);
+            assert!(!node.verified);
+            let headers = sign_headers_for_node(&node, "{}").unwrap();
+            assert!(headers.is_empty(), "an unpaired/unverified node gets no signature headers: {headers:?}");
         });
     }
 
     #[test]
-    fn sign_headers_for_peer_round_trips_a_genuine_signature_for_a_verified_peer() {
-        with_peer_state("sign-verified", || {
+    fn sign_headers_for_node_round_trips_a_genuine_signature_for_a_verified_node() {
+        with_node_state("sign-verified", || {
             let info = aoide_storage::identity::load_or_mint().unwrap().0.info();
-            let mut peer = fixture_peer(None);
-            peer.verified = true;
+            let mut node = fixture_node(None);
+            node.verified = true;
             let body = r#"{"jsonrpc":"2.0","method":"message/send"}"#;
-            let headers = sign_headers_for_peer(&peer, body).unwrap();
+            let headers = sign_headers_for_node(&node, body).unwrap();
 
             let get = |name: &str| {
                 headers
@@ -3852,7 +3852,7 @@ mod tests {
                     .map(|(_, v)| v.clone())
                     .unwrap_or_else(|| panic!("missing header {name}: {headers:?}"))
             };
-            assert_eq!(get(aoide_storage::wire_auth::HEADER_PEER), aoide_storage::display::local_host_name());
+            assert_eq!(get(aoide_storage::wire_auth::HEADER_NODE), aoide_storage::display::local_host_name());
             let timestamp = get(aoide_storage::wire_auth::HEADER_TIMESTAMP);
             let nonce = get(aoide_storage::wire_auth::HEADER_NONCE);
             let signature = get(aoide_storage::wire_auth::HEADER_SIGNATURE);
@@ -3860,12 +3860,12 @@ mod tests {
             assert!(!nonce.is_empty());
 
             // The server verifies against the SAME path this instance's own
-            // `peer_store::url_path` derives from `peer.url` — recomputing it
+            // `node_store::url_path` derives from `node.url` — recomputing it
             // here, rather than hardcoding "/", proves the client and server
             // sides stay bound to the one shared function. Same reasoning for
             // `HTTP_METHOD` (P-P4 review finding 2) over a second `"POST"`
             // literal.
-            let path = aoide_storage::peer_store::url_path(&peer.url);
+            let path = aoide_storage::node_store::url_path(&node.url);
             let canonical = aoide_storage::wire_auth::canonical_string(HTTP_METHOD, &path, &timestamp, &nonce, body.as_bytes());
             assert!(
                 aoide_storage::wire_auth::verify_signature_hex(&info.pubkey_hex, canonical.as_bytes(), &signature),
@@ -3881,46 +3881,46 @@ mod tests {
     }
 
     #[test]
-    fn sign_headers_for_peer_sends_this_instances_own_self_name_not_the_peer_nickname() {
+    fn sign_headers_for_node_sends_this_instances_own_self_name_not_the_node_nickname() {
         // Live yomi<->sakaki defect, 2026-08-26: e78999f fixed the pairing
         // wire name (`run_pair_request`) but left THIS header sending
-        // `peer.name` — this instance's local nickname for the counterpart
+        // `node.name` — this instance's local nickname for the counterpart
         // — instead of its own self name, so the far end's
-        // `verify_signed_request` lookup (`peers.iter().find(|p| p.name ==
-        // peer_name)`) failed with "unknown peer" for every signed request
-        // after an otherwise-successful pair. `fixture_peer`'s name
+        // `verify_signed_request` lookup (`nodes.iter().find(|p| p.name ==
+        // node_name)`) failed with "unknown node" for every signed request
+        // after an otherwise-successful pair. `fixture_node`'s name
         // ("yomi-strix") deliberately stands in for "this side's nickname
         // for the counterpart," distinct from whatever this test process's
         // own `local_host_name()` resolves to, so a regression back to
-        // `peer.name.clone()` fails this assertion.
-        with_peer_state("sign-self-name", || {
-            let mut peer = fixture_peer(None);
-            peer.name = "this-sides-nickname-for-the-approver".to_string();
-            peer.verified = true;
-            let headers = sign_headers_for_peer(&peer, "{}").unwrap();
+        // `node.name.clone()` fails this assertion.
+        with_node_state("sign-self-name", || {
+            let mut node = fixture_node(None);
+            node.name = "this-sides-nickname-for-the-approver".to_string();
+            node.verified = true;
+            let headers = sign_headers_for_node(&node, "{}").unwrap();
             let sent = headers
                 .iter()
-                .find(|(k, _)| k == aoide_storage::wire_auth::HEADER_PEER)
+                .find(|(k, _)| k == aoide_storage::wire_auth::HEADER_NODE)
                 .map(|(_, v)| v.clone())
-                .unwrap_or_else(|| panic!("missing {}: {headers:?}", aoide_storage::wire_auth::HEADER_PEER));
+                .unwrap_or_else(|| panic!("missing {}: {headers:?}", aoide_storage::wire_auth::HEADER_NODE));
             assert_eq!(sent, aoide_storage::display::local_host_name(), "must carry this instance's own self name");
-            assert_ne!(sent, peer.name, "must never carry the local nickname for the counterpart");
+            assert_ne!(sent, node.name, "must never carry the local nickname for the counterpart");
         });
     }
 
     #[test]
-    fn peer_allow_refuses_an_unknown_peer_or_an_unknown_capability() {
-        with_peer_state("refusals", || {
-            aoide_storage::peer_store::save_peers(&[fixture_peer(None)]).unwrap();
+    fn node_allow_refuses_an_unknown_node_or_an_unknown_capability() {
+        with_node_state("refusals", || {
+            aoide_storage::node_store::save_nodes(&[fixture_node(None)]).unwrap();
 
-            let unknown_peer = handle_peer_allow(&allow_inv(&["ghost", "spawn", "on"]));
-            assert_eq!(unknown_peer.status, aoide_protocol::output::Status::Error);
+            let unknown_node = handle_node_allow(&allow_inv(&["ghost", "spawn", "on"]));
+            assert_eq!(unknown_node.status, aoide_protocol::output::Status::Error);
             assert_eq!(
-                unknown_peer.data.as_ref().and_then(|d| d.get("reason")).and_then(|v| v.as_str()),
-                Some("unknown-peer")
+                unknown_node.data.as_ref().and_then(|d| d.get("reason")).and_then(|v| v.as_str()),
+                Some("unknown-node")
             );
 
-            let unknown_cap = handle_peer_allow(&allow_inv(&["yomi-strix", "write", "on"]));
+            let unknown_cap = handle_node_allow(&allow_inv(&["yomi-strix", "write", "on"]));
             assert_eq!(unknown_cap.status, aoide_protocol::output::Status::Error);
             assert!(unknown_cap.message.contains("read"), "names the valid set: {}", unknown_cap.message);
             assert!(unknown_cap.message.contains("spawn"), "names the valid set: {}", unknown_cap.message);
@@ -3929,27 +3929,27 @@ mod tests {
                 Some("unknown-capability")
             );
 
-            assert!(aoide_storage::peer_store::load_peers()[0].allows.is_empty(), "no refusal mutates the registry");
+            assert!(aoide_storage::node_store::load_nodes()[0].allows.is_empty(), "no refusal mutates the registry");
         });
     }
 
     #[test]
-    fn peer_allow_reports_usage_on_a_missing_or_malformed_on_off_argument() {
-        with_peer_state("usage", || {
-            assert_eq!(handle_peer_allow(&allow_inv(&[])).status, aoide_protocol::output::Status::Usage);
-            assert_eq!(handle_peer_allow(&allow_inv(&["yomi-strix"])).status, aoide_protocol::output::Status::Usage);
-            assert_eq!(handle_peer_allow(&allow_inv(&["yomi-strix", "spawn"])).status, aoide_protocol::output::Status::Usage);
+    fn node_allow_reports_usage_on_a_missing_or_malformed_on_off_argument() {
+        with_node_state("usage", || {
+            assert_eq!(handle_node_allow(&allow_inv(&[])).status, aoide_protocol::output::Status::Usage);
+            assert_eq!(handle_node_allow(&allow_inv(&["yomi-strix"])).status, aoide_protocol::output::Status::Usage);
+            assert_eq!(handle_node_allow(&allow_inv(&["yomi-strix", "spawn"])).status, aoide_protocol::output::Status::Usage);
             assert_eq!(
-                handle_peer_allow(&allow_inv(&["yomi-strix", "spawn", "maybe"])).status,
+                handle_node_allow(&allow_inv(&["yomi-strix", "spawn", "maybe"])).status,
                 aoide_protocol::output::Status::Usage
             );
         });
     }
 
-    // ── `handle_peer_spawn` (P-P5b) — the local refusal shapes are pure file
+    // ── `handle_node_spawn` (P-P5b) — the local refusal shapes are pure file
     // ── I/O (unpaired/unknown), so unit-testable directly; the real signed
-    // ── network round trip lives at `cli/tests/peer_connectivity.rs`'s
-    // ── `#[ignore]`'d integration layer, same split `peer allow`'s own
+    // ── network round trip lives at `cli/tests/node_connectivity.rs`'s
+    // ── `#[ignore]`'d integration layer, same split `node allow`'s own
     // ── comment above documents. Whether the exact spawn-shaped body
     // ── (`context_id: None`) matches `do_spawn`'s own contract is proven
     // ── against the SERVER's real parser in `aoide-server::a2a`'s own test
@@ -3962,7 +3962,7 @@ mod tests {
             flags.insert("yes".to_string(), "true".to_string());
         }
         Invocation {
-            path: vec!["peer".to_string(), "spawn".to_string()],
+            path: vec!["node".to_string(), "spawn".to_string()],
             args: args.iter().map(|s| s.to_string()).collect(),
             flags,
             door: aoide_protocol::Door::Cli,
@@ -3970,11 +3970,11 @@ mod tests {
     }
 
     #[test]
-    fn peer_spawn_refuses_an_unknown_peer_naming_pair_request() {
-        with_peer_state("spawn-unknown", || {
-            let out = handle_peer_spawn(&spawn_inv(&["nosuchpeer", "hello"], true));
+    fn node_spawn_refuses_an_unknown_node_naming_pair_request() {
+        with_node_state("spawn-unknown", || {
+            let out = handle_node_spawn(&spawn_inv(&["nosuchnode", "hello"], true));
             assert_eq!(out.status, aoide_protocol::output::Status::Error);
-            assert_eq!(out.data.as_ref().unwrap()["reason"], "unknown-peer");
+            assert_eq!(out.data.as_ref().unwrap()["reason"], "unknown-node");
             assert!(
                 out.message.contains("aoide pair"),
                 "taught error must name the pairing ceremony: {}",
@@ -3984,16 +3984,16 @@ mod tests {
     }
 
     #[test]
-    fn peer_spawn_refuses_a_registered_but_unpaired_peer_naming_pair_request() {
-        with_peer_state("spawn-unpaired", || {
-            // `verified: false` — registered via the legacy `peer add` escape,
-            // never paired. An unsigned request from this peer could never
-            // satisfy the remote door's `PeerRung::Signature`-only spawn gate
+    fn node_spawn_refuses_a_registered_but_unpaired_node_naming_pair_request() {
+        with_node_state("spawn-unpaired", || {
+            // `verified: false` — registered via the legacy `node add` escape,
+            // never paired. An unsigned request from this node could never
+            // satisfy the remote door's `NodeRung::Signature`-only spawn gate
             // (P-P4) — refused LOCALLY with a clear reason, never sent.
-            aoide_storage::peer_store::save_peers(&[fixture_peer(None)]).unwrap();
-            let out = handle_peer_spawn(&spawn_inv(&["yomi-strix", "hello"], true));
+            aoide_storage::node_store::save_nodes(&[fixture_node(None)]).unwrap();
+            let out = handle_node_spawn(&spawn_inv(&["yomi-strix", "hello"], true));
             assert_eq!(out.status, aoide_protocol::output::Status::Error);
-            assert_eq!(out.data.as_ref().unwrap()["reason"], "unpaired-peer");
+            assert_eq!(out.data.as_ref().unwrap()["reason"], "unpaired-node");
             assert!(
                 out.message.contains("aoide pair"),
                 "taught error must name the pairing ceremony: {}",
@@ -4003,31 +4003,31 @@ mod tests {
     }
 
     #[test]
-    fn peer_spawn_reports_usage_on_a_missing_name_or_empty_text() {
-        with_peer_state("spawn-usage", || {
-            assert_eq!(handle_peer_spawn(&spawn_inv(&[], true)).status, aoide_protocol::output::Status::Usage);
-            assert_eq!(handle_peer_spawn(&spawn_inv(&["yomi-strix"], true)).status, aoide_protocol::output::Status::Usage);
-            assert_eq!(handle_peer_spawn(&spawn_inv(&["yomi-strix", "  "], true)).status, aoide_protocol::output::Status::Usage);
+    fn node_spawn_reports_usage_on_a_missing_name_or_empty_text() {
+        with_node_state("spawn-usage", || {
+            assert_eq!(handle_node_spawn(&spawn_inv(&[], true)).status, aoide_protocol::output::Status::Usage);
+            assert_eq!(handle_node_spawn(&spawn_inv(&["yomi-strix"], true)).status, aoide_protocol::output::Status::Usage);
+            assert_eq!(handle_node_spawn(&spawn_inv(&["yomi-strix", "  "], true)).status, aoide_protocol::output::Status::Usage);
         });
     }
 
     #[test]
-    fn peer_spawn_signs_the_exact_spawn_shaped_body_it_would_send() {
+    fn node_spawn_signs_the_exact_spawn_shaped_body_it_would_send() {
         // "signs it (headers present)" — the FIRST production caller that
         // ever signs a `context_id: None` (spawn-shaped) POST. Reuses
-        // `sign_headers_for_peer` directly against the SAME body
-        // `handle_peer_spawn` builds (`crate::wire::build_message_send_body`
+        // `sign_headers_for_node` directly against the SAME body
+        // `handle_node_spawn` builds (`crate::wire::build_message_send_body`
         // with `None`), rather than re-guessing the shape.
-        with_peer_state("spawn-signs", || {
-            let mut peer = fixture_peer(None);
-            peer.verified = true;
+        with_node_state("spawn-signs", || {
+            let mut node = fixture_node(None);
+            node.verified = true;
             let body = crate::wire::build_message_send_body("do the thing", &gen_message_id(), None);
             assert!(body["params"]["message"].get("contextId").is_none(), "spawn-shaped body carries no contextId");
             let body_str = serde_json::to_string(&body).unwrap();
-            let headers = sign_headers_for_peer(&peer, &body_str).unwrap();
+            let headers = sign_headers_for_node(&node, &body_str).unwrap();
             assert_eq!(headers.len(), 4, "all four X-Aoide-* headers present: {headers:?}");
             for name in [
-                aoide_storage::wire_auth::HEADER_PEER,
+                aoide_storage::wire_auth::HEADER_NODE,
                 aoide_storage::wire_auth::HEADER_TIMESTAMP,
                 aoide_storage::wire_auth::HEADER_NONCE,
                 aoide_storage::wire_auth::HEADER_SIGNATURE,
@@ -4037,23 +4037,23 @@ mod tests {
         });
     }
 
-    // ── resolve_peer_bearer — the no-secret-configured short circuit ────────
+    // ── resolve_node_bearer — the no-secret-configured short circuit ────────
     //
     // This is the one branch testable with NO broker/socket at all: an
-    // unconfigured peer never even tries to connect. Every OTHER branch
+    // unconfigured node never even tries to connect. Every OTHER branch
     // (a real resolve, a broker-down failure) is exercised end-to-end in
-    // `cli/tests/peer_connectivity.rs`, mirroring how every other `peer`
+    // `cli/tests/node_connectivity.rs`, mirroring how every other `node`
     // command in this file is tested at that integration layer rather than
     // here (this module carried zero unit tests before this task).
 
     #[test]
-    fn resolve_peer_bearer_is_none_when_unset() {
-        assert_eq!(resolve_peer_bearer(&fixture_peer(None)).unwrap(), None);
+    fn resolve_node_bearer_is_none_when_unset() {
+        assert_eq!(resolve_node_bearer(&fixture_node(None)).unwrap(), None);
     }
 
     #[test]
-    fn resolve_peer_bearer_is_none_when_set_to_an_empty_string() {
-        assert_eq!(resolve_peer_bearer(&fixture_peer(Some(""))).unwrap(), None);
+    fn resolve_node_bearer_is_none_when_set_to_an_empty_string() {
+        assert_eq!(resolve_node_bearer(&fixture_node(Some(""))).unwrap(), None);
     }
 
     // ── ScratchBodyFile — pure I/O, no broker needed ─────────────────────────
@@ -4080,13 +4080,13 @@ mod tests {
         assert_ne!(a.0, b.0);
     }
 
-    // ── `peer discover` — discovery grants nothing (P-P6). ───────────────────
+    // ── `node discover` — discovery grants nothing (P-P6). ───────────────────
     //
     // `run_sweep` needs a real socket (a plain fixed-port bind — no group
     // join since the #106 broadcast fix, so this runs everywhere, the nix
     // build sandbox included), but it does NOT need a real ADVERTISEMENT
     // to prove the one invariant that matters here: a 1s sweep that hears
-    // nothing still must leave `state/peers.json` byte-identical to what
+    // nothing still must leave `state/nodes.json` byte-identical to what
     // it was before. The genuine heard-a-real-advertisement path is
     // `discover::tests::run_sweep_hears_an_advertisement_sent_over_the_
     // real_loopback_stack` plus `cli/tests/discovery_connectivity.rs`'s
@@ -4094,7 +4094,7 @@ mod tests {
 
     fn discover_inv(secs: &str) -> Invocation {
         Invocation {
-            path: vec!["peer".to_string(), "discover".to_string()],
+            path: vec!["node".to_string(), "discover".to_string()],
             args: vec![],
             flags: [("secs".to_string(), secs.to_string())].into_iter().collect(),
             door: aoide_protocol::Door::Cli,
@@ -4102,18 +4102,18 @@ mod tests {
     }
 
     #[test]
-    fn peer_discover_never_writes_peers_json_even_on_an_empty_sweep() {
-        with_peer_state("discover-no-write", || {
-            // A pre-existing peer record must survive `peer discover`
+    fn node_discover_never_writes_nodes_json_even_on_an_empty_sweep() {
+        with_node_state("discover-no-write", || {
+            // A pre-existing node record must survive `node discover`
             // completely untouched — the clearest possible proof discover
-            // never took a write path into `state/peers.json` at all.
-            aoide_storage::peer_store::save_peers(&[fixture_peer(None)]).unwrap();
-            let before = aoide_storage::peer_store::load_peers();
+            // never took a write path into `state/nodes.json` at all.
+            aoide_storage::node_store::save_nodes(&[fixture_node(None)]).unwrap();
+            let before = aoide_storage::node_store::load_nodes();
 
-            let out = handle_peer_discover(&discover_inv("1"));
+            let out = handle_node_discover(&discover_inv("1"));
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
-            let after = aoide_storage::peer_store::load_peers();
+            let after = aoide_storage::node_store::load_nodes();
             assert_eq!(before.len(), after.len());
             assert_eq!(before[0].name, after[0].name);
             assert_eq!(before[0].verified, after[0].verified);
@@ -4122,23 +4122,23 @@ mod tests {
     }
 
     #[test]
-    fn peer_discover_never_writes_peers_json_from_an_entirely_empty_registry() {
-        with_peer_state("discover-no-write-empty", || {
-            let out = handle_peer_discover(&discover_inv("1"));
+    fn node_discover_never_writes_nodes_json_from_an_entirely_empty_registry() {
+        with_node_state("discover-no-write-empty", || {
+            let out = handle_node_discover(&discover_inv("1"));
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
             assert!(
-                aoide_storage::peer_store::load_peers().is_empty(),
-                "discover must never create state/peers.json out of nothing"
+                aoide_storage::node_store::load_nodes().is_empty(),
+                "discover must never create state/nodes.json out of nothing"
             );
         });
     }
 
-    // ── `peer advertise on|off` (task #120) — the runtime switch, default
+    // ── `node advertise on|off` (task #120) — the runtime switch, default
     // ── off, idempotent, reporting exactly what changed. ─────────────────────
 
     fn advertise_inv(args: &[&str]) -> Invocation {
         Invocation {
-            path: vec!["peer".to_string(), "advertise".to_string()],
+            path: vec!["node".to_string(), "advertise".to_string()],
             args: args.iter().map(|s| s.to_string()).collect(),
             flags: Default::default(),
             door: aoide_protocol::Door::Cli,
@@ -4146,32 +4146,32 @@ mod tests {
     }
 
     #[test]
-    fn peer_advertise_flips_the_switch_idempotently_and_reports_exactly_what_changed() {
-        with_peer_state("advertise-toggle", || {
+    fn node_advertise_flips_the_switch_idempotently_and_reports_exactly_what_changed() {
+        with_node_state("advertise-toggle", || {
             assert!(!aoide_storage::advertise::enabled(), "default posture is OFF");
 
-            let on = handle_peer_advertise(&advertise_inv(&["on"]));
+            let on = handle_node_advertise(&advertise_inv(&["on"]));
             assert_eq!(on.status, aoide_protocol::output::Status::Ok, "{on:?}");
             assert_eq!(on.data.as_ref().unwrap()["changed"], true, "{on:?}");
             assert!(aoide_storage::advertise::enabled());
 
-            let again = handle_peer_advertise(&advertise_inv(&["on"]));
+            let again = handle_node_advertise(&advertise_inv(&["on"]));
             assert_eq!(again.status, aoide_protocol::output::Status::Ok, "{again:?}");
             assert_eq!(again.data.as_ref().unwrap()["changed"], false, "{again:?}");
             assert!(again.message.contains("already on"), "{}", again.message);
 
-            let off = handle_peer_advertise(&advertise_inv(&["off"]));
+            let off = handle_node_advertise(&advertise_inv(&["off"]));
             assert_eq!(off.data.as_ref().unwrap()["changed"], true, "{off:?}");
             assert!(!aoide_storage::advertise::enabled());
         });
     }
 
     #[test]
-    fn peer_advertise_refuses_anything_but_on_or_off() {
+    fn node_advertise_refuses_anything_but_on_or_off() {
         // Pure arg validation — refused before any state file is touched,
         // so no temp dir is needed.
         for bad in [&[][..], &["maybe"][..], &["ON"][..]] {
-            let out = handle_peer_advertise(&advertise_inv(bad));
+            let out = handle_node_advertise(&advertise_inv(bad));
             assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
         }
     }
@@ -4188,8 +4188,8 @@ mod tests {
     // ── port fails identically (and fast) through either call site. ─────────
 
     #[test]
-    fn peer_pair_hostname_arm_and_url_arm_are_the_same_function_not_two_copies() {
-        with_peer_state("hostname-arm-shares-run-pair-request", || {
+    fn node_pair_hostname_arm_and_url_arm_are_the_same_function_not_two_copies() {
+        with_node_state("hostname-arm-shares-run-pair-request", || {
             // Port 1 is reserved and never listened on in practice — an
             // immediate, deterministic connection refusal either way.
             let url = "http://127.0.0.1:1/";
@@ -4223,7 +4223,7 @@ mod tests {
     // ── Dial resolution (P-S4): the identity guarantee, per call site,
     // ── pinned directly rather than trusted from a comment — §0.4's
     // ── "off = unchanged" promise, and the path-preservation invariant
-    // ── sign_headers_for_peer's canonical string depends on. No real ssh
+    // ── sign_headers_for_node's canonical string depends on. No real ssh
     // ── anywhere below: a `via` case seeds a REUSABLE tunnel record
     // ── (a real local listener, this test process's own — genuinely
     // ── alive — pid) so `aoide_client::tunnel::open_or_reuse` takes its
@@ -4298,17 +4298,17 @@ mod tests {
     }
 
     #[test]
-    fn post_json_to_peer_dials_peer_url_verbatim_when_peer_via_is_absent() {
-        // post_json_to_peer's OWN via resolution (peer.via, not the
+    fn post_json_to_node_dials_node_url_verbatim_when_node_via_is_absent() {
+        // post_json_to_node's OWN via resolution (node.via, not the
         // resolve_dial_url helper directly) — proven by forcing a
-        // connection failure and asserting the error names peer.url's own
+        // connection failure and asserting the error names node.url's own
         // host:port, never a rewritten 127.0.0.1:<port> authority.
-        let mut peer = fixture_peer(None);
-        peer.url = "http://127.0.0.1:1/aoide/rpc".to_string(); // reserved, never listened on
-        let err = post_json_to_peer(&peer, "{}", None, &[], 1).unwrap_err();
+        let mut node = fixture_node(None);
+        node.url = "http://127.0.0.1:1/aoide/rpc".to_string(); // reserved, never listened on
+        let err = post_json_to_node(&node, "{}", None, &[], 1).unwrap_err();
         assert!(
             err.contains("127.0.0.1:1") || err.contains("connect"),
-            "an absent via must dial peer.url's own authority verbatim: {err}"
+            "an absent via must dial node.url's own authority verbatim: {err}"
         );
     }
 
@@ -4323,7 +4323,7 @@ mod tests {
                 let dial = resolve_dial_url(logical, Some(&via), "sakaki").unwrap();
                 assert_eq!(
                     dial,
-                    format!("http://127.0.0.1:{port}{}", aoide_storage::peer_store::url_path(logical)),
+                    format!("http://127.0.0.1:{port}{}", aoide_storage::node_store::url_path(logical)),
                     "authority becomes 127.0.0.1:<local port>, path preserved via url_path directly"
                 );
             }
@@ -4332,68 +4332,68 @@ mod tests {
     }
 
     /// §0.4's identity guarantee, pinned directly against
-    /// `sign_headers_for_peer`'s own path source: `sign_headers_for_peer`
+    /// `sign_headers_for_node`'s own path source: `sign_headers_for_node`
     /// never reads the DIAL url at all (it signs over
-    /// `peer_store::url_path(&peer.url)`, computed independently, before
+    /// `node_store::url_path(&node.url)`, computed independently, before
     /// dial resolution ever runs) — so the canonical string it signs is
     /// unaffected by a via rewrite PROVIDED the dial's own path equals
-    /// that same `url_path(&peer.url)`. This asserts exactly that equality
-    /// for a peer carrying a `via`, which is what makes "the far end's
+    /// that same `url_path(&node.url)`. This asserts exactly that equality
+    /// for a node carrying a `via`, which is what makes "the far end's
     /// `HttpRequest.path` (what the tunnel actually delivers) matches what
     /// was signed" true — a live curl round trip through the tunnel is out
     /// of reach here (no real ssh), but every byte this signature depends
     /// on is proven identical either way.
     #[test]
-    fn a_via_rewrite_never_changes_the_path_sign_headers_for_peer_signs_over() {
-        // Sandbox fix (review): this test calls `sign_headers_for_peer`,
+    fn a_via_rewrite_never_changes_the_path_sign_headers_for_node_signs_over() {
+        // Sandbox fix (review): this test calls `sign_headers_for_node`,
         // which mints/loads THIS instance's identity
         // (`aoide_storage::identity::load_or_mint`) — that needs a
         // writable `AOIDE_STATE_DIR`, which `with_temp_runtime_dir` alone
         // never sets (it only isolates `XDG_RUNTIME_DIR` for the tunnel
         // record). In a build sandbox with no real `$HOME`,
         // `load_or_mint`'s own default state-dir fallback is unwritable —
-        // "Permission denied" — exactly the failure `with_peer_state`
+        // "Permission denied" — exactly the failure `with_node_state`
         // (used by every OTHER identity-touching test in this module,
-        // e.g. `sign_headers_for_peer_round_trips_a_genuine_signature_for_
-        // a_verified_peer`) already avoids. `with_peer_state_and_temp_
+        // e.g. `sign_headers_for_node_round_trips_a_genuine_signature_for_
+        // a_verified_node`) already avoids. `with_node_state_and_temp_
         // runtime_dir` isolates BOTH under one `env_lock` acquisition
         // (nesting the two single-purpose helpers would deadlock — see
         // its own doc).
-        with_peer_state_and_temp_runtime_dir("sign-headers-path-pin", || {
+        with_node_state_and_temp_runtime_dir("sign-headers-path-pin", || {
             let session_id = tunnel_session_id();
             let (listener, port) = seed_reusable_tunnel(&session_id, "sakaki");
 
-            let mut peer = fixture_peer(None);
-            peer.name = "sakaki".to_string();
-            peer.url = "http://sakaki:8710/aoide/rpc".to_string();
-            peer.via = Some("ssh://sakaki".to_string());
+            let mut node = fixture_node(None);
+            node.name = "sakaki".to_string();
+            node.url = "http://sakaki:8710/aoide/rpc".to_string();
+            node.via = Some("ssh://sakaki".to_string());
 
-            let signed_path = aoide_storage::peer_store::url_path(&peer.url);
+            let signed_path = aoide_storage::node_store::url_path(&node.url);
 
-            let via = aoide_storage::tunnel::parse_via(peer.via.as_deref().unwrap()).unwrap();
-            let dial = resolve_dial_url(&peer.url, Some(&via), &peer.name).unwrap();
-            let dial_path = aoide_storage::peer_store::url_path(&dial);
+            let via = aoide_storage::tunnel::parse_via(node.via.as_deref().unwrap()).unwrap();
+            let dial = resolve_dial_url(&node.url, Some(&via), &node.name).unwrap();
+            let dial_path = aoide_storage::node_store::url_path(&dial);
 
             assert_eq!(
                 dial_path, signed_path,
-                "the tunnel rewrite must never change the byte-for-byte path sign_headers_for_peer signs over"
+                "the tunnel rewrite must never change the byte-for-byte path sign_headers_for_node signs over"
             );
             assert!(dial.starts_with(&format!("http://127.0.0.1:{port}")), "authority is rewritten to the local forward: {dial}");
 
-            // And directly: sign_headers_for_peer itself only ever reads
-            // peer.url (never peer.via, never a dial url) — an unverified
-            // peer's empty-headers shortcut is untouched by via either way.
-            assert_eq!(sign_headers_for_peer(&peer, "{}").unwrap(), Vec::<(String, String)>::new(), "unverified peers are unaffected, via or not");
-            peer.verified = true;
-            let headers_with_via = sign_headers_for_peer(&peer, "{}").unwrap();
-            let mut peer_no_via = peer.clone();
-            peer_no_via.via = None;
-            let headers_without_via = sign_headers_for_peer(&peer_no_via, "{}").unwrap();
+            // And directly: sign_headers_for_node itself only ever reads
+            // node.url (never node.via, never a dial url) — an unverified
+            // node's empty-headers shortcut is untouched by via either way.
+            assert_eq!(sign_headers_for_node(&node, "{}").unwrap(), Vec::<(String, String)>::new(), "unverified nodes are unaffected, via or not");
+            node.verified = true;
+            let headers_with_via = sign_headers_for_node(&node, "{}").unwrap();
+            let mut node_no_via = node.clone();
+            node_no_via.via = None;
+            let headers_without_via = sign_headers_for_node(&node_no_via, "{}").unwrap();
             // Nonce/timestamp differ call to call (fresh each time) — but
-            // the PEER identity header (never derived from via) must agree.
-            let peer_header_idx = aoide_storage::wire_auth::HEADER_PEER;
-            let get = |hs: &[(String, String)]| hs.iter().find(|(k, _)| k == peer_header_idx).map(|(_, v)| v.clone());
-            assert_eq!(get(&headers_with_via), get(&headers_without_via), "peer.via must never influence the signed X-Aoide-Peer identity");
+            // the NODE identity header (never derived from via) must agree.
+            let node_header_idx = aoide_storage::wire_auth::HEADER_NODE;
+            let get = |hs: &[(String, String)]| hs.iter().find(|(k, _)| k == node_header_idx).map(|(_, v)| v.clone());
+            assert_eq!(get(&headers_with_via), get(&headers_without_via), "node.via must never influence the signed X-Aoide-Node identity");
 
             drop(listener);
         });
@@ -4402,7 +4402,7 @@ mod tests {
     #[test]
     fn parse_via_flag_absent_is_none_present_invalid_is_err_never_a_silent_fallback() {
         let inv = |flags: &[(&str, &str)]| Invocation {
-            path: vec!["peer".to_string(), "add".to_string()],
+            path: vec!["node".to_string(), "add".to_string()],
             args: vec![],
             flags: flags.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect(),
             door: aoide_protocol::Door::Cli,
@@ -4417,25 +4417,25 @@ mod tests {
     }
 
     #[test]
-    fn handle_peer_add_with_an_invalid_via_is_a_usage_error_and_registers_nothing() {
-        with_peer_state("add-invalid-via", || {
+    fn handle_node_add_with_an_invalid_via_is_a_usage_error_and_registers_nothing() {
+        with_node_state("add-invalid-via", || {
             let inv = Invocation {
-                path: vec!["peer".to_string(), "add".to_string()],
+                path: vec!["node".to_string(), "add".to_string()],
                 args: vec!["sakaki".to_string(), "http://sakaki:8710/".to_string()],
                 flags: [("via".to_string(), "http://not-ssh".to_string())].into_iter().collect(),
                 door: aoide_protocol::Door::Cli,
             };
-            let out = handle_peer_add(&inv);
+            let out = handle_node_add(&inv);
             assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
-            assert!(aoide_storage::peer_store::load_peers().is_empty(), "an invalid --via registers nothing");
+            assert!(aoide_storage::node_store::load_nodes().is_empty(), "an invalid --via registers nothing");
         });
     }
 
-    /// Both `AOIDE_STATE_DIR` (peers.json) and `XDG_RUNTIME_DIR` (tunnel
-    /// records) under ONE `env_lock` acquisition — `with_peer_state` and
+    /// Both `AOIDE_STATE_DIR` (nodes.json) and `XDG_RUNTIME_DIR` (tunnel
+    /// records) under ONE `env_lock` acquisition — `with_node_state` and
     /// `with_temp_runtime_dir` each lock it themselves, so nesting them
     /// would deadlock (a plain `std::sync::Mutex` is not reentrant).
-    fn with_peer_state_and_temp_runtime_dir<T>(tag: &str, f: impl FnOnce() -> T) -> T {
+    fn with_node_state_and_temp_runtime_dir<T>(tag: &str, f: impl FnOnce() -> T) -> T {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
@@ -4585,15 +4585,15 @@ mod tests {
     /// Task #103, requester side: once the remote A2A door's bounded
     /// liveness check (`aoide-server::a2a::do_spawn`) turns a failed spawn
     /// into a proper JSON-RPC error instead of an optimistic `submitted`
-    /// ack, `spawn_on_peer_via` must surface that taught message CLEANLY —
+    /// ack, `spawn_on_node_via` must surface that taught message CLEANLY —
     /// never swallowed, never re-summarized — through its existing
-    /// `"peer-refused"` arm. No new client-side code was needed for this;
+    /// `"node-refused"` arm. No new client-side code was needed for this;
     /// this test PINS that the existing plumbing already does the job,
     /// driven through a fake `curl` shim standing in for the remote door's
     /// HTTP 200 / JSON-RPC-error response (JSON-RPC errors are always HTTP
     /// 200 — the error lives in the envelope, not the status line).
     #[test]
-    fn spawn_on_peer_via_surfaces_a_json_rpc_error_ack_as_a_taught_peer_refused_error() {
+    fn spawn_on_node_via_surfaces_a_json_rpc_error_ack_as_a_taught_node_refused_error() {
         let taught = "the configured agent (`claude`) exited immediately after launch \
                        (exit status: 1) \u{2014} it is likely missing from this unit's PATH, \
                        or the configured spawnAgent command line is wrong";
@@ -4609,10 +4609,10 @@ mod tests {
         // the separator `run_curl`'s `rsplit_once('\n')` expects before the
         // `-w "\n%{http_code}"` status line.
         let script = format!("cat <<'JSONBODY'\n{body}\nJSONBODY\nprintf '200'\n");
-        let peer = fixture_peer(None);
-        let result = with_fake_curl("spawn-refused", &script, || spawn_on_peer_via(&peer, "hello", None));
+        let node = fixture_node(None);
+        let result = with_fake_curl("spawn-refused", &script, || spawn_on_node_via(&node, "hello", None));
         let err = result.expect_err("a JSON-RPC error ack must surface as an Err, never as Ok");
-        assert_eq!(err.reason, "peer-refused");
+        assert_eq!(err.reason, "node-refused");
         assert!(
             err.message.contains(taught),
             "the taught message must reach the caller verbatim, not summarized: {}",
@@ -4620,21 +4620,21 @@ mod tests {
         );
     }
 
-    /// Review finding, P-S4 follow-up: `peer add`'s AgentCard verification
-    /// is its ONE network call, and used to dial `peer.url` directly even
+    /// Review finding, P-S4 follow-up: `node add`'s AgentCard verification
+    /// is its ONE network call, and used to dial `node.url` directly even
     /// when `--via` was given — exactly the scenario `--via` exists for (a
     /// loopback-bound door reachable only through the tunnel) would fail
     /// verification and never get registered. Proven end to end with a
     /// REAL `curl` GET (no mock) reaching a REAL local HTTP responder
     /// through a REUSED tunnel record (P-S3's seam, no real ssh anywhere):
-    /// the peer's logical url names an RFC 2606 `.invalid` host that can
+    /// the node's logical url names an RFC 2606 `.invalid` host that can
     /// never resolve, so the fetch can only have succeeded by going
     /// through the rewritten `127.0.0.1:<port>` target the seeded record
-    /// names — an `Ok` outcome here is the proof. The recorded `peer.url`
+    /// names — an `Ok` outcome here is the proof. The recorded `node.url`
     /// must still be the LOGICAL url, never the rewritten one.
     #[test]
-    fn handle_peer_add_with_a_valid_via_verifies_the_agentcard_through_the_tunnel_and_records_the_logical_url() {
-        with_peer_state_and_temp_runtime_dir("add-valid-via", || {
+    fn handle_node_add_with_a_valid_via_verifies_the_agentcard_through_the_tunnel_and_records_the_logical_url() {
+        with_node_state_and_temp_runtime_dir("add-valid-via", || {
             let (listener, port) = spawn_fake_card_server(r#"{"name":"fake-agent"}"#);
 
             let session_id = tunnel_session_id();
@@ -4653,28 +4653,28 @@ mod tests {
 
             let logical_url = "http://sakaki-unresolvable-host.invalid:8710/";
             let inv = Invocation {
-                path: vec!["peer".to_string(), "add".to_string()],
+                path: vec!["node".to_string(), "add".to_string()],
                 args: vec!["sakaki".to_string(), logical_url.to_string()],
                 flags: [("via".to_string(), "ssh://sakaki".to_string())].into_iter().collect(),
                 door: aoide_protocol::Door::Cli,
             };
-            let out = handle_peer_add(&inv);
+            let out = handle_node_add(&inv);
             assert_eq!(
                 out.status,
                 aoide_protocol::output::Status::Ok,
                 "the fetch must have gone through the tunnel — the logical host cannot resolve at all: {out:?}"
             );
 
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].url, logical_url, "the recorded peer.url stays LOGICAL, never the rewritten dial url");
-            assert_eq!(peers[0].via.as_deref(), Some("ssh://sakaki"));
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].url, logical_url, "the recorded node.url stays LOGICAL, never the rewritten dial url");
+            assert_eq!(nodes[0].via.as_deref(), Some("ssh://sakaki"));
 
             drop(listener);
         });
     }
 
-    /// `peer add --no-verify` (M3, task #16: Melete inbound via the
+    /// `node add --no-verify` (M3, task #16: Melete inbound via the
     /// existing A2A door) skips the AgentCard fetch — `run_curl`'s ONE
     /// call site for the whole command — entirely. Proven the same way
     /// `aoide_secrets::enroll`'s `qrencode` shim and `aoide_secrets::
@@ -4686,10 +4686,10 @@ mod tests {
     /// parseable JSON, so the command would ALSO fail — a false pass here
     /// is not possible by construction.
     #[test]
-    fn handle_peer_add_no_verify_never_invokes_curl() {
-        with_peer_state("add-no-verify", || {
+    fn handle_node_add_no_verify_never_invokes_curl() {
+        with_node_state("add-no-verify", || {
             let shim_dir = std::env::temp_dir().join(format!(
-                "aoide-client-peer-add-noverify-curlshim-{}-{}",
+                "aoide-client-node-add-noverify-curlshim-{}-{}",
                 std::process::id(),
                 std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
             ));
@@ -4705,12 +4705,12 @@ mod tests {
             std::env::set_var("PATH", format!("{}:{}", shim_dir.display(), saved_path.clone().unwrap_or_default()));
 
             let inv = Invocation {
-                path: vec!["peer".to_string(), "add".to_string()],
+                path: vec!["node".to_string(), "add".to_string()],
                 args: vec!["melete".to_string(), "http://melete.example:8710/".to_string()],
                 flags: [("no-verify".to_string(), "true".to_string())].into_iter().collect(),
                 door: aoide_protocol::Door::Cli,
             };
-            let out = handle_peer_add(&inv);
+            let out = handle_node_add(&inv);
 
             match saved_path {
                 Some(p) => std::env::set_var("PATH", p),
@@ -4722,60 +4722,60 @@ mod tests {
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
             assert!(!curl_ran, "--no-verify must never invoke curl (the shim would have touched its marker)");
 
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].name, "melete");
-            assert_eq!(peers[0].url, "http://melete.example:8710/");
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].name, "melete");
+            assert_eq!(nodes[0].url, "http://melete.example:8710/");
             assert!(
-                !peers[0].verified,
-                "peer add --no-verify still records verified:false — a card fetch was never identity, only reachability"
+                !nodes[0].verified,
+                "node add --no-verify still records verified:false — a card fetch was never identity, only reachability"
             );
         });
     }
 
-    /// `--via` beats `Peer.via` — proven WITHOUT ever needing a real
-    /// tunnel or ssh, by making the RECORDED `peer.via` a deliberately
+    /// `--via` beats `Node.via` — proven WITHOUT ever needing a real
+    /// tunnel or ssh, by making the RECORDED `node.via` a deliberately
     /// UNPARSEABLE string (`parse_via`'s own refusal, pure and instant):
-    /// with no override, `post_json_to_peer` must consult it and fail
+    /// with no override, `post_json_to_node` must consult it and fail
     /// immediately on the parse error (proving the recorded via IS read
     /// when nothing beats it); with an explicit, VALID override, the same
-    /// invalid `peer.via` string must never surface at all — the override
-    /// short-circuits before `peer.via` is ever parsed. The override case
+    /// invalid `node.via` string must never surface at all — the override
+    /// short-circuits before `node.via` is ever parsed. The override case
     /// seeds a REUSABLE tunnel record (this test module's own no-real-ssh
     /// seam) so the override path completes rather than needing a live
     /// ssh child.
     #[test]
-    fn via_override_beats_the_recorded_peer_via() {
+    fn via_override_beats_the_recorded_node_via() {
         with_temp_runtime_dir("override-beats-recorded", || {
-            let mut peer = fixture_peer(None);
-            peer.name = "sakaki".to_string();
-            peer.url = "http://sakaki:8710/".to_string();
-            peer.via = Some("not-a-valid-via-at-all".to_string());
+            let mut node = fixture_node(None);
+            node.name = "sakaki".to_string();
+            node.url = "http://sakaki:8710/".to_string();
+            node.via = Some("not-a-valid-via-at-all".to_string());
 
-            // No override: post_json_to_peer_with_via_override falls back
-            // to post_json_to_peer, which parses peer.via and refuses
+            // No override: post_json_to_node_with_via_override falls back
+            // to post_json_to_node, which parses node.via and refuses
             // immediately — no network touched, the taught parse error
-            // surfaces directly, proving peer.via WAS consulted.
+            // surfaces directly, proving node.via WAS consulted.
             let no_override_err =
-                post_json_to_peer_with_via_override(&peer, "{}", None, &[], 1, None).unwrap_err();
+                post_json_to_node_with_via_override(&node, "{}", None, &[], 1, None).unwrap_err();
             assert!(
                 no_override_err.contains("not-a-valid-via-at-all"),
-                "with no override, the recorded (invalid) peer.via must be the thing that fails: {no_override_err}"
+                "with no override, the recorded (invalid) node.via must be the thing that fails: {no_override_err}"
             );
 
-            // With an explicit, VALID override, peer.via's garbage string
+            // With an explicit, VALID override, node.via's garbage string
             // must never even be looked at — seed a reusable record for
-            // the SAME key (peer.name) the override path also dials
+            // the SAME key (node.name) the override path also dials
             // through, so this completes with no real ssh spawned.
             let session_id = tunnel_session_id();
             let (listener, _port) = seed_reusable_tunnel(&session_id, "sakaki");
             let override_via = aoide_storage::tunnel::parse_via("ssh://khoa@sakaki").unwrap();
             let with_override =
-                post_json_to_peer_with_via_override(&peer, "{}", None, &[], 1, Some(&override_via));
+                post_json_to_node_with_via_override(&node, "{}", None, &[], 1, Some(&override_via));
             match with_override {
                 Err(e) => assert!(
                     !e.contains("not-a-valid-via-at-all"),
-                    "an explicit --via override must never surface the recorded (invalid) peer.via: {e}"
+                    "an explicit --via override must never surface the recorded (invalid) node.via: {e}"
                 ),
                 Ok(_) => {} // a bounded curl call against the seeded listener may also just succeed/timeout cleanly
             }
@@ -4788,7 +4788,7 @@ mod tests {
 
     /// `approve_inbound`'s own commit is now PURELY LOCAL (module doc) — the
     /// old shape's ONE network call (the `aoide/pairApprove` callback) is
-    /// gone outright. Proven the same way `handle_peer_add_no_verify_
+    /// gone outright. Proven the same way `handle_node_add_no_verify_
     /// never_invokes_curl` proves an external binary was never invoked: a
     /// fake `curl` dropped on `PATH` that touches a marker file if ever run.
     /// This is THE test that pins "no approver->requester network callback
@@ -4796,7 +4796,7 @@ mod tests {
     /// same invariant one layer down, by never dialing an undialable url).
     #[test]
     fn approve_inbound_never_invokes_curl_purely_local_commit() {
-        with_peer_state("approve-inbound-no-curl", || {
+        with_node_state("approve-inbound-no-curl", || {
             let now = aoide_storage::time::now_iso_utc();
             let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
             let pubkey_a = "a".repeat(64);
@@ -4846,9 +4846,9 @@ mod tests {
             assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
             assert!(!curl_ran, "approving an inbound request must never invoke curl — it is purely local");
 
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
-            assert!(peers[0].verified);
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert!(nodes[0].verified);
             let listed = aoide_storage::pairing::list_inbound(now_epoch);
             assert_eq!(listed.len(), 1, "the entry stays parked for the requester's own poll");
             assert!(listed[0].approved);
@@ -4939,7 +4939,7 @@ mod tests {
     /// The expected reply code an outbound entry built by
     /// [`sample_outbound_awaiting_approval`] gates its final commit on —
     /// `derive_reply_sas` from THIS process's own freshly-minted identity
-    /// (`with_peer_state`'s sandboxed `AOIDE_STATE_DIR`) plus the fixture's
+    /// (`with_node_state`'s sandboxed `AOIDE_STATE_DIR`) plus the fixture's
     /// own transcript fields, the exact computation `commit_outbound`
     /// itself performs.
     fn expected_reply_sas(pubkey_b: &str) -> String {
@@ -4965,7 +4965,7 @@ mod tests {
 
     #[test]
     fn commit_outbound_scripted_correct_reply_code_commits_and_takes_the_entry() {
-        with_peer_state("commit-outbound-code-match", || {
+        with_node_state("commit-outbound-code-match", || {
             let pubkey_b = "b".repeat(64);
             let entry = awaiting_confirm_outbound("deadbeef", &pubkey_b);
             aoide_storage::pairing::park_outbound(entry.clone()).unwrap();
@@ -4978,16 +4978,16 @@ mod tests {
             let out = commit_outbound(CodeGate::Code(code), "pair", "deadbeef", entry, &now, now_epoch, &[]);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
-            assert!(peers[0].verified);
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert!(nodes[0].verified);
             assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "commit takes the entry");
         });
     }
 
     #[test]
     fn commit_outbound_scripted_wrong_reply_codes_count_persisted_tries_then_auto_abort_at_three() {
-        with_peer_state("commit-outbound-code-mismatch", || {
+        with_node_state("commit-outbound-code-mismatch", || {
             let pubkey_b = "b".repeat(64);
             let entry = awaiting_confirm_outbound("deadbeef", &pubkey_b);
             aoide_storage::pairing::park_outbound(entry).unwrap();
@@ -5010,13 +5010,13 @@ mod tests {
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("auto-abort-on-code-mismatch"));
             assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the parked entry is removed, exactly like a reject");
-            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing of this end's own was ever committed");
+            assert!(aoide_storage::node_store::load_nodes().is_empty(), "nothing of this end's own was ever committed");
         });
     }
 
     #[test]
     fn commit_outbound_refuses_where_no_code_can_be_collected_and_counts_no_try() {
-        with_peer_state("commit-outbound-no-code", || {
+        with_node_state("commit-outbound-no-code", || {
             let pubkey_b = "b".repeat(64);
             let entry = awaiting_confirm_outbound("deadbeef", &pubkey_b);
             aoide_storage::pairing::park_outbound(entry.clone()).unwrap();
@@ -5037,7 +5037,7 @@ mod tests {
     /// entry before the gate ever runs, never re-offer one more try.
     #[test]
     fn commit_outbound_denies_up_front_when_already_at_the_try_limit() {
-        with_peer_state("commit-outbound-limit-reached", || {
+        with_node_state("commit-outbound-limit-reached", || {
             let pubkey_b = "b".repeat(64);
             let mut entry = awaiting_confirm_outbound("deadbeef", &pubkey_b);
             entry.tries = MAX_CODE_TRIES;
@@ -5052,7 +5052,7 @@ mod tests {
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("auto-abort-on-code-mismatch"));
             assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "an entry already at the limit is never approvable");
-            assert!(aoide_storage::peer_store::load_peers().is_empty());
+            assert!(aoide_storage::node_store::load_nodes().is_empty());
         });
     }
 
@@ -5063,7 +5063,7 @@ mod tests {
     /// forward dial (module doc on `approve_outbound`, task #119).
     #[test]
     fn approve_outbound_polls_a_real_server_and_completes_on_an_approved_matching_release() {
-        with_peer_state("approve-outbound-poll-approved", || {
+        with_node_state("approve-outbound-poll-approved", || {
             let pubkey_b = "b".repeat(64);
             let body: String = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"approved","pubkeyHex":"{pubkey_b}"}}}}"#);
             let body: &'static str = Box::leak(body.into_boxed_str());
@@ -5077,11 +5077,11 @@ mod tests {
             let outcome = approve_outbound(CodeGate::Code(expected_reply_sas(&pubkey_b)), "pair", "deadbeef", entry, &now, now_epoch, None);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Ok, "{outcome:?}");
 
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].name, "box-b");
-            assert_eq!(peers[0].pubkey.as_deref(), Some(pubkey_b.as_str()));
-            assert!(peers[0].verified);
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].name, "box-b");
+            assert_eq!(nodes[0].pubkey.as_deref(), Some(pubkey_b.as_str()));
+            assert!(nodes[0].verified);
             assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the outbound entry is consumed on commit");
         });
     }
@@ -5183,7 +5183,7 @@ mod tests {
     /// unreachable box returns on the FIRST tick rather than after the wait.
     #[test]
     fn the_wait_returns_at_once_on_a_terminal_refusal_it_never_retries() {
-        with_peer_state("wait-terminal-refusal", || {
+        with_node_state("wait-terminal-refusal", || {
             let pubkey_b = "b".repeat(64);
             // Port 1 on loopback: nothing listens, so the dial fails fast.
             let entry = sample_outbound_awaiting_approval("deadbeef", "http://127.0.0.1:1/", &pubkey_b);
@@ -5200,7 +5200,7 @@ mod tests {
 
     #[test]
     fn the_wait_times_out_leaving_the_request_pending_and_finishable_later() {
-        with_peer_state("wait-timeout", || {
+        with_node_state("wait-timeout", || {
             let pubkey_b = "b".repeat(64);
             let (_listener, port) = spawn_fake_pair_poll_server(r#"{"jsonrpc":"2.0","id":1,"result":{"status":"pending"}}"#);
             let url = format!("http://127.0.0.1:{port}/");
@@ -5217,7 +5217,7 @@ mod tests {
 
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             assert_eq!(aoide_storage::pairing::list_outbound(now_epoch).len(), 1, "the request survives the timeout — that is what makes Ctrl-C safe");
-            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing commits on a timeout");
+            assert!(aoide_storage::node_store::load_nodes().is_empty(), "nothing commits on a timeout");
         });
     }
 
@@ -5230,7 +5230,7 @@ mod tests {
     /// auto-commits, and no try is counted.
     #[test]
     fn the_wait_release_with_no_code_available_parks_at_awaiting_confirm_never_refuses() {
-        with_peer_state("wait-release-no-code", || {
+        with_node_state("wait-release-no-code", || {
             let pubkey_b = "b".repeat(64);
             let body = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"approved","pubkeyHex":"{pubkey_b}"}}}}"#);
             let body: &'static str = Box::leak(body.into_boxed_str());
@@ -5249,7 +5249,7 @@ mod tests {
             assert_eq!(listed.len(), 1, "the entry stays parked, never taken");
             assert_eq!(listed[0].state, aoide_storage::pairing::OutboundState::AwaitingConfirm, "the poll's own release already transitioned it");
             assert_eq!(listed[0].tries, 0, "no try is counted — there was no code to compare");
-            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing auto-commits");
+            assert!(aoide_storage::node_store::load_nodes().is_empty(), "nothing auto-commits");
         });
     }
 
@@ -5258,7 +5258,7 @@ mod tests {
     /// the only way to prove the loop without inventing a test-only knob.
     #[test]
     fn the_wait_repolls_a_pending_answer_and_completes_when_it_turns_approved() {
-        with_peer_state("wait-repoll", || {
+        with_node_state("wait-repoll", || {
             let pubkey_b = "b".repeat(64);
             let approved = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"approved","pubkeyHex":"{pubkey_b}"}}}}"#);
             let (_listener, port) = spawn_fake_pair_poll_server_pending_then_approved(1, approved);
@@ -5275,10 +5275,10 @@ mod tests {
             let out = wait_and_commit("pair", "deadbeef", "box-b", "111-222", &finish);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
-            assert!(peers[0].verified, "the pair completes inside the one command — no second invocation");
-            assert_eq!(peers[0].allows, vec!["read".to_string(), "spawn".to_string()], "`pair --allow` reaches the commit, which is why the flag belongs here now");
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert!(nodes[0].verified, "the pair completes inside the one command — no second invocation");
+            assert_eq!(nodes[0].allows, vec!["read".to_string(), "spawn".to_string()], "`pair --allow` reaches the commit, which is why the flag belongs here now");
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the entry is consumed on commit");
         });
@@ -5286,7 +5286,7 @@ mod tests {
 
     #[test]
     fn the_wait_says_so_when_the_request_vanishes_underneath_it() {
-        with_peer_state("wait-request-gone", || {
+        with_node_state("wait-request-gone", || {
             let finish = PairFinish { wait_secs: 600, skip_confirm: true, grant: None, code: None, door: aoide_protocol::Door::Cli };
             let out = wait_and_commit("pair", "nosuchid", "box-b", "111-222", &finish);
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
@@ -5296,12 +5296,12 @@ mod tests {
     }
 
     /// A poll answering `{"status":"pending"}` refuses with the SAME
-    /// "still awaiting the peer's own approval" message the old
+    /// "still awaiting the node's own approval" message the old
     /// callback-wait refusal gave — an ordinary, expected outcome; the
     /// outbound entry is untouched, so a later retry can still resolve it.
     #[test]
     fn approve_outbound_polls_a_real_server_and_refuses_cleanly_while_pending() {
-        with_peer_state("approve-outbound-poll-pending", || {
+        with_node_state("approve-outbound-poll-pending", || {
             let pubkey_b = "b".repeat(64);
             let (_listener, port) = spawn_fake_pair_poll_server(r#"{"jsonrpc":"2.0","id":1,"result":{"status":"pending"}}"#);
             let url = format!("http://127.0.0.1:{port}/");
@@ -5312,9 +5312,9 @@ mod tests {
             let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
             let outcome = approve_outbound(CodeGate::Unavailable, "pair", "deadbeef", entry, &now, now_epoch, None);
             assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
-            assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("awaiting-peer-approval"));
+            assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("awaiting-node-approval"));
 
-            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing commits while still pending");
+            assert!(aoide_storage::node_store::load_nodes().is_empty(), "nothing commits while still pending");
             let listed = aoide_storage::pairing::list_outbound(now_epoch);
             assert_eq!(listed.len(), 1, "a pending poll leaves the entry untouched for a later retry");
             assert_eq!(listed[0].state, aoide_storage::pairing::OutboundState::AwaitingApproval);
@@ -5329,7 +5329,7 @@ mod tests {
     /// Finding 2, preserved under Design A).
     #[test]
     fn approve_outbound_rejects_a_substituted_pubkey_release_and_commits_nothing() {
-        with_peer_state("approve-outbound-poll-mismatch", || {
+        with_node_state("approve-outbound-poll-mismatch", || {
             let real_pubkey_b = "b".repeat(64);
             let substituted_pubkey = "f".repeat(64);
             let body: String = format!(r#"{{"jsonrpc":"2.0","id":1,"result":{{"status":"approved","pubkeyHex":"{substituted_pubkey}"}}}}"#);
@@ -5345,7 +5345,7 @@ mod tests {
             assert_eq!(outcome.status, aoide_protocol::output::Status::Error, "{outcome:?}");
             assert_eq!(outcome.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("reveal-mismatch"));
 
-            assert!(aoide_storage::peer_store::load_peers().is_empty(), "a substituted release must never commit a peer record");
+            assert!(aoide_storage::node_store::load_nodes().is_empty(), "a substituted release must never commit a node record");
             let listed = aoide_storage::pairing::list_outbound(now_epoch);
             assert_eq!(listed.len(), 1, "the entry is left untouched, never removed, on a mismatch");
             assert_eq!(listed[0].state, aoide_storage::pairing::OutboundState::AwaitingApproval, "never advances past awaiting-approval on a mismatch");
@@ -5423,7 +5423,7 @@ mod tests {
 
     #[test]
     fn approve_inbound_scripted_wrong_codes_count_persisted_tries_then_auto_deny_at_three() {
-        with_peer_state("approve-inbound-code-mismatch", || {
+        with_node_state("approve-inbound-code-mismatch", || {
             let now_epoch = 1_700_000_000_i64;
             let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
             let (entry, _sas) = parked_revealed_inbound(now_epoch);
@@ -5447,13 +5447,13 @@ mod tests {
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             assert_eq!(out.data.as_ref().and_then(|d| d.get("reason")).and_then(Value::as_str), Some("auto-deny-on-code-mismatch"));
             assert!(aoide_storage::pairing::list_inbound(now_epoch).is_empty(), "the parked entry is removed, exactly like a reject");
-            assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing was ever committed");
+            assert!(aoide_storage::node_store::load_nodes().is_empty(), "nothing was ever committed");
         });
     }
 
     #[test]
     fn approve_inbound_scripted_correct_code_commits_and_marks_approved() {
-        with_peer_state("approve-inbound-code-match", || {
+        with_node_state("approve-inbound-code-match", || {
             let now_epoch = 1_700_000_000_i64;
             let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
             let (entry, sas) = parked_revealed_inbound(now_epoch);
@@ -5464,9 +5464,9 @@ mod tests {
             let out = approve_inbound(CodeGate::Code(sas.replace('-', "")), "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
-            assert!(peers[0].verified, "the ceremony's commit is unchanged by the gate swap");
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert!(nodes[0].verified, "the ceremony's commit is unchanged by the gate swap");
             let listed = aoide_storage::pairing::list_inbound(now_epoch);
             assert_eq!(listed.len(), 1, "an approved entry stays parked for the requester's poll (Design A)");
             assert!(listed[0].approved);
@@ -5481,7 +5481,7 @@ mod tests {
     /// poll" text alone.
     #[test]
     fn approve_inbound_ok_outcome_carries_the_reply_code_including_on_an_idempotent_rerun() {
-        with_peer_state("approve-inbound-reply-sas", || {
+        with_node_state("approve-inbound-reply-sas", || {
             let now_epoch = 1_700_000_000_i64;
             let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
             let (entry, sas) = parked_revealed_inbound(now_epoch);
@@ -5514,7 +5514,7 @@ mod tests {
     // ── The grant a commit stamps (task #135 P1) — `config.toml`'s
     // ── `[pairing] defaultGrant`, or this commit's own `--allow`. ────────────
 
-    /// Write a `config.toml` into the sandboxed `AOIDE_ROOT` `with_peer_state`
+    /// Write a `config.toml` into the sandboxed `AOIDE_ROOT` `with_node_state`
     /// already sets up, so a test can drive the real resolution path rather
     /// than a hand-built `Config`.
     fn write_config(body: &str) {
@@ -5530,20 +5530,20 @@ mod tests {
 
     #[test]
     fn a_first_pairing_stamps_the_configs_default_grant_not_a_literal() {
-        with_peer_state("grant-config-default", || {
+        with_node_state("grant-config-default", || {
             // No config.toml at all — the built-in default, which task #135
             // P1 narrowed from ["read","spawn"] to ["read"].
             let out = approve_the_one_inbound(1_700_000_000, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
-            assert_eq!(aoide_storage::peer_store::load_peers()[0].allows, vec!["read".to_string()]);
+            assert_eq!(aoide_storage::node_store::load_nodes()[0].allows, vec!["read".to_string()]);
             assert!(out.message.contains("granted read"), "the commit says what it granted: {}", out.message);
         });
-        with_peer_state("grant-config-widened", || {
+        with_node_state("grant-config-widened", || {
             write_config("[pairing]\ndefaultGrant = [\"read\", \"spawn\"]\n");
             let out = approve_the_one_inbound(1_700_000_000, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
             assert_eq!(
-                aoide_storage::peer_store::load_peers()[0].allows,
+                aoide_storage::node_store::load_nodes()[0].allows,
                 vec!["read".to_string(), "spawn".to_string()],
                 "an operator who widened defaultGrant gets the wider set, with no code change and no rebuild"
             );
@@ -5552,11 +5552,11 @@ mod tests {
 
     #[test]
     fn allow_overrides_the_config_default_for_this_one_pairing() {
-        with_peer_state("grant-allow-override", || {
+        with_node_state("grant-allow-override", || {
             write_config("[pairing]\ndefaultGrant = [\"read\"]\n");
             let out = approve_the_one_inbound(1_700_000_000, Some(&["read".to_string(), "spawn".to_string()]));
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
-            assert_eq!(aoide_storage::peer_store::load_peers()[0].allows, vec!["read".to_string(), "spawn".to_string()]);
+            assert_eq!(aoide_storage::node_store::load_nodes()[0].allows, vec!["read".to_string(), "spawn".to_string()]);
             assert!(out.message.contains("granted read, spawn"), "{}", out.message);
 
             // Nothing persisted it: the config is untouched, so the NEXT
@@ -5567,38 +5567,38 @@ mod tests {
     }
 
     /// The half an operator is most likely to get wrong: `--allow` on a
-    /// RE-pairing looks like it widens a live peer and does not.
+    /// RE-pairing looks like it widens a live node and does not.
     #[test]
     fn re_pairing_never_regrants_and_the_message_says_so() {
-        with_peer_state("grant-repair-unchanged", || {
+        with_node_state("grant-repair-unchanged", || {
             let now_epoch = 1_700_000_000_i64;
             approve_the_one_inbound(now_epoch, None);
-            assert_eq!(aoide_storage::peer_store::load_peers()[0].allows, vec!["read".to_string()]);
+            assert_eq!(aoide_storage::node_store::load_nodes()[0].allows, vec!["read".to_string()]);
 
             // Same box pairs again (a key rotation) and this operator types
             // the wider grant.
             let out = approve_the_one_inbound(now_epoch, Some(&["read".to_string(), "spawn".to_string()]));
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
             assert_eq!(
-                aoide_storage::peer_store::load_peers()[0].allows,
+                aoide_storage::node_store::load_nodes()[0].allows,
                 vec!["read".to_string()],
-                "an already-verified peer's grant survives a re-pair untouched — a revoked spawn stays revoked"
+                "an already-verified node's grant survives a re-pair untouched — a revoked spawn stays revoked"
             );
             assert!(out.message.contains("grant unchanged"), "a --allow that did nothing must never be silent: {}", out.message);
-            assert!(out.message.contains("peer allow"), "and it names the command that does change a live grant: {}", out.message);
+            assert!(out.message.contains("node allow"), "and it names the command that does change a live grant: {}", out.message);
         });
     }
 
     #[test]
     fn a_malformed_config_refuses_the_commit_rather_than_guessing_a_grant() {
-        with_peer_state("grant-config-malformed", || {
+        with_node_state("grant-config-malformed", || {
             write_config("[pairing]\ndefaultGrant = [\"read\", \"root\"]\n");
             let out = approve_the_one_inbound(1_700_000_000, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
             assert!(out.message.contains("root"), "the refusal names the offending value: {}", out.message);
             assert!(out.message.contains("--allow"), "and the way past it: {}", out.message);
             assert!(
-                aoide_storage::peer_store::load_peers().is_empty(),
+                aoide_storage::node_store::load_nodes().is_empty(),
                 "nothing is committed on an unresolvable grant — a grants file that cannot be read must not fall back to a default"
             );
         });
@@ -5625,7 +5625,7 @@ mod tests {
 
     fn pair_approve_inv(args: &[&str]) -> Invocation {
         Invocation {
-            path: vec!["peer".to_string(), "pair".to_string(), "approve".to_string()],
+            path: vec!["node".to_string(), "pair".to_string(), "approve".to_string()],
             args: args.iter().map(|s| s.to_string()).collect(),
             flags: Default::default(),
             door: aoide_protocol::Door::Cli,
@@ -5637,11 +5637,11 @@ mod tests {
     /// via: the claim itself}` — never `entry.url` (the requester-observed
     /// host the approver can never dial directly through the tunnel that
     /// delivered this very request). The sakaki/chiyo/osaka rows in
-    /// production `peers.json` are this exact shape, hand-derived before
+    /// production `nodes.json` are this exact shape, hand-derived before
     /// this fix existed.
     #[test]
     fn approve_inbound_records_loopback_url_and_claimed_via_when_self_via_present() {
-        with_peer_state("approve-inbound-self-via-present", || {
+        with_node_state("approve-inbound-self-via-present", || {
             let now_epoch = 1_700_000_000_i64;
             let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
             let (entry, sas) = parked_revealed_inbound_with_self_via(now_epoch, Some("ssh://khoa@box-a"));
@@ -5650,15 +5650,15 @@ mod tests {
             let out = approve_inbound(CodeGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes.len(), 1);
             // The fixture's own url (`http://box-a:8710/`) happens to carry
             // the house default port too — `approve_inbound_records_the_
             // requesters_own_port_parsed_from_entry_url` below is the test
             // that actually proves this is parsed off entry.url and not
             // this box's own `AOIDE_A2A_PORT`, by using a DIFFERENT port.
-            assert_eq!(peers[0].url, format!("http://127.0.0.1:{}/", default_a2a_port()), "the claim's presence rewrites the record to the loopback-as-seen-from-the-far-side convention, never entry.url");
-            assert_eq!(peers[0].via.as_deref(), Some("ssh://khoa@box-a"), "via is the claim itself, committed in the same write");
+            assert_eq!(nodes[0].url, format!("http://127.0.0.1:{}/", default_a2a_port()), "the claim's presence rewrites the record to the loopback-as-seen-from-the-far-side convention, never entry.url");
+            assert_eq!(nodes[0].via.as_deref(), Some("ssh://khoa@box-a"), "via is the claim itself, committed in the same write");
         });
     }
 
@@ -5671,7 +5671,7 @@ mod tests {
     /// defaulting to this box's.
     #[test]
     fn approve_inbound_records_the_requesters_own_port_parsed_from_entry_url() {
-        with_peer_state("approve-inbound-self-via-nondefault-port", || {
+        with_node_state("approve-inbound-self-via-nondefault-port", || {
             let now_epoch = 1_700_000_000_i64;
             let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
             let (entry, sas) =
@@ -5682,9 +5682,9 @@ mod tests {
             let out = approve_inbound(CodeGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].url, "http://127.0.0.1:9999/", "the loopback rewrite must carry the REQUESTER's own door port, parsed from entry.url, never this box's own AOIDE_A2A_PORT/default");
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].url, "http://127.0.0.1:9999/", "the loopback rewrite must carry the REQUESTER's own door port, parsed from entry.url, never this box's own AOIDE_A2A_PORT/default");
         });
     }
 
@@ -5694,7 +5694,7 @@ mod tests {
     /// regression on the ordinary direct-LAN case.
     #[test]
     fn approve_inbound_leaves_todays_shape_when_self_via_absent() {
-        with_peer_state("approve-inbound-self-via-absent", || {
+        with_node_state("approve-inbound-self-via-absent", || {
             let now_epoch = 1_700_000_000_i64;
             let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
             let (entry, sas) = parked_revealed_inbound(now_epoch);
@@ -5704,16 +5704,16 @@ mod tests {
             let out = approve_inbound(CodeGate::Code(sas), "pair", &id, entry, &now, now_epoch, None);
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
 
-            let peers = aoide_storage::peer_store::load_peers();
-            assert_eq!(peers.len(), 1);
-            assert_eq!(peers[0].url, entry_url, "no claim — url is entry.url verbatim, exactly today's behavior");
-            assert!(peers[0].via.is_none(), "no claim — via stays absent, exactly today's behavior");
+            let nodes = aoide_storage::node_store::load_nodes();
+            assert_eq!(nodes.len(), 1);
+            assert_eq!(nodes[0].url, entry_url, "no claim — url is entry.url verbatim, exactly today's behavior");
+            assert!(nodes[0].via.is_none(), "no claim — via stays absent, exactly today's behavior");
         });
     }
 
     #[test]
     fn approve_inbound_refuses_where_no_code_can_be_collected_and_counts_no_try() {
-        with_peer_state("approve-inbound-no-code", || {
+        with_node_state("approve-inbound-no-code", || {
             let now_epoch = 1_700_000_000_i64;
             let now = aoide_storage::time::iso_utc_from_epoch(now_epoch);
             let (entry, _sas) = parked_revealed_inbound(now_epoch);
@@ -5742,7 +5742,7 @@ mod tests {
     /// scripted caller hits).
     #[test]
     fn pair_on_an_inbound_target_refuses_yes_and_non_tty_without_code() {
-        with_peer_state("approve-inbound-handler-gate", || {
+        with_node_state("approve-inbound-handler-gate", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             let (entry, _sas) = parked_revealed_inbound(now_epoch);
 
@@ -5762,7 +5762,7 @@ mod tests {
     /// [`commit_outbound`]'s own gate with no network call at all.
     #[test]
     fn pair_on_an_outbound_target_refuses_yes_and_non_tty_without_code() {
-        with_peer_state("resume-outbound-handler-gate", || {
+        with_node_state("resume-outbound-handler-gate", || {
             let pubkey_b = "b".repeat(64);
             let mut entry = sample_outbound_awaiting_approval("deadbeef", "http://box-b/", &pubkey_b);
             entry.state = aoide_storage::pairing::OutboundState::AwaitingConfirm;
@@ -5773,18 +5773,18 @@ mod tests {
                 assert_eq!(out.status, aoide_protocol::output::Status::Usage, "{out:?}");
                 assert!(out.message.contains("--code"), "{}", out.message);
             }
-            assert!(aoide_storage::peer_store::load_peers().is_empty(), "a refusal must never commit");
+            assert!(aoide_storage::node_store::load_nodes().is_empty(), "a refusal must never commit");
         });
     }
 
     /// Bare `pair` off a tty is the pending LISTING, not a hang and not a
-    /// refusal (task #135 P3' — the old `peer pending`, which died into
+    /// refusal (task #135 P3' — the old `node pending`, which died into
     /// this): a non-CLI door, a `--json` ask, and a non-tty CLI invocation
     /// all get the listing instantly, before any sweep could run — the
     /// machine face agents drive.
     #[test]
     fn bare_pair_off_a_tty_is_the_pending_listing_never_a_menu() {
-        with_peer_state("bare-pair-listing", || {
+        with_node_state("bare-pair-listing", || {
             let inv = |door, flags: &[(&str, &str)]| Invocation {
                 path: vec!["pair".into()],
                 args: vec![],
@@ -5818,7 +5818,7 @@ mod tests {
     /// consulted, so a re-run (scripted or not) never trips the refusal.
     #[test]
     fn pair_on_an_already_approved_inbound_target_is_still_a_no_op_success() {
-        with_peer_state("approve-inbound-idempotent", || {
+        with_node_state("approve-inbound-idempotent", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             let (entry, _sas) = parked_revealed_inbound(now_epoch);
             aoide_storage::pairing::mark_inbound_approved(&entry.id, now_epoch).unwrap();
@@ -5836,14 +5836,14 @@ mod tests {
     /// scripted `--code` rides the same command.
     #[test]
     fn pair_routes_a_name_to_its_pending_inbound_request() {
-        with_peer_state("pair-routes-name-inbound", || {
+        with_node_state("pair-routes-name-inbound", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             let (entry, sas) = parked_revealed_inbound(now_epoch);
 
             let out = handle_pair(&pair_inv(&[&entry.name], &[("code", &sas)]));
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
-            assert_eq!(out.data.as_ref().and_then(|d| d.get("peer")).and_then(Value::as_str), Some(entry.name.as_str()));
-            assert!(aoide_storage::peer_store::load_peers()[0].verified, "the routed approve really commits");
+            assert_eq!(out.data.as_ref().and_then(|d| d.get("node")).and_then(Value::as_str), Some(entry.name.as_str()));
+            assert!(aoide_storage::node_store::load_nodes()[0].verified, "the routed approve really commits");
         });
     }
 
@@ -5853,7 +5853,7 @@ mod tests {
     /// why this family's own messages print ids.
     #[test]
     fn pair_refuses_an_ambiguous_name_listing_the_ids() {
-        with_peer_state("pair-ambiguous-name", || {
+        with_node_state("pair-ambiguous-name", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             let (inbound_entry, sas) = parked_revealed_inbound(now_epoch);
             let pubkey_b = "b".repeat(64);
@@ -5877,17 +5877,17 @@ mod tests {
         });
     }
 
-    /// `pair <name>` on an ALREADY-verified peer with nothing pending is
+    /// `pair <name>` on an ALREADY-verified node with nothing pending is
     /// gated (task #135 P3' — a re-pair replaces key material, and the
     /// smart command makes accidental invocation likely): off a tty and
     /// without `--yes` it refuses by name; `--yes` proceeds into the
     /// ordinary request arm (proven by reaching the sweep's own no-match).
     #[test]
     fn pair_on_an_already_verified_name_is_gated_before_any_request() {
-        with_peer_state("pair-repair-gate", || {
-            let mut peers = Vec::new();
-            aoide_storage::peer_store::upsert_paired_peer(&mut peers, "box-v", "http://box-v:8710/", &"a".repeat(64), "2026-08-30T00:00:00Z", &["read".to_string()]);
-            aoide_storage::peer_store::save_peers(&peers).unwrap();
+        with_node_state("pair-repair-gate", || {
+            let mut nodes = Vec::new();
+            aoide_storage::node_store::upsert_paired_node(&mut nodes, "box-v", "http://box-v:8710/", &"a".repeat(64), "2026-08-30T00:00:00Z", &["read".to_string()]);
+            aoide_storage::node_store::save_nodes(&nodes).unwrap();
 
             let out = handle_pair(&pair_inv(&["box-v"], &[]));
             assert_eq!(out.status, aoide_protocol::output::Status::Error, "{out:?}");
@@ -5910,8 +5910,8 @@ mod tests {
     /// own screen and typed on the approver's; showing it here would defeat
     /// that out-of-band comparison.
     #[test]
-    fn peer_pending_never_carries_the_sas_code_inbound_or_outbound() {
-        with_peer_state("pending-no-sas", || {
+    fn node_pending_never_carries_the_sas_code_inbound_or_outbound() {
+        with_node_state("pending-no-sas", || {
             let now_epoch = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc()).unwrap();
             let (_inbound_entry, inbound_sas) = parked_revealed_inbound(now_epoch);
             let pubkey_b = "b".repeat(64);
@@ -5950,8 +5950,8 @@ mod tests {
     /// window it actually ran) — never the url arm's reason, and vice
     /// versa.
     #[test]
-    fn peer_pair_smart_target_dispatches_url_and_hostname_to_different_arms() {
-        with_peer_state("smart-target-url-arm", || {
+    fn node_pair_smart_target_dispatches_url_and_hostname_to_different_arms() {
+        with_node_state("smart-target-url-arm", || {
             // Port 1 is reserved and never listened on in practice — an
             // immediate, deterministic connection refusal, never a sweep.
             let inv = Invocation {
@@ -5969,8 +5969,8 @@ mod tests {
             );
         });
 
-        with_peer_state("smart-target-hostname-arm", || {
-            // `with_peer_state` already holds `crate::env_lock()` for its
+        with_node_state("smart-target-hostname-arm", || {
+            // `with_node_state` already holds `crate::env_lock()` for its
             // whole body — the SAME lock every real-sweep test in this
             // module takes (its own doc, `run_sweep_hears_an_advertisement_
             // sent_over_the_real_loopback_stack`'s doc in `discover.rs`); a
@@ -5993,8 +5993,8 @@ mod tests {
         });
     }
 
-    /// Review finding (P-PV2 follow-up): old `peer pair request <url>`
-    /// muscle memory has no third `peer.pair.request` path to greedily
+    /// Review finding (P-PV2 follow-up): old `node pair request <url>`
+    /// muscle memory has no third `node.pair.request` path to greedily
     /// match anymore, so it lands here as `pair`'s OWN two args
     /// (`["request", "<url>"]`) — reading only `args[0]` and discarding the
     /// url would silently burn a full sweep window looking for an
@@ -6035,7 +6035,7 @@ mod tests {
     fn pair_reject_and_watch_subcommand_names_win_over_a_target_positional() {
         let mut r = Registry::new();
         register_pair(&mut r);
-        register_peer_discovery(&mut r);
+        register_node_discovery(&mut r);
 
         for sub in ["reject", "watch"] {
             let argv = vec!["pair".to_string(), sub.to_string()];

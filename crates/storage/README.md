@@ -2,7 +2,7 @@
 
 Durable session data + memory persistence: stage-file record shapes, atomic
 stage I/O, session/hook upsert ops, the staging/declarative mode marker, the
-peer-federation registry + pull cache (CONTRACTS.md §7), and the one INTENT
+node-federation registry + pull cache (CONTRACTS.md §7), and the one INTENT
 file among all that state — the portable runtime config (`config`). File-first
 by decision — no embedded database yet
 (`docs/architecture/PACKAGE-LAYOUT.md`, "storage backend" open question).
@@ -85,7 +85,7 @@ by decision — no embedded database yet
   key off a typed `Config` — and `validate`, `set`, and `aoide config`'s own
   listing all walk it rather than restating it in match arms. v0 carries
   exactly one section: `[pairing]`'s `defaultGrant`, whose vocabulary IS
-  `peer_store::PEER_CAPABILITIES` (the same closed set `peer allow`
+  `node_store::NODE_CAPABILITIES` (the same closed set `node allow`
   enforces, never a second list). `set` is the only writer: it refuses a
   managed config, an unknown key, a value outside its vocabulary, and a
   config already on disk that does not load — each with a taught error, and
@@ -96,62 +96,62 @@ by decision — no embedded database yet
 
   `[mesh.<name>]` (task #135 P4) is the one DECLARED-but-not-SETTABLE
   section: zero or more operator-named meshes, each a `grant`/`sameOperator`
-  pair plus a `peers` map (`name -> ssh hop`, `tunnel::parse_via`'s own
+  pair plus a `nodes` map (`name -> ssh hop`, `tunnel::parse_via`'s own
   shape). `validate` fully type- and vocabulary-checks it — same closed
-  `PEER_CAPABILITIES` grant vocabulary, `peer_store::valid_peer_name`-shaped
-  names, no peer name declared in two meshes — but it never joins `SCHEMA`:
-  the section's KEYS are the operator's own mesh/peer names, not a static
+  `NODE_CAPABILITIES` grant vocabulary, `node_store::valid_node_name`-shaped
+  names, no node name declared in two meshes — but it never joins `SCHEMA`:
+  the section's KEYS are the operator's own mesh/node names, not a static
   table `&'static str` can enumerate, so `config set` structurally cannot
   reach into it (`SetRefusal::UnknownKey` for any `mesh.*` key, same as a
   typo). Writing a mesh is a text edit to `config.toml` — reading what it
-  implies about the live peer registry is `aoide mesh`, and acting on it
-  (pairing the declared peers, stamping the declared `grant`) is `aoide mesh
+  implies about the live node registry is `aoide mesh`, and acting on it
+  (pairing the declared nodes, stamping the declared `grant`) is `aoide mesh
   pair`; both live in `aoide_client::mesh`, never this crate.
 - `session` — pure session/hook upsert operations.
-- `peer_store` — the peer-federation registry + pull cache (CONTRACTS.md §7).
-  `Peer` carries two independent, opposite-direction credential fields:
-  `tokenFile` (inbound — what a peer presents TO US, read from a local
-  file) and `bearerSecret` (outbound — what WE present TO a peer, a
+- `node_store` — the node-federation registry + pull cache (CONTRACTS.md §7).
+  `Node` carries two independent, opposite-direction credential fields:
+  `tokenFile` (inbound — what a node presents TO US, read from a local
+  file) and `bearerSecret` (outbound — what WE present TO a node, a
   secrets-broker secret NAME resolved fresh at request time by
   `aoide-client`, task #84). Both are optional and independently settable
-  via `peer add`; neither implies the other. `hub` (P-D5,
-  `docs/architecture/AOIDED.md`) marks AT MOST ONE registered peer as the
+  via `node add`; neither implies the other. `hub` (P-D5,
+  `docs/architecture/AOIDED.md`) marks AT MOST ONE registered node as the
   standing orchestrator address resolution falls back to — additive,
   `#[serde(default)]`, omitted from the wire when `false`
   (`SessionRecord::headless`'s precedent, `records.rs`). `set_hub`/
   `clear_hub` hold the "at most one" and idempotence invariants; nothing
   else writes the field directly. `pubkey`/`verified` (P-P2,
-  `docs/architecture/PAIRING.md`, CONTRACTS.md §7's "Peer record" note) are
+  `docs/architecture/PAIRING.md`, CONTRACTS.md §7's "Node record" note) are
   the pairing ceremony's own additive fields — set ONLY by
-  `upsert_paired_peer`, never by `peer add`; a legacy record predating them
+  `upsert_paired_node`, never by `node add`; a legacy record predating them
   loads with `pubkey: None`/`verified: false` unchanged.
-  `default_peer_name_from_url` sanitizes a bare URL host into the same
-  nickname shape `valid_peer_name` requires, for `aoide pair`'s url arm's
+  `default_node_name_from_url` sanitizes a bare URL host into the same
+  nickname shape `valid_node_name` requires, for `aoide pair`'s url arm's
   no-`--name` default. `url_path` (P-P4) extracts just the path component
-  from a peer's `url` (`"http://host:port/foo?x"` → `"/foo"`, `""` when
+  from a node's `url` (`"http://host:port/foo?x"` → `"/foo"`, `""` when
   none) — the ONE function both `aoide-client`'s signer and
   `aoide-server`'s HTTP request parser derive a wire path from, so a
   signature's canonical string binds to the exact same string on both
   ends. `allows` (P-P3, `docs/architecture/PAIRING.md`
-  decision 5) is a CLOSED capability set (`PEER_CAPABILITIES`: `"read"`,
+  decision 5) is a CLOSED capability set (`NODE_CAPABILITIES`: `"read"`,
   `"spawn"`) — never a per-capability serde bool scatter — additive,
-  empty for every unpaired/legacy peer; `upsert_paired_peer` stamps the
+  empty for every unpaired/legacy node; `upsert_paired_node` stamps the
   grant its CALLER resolved (`config.toml`'s `[pairing] defaultGrant`, or a
   `--allow` typed on that one commit — never a literal here) the moment a
-  peer FIRST becomes verified, and leaves it untouched on a later key rotation (a
-  revoked capability survives re-pairing). `set_peer_allow` (`peer allow
+  node FIRST becomes verified, and leaves it untouched on a later key rotation (a
+  revoked capability survives re-pairing). `set_node_allow` (`node allow
   <name> <cap> on|off`'s library half) is the only OTHER writer —
-  idempotent, refuses an unknown peer or an unknown capability (the
-  capability check runs first). `resolve_peer` (decision 6) is the
-  caller-identity ladder the A2A door keys off, returning WHICH `PeerRung`
-  matched alongside the `Peer`: a presented bearer against a peer's own
-  `token_file` first (`PeerRung::Token`), an origin address against that
-  peer's `url` second (`PeerRung::Addr`) — unlike `is_autogated_peer_token`/
-  `is_autogated_peer_addr` above, it looks at EVERY registered peer, not
-  only `autogate`-marked ones, since resolving WHICH peer is calling is a
-  different question from "should this peer skip the pending queue."
-  `PeerRung` carries a THIRD variant, `Signature` (P-P4) — the strongest
-  rung, never produced by `resolve_peer` itself (it has no access to the
+  idempotent, refuses an unknown node or an unknown capability (the
+  capability check runs first). `resolve_node` (decision 6) is the
+  caller-identity ladder the A2A door keys off, returning WHICH `NodeRung`
+  matched alongside the `Node`: a presented bearer against a node's own
+  `token_file` first (`NodeRung::Token`), an origin address against that
+  node's `url` second (`NodeRung::Addr`) — unlike `is_autogated_node_token`/
+  `is_autogated_node_addr` above, it looks at EVERY registered node, not
+  only `autogate`-marked ones, since resolving WHICH node is calling is a
+  different question from "should this node skip the pending queue."
+  `NodeRung` carries a THIRD variant, `Signature` (P-P4) — the strongest
+  rung, never produced by `resolve_node` itself (it has no access to the
   raw HTTP request a signature needs); it is yielded only by
   `aoide-server::a2a::verify_signed_request`, which resolves the caller BY
   the stored `pubkey` that verifies the request's `X-Aoide-*` signature
@@ -159,27 +159,27 @@ by decision — no embedded database yet
   only — see `wire_auth` below, CONTRACTS.md §6's P-P4 amendment for the
   full wire shape). None of the three rungs are interchangeable strength:
   `aoide-server`'s spawn arm (`spawn_admitted`) accepts ONLY
-  `PeerRung::Signature` — a bare address match carries no possession
+  `NodeRung::Signature` — a bare address match carries no possession
   proof, and a bare token match is replayable and identical across every
-  request the real peer or an impersonator ever sends; both remain fine
+  request the real node or an impersonator ever sends; both remain fine
   for attribution/origin-stamping and the ordinary autogate question, just
-  never for Spawn. Ambiguity resolves deterministically: `peer add` refuses only a
-  duplicate NAME (CONTRACTS.md §7), so two peers can share a URL host or
-  hold byte-identical `token_file` contents, and `resolve_peer` then
+  never for Spawn. Ambiguity resolves deterministically: `node add` refuses only a
+  duplicate NAME (CONTRACTS.md §7), so two nodes can share a URL host or
+  hold byte-identical `token_file` contents, and `resolve_node` then
   answers with whichever matches FIRST in registry (array) order — not
   the last, not random. `via` (P-S4, ssh-transport lane) is the
   `Option<String>` transport marker `aoide-client`'s dial resolution reads
-  before every outbound POST to this peer (an `ssh://[user@]host[:port]`
+  before every outbound POST to this node (an `ssh://[user@]host[:port]`
   string, `crate::tunnel::parse_via`'s own shape) — additive,
   `#[serde(default)]`+`skip_serializing_if`, the `hub` discipline verbatim:
-  absent for every peer registered before this field existed, and `None`
-  means direct dial (today's behavior, unchanged). `set_peer_via` is the
-  ONLY writer — a SIBLING to `upsert_paired_peer` rather than a new
+  absent for every node registered before this field existed, and `None`
+  means direct dial (today's behavior, unchanged). `set_node_via` is the
+  ONLY writer — a SIBLING to `upsert_paired_node` rather than a new
   parameter on it, since that function's signature is also called from
   `aoide-server`'s own pairing integration tests, outside this field's
   blast radius.
 - `pairing` — the pairing ceremony's own park-and-approve state (P-P2,
-  `docs/architecture/PAIRING.md`, CONTRACTS.md §4's `state/peer-pairing-
+  `docs/architecture/PAIRING.md`, CONTRACTS.md §4's `state/node-pairing-
   inbound.json`/`-outbound.json` subsection): two disk-persisted queues,
   one per direction (`InboundPairingRequest` on the approver, generated by
   `aoide/pairRequest`'s handler; `OutboundPairingRequest` on the requester,
@@ -215,7 +215,7 @@ by decision — no embedded database yet
   `fs::with_stage_lock` — the same flock `inbox::receive` reuses for a
   `state/` file — so the `a2a serve` process and a concurrent CLI never
   race each other's read-modify-write on
-  `state/peer-pairing-{inbound,outbound}.json`. One live parked request
+  `state/node-pairing-{inbound,outbound}.json`. One live parked request
   per requester identity (R3): `park_inbound` SUPERSEDES — never refuses —
   any entry already parked for the SAME `pubkey_hex` (approved-but-unpolled
   included), evicted under the same `PARK_LOCK` acquisition BEFORE the cap
@@ -227,7 +227,7 @@ by decision — no embedded database yet
   A cross-direction pair (an inbound entry FROM X alongside an outbound
   entry TO X) is left alone — the two files never reference each other.
   `OutboundPairingRequest.state` (`AwaitingApproval` → `AwaitingConfirm`,
-  `mark_outbound_awaiting_confirm`) defers the REQUESTER's own peer-record
+  `mark_outbound_awaiting_confirm`) defers the REQUESTER's own node-record
   commit until its own operator confirms a second time, after this
   instance's own `aoide/pairPoll` (Design A, task #119 — REPLACES the old
   `aoide/pairApprove` reverse callback: the requester polls the approver's
@@ -259,7 +259,7 @@ by decision — no embedded database yet
   explicit `--via`, or `pair`'s hostname arm/bare `pair`'s src_addr-derived
   default) forward to
   the SEPARATE, later `aoide pair` invocation that actually commits
-  the peer record — the only place that commit happens, so the value has
+  the node record — the only place that commit happens, so the value has
   nowhere else to ride between the two.
   `InboundPairingRequest.self_via` (task #131, additive, `#[serde(default,
   skip_serializing_if = "Option::is_none")]`) is the mirror image on the
@@ -292,7 +292,7 @@ by decision — no embedded database yet
   `records::SessionRecord.origin`/`LedgerEntry.origin` (P-P3,
   `docs/architecture/PAIRING.md` decision 7; write-authority tightened at
   LANE IDENTITY P-ID0, G16/G5, review round 1) are the provenance pair:
-  `"peer:<name>"` for a session an identified, paired peer's A2A spawn
+  `"node:<name>"` for a session an identified, paired node's A2A spawn
   created, additive on the live record (`skip_serializing_if`), always
   present (possibly `null`) on the closed ledger line — `SessionRecord`'s
   own value is projected verbatim into the `LedgerEntry` at exit, the same
@@ -301,21 +301,21 @@ by decision — no embedded database yet
   `graph/resurrect.rs::origin_to_carry` now reads the ledger field back on
   revival to carry a LOCAL-class session's own provenance forward onto its
   fresh record (G6 — the ledger wrote `origin` on every exit long before
-  anything read it back), REFUSING to carry a `peer:*` shape found there
+  anything read it back), REFUSING to carry a `node:*` shape found there
   (eprintln, never carried) — `state/session-ledger.jsonl` is a plain,
   same-uid-writable, append-only file, so a same-uid process could append a
-  line claiming `origin:"peer:X"` and drive the ungated local `aoide
+  line claiming `origin:"node:X"` and drive the ungated local `aoide
   resurrect`, which has no door and no seal behind it to re-mint that
   authority. `origin` is still attribution, not an authenticated
   credential — the invariant `aoide-conduct`'s `stamp_origin` (`pub`,
   crossing the crate boundary) now holds is by SHAPE, not caller count: a
-  `peer:<name>` value may be stamped from exactly one place,
+  `node:<name>` value may be stamped from exactly one place,
   `aoide-server`'s `a2a::do_spawn`, DIRECTLY on the record from the door
-  that authenticated the peer name; every other caller
+  that authenticated the node name; every other caller
   (`session_conduct`'s env read, `origin_to_carry`'s ledger read) may
-  stamp a LOCAL-CLASS value but refuses a `peer:*` shape from its own
+  stamp a LOCAL-CLASS value but refuses a `node:*` shape from its own
   untrusted source. **This closes the STAMP paths, not the files** — a
-  hand-crafted `sessions.json`/ledger line claiming `peer:X` is still a
+  hand-crafted `sessions.json`/ledger line claiming `node:X` is still a
   readable, unflagged string on disk; nothing here makes the files
   tamper-evident, that is P-ID1 (the daemon-signed credential) minted and
   stored, verified on the per-session control socket's own accept and
@@ -331,7 +331,7 @@ by decision — no embedded database yet
   `attest`) consume; the consumer NAME presenting a request stays
   unauthenticated either way (a separate, unbuilt axis — CONTRACTS.md's
   identity-lane accounting). What P-ID0 closes: every
-  record-STAMP path this codebase drives now refuses a `peer:*` shape it
+  record-STAMP path this codebase drives now refuses a `node:*` shape it
   didn't mint itself at the door — env AND the unsealed ledger both.
   `records::RestoreSnapshot`/`SessionRecord.restore`/`LedgerEntry.restore`
   (P-C5, durable-sessions plan) are a conducted TERMINAL's continuously-
@@ -349,11 +349,11 @@ by decision — no embedded database yet
 - `undying` — the undying mark (durable-sessions plan, P-C1; renamed from
   "carry" at command-defrag lane U1, 2026-08-27): `state/undying.json`, the
   set of session ids marked durable so a project's whole undying set can be
-  resurrected together (`session grant undying on|off`). Mirrors `peer_store`
+  resurrected together (`session grant undying on|off`). Mirrors `node_store`
   exactly — `load_undying`/`save_undying` tolerate a missing/corrupt file as
   empty and write atomically via `fs::atomic_write` (not
   `atomic_write_private`: a session id is the same class of data
-  `sessions.json`/`peers.json` already keep at default mode).
+  `sessions.json`/`nodes.json` already keep at default mode).
   `set_undying`/`is_undying` are pure list operations; `set_undying` returns
   whether the undying/not-undying TRANSITION changed, and separately
   refreshes `markedAt` on every `on` call including a re-mark of an
@@ -384,7 +384,7 @@ by decision — no embedded database yet
   never resumes from the symlink's own target ancestry).
 - `tunnel` — the ssh tunnel registry (ssh-transport lane, P-S2,
   `docs/architecture/PAIRING.md`'s forthcoming Transport section): a cross-box
-  client action that cannot reach a peer's loopback-bound door directly opens
+  client action that cannot reach a node's loopback-bound door directly opens
   an ssh `-L` forward and records it at `$XDG_RUNTIME_DIR/aoide/tunnel/
   <sessionId>/<key>.json` (`TUNNEL_VERSION` "0" — two path levels, since
   both components may carry `-` and a flat joined name could collide two
@@ -392,20 +392,20 @@ by decision — no embedded database yet
   convention `aoide_conduct::graph::conduct_socket_path` resolves its own
   `session-<id>.sock` into — re-derived here (`runtime_dir`), not imported,
   since this crate sits below `conduct` in the DAG. `parse_via` reads a
-  `--via`/`Peer.via` marker (`ssh://[user@]host[:port]`, `ssh` scheme only,
+  `--via`/`Node.via` marker (`ssh://[user@]host[:port]`, `ssh` scheme only,
   user and port both optional, a present port bounded `1..=65535`) into a
   `Via`; `default_via` builds one directly from an observed IP + login with
-  no string round trip. `dial_url` rewrites a logical peer url's authority to
+  no string round trip. `dial_url` rewrites a logical node url's authority to
   `127.0.0.1:<local port>` while preserving BOTH the scheme and the PATH
-  verbatim — the path half delegates to `peer_store::url_path` rather than
-  re-deriving it, since `sign_headers_for_peer`'s canonical string
+  verbatim — the path half delegates to `node_store::url_path` rather than
+  re-deriving it, since `sign_headers_for_node`'s canonical string
   (`aoide-client`) is bound to that exact same path; a divergent cut here
   would make every signed call through the tunnel fail on the far end with an
   opaque `-32007`. `record_path` refuses a traversal-shaped `sessionId` or
   `key` before either ever reaches a path join — `key` through
-  `peer_store::valid_peer_name`, `sessionId` through this module's own looser
+  `node_store::valid_node_name`, `sessionId` through this module's own looser
   `is_safe_id` (a session id is not an operator-typed nickname, so it can't
-  reuse `valid_peer_name` verbatim). `save`/`load`/`remove` are the CRUD
+  reuse `valid_node_name` verbatim). `save`/`load`/`remove` are the CRUD
   (`atomic_write_private`, `0600` — module doc's own note on why a
   non-secret record still gets that discipline; `load` additionally
   refuses a record whose own fields name a different pair than the path it
@@ -414,8 +414,8 @@ by decision — no embedded database yet
   (`aoide-conduct::reap`) that lets a sibling convention's files
   (`session-*.sock`, `aoided.sock`) share the same runtime directory without
   ever being mis-parsed. No process is ever spawned here — the ssh child
-  itself lives in `aoide-client::tunnel` (P-S3), the same `peer_store`
-  (storage) / `commands` (client) split this crate already holds for peer
+  itself lives in `aoide-client::tunnel` (P-S3), the same `node_store`
+  (storage) / `commands` (client) split this crate already holds for node
   transport.
 - `takes` — the take store behind `rice back`/`rice take`, hanging off
   `songbook/<song>/takes/` when staged directly or
@@ -428,17 +428,17 @@ by decision — no embedded database yet
   render-time-only display grammar.
 - `addr` — the pure address resolver (messaging/presence plan, P-C1),
   inverting `display::session_label`'s grammar to turn a typed query back
-  into a local session id or a deferred `peer/<rest>` remote query. Zero
+  into a local session id or a deferred `node/<rest>` remote query. Zero
   I/O, agnostic of any call site — bare `session`/`--hosts`
   (`aoide-conduct::graph::who`, C2 — the roster core, formerly the standalone
   `who` command) and `send --to` (`aoide-conduct::graph::send`, C3) both call
   `resolve` directly. `resolve_with_hub` (P-D5) composes it with the hub
-  preference (`peer_store::Peer.hub`): a hub-designated peer is offered as
+  preference (`node_store::Node.hub`): a hub-designated node is offered as
   one last, least-specific `Remote` candidate only on `resolve`'s own
   `NotFound` — every earlier precedence tier is untouched. As of P-D5 it is
   a tested library function only; `send --to`'s live call site still
   calls plain `resolve` (the same "land the function, wire a caller later"
-  order this module's own tier-5 `peer/<rest>` grammar went through).
+  order this module's own tier-5 `node/<rest>` grammar went through).
 - `inbox` — the durable per-host message store (messaging plan P-C6,
   `state/inbox.json`, CONTRACTS.md §4): every message that lands in a local
   session, filed by `conduct`'s `deliver_local` success path — the ONE
@@ -458,8 +458,8 @@ by decision — no embedded database yet
   fingerprint, mint time) is the only serializable shape this module
   emits, and a source-scanning test in `identity.rs` mechanically holds
   that boundary. The pairing ceremony (`aoide pair`, P-P2) builds on this
-  directly (`peer_store`/`pairing` above); the `allows` set + A2A spawn-gate
-  flip (P-P3, `peer_store::allows`/`resolve_peer` above) also build on it;
+  directly (`node_store`/`pairing` above); the `allows` set + A2A spawn-gate
+  flip (P-P3, `node_store::allows`/`resolve_node` above) also build on it;
   so does `wire_auth` below (P-P4) — `Keypair::sign`/`Keypair::verify` are
   its ONLY two entry points into `ed25519_dalek`, so neither
   `aoide-client` nor `aoide-server` needs that dependency directly.
@@ -475,7 +475,7 @@ by decision — no embedded database yet
   verify against a differently-cased one), and `mint_seal`/`verify_seal` —
   thin wrappers over `wire_auth::sign_hex`/`verify_signature_hex`, so this
   module never touches `ed25519_dalek` directly either. **The signing key
-  is NOT `identity::load_or_mint`'s on-disk peer-wire key** — under OQ1-A
+  is NOT `identity::load_or_mint`'s on-disk node-wire key** — under OQ1-A
   (the plan file's User-answered threat-model question) a same-uid
   attacker can read any file the operator owns, so an on-disk key is not
   secret against it; `identity::mint_ephemeral` (this crate's other new
@@ -520,9 +520,9 @@ by decision — no embedded database yet
   — `records::SessionRecord`, `stage::sessions_path`, `sealed_id`,
   `identity` — already does; resolution only, never a policy decision
   (this crate's `AGENTS.md`).
-- `wire_auth` — per-request signed wire authentication for paired peers
+- `wire_auth` — per-request signed wire authentication for paired nodes
   (P-P4, `docs/architecture/PAIRING.md`'s "Wire authentication (paired
-  peers)" section, CONTRACTS.md §6's own amendment for the full wire
+  nodes)" section, CONTRACTS.md §6's own amendment for the full wire
   shape and pinned vectors). `canonical_string(method, path, timestamp,
   nonce, body)` is the ONE function both ends build independently (never
   a wire-carried canonical string) — five fields, each trimmed+lowercased,
@@ -538,7 +538,7 @@ by decision — no embedded database yet
   process-local, per-`a2a serve` runtime state with no durable file behind
   it at all, unlike everything else this crate persists, so it lives in
   `aoide-server::a2a` next to its one consumer instead (this module's own
-  doc comment states the reasoning). `HEADER_PEER`/`HEADER_TIMESTAMP`/
+  doc comment states the reasoning). `HEADER_NODE`/`HEADER_TIMESTAMP`/
   `HEADER_NONCE`/`HEADER_SIGNATURE` are the four wire header names — always
   present together or not at all, never independently optional.
 - `advertise` — the discovery advertisement's wire format and the
@@ -554,11 +554,11 @@ by decision — no embedded database yet
   shapes, and `MAX_LINE_BYTES` checked on the raw bytes before any JSON
   parse — house rule 4's discipline, an advertisement is untrusted
   network data), and `enabled`/`set_enabled`, the `state/advertise.json`
-  switch `aoide peer advertise on|off` flips (default OFF,
+  switch `aoide node advertise on|off` flips (default OFF,
   tolerate-missing, atomic write). No socket I/O lives here
   (`aoide-server::discovery` sends, `aoide-client::discover` listens)
-  and no write path into `peer_store` — discovery grants nothing, by
-  construction, since this module cannot write a peer record even if a
+  and no write path into `node_store` — discovery grants nothing, by
+  construction, since this module cannot write a node record even if a
   caller wanted it to.
 - `commands` — this crate's CLI commands: `usage` (local token/cost rollup),
   `inbox list|read|clear` (the store above's CLI surface), `identity`
@@ -567,7 +567,7 @@ by decision — no embedded database yet
   from, and whether it is managed or unmanaged; `config set` is the one
   schema-validated write). `aoide pair`/`pair reject`/`pair watch`
   lives in `aoide-client` instead (outbound transport crosses the
-  `client → storage` DAG edge; this crate exposes `pairing`/`peer_store`
+  `client → storage` DAG edge; this crate exposes `pairing`/`node_store`
   as the library, `client` drives the wire).
 
 ## What it consumes

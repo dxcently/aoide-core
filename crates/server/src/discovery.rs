@@ -4,7 +4,7 @@
 //! `aoide_storage::advertise::Advertisement` line by UDP broadcast to the
 //! fixed port on a jittered ~30s cadence — but ONLY on ticks where
 //! advertising is actually switched on. The switch is read EVERY tick
-//! (`aoide_storage::advertise::enabled`, flipped by `aoide peer advertise
+//! (`aoide_storage::advertise::enabled`, flipped by `aoide node advertise
 //! on|off`), so an operator's toggle lands within one cadence, no restart;
 //! `--discovery-advertise`/`AOIDE_DISCOVERY_ADVERTISE`
 //! (`a2a::resolve_discovery_advertise`, the nix-declarative path) force it
@@ -24,8 +24,8 @@
 //! `AGENTS.md`); sending an advertisement is the one thing the
 //! door-owning PROCESS itself does, never something a client-side command
 //! triggers. **No resident listener exists anywhere** (PAIRING.md,
-//! verbatim) — hearing an advertisement is always an on-demand `peer
-//! discover`/`peer invite` sweep, never something `a2a serve` does on its
+//! verbatim) — hearing an advertisement is always an on-demand `node
+//! discover`/`node invite` sweep, never something `a2a serve` does on its
 //! own.
 //!
 //! **Rendezvous, not authentication** (`aoide_storage::advertise`'s module

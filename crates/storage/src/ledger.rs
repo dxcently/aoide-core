@@ -53,8 +53,8 @@ pub struct LedgerEntry {
     #[serde(rename = "resumedFrom", default)]
     pub resumed_from: Option<String>,
     /// Projected verbatim from `SessionRecord.origin` (P-P3,
-    /// `docs/architecture/PAIRING.md` decision 7) — `"peer:<name>"` for a
-    /// session an identified, paired peer's A2A spawn created; `None` for
+    /// `docs/architecture/PAIRING.md` decision 7) — `"node:<name>"` for a
+    /// session an identified, paired node's A2A spawn created; `None` for
     /// every locally-registered session and every entry predating this
     /// field. Always serializes (never `skip_serializing_if`), same
     /// closed-historical-record discipline every other field here holds.
@@ -151,7 +151,7 @@ mod tests {
             started_at: "2026-08-24T00:00:00Z".to_string(),
             ended_at: "2026-08-24T01:00:00Z".to_string(),
             resumed_from: None,
-            origin: Some("peer:yomi-strix".to_string()),
+            origin: Some("node:yomi-strix".to_string()),
             restore: Some(RestoreSnapshot {
                 cwd: Some("/home/khoa/Aoide".to_string()),
                 idle: true,
@@ -166,7 +166,7 @@ mod tests {
         assert_eq!(back[0].session_id, "s1");
         assert_eq!(back[0].harness_session_id.as_deref(), Some("h1"));
         assert_eq!(back[0].resumed_from, None);
-        assert_eq!(back[0].origin.as_deref(), Some("peer:yomi-strix"));
+        assert_eq!(back[0].origin.as_deref(), Some("node:yomi-strix"));
         assert_eq!(back[0].restore, entry.restore);
 
         std::env::remove_var("AOIDE_STATE_DIR");

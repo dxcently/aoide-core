@@ -58,7 +58,7 @@ aoide-secrets = { workspace = true }
 # dispatch end to end — versions inherit from `[workspace.dependencies]`.
 crossterm = { workspace = true }
 ratatui = { workspace = true }
-# `tests/peer_connectivity.rs` (CONTRACTS.md §7) needs the shared
+# `tests/node_connectivity.rs` (CONTRACTS.md §7) needs the shared
 # process-wide env lock (`env_lock`) to serialise its env-mutating tests —
 # the same rig every domain crate's own tests already share.
 aoide-test-support = { workspace = true }

@@ -1,4 +1,4 @@
-//! Real two-instance, same-network connectivity proof for the peer
+//! Real two-instance, same-network connectivity proof for the node
 //! federation feature (CONTRACTS.md §7) — owner-directed priority
 //! (2026-08-14): a genuine end-to-end round trip, not mocked HTTP.
 //!
@@ -8,8 +8,8 @@
 //! same-subnet HTTP reachability whether the two addresses happen to share a
 //! loopback interface or are two real LAN IPs; nothing in the protocol
 //! (a JSON-RPC method over a plain URL) cares which. One is registered as a
-//! peer of the "local" side via a REAL `aoide peer add <name> <url>` (a real
-//! curl GET of the AgentCard), then pulled via a REAL `aoide peer pull` (a
+//! node of the "local" side via a REAL `aoide node add <name> <url>` (a real
+//! curl GET of the AgentCard), then pulled via a REAL `aoide node pull` (a
 //! real curl POST of `aoide/graphSummary`) — real bytes over a real socket,
 //! a real cache write, a real graph fold. Both binds stay strictly loopback
 //! (house rule: never bind non-loopback in this suite, never reach a real
@@ -28,7 +28,7 @@
 //! skeleton: no live-system integration tests in the sandbox", that file's
 //! own comment). `#[ignore]` keeps the hermetic package build green while
 //! keeping this test 100% real (not a mock) for the environment it needs:
-//! run explicitly with `cargo test -p aoide-cli --test peer_connectivity -- --ignored`
+//! run explicitly with `cargo test -p aoide-cli --test node_connectivity -- --ignored`
 //! (confirmed passing in `nix develop #default`, which DOES have `curl` and
 //! a real loopback network stack).
 
@@ -42,7 +42,7 @@ use std::time::{Duration, Instant};
 fn unique_root(tag: &str) -> PathBuf {
     let mut dir = std::env::temp_dir();
     dir.push(format!(
-        "aoide-peer-connectivity-{tag}-{}-{}",
+        "aoide-node-connectivity-{tag}-{}-{}",
         std::process::id(),
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -104,13 +104,13 @@ fn setup_env(root: &std::path::Path) -> PathBuf {
 
 #[test]
 #[ignore = "real loopback TCP + real curl — no network/curl in the nix sandbox; run with --ignored"]
-fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() {
+fn node_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("main");
     let _stage = setup_env(&root);
 
     // Seed a real, checkable node on the (shared, single-process) stage
-    // BEFORE peer B starts serving, so B's FIRST graphSummary response
+    // BEFORE node B starts serving, so B's FIRST graphSummary response
     // carries it. (The path must be a real absolute dir — `project
     // add` rejects anything else now — so it lives under this test's own
     // `root` and is removed with it.)
@@ -123,7 +123,7 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
     ));
     assert_eq!(seed.status, Status::Ok, "{}", seed.message);
 
-    // Bind peer "B"'s A2A door to a REAL loopback port and serve it on a
+    // Bind node "B"'s A2A door to a REAL loopback port and serve it on a
     // background thread — a genuine accept loop, genuine HTTP/1.1 parsing,
     // genuine JSON-RPC dispatch. Never bound non-loopback.
     let port_b = free_port();
@@ -136,26 +136,26 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
             "yomi-strix",
             "",
             "",
-            Path::new("/tmp/aoide-a2a-peer-connectivity-unused.sock"),
+            Path::new("/tmp/aoide-a2a-node-connectivity-unused.sock"),
             false,
             registry(),
         );
     });
     wait_for_tcp_up(&format!("127.0.0.1:{port_b}"));
-    let peer_url = format!("http://127.0.0.1:{port_b}/");
+    let node_url = format!("http://127.0.0.1:{port_b}/");
 
-    // `peer add` — a REAL curl GET of B's `/.well-known/agent-card.json`
+    // `node add` — a REAL curl GET of B's `/.well-known/agent-card.json`
     // over real HTTP (verification-before-registering).
-    let add_out = dispatch(&cli_invocation(&["peer", "add"], &["yomi-strix", &peer_url], &[]));
-    assert_eq!(add_out.status, Status::Ok, "peer add: {}", add_out.message);
-    let peers = aoide_storage::peer_store::load_peers();
-    assert_eq!(peers.len(), 1);
-    assert_eq!(peers[0].name, "yomi-strix");
-    assert_eq!(peers[0].url, peer_url);
+    let add_out = dispatch(&cli_invocation(&["node", "add"], &["yomi-strix", &node_url], &[]));
+    assert_eq!(add_out.status, Status::Ok, "node add: {}", add_out.message);
+    let nodes = aoide_storage::node_store::load_nodes();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].name, "yomi-strix");
+    assert_eq!(nodes[0].url, node_url);
 
-    // `peer pull` — a REAL curl POST of `aoide/graphSummary` over real HTTP.
-    let pull_out = dispatch(&cli_invocation(&["peer", "pull"], &["yomi-strix"], &[]));
-    assert_eq!(pull_out.status, Status::Ok, "peer pull: {}", pull_out.message);
+    // `node pull` — a REAL curl POST of `aoide/graphSummary` over real HTTP.
+    let pull_out = dispatch(&cli_invocation(&["node", "pull"], &["yomi-strix"], &[]));
+    assert_eq!(pull_out.status, Status::Ok, "node pull: {}", pull_out.message);
     let results = pull_out.data.as_ref().unwrap()["results"].as_array().unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0]["ok"], true, "pull result: {results:?}");
@@ -164,10 +164,10 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
     // stub: B's instance name is exactly what `serve` was told to
     // advertise, and the graph carries the project registered before B
     // started serving.
-    let cache = aoide_storage::peer_store::load_peer_cache("yomi-strix").expect("cache written");
+    let cache = aoide_storage::node_store::load_node_cache("yomi-strix").expect("cache written");
     assert!(!cache.stale);
     assert_eq!(cache.instance.as_ref().unwrap()["name"], "yomi-strix");
-    assert_eq!(cache.instance.as_ref().unwrap()["url"], peer_url);
+    assert_eq!(cache.instance.as_ref().unwrap()["url"], node_url);
     let graph = cache.graph.as_ref().unwrap();
     assert!(
         graph["nodes"]
@@ -175,7 +175,7 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
             .unwrap()
             .iter()
             .any(|n| n["id"] == "project:aoide-remote"),
-        "the peer's REAL served graph round-tripped over real HTTP: {graph}"
+        "the node's REAL served graph round-tripped over real HTTP: {graph}"
     );
 
     // Mutate LOCAL state AFTER the pull — the cache is a frozen snapshot of
@@ -191,7 +191,7 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
     assert_eq!(mutate.status, Status::Ok);
 
     // The fold: `graph --json`'s resolved document now carries BOTH
-    // local projects PLUS a `peer:yomi-strix` root node whose `children`
+    // local projects PLUS a `node:yomi-strix` root node whose `children`
     // reflect the OLD (pre-mutation) snapshot only.
     let view_out = dispatch(&cli_invocation(&["graph"], &[], &[("json", "true")]));
     assert_eq!(view_out.status, Status::Ok);
@@ -199,26 +199,26 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
     let nodes = doc["nodes"].as_array().unwrap();
     assert!(nodes.iter().any(|n| n["id"] == "project:aoide-remote"));
     assert!(nodes.iter().any(|n| n["id"] == "project:local-only"));
-    let peer_node = nodes
+    let mesh_node = nodes
         .iter()
-        .find(|n| n["id"] == "peer:yomi-strix")
-        .expect("peer node folded into the LOCAL resolved graph document");
-    assert_eq!(peer_node["state"], "fresh");
-    let children = peer_node["children"]["nodes"].as_array().unwrap();
+        .find(|n| n["id"] == "node:yomi-strix")
+        .expect("mesh node folded into the LOCAL resolved graph document");
+    assert_eq!(mesh_node["state"], "fresh");
+    let children = mesh_node["children"]["nodes"].as_array().unwrap();
     assert!(
         children.iter().any(|n| n["id"] == "project:aoide-remote"),
-        "the peer's cached subtree carries what B had at pull time: {children:?}"
+        "the node's cached subtree carries what B had at pull time: {children:?}"
     );
     assert!(
         !children.iter().any(|n| n["id"] == "project:local-only"),
-        "the peer's cached subtree must NOT reflect a LOCAL mutation made after the pull \
+        "the node's cached subtree must NOT reflect a LOCAL mutation made after the pull \
          — it's a frozen cache from a real pull, not a live re-fetch: {children:?}"
     );
 
-    // `peer status` reports it fresh, over the same real cache.
-    let status_out = dispatch(&cli_invocation(&["peer", "status"], &[], &[]));
+    // `node status` reports it fresh, over the same real cache.
+    let status_out = dispatch(&cli_invocation(&["node", "status"], &[], &[]));
     assert_eq!(status_out.status, Status::Ok);
-    let rows = status_out.data.as_ref().unwrap()["peers"].as_array().unwrap();
+    let rows = status_out.data.as_ref().unwrap()["nodes"].as_array().unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0]["name"], "yomi-strix");
     assert_eq!(rows[0]["state"], "fresh");
@@ -232,24 +232,24 @@ fn peer_add_and_pull_round_trip_over_real_http_between_two_loopback_instances() 
 
 #[test]
 #[ignore = "real loopback TCP + real curl — no network/curl in the nix sandbox; run with --ignored"]
-fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_marks_stale_without_breaking_others() {
+fn node_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_node_marks_stale_without_breaking_others() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("unreachable");
     let _stage = setup_env(&root);
 
-    // `peer add` against a port NOTHING is listening on — a real, genuine
+    // `node add` against a port NOTHING is listening on — a real, genuine
     // connection-refused, not a mock. It must never register.
     let dead_port = free_port(); // reserved, then dropped — nothing binds it
     let dead_url = format!("http://127.0.0.1:{dead_port}/");
-    let add_out = dispatch(&cli_invocation(&["peer", "add"], &["ghost", &dead_url], &[]));
-    assert_eq!(add_out.status, Status::Error, "an unreachable peer must fail peer add");
+    let add_out = dispatch(&cli_invocation(&["node", "add"], &["ghost", &dead_url], &[]));
+    assert_eq!(add_out.status, Status::Error, "an unreachable node must fail node add");
     assert!(
-        aoide_storage::peer_store::load_peers().is_empty(),
-        "a peer that fails AgentCard verification is never registered"
+        aoide_storage::node_store::load_nodes().is_empty(),
+        "a node that fails AgentCard verification is never registered"
     );
 
-    // Now register ONE real, reachable peer alongside a SECOND, registered
-    // peer that is unreachable (its listener never came up) — `peer pull`
+    // Now register ONE real, reachable node alongside a SECOND, registered
+    // node that is unreachable (its listener never came up) — `node pull`
     // with no name pulls both, and the good one must succeed regardless of
     // the bad one.
     let port_b = free_port();
@@ -259,24 +259,24 @@ fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_m
             port_b,
             &PathBuf::from("/dev/null"),
             "",
-            "good-peer",
+            "good-node",
             "",
             "",
-            Path::new("/tmp/aoide-a2a-peer-connectivity-unused.sock"),
+            Path::new("/tmp/aoide-a2a-node-connectivity-unused.sock"),
             false,
             registry(),
         );
     });
     wait_for_tcp_up(&format!("127.0.0.1:{port_b}"));
     let good_url = format!("http://127.0.0.1:{port_b}/");
-    let add_good = dispatch(&cli_invocation(&["peer", "add"], &["good", &good_url], &[]));
+    let add_good = dispatch(&cli_invocation(&["node", "add"], &["good", &good_url], &[]));
     assert_eq!(add_good.status, Status::Ok, "{}", add_good.message);
 
-    // A second peer entry registered by hand pointing at a dead port (bypasses
-    // `peer add`'s verification so we can exercise `peer pull`'s per-peer
+    // A second node entry registered by hand pointing at a dead port (bypasses
+    // `node add`'s verification so we can exercise `node pull`'s per-node
     // failure isolation without a second live server).
-    let mut peers = aoide_storage::peer_store::load_peers();
-    peers.push(aoide_storage::peer_store::Peer {
+    let mut nodes = aoide_storage::node_store::load_nodes();
+    nodes.push(aoide_storage::node_store::Node {
         name: "flaky".to_string(),
         url: dead_url.clone(),
         autogate: false,
@@ -289,32 +289,32 @@ fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_m
         via: None,
         added_at: aoide_storage::time::now_iso_utc(),
     });
-    aoide_storage::peer_store::save_peers(&peers).unwrap();
+    aoide_storage::node_store::save_nodes(&nodes).unwrap();
 
-    let pull_out = dispatch(&cli_invocation(&["peer", "pull"], &[], &[]));
-    assert_eq!(pull_out.status, Status::Ok, "peer pull itself never errors over one bad peer: {}", pull_out.message);
+    let pull_out = dispatch(&cli_invocation(&["node", "pull"], &[], &[]));
+    assert_eq!(pull_out.status, Status::Ok, "node pull itself never errors over one bad node: {}", pull_out.message);
     let results = pull_out.data.as_ref().unwrap()["results"].as_array().unwrap();
     assert_eq!(results.len(), 2);
     let good_result = results.iter().find(|r| r["name"] == "good").unwrap();
     let flaky_result = results.iter().find(|r| r["name"] == "flaky").unwrap();
-    assert_eq!(good_result["ok"], true, "the reachable peer still succeeds: {good_result:?}");
-    assert_eq!(flaky_result["ok"], false, "the unreachable peer fails, but doesn't abort the batch");
+    assert_eq!(good_result["ok"], true, "the reachable node still succeeds: {good_result:?}");
+    assert_eq!(flaky_result["ok"], false, "the unreachable node fails, but doesn't abort the batch");
 
-    // The good peer's cache is fresh; the flaky one is stale but PRESENT
+    // The good node's cache is fresh; the flaky one is stale but PRESENT
     // (never deleted, never silently dropped).
-    let good_cache = aoide_storage::peer_store::load_peer_cache("good").unwrap();
+    let good_cache = aoide_storage::node_store::load_node_cache("good").unwrap();
     assert!(!good_cache.stale);
-    let flaky_cache = aoide_storage::peer_store::load_peer_cache("flaky").unwrap();
+    let flaky_cache = aoide_storage::node_store::load_node_cache("flaky").unwrap();
     assert!(flaky_cache.stale);
     assert!(flaky_cache.last_error.is_some());
 
-    // And the fold shows both: `good-peer` fresh with children, `flaky`
-    // stale with none — never a crash, never a silently-dropped peer.
+    // And the fold shows both: `good-node` fresh with children, `flaky`
+    // stale with none — never a crash, never a silently-dropped node.
     let view_out = dispatch(&cli_invocation(&["graph"], &[], &[("json", "true")]));
     let nodes = view_out.data.as_ref().unwrap()["nodes"].as_array().unwrap();
-    let good_node = nodes.iter().find(|n| n["id"] == "peer:good").unwrap();
+    let good_node = nodes.iter().find(|n| n["id"] == "node:good").unwrap();
     assert_eq!(good_node["state"], "fresh");
-    let flaky_node = nodes.iter().find(|n| n["id"] == "peer:flaky").unwrap();
+    let flaky_node = nodes.iter().find(|n| n["id"] == "node:flaky").unwrap();
     assert_eq!(flaky_node["state"], "stale");
     assert!(flaky_node.get("children").is_none());
 
@@ -325,12 +325,12 @@ fn peer_add_against_an_unreachable_url_never_registers_and_pull_of_a_down_peer_m
     std::env::remove_var("AOIDE_AUDIT_LOG");
 }
 
-// ── Peer nickname validation — NOT `#[ignore]`'d: both handlers reject a
+// ── Node nickname validation — NOT `#[ignore]`'d: both handlers reject a
 // ── bad name before ever reaching `run_curl`, so this needs no real network
 // ── and runs in the ordinary sandboxed `cargo test` pass. ────────────────
 
 #[test]
-fn peer_add_rejects_a_path_traversal_name_without_touching_the_network_or_registry() {
+fn node_add_rejects_a_path_traversal_name_without_touching_the_network_or_registry() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("add-traversal");
     let _stage = setup_env(&root);
@@ -339,10 +339,10 @@ fn peer_add_rejects_a_path_traversal_name_without_touching_the_network_or_regist
     // short-circuit first, this would fail on the curl fetch instead, which
     // would also assert Error but for the WRONG reason; asserting
     // `invalid-name` specifically proves the traversal guard fired first.
-    let out = dispatch(&cli_invocation(&["peer", "add"], &["../../evil", "http://127.0.0.1:1/"], &[]));
+    let out = dispatch(&cli_invocation(&["node", "add"], &["../../evil", "http://127.0.0.1:1/"], &[]));
     assert_eq!(out.status, Status::Error);
     assert_eq!(out.data.unwrap()["reason"], "invalid-name");
-    assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing registered");
+    assert!(aoide_storage::node_store::load_nodes().is_empty(), "nothing registered");
 
     let _ = std::fs::remove_dir_all(&root);
     std::env::remove_var("AOIDE_STAGE_DIR");
@@ -352,12 +352,12 @@ fn peer_add_rejects_a_path_traversal_name_without_touching_the_network_or_regist
 }
 
 #[test]
-fn peer_remove_rejects_a_path_traversal_name_before_touching_the_cache_file() {
+fn node_remove_rejects_a_path_traversal_name_before_touching_the_cache_file() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("remove-traversal");
     let _stage = setup_env(&root);
 
-    let out = dispatch(&cli_invocation(&["peer", "remove"], &["../../evil"], &[]));
+    let out = dispatch(&cli_invocation(&["node", "remove"], &["../../evil"], &[]));
     assert_eq!(out.status, Status::Error);
     assert_eq!(out.data.unwrap()["reason"], "invalid-name");
 
@@ -368,40 +368,40 @@ fn peer_remove_rejects_a_path_traversal_name_before_touching_the_cache_file() {
     std::env::remove_var("AOIDE_AUDIT_LOG");
 }
 
-/// `peer rm <name>` is a PARSER-LEVEL alias for `peer remove <name>`
+/// `node rm <name>` is a PARSER-LEVEL alias for `node remove <name>`
 /// (`aoide_protocol::door::ALIASES`) — never a second registered command.
 /// Proves the alias end to end against the REAL registry: `door::parse`
-/// resolves `peer rm ghost` to the canonical `peer.remove` path and hands it
-/// the same `ghost` arg, dispatch actually runs `handle_peer_remove` (its
-/// `unknown-peer` refusal is the tell — a parser bug that left `rm`
+/// resolves `node rm ghost` to the canonical `node.remove` path and hands it
+/// the same `ghost` arg, dispatch actually runs `handle_node_remove` (its
+/// `unknown-node` refusal is the tell — a parser bug that left `rm`
 /// unresolved would fail as `unknown command`, not reach this handler at
-/// all), and `schema --json` never grows a second `peer.rm` entry — the
+/// all), and `schema --json` never grows a second `node.rm` entry — the
 /// alias is invisible to the schema, the golden snapshot, and every other
 /// consumer of the registry.
 #[test]
-fn peer_rm_is_a_parser_alias_for_peer_remove_and_never_a_second_schema_entry() {
+fn node_rm_is_a_parser_alias_for_node_remove_and_never_a_second_schema_entry() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("rm-alias");
     let _stage = setup_env(&root);
 
     let (inv, _json) = aoide_protocol::door::parse(
-        &["peer".to_string(), "rm".to_string(), "ghost".to_string()],
+        &["node".to_string(), "rm".to_string(), "ghost".to_string()],
         Door::Cli,
         "aoide",
         registry(),
     )
-    .expect("`peer rm ghost` must parse — the alias resolves to a real command path");
-    assert_eq!(inv.path, vec!["peer", "remove"], "resolves to the CANONICAL path, never its own `peer.rm` path");
+    .expect("`node rm ghost` must parse — the alias resolves to a real command path");
+    assert_eq!(inv.path, vec!["node", "remove"], "resolves to the CANONICAL path, never its own `node.rm` path");
     assert_eq!(inv.args, vec!["ghost"]);
 
     let out = dispatch(&inv);
-    assert_eq!(out.command, "peer.remove", "dispatch actually ran the `peer remove` handler");
+    assert_eq!(out.command, "node.remove", "dispatch actually ran the `node remove` handler");
     assert_eq!(out.status, Status::Error);
-    assert_eq!(out.data.unwrap()["reason"], "unknown-peer");
+    assert_eq!(out.data.unwrap()["reason"], "unknown-node");
 
     let dotted: Vec<String> = registry().commands().map(|c| c.dotted()).collect();
-    assert!(dotted.iter().any(|p| p == "peer.remove"), "peer.remove must still be registered");
-    assert!(!dotted.iter().any(|p| p == "peer.rm"), "the alias must never become a second schema entry");
+    assert!(dotted.iter().any(|p| p == "node.remove"), "node.remove must still be registered");
+    assert!(!dotted.iter().any(|p| p == "node.rm"), "the alias must never become a second schema entry");
 
     let _ = std::fs::remove_dir_all(&root);
     std::env::remove_var("AOIDE_STAGE_DIR");
@@ -413,12 +413,12 @@ fn peer_rm_is_a_parser_alias_for_peer_remove_and_never_a_second_schema_entry() {
 // ── The pairing ceremony's CLI half (P-P2) ───────────────────────────────
 
 #[test]
-fn peer_pair_url_target_rejects_an_invalid_name_without_touching_the_network_or_registry() {
+fn node_pair_url_target_rejects_an_invalid_name_without_touching_the_network_or_registry() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-request-invalid-name");
     let _stage = setup_env(&root);
 
-    // Same short-circuit proof as `peer add`'s traversal test above: the
+    // Same short-circuit proof as `node add`'s traversal test above: the
     // url points at a port nothing listens on, so a `reason: invalid-name`
     // (not a fetch error) proves the name check fired before any network
     // I/O or identity mint.
@@ -429,7 +429,7 @@ fn peer_pair_url_target_rejects_an_invalid_name_without_touching_the_network_or_
     ));
     assert_eq!(out.status, Status::Error);
     assert_eq!(out.data.unwrap()["reason"], "invalid-name");
-    assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing registered");
+    assert!(aoide_storage::node_store::load_nodes().is_empty(), "nothing registered");
 
     let _ = std::fs::remove_dir_all(&root);
     std::env::remove_var("AOIDE_STAGE_DIR");
@@ -445,7 +445,7 @@ fn bare_pair_off_a_tty_is_the_pending_listing() {
     let _stage = setup_env(&root);
 
     // Task #135 P3': bare `pair` off a tty (test-harness stdio) is the
-    // pending LISTING — the old `peer pending`, which died into this —
+    // pending LISTING — the old `node pending`, which died into this —
     // never a usage error and never a hung menu.
     let out = dispatch(&cli_invocation(&["pair"], &[], &[]));
     assert_eq!(out.status, Status::Ok);
@@ -498,7 +498,7 @@ fn pair_reject_on_an_unknown_id_leaves_no_record_change() {
     let root = unique_root("pair-unknown-id");
     let _stage = setup_env(&root);
 
-    // The old `peer pair approve nosuchid` unknown-id refusal is GONE by
+    // The old `node pair approve nosuchid` unknown-id refusal is GONE by
     // design: under the one-command dispatch an unknown target means "request
     // a pair with that name", which is the feature, not a typo. `pair
     // reject` keeps the taught unknown-id error — there is nothing to
@@ -506,7 +506,7 @@ fn pair_reject_on_an_unknown_id_leaves_no_record_change() {
     let reject = dispatch(&cli_invocation(&["pair", "reject"], &["nosuchid"], &[]));
     assert_eq!(reject.status, Status::Error);
     assert_eq!(reject.data.unwrap()["reason"], "unknown-id");
-    assert!(aoide_storage::peer_store::load_peers().is_empty(), "reject of an unknown id writes no peer");
+    assert!(aoide_storage::node_store::load_nodes().is_empty(), "reject of an unknown id writes no node");
 
     let _ = std::fs::remove_dir_all(&root);
     std::env::remove_var("AOIDE_STAGE_DIR");
@@ -527,7 +527,7 @@ fn pair_reject_on_an_unknown_id_leaves_no_record_change() {
 // ── an already-parked entry. ──────────────────────────────────────────────
 
 #[test]
-fn peer_pair_approve_on_an_unrevealed_inbound_entry_is_refused_with_awaiting_reveal() {
+fn node_pair_approve_on_an_unrevealed_inbound_entry_is_refused_with_awaiting_reveal() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-approve-unrevealed");
     let _stage = setup_env(&root);
@@ -542,7 +542,7 @@ fn peer_pair_approve_on_an_unrevealed_inbound_entry_is_refused_with_awaiting_rev
     let out = dispatch(&cli_invocation(&["pair"], &[entry.id.as_str()], &[("yes", "true"), ("wait", "0")]));
     assert_eq!(out.status, Status::Error);
     assert_eq!(out.data.unwrap()["reason"], "awaiting-reveal");
-    assert!(aoide_storage::peer_store::load_peers().is_empty(), "an unrevealed entry never commits a peer record");
+    assert!(aoide_storage::node_store::load_nodes().is_empty(), "an unrevealed entry never commits a node record");
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
     assert_eq!(aoide_storage::pairing::list_inbound(now_epoch).len(), 1, "the entry stays parked — refusal, not a drop");
 
@@ -554,7 +554,7 @@ fn peer_pair_approve_on_an_unrevealed_inbound_entry_is_refused_with_awaiting_rev
 }
 
 #[test]
-fn peer_pair_reject_on_an_outbound_entry_aborts_before_the_approvers_callback() {
+fn node_pair_reject_on_an_outbound_entry_aborts_before_the_approvers_callback() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-reject-outbound-pre-callback");
     let _stage = setup_env(&root);
@@ -580,7 +580,7 @@ fn peer_pair_reject_on_an_outbound_entry_aborts_before_the_approvers_callback() 
     let out = dispatch(&cli_invocation(&["pair", "reject"], &["abcd1234"], &[]));
     assert_eq!(out.status, Status::Ok, "{}", out.message);
     assert_eq!(out.data.as_ref().unwrap()["direction"], "outbound");
-    assert!(aoide_storage::peer_store::load_peers().is_empty(), "reject writes no peer record");
+    assert!(aoide_storage::node_store::load_nodes().is_empty(), "reject writes no node record");
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
     assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the outbound entry is gone");
 
@@ -592,7 +592,7 @@ fn peer_pair_reject_on_an_outbound_entry_aborts_before_the_approvers_callback() 
 }
 
 #[test]
-fn peer_pair_reject_on_an_outbound_entry_aborts_after_the_approvers_callback() {
+fn node_pair_reject_on_an_outbound_entry_aborts_after_the_approvers_callback() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-reject-outbound-post-callback");
     let _stage = setup_env(&root);
@@ -621,7 +621,7 @@ fn peer_pair_reject_on_an_outbound_entry_aborts_after_the_approvers_callback() {
     let out = dispatch(&cli_invocation(&["pair", "reject"], &["abcd5678"], &[]));
     assert_eq!(out.status, Status::Ok, "{}", out.message);
     assert_eq!(out.data.as_ref().unwrap()["direction"], "outbound");
-    assert!(aoide_storage::peer_store::load_peers().is_empty(), "reject writes no peer record even mid-ceremony");
+    assert!(aoide_storage::node_store::load_nodes().is_empty(), "reject writes no node record even mid-ceremony");
     assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "the outbound entry is gone");
 
     let _ = std::fs::remove_dir_all(&root);
@@ -669,7 +669,7 @@ fn spawn_fake_pair_poll_server(body: &'static str) -> (TcpListener, u16) {
 /// `--ignored` in `nix develop`.
 #[test]
 #[ignore = "real loopback TCP + real curl (Design A's poll) — no network/curl in the nix sandbox; run with --ignored"]
-fn peer_pair_approve_on_an_outbound_entry_still_awaiting_the_peers_own_approval_is_refused() {
+fn node_pair_approve_on_an_outbound_entry_still_awaiting_the_nodes_own_approval_is_refused() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-approve-outbound-too-early");
     let _stage = setup_env(&root);
@@ -699,8 +699,8 @@ fn peer_pair_approve_on_an_outbound_entry_still_awaiting_the_peers_own_approval_
     // answers "pending", then returns Ok-still-parked instead of this refusal.
     let out = dispatch(&cli_invocation(&["pair"], &["efgh1234"], &[("yes", "true"), ("wait", "0")]));
     assert_eq!(out.status, Status::Error, "{}", out.message);
-    assert_eq!(out.data.unwrap()["reason"], "awaiting-peer-approval");
-    assert!(aoide_storage::peer_store::load_peers().is_empty());
+    assert_eq!(out.data.unwrap()["reason"], "awaiting-node-approval");
+    assert!(aoide_storage::node_store::load_nodes().is_empty());
     let now_epoch = aoide_storage::time::parse_iso_utc(&now).unwrap();
     assert_eq!(
         aoide_storage::pairing::list_outbound(now_epoch)[0].state,
@@ -723,7 +723,7 @@ fn peer_pair_approve_on_an_outbound_entry_still_awaiting_the_peers_own_approval_
 /// commit (see `..._with_yes_alone_is_the_taught_refusal` below); this
 /// test now drives it with the correct scripted `--code`.
 #[test]
-fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_the_reply_code() {
+fn node_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_the_reply_code() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-approve-outbound-confirm");
     let _stage = setup_env(&root);
@@ -745,9 +745,9 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_the_repl
         expires_at: expires,
         state: aoide_storage::pairing::OutboundState::AwaitingApproval,
         // P-S4: the via this ceremony resolved at request time (a --via
-        // flag, or peer invite's observed src_addr) rides the parked
+        // flag, or node invite's observed src_addr) rides the parked
         // entry to this later, separate `pair <target>` invocation —
-        // asserted below, committed onto the peer record only here.
+        // asserted below, committed onto the node record only here.
         via: Some("ssh://khoa@box-b".to_string()),
         tries: 0,
     };
@@ -763,13 +763,13 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_the_repl
     assert_eq!(data["replySas"], expected_reply_sas);
     assert_eq!(data["direction"], "outbound");
 
-    let peers = aoide_storage::peer_store::load_peers();
-    assert_eq!(peers.len(), 1);
-    assert_eq!(peers[0].name, "box-b");
-    assert_eq!(peers[0].url, "http://b/");
-    assert_eq!(peers[0].pubkey.as_deref(), Some("b".repeat(64).as_str()));
-    assert_eq!(peers[0].verified, true);
-    assert_eq!(peers[0].via.as_deref(), Some("ssh://khoa@box-b"), "the parked entry's via is committed onto the peer record at approve time (P-S4)");
+    let nodes = aoide_storage::node_store::load_nodes();
+    assert_eq!(nodes.len(), 1);
+    assert_eq!(nodes[0].name, "box-b");
+    assert_eq!(nodes[0].url, "http://b/");
+    assert_eq!(nodes[0].pubkey.as_deref(), Some("b".repeat(64).as_str()));
+    assert_eq!(nodes[0].verified, true);
+    assert_eq!(nodes[0].via.as_deref(), Some("ssh://khoa@box-b"), "the parked entry's via is committed onto the node record at approve time (P-S4)");
     assert!(aoide_storage::pairing::list_outbound(now_epoch).is_empty(), "committed and removed from the outbound queue");
 
     let _ = std::fs::remove_dir_all(&root);
@@ -787,7 +787,7 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_commits_with_the_repl
 /// removed from the queue, and no try is counted — the refusal fires
 /// before `commit_outbound` ever compares a code.
 #[test]
-fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_with_yes_alone_is_the_taught_refusal() {
+fn node_pair_approve_on_an_outbound_entry_awaiting_confirm_with_yes_alone_is_the_taught_refusal() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-approve-outbound-confirm-yes-alone");
     let _stage = setup_env(&root);
@@ -820,7 +820,7 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_with_yes_alone_is_the
         out.message
     );
 
-    assert!(aoide_storage::peer_store::load_peers().is_empty(), "nothing was ever committed");
+    assert!(aoide_storage::node_store::load_nodes().is_empty(), "nothing was ever committed");
     let listed = aoide_storage::pairing::list_outbound(now_epoch);
     assert_eq!(listed.len(), 1, "the entry stays parked, never removed by a refused confirm");
     assert_eq!(listed[0].tries, 0, "a refusal with no code offered counts no try");
@@ -833,12 +833,12 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_with_yes_alone_is_the
 }
 
 /// Review finding (P-S4 follow-up): a plain re-pair with NO `--via` must
-/// never wipe a `via` a previous ceremony (e.g. `peer invite`) already
-/// recorded — `set_peer_via` is only called at all when the entry names
-/// one, mirroring `upsert_paired_peer`'s own "untouched unless this call
+/// never wipe a `via` a previous ceremony (e.g. `node invite`) already
+/// recorded — `set_node_via` is only called at all when the entry names
+/// one, mirroring `upsert_paired_node`'s own "untouched unless this call
 /// names a change" stance for `autogate`/`tokenFile`/`bearerSecret`/`hub`/
 /// `allows`. Seeds `box-b` already paired WITH a `via` (as if a prior
-/// `peer invite` had run), then re-pairs it through an outbound entry
+/// `node invite` had run), then re-pairs it through an outbound entry
 /// carrying `via: None` — the re-pair's own pubkey/url land as usual, but
 /// the existing `via` must survive untouched. Driven through the CORRECT
 /// `--code` (the mutual-code redesign, R1, made `--yes` alone insufficient
@@ -846,15 +846,15 @@ fn peer_pair_approve_on_an_outbound_entry_awaiting_confirm_with_yes_alone_is_the
 /// half) so this test still isolates the property it exists for: the via
 /// preservation, not the code gate.
 #[test]
-fn peer_pair_approve_on_an_outbound_entry_with_no_via_leaves_a_previously_recorded_via_untouched() {
+fn node_pair_approve_on_an_outbound_entry_with_no_via_leaves_a_previously_recorded_via_untouched() {
     let _guard = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
     let root = unique_root("pair-approve-outbound-preserves-via");
     let _stage = setup_env(&root);
 
-    // box-b is already a VERIFIED peer carrying a via from an earlier
-    // ceremony (`peer invite`'s own src_addr-derived default, in
+    // box-b is already a VERIFIED node carrying a via from an earlier
+    // ceremony (`node invite`'s own src_addr-derived default, in
     // practice) — this re-pair must not touch it.
-    aoide_storage::peer_store::save_peers(&[aoide_storage::peer_store::Peer {
+    aoide_storage::node_store::save_nodes(&[aoide_storage::node_store::Node {
         name: "box-b".to_string(),
         url: "http://old-b/".to_string(),
         autogate: false,
@@ -901,16 +901,16 @@ fn peer_pair_approve_on_an_outbound_entry_with_no_via_leaves_a_previously_record
     let data = out.data.unwrap();
     assert_eq!(data["replySas"], expected_reply_sas);
 
-    let peers = aoide_storage::peer_store::load_peers();
-    assert_eq!(peers.len(), 1);
+    let nodes = aoide_storage::node_store::load_nodes();
+    assert_eq!(nodes.len(), 1);
     // The re-pair's own fields DID land (pubkey/url replace on every
-    // re-pair, per upsert_paired_peer's own contract) —
-    assert_eq!(peers[0].url, "http://new-b/");
-    assert_eq!(peers[0].pubkey.as_deref(), Some("e".repeat(64).as_str()));
+    // re-pair, per upsert_paired_node's own contract) —
+    assert_eq!(nodes[0].url, "http://new-b/");
+    assert_eq!(nodes[0].pubkey.as_deref(), Some("e".repeat(64).as_str()));
     // — but the via from the EARLIER ceremony survives this via-less
     // re-pair untouched, never silently cleared.
     assert_eq!(
-        peers[0].via.as_deref(),
+        nodes[0].via.as_deref(),
         Some("ssh://khoa@previously-recorded"),
         "a via-less re-pair must never wipe a previously-recorded via"
     );

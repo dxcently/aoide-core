@@ -20,7 +20,7 @@ use serde_json::Value;
 
 /// A JSON-RPC 2.0 request envelope — used when THIS process is the one
 /// building a request to send (e.g. the outbound `message/send` aoide POSTs
-/// to a registered peer). `params` stays a raw [`Value`] rather than a
+/// to a registered node). `params` stays a raw [`Value`] rather than a
 /// method-specific type, since the shape of `params` depends on `method`;
 /// callers build the method-specific params type (e.g.
 /// [`super::a2a::MessageSendParams`]) and convert it to `Value` first.

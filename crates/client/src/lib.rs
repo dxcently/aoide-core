@@ -17,25 +17,25 @@
 //!
 //! `discover` (P-P6 + task #120, `docs/architecture/PAIRING.md`'s
 //! "Discovery (advertise-but-locked)" section) is the discovery
-//! advertisement's LISTEN half — `peer discover`/`peer invite`'s shared
+//! advertisement's LISTEN half — `node discover`/`node invite`'s shared
 //! UDP sweep (a plain fixed-port bind hears the broadcast; no group join,
-//! no probing), its bounded dedupe fold, and (for `peer invite`) the pure
+//! no probing), its bounded dedupe fold, and (for `node invite`) the pure
 //! heard-set resolution its ambiguous/absent-name refusal is built on. The
 //! SEND half (`a2a serve`'s own advertise thread) lives in
 //! `aoide-server::discovery` instead — this crate is outbound-only, and
 //! LISTENING is the client-side action here, mirroring every other
-//! `peer *` command's shape.
+//! `node *` command's shape.
 //!
 //! `tunnel` (P-S3, ssh-transport lane) is the ONE place `ssh` is ever
 //! spawned: `open_or_reuse`/`close`/`close_all_for_session` open, probe,
-//! reuse, and tear down the loopback forward a cross-box peer action dials
-//! through when a `--via`/`Peer.via` transport marker is present.
+//! reuse, and tear down the loopback forward a cross-box node action dials
+//! through when a `--via`/`Node.via` transport marker is present.
 //! `aoide_storage::tunnel` (P-S2) owns the record's shape and every pure
 //! helper around it; this module owns the child process.
 //!
 //! `mcp_client` (M2, task #14) is the Melete MCP client: `melete
 //! status|graph|call` speak MCP (JSON-RPC 2.0 over HTTP POST) over
-//! `commands::post_json`, the SAME curl transport `peer` already uses — no
+//! `commands::post_json`, the SAME curl transport `node` already uses — no
 //! new outbound protocol stack, just a new method vocabulary over the
 //! existing one.
 
@@ -46,18 +46,18 @@ pub mod discover;
 pub mod mcp_client;
 pub mod mesh;
 pub mod pair_watch;
-pub mod peer;
+pub mod node;
 pub mod tunnel;
 pub mod wire;
 
 /// A crate-wide lock serialising every test that mutates process-global env
 /// (`AOIDE_DAEMON_SOCKET` today) OR binds `aoide_storage::advertise::PORT`,
 /// the ONE fixed UDP port `discover::run_sweep` and every test that drives
-/// it through (`discover`'s own real-loopback test, `commands`' `peer
+/// it through (`discover`'s own real-loopback test, `commands`' `node
 /// discover` tests) all bind directly (#126). `cargo test` runs `#[test]`
 /// fns across multiple threads by default, and two concurrent binds of the
 /// same fixed port collide (`EADDRINUSE`) — the `commands.rs` sweep tests
-/// were already serialized against EACH OTHER (`with_peer_state` takes this
+/// were already serialized against EACH OTHER (`with_node_state` takes this
 /// lock for its whole closure), but `discover`'s own real-socket test held
 /// no lock at all, so it could still race either of them. Delegates to
 /// `aoide-test-support`'s single mutex, the same pattern

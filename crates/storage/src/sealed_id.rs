@@ -14,7 +14,7 @@
 //! MACHINERY, not a security boundary in force.
 //!
 //! **The signing key is NOT [`crate::identity::Keypair::load_or_mint`]'s
-//! on-disk peer-wire key.** Under OQ1-A (the User-answered threat-model
+//! on-disk node-wire key.** Under OQ1-A (the User-answered threat-model
 //! question, plan file) the seal's secrecy rests on PROCESS LIVENESS, not
 //! file permissions: the daemon mints [`crate::identity::mint_ephemeral`]
 //! once at startup and holds it only in memory, never on disk. A same-uid
@@ -24,7 +24,7 @@
 //! default on the target host. If Yama is off, this degrades to a
 //! liveness-only guarantee (a live daemon process, not a same-uid-secret
 //! key) — an honesty note carried into CONTRACTS, not hidden here. The
-//! on-disk `identity.rs` key keeps its unrelated peer-wire (`wire_auth.rs`)
+//! on-disk `identity.rs` key keeps its unrelated node-wire (`wire_auth.rs`)
 //! role untouched; nothing in this module reads or writes it.
 //!
 //! **The canonical signing string** ([`canonical_seal_string`]) reuses
@@ -42,7 +42,7 @@
 //! defeating the exact identity binding a credential exists to provide).
 //! `origin_class` gets the same treatment for the same reason — it is
 //! about to become the P-ID4 origin-gate's own lookup key, and folding
-//! `"peer:Box-B"` and `"peer:box-b"` together would be exactly the wrong
+//! `"node:Box-B"` and `"node:box-b"` together would be exactly the wrong
 //! kind of leniency for a security-relevant enum-shaped string. Neither
 //! field is trimmed either: nothing in this codebase's session-id
 //! generation (`conduct-<pid>-<ts>`, an operator's own `--id`, or a
@@ -64,7 +64,7 @@
 //! **Signing itself is a thin wrapper over `wire_auth::sign_hex`/
 //! `verify_signature_hex`** — this module never touches an `ed25519_dalek`
 //! type directly, keeping that dependency contained to this crate exactly
-//! as `identity.rs`'s own module doc already advertises for the peer wire.
+//! as `identity.rs`'s own module doc already advertises for the node wire.
 
 use crate::identity::Keypair;
 use crate::wire_auth::{sign_hex, verify_signature_hex};
@@ -163,12 +163,12 @@ mod tests {
             session_id: "Session-AbC123".to_string(),
             pid: 4242,
             pid_starttime: 987654321,
-            origin_class: "Peer:Box-B".to_string(),
+            origin_class: "Node:Box-B".to_string(),
             issued_at: 1_700_000_000,
         };
         assert_eq!(
             canonical_seal_string(&id),
-            "Session-AbC123\u{0}4242\u{0}987654321\u{0}Peer:Box-B\u{0}1700000000\u{0}"
+            "Session-AbC123\u{0}4242\u{0}987654321\u{0}Node:Box-B\u{0}1700000000\u{0}"
         );
     }
 
@@ -192,9 +192,9 @@ mod tests {
         );
 
         let mut origin_lower = sample();
-        origin_lower.origin_class = "peer:box-b".to_string();
+        origin_lower.origin_class = "node:box-b".to_string();
         let mut origin_upper = sample();
-        origin_upper.origin_class = "Peer:Box-B".to_string();
+        origin_upper.origin_class = "Node:Box-B".to_string();
         assert_ne!(
             canonical_seal_string(&origin_lower),
             canonical_seal_string(&origin_upper),
@@ -278,7 +278,7 @@ mod tests {
         let seal_hex = mint_seal(&kp, &id);
 
         let mut tampered = id.clone();
-        tampered.origin_class = "peer:forged".to_string();
+        tampered.origin_class = "node:forged".to_string();
         assert!(
             !verify_seal(&pubkey_hex, &tampered, &seal_hex),
             "a seal must not verify against a tampered origin_class"

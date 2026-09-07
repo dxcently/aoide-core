@@ -340,7 +340,7 @@ fn choose_many_tty(prompt: &str, rows: &[String], default: &[usize]) -> Option<V
 /// `y`/`yes` otherwise. `Esc`/`Ctrl-C` on a tty both read as a decline —
 /// same "no distinct abort shape" rule [`choose_tty`] holds — everything
 /// else that reaches `inquire` (an I/O failure) is a genuine `Err`, since a
-/// confirm's caller (`peer spawn`, a pairing SAS check) needs to know a
+/// confirm's caller (`node spawn`, a pairing SAS check) needs to know a
 /// real read failure apart from an ordinary decline.
 pub fn confirm(prompt: &str) -> Result<bool, String> {
     if tty_capable() {

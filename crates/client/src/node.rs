@@ -1,10 +1,10 @@
-//! The peer-federation client-side wire builders/parsers (CONTRACTS.md §7):
+//! The node-federation client-side wire builders/parsers (CONTRACTS.md §7):
 //! the outbound `aoide/graphSummary` JSON-RPC request body, and parsing a
-//! peer's response into a `state/peer-cache/<name>.json` entry
-//! (`aoide-storage::peer_store::PeerCacheEntry`).
+//! node's response into a `state/node-cache/<name>.json` entry
+//! (`aoide-storage::node_store::NodeCacheEntry`).
 //!
 //! Mirrors `wire.rs`'s separation exactly — the pure wire shapes live here,
-//! the curl transport + CLI commands (`peer add|remove|pull|status`) live
+//! the curl transport + CLI commands (`node add|remove|pull|status`) live
 //! in `commands.rs`, same split `wire.rs`/`commands.rs` hold throughout.
 //!
 //! The pairing ceremony's wire shapes (P-P2, CONTRACTS.md §6) join the same
@@ -24,11 +24,11 @@
 //! JSON-RPC envelope either side of that wire.
 
 use aoide_protocol::wire::JsonRpcRequest;
-use aoide_storage::peer_store::PeerCacheEntry;
+use aoide_storage::node_store::NodeCacheEntry;
 use serde_json::{json, Value};
 
-/// Build the JSON-RPC `aoide/graphSummary` request body `peer pull` POSTs to
-/// a registered peer's endpoint. No params — the method takes none
+/// Build the JSON-RPC `aoide/graphSummary` request body `node pull` POSTs to
+/// a registered node's endpoint. No params — the method takes none
 /// (CONTRACTS.md §7). Pure.
 pub fn build_graph_summary_request() -> Value {
     let req = JsonRpcRequest {
@@ -40,14 +40,14 @@ pub fn build_graph_summary_request() -> Value {
     serde_json::to_value(&req).expect("JsonRpcRequest always serializes")
 }
 
-/// Parse a peer's `aoide/graphSummary` JSON-RPC response into a FRESH
-/// [`PeerCacheEntry`] for `name`. Requires `result.schemaVersion == "0"` and
+/// Parse a node's `aoide/graphSummary` JSON-RPC response into a FRESH
+/// [`NodeCacheEntry`] for `name`. Requires `result.schemaVersion == "0"` and
 /// a `result.graph` object; `result.instance` rides through verbatim when
 /// present. Pure — the HTTP fetch itself is the caller's (`commands.rs`) job.
-pub fn parse_graph_summary_response(resp: &Value, name: &str, fetched_at: &str) -> Result<PeerCacheEntry, String> {
+pub fn parse_graph_summary_response(resp: &Value, name: &str, fetched_at: &str) -> Result<NodeCacheEntry, String> {
     if let Some(err) = resp.get("error") {
         let detail = err.get("message").and_then(Value::as_str).unwrap_or("(no message)");
-        return Err(format!("peer returned an error: {detail}"));
+        return Err(format!("node returned an error: {detail}"));
     }
     let result = resp
         .get("result")
@@ -61,7 +61,7 @@ pub fn parse_graph_summary_response(resp: &Value, name: &str, fetched_at: &str) 
         .filter(|g| g.is_object())
         .ok_or_else(|| "response has no `graph` object".to_string())?
         .clone();
-    Ok(PeerCacheEntry {
+    Ok(NodeCacheEntry {
         schema_version: "0".to_string(),
         name: name.to_string(),
         instance: result.get("instance").cloned(),
@@ -124,7 +124,7 @@ pub struct PairRequestAck {
 pub fn parse_pair_request_response(resp: &Value) -> Result<PairRequestAck, String> {
     if let Some(err) = resp.get("error") {
         let detail = err.get("message").and_then(Value::as_str).unwrap_or("(no message)");
-        return Err(format!("the peer returned an error: {detail}"));
+        return Err(format!("the node returned an error: {detail}"));
     }
     let result = resp.get("result").ok_or_else(|| "response has no `result`".to_string())?;
     let id = result
@@ -169,7 +169,7 @@ pub fn build_pair_reveal_body(id: &str, nonce_hex: &str) -> Value {
 /// self-contained signature over
 /// `aoide_storage::wire_auth::canonical_string("PAIRPOLL", id, timestamp_iso,
 /// nonce_hex, &[])`, signed with the requester's OWN identity — never P-P4's
-/// header-based scheme, which needs a verified peer record that doesn't
+/// header-based scheme, which needs a verified node record that doesn't
 /// exist yet at poll time (`aoide-server::a2a::pair_poll`'s own doc has the
 /// full bootstrapping reasoning). Pure.
 pub fn build_pair_poll_body(id: &str, timestamp_iso: &str, nonce_hex: &str, signature_hex: &str) -> Value {
@@ -200,7 +200,7 @@ pub enum PairPollStatus {
 pub fn parse_pair_poll_response(resp: &Value) -> Result<PairPollStatus, String> {
     if let Some(err) = resp.get("error") {
         let detail = err.get("message").and_then(Value::as_str).unwrap_or("(no message)");
-        return Err(format!("the peer refused the poll: {detail}"));
+        return Err(format!("the node refused the poll: {detail}"));
     }
     let result = resp.get("result").ok_or_else(|| "response has no `result`".to_string())?;
     match result.get("status").and_then(Value::as_str) {
@@ -222,7 +222,7 @@ pub fn parse_pair_poll_response(resp: &Value) -> Result<PairPollStatus, String> 
 pub fn check_pair_reveal_response(resp: &Value) -> Result<(), String> {
     if let Some(err) = resp.get("error") {
         let detail = err.get("message").and_then(Value::as_str).unwrap_or("(no message)");
-        return Err(format!("the peer refused the reveal: {detail}"));
+        return Err(format!("the node refused the reveal: {detail}"));
     }
     Ok(())
 }

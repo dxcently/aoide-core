@@ -41,9 +41,9 @@
 //! (an existing session's socket vs. a session that doesn't have a
 //! registry entry yet).
 //!
-//! `deliver_remote` (an OUTBOUND `--to peer/<x>` send to another box) never
+//! `deliver_remote` (an OUTBOUND `--to node/<x>` send to another box) never
 //! calls [`receive`] — there is nothing to file on THIS host: the message
-//! lands in the REMOTE peer's OWN inbox, via whichever of that peer's own
+//! lands in the REMOTE node's OWN inbox, via whichever of that node's own
 //! two sites actually delivers it.
 //!
 //! **Cap + oldest-drop**: [`INBOX_CAP`] mirrors `herald.rs`'s `LEDGER_CAP`
@@ -58,7 +58,7 @@
 //!
 //! **Not built here (deferred, one flagged line each, per the plan):**
 //! - No conductor pane — rides a later phase.
-//! - No outbox retry for a peer that was unreachable at send time — the
+//! - No outbox retry for a node that was unreachable at send time — the
 //!   sender already gets a clean error from `deliver_remote`; nothing queues
 //!   a retry.
 
@@ -115,7 +115,7 @@ pub struct InboxFile {
 }
 
 /// `~/Aoide/state/inbox.json` — durable, per-host, NOT song-scoped (same
-/// tier as `usage.json`/`peers.json`, never reset by a stage reseed).
+/// tier as `usage.json`/`nodes.json`, never reset by a stage reseed).
 pub fn inbox_path() -> PathBuf {
     state_dir().join("inbox.json")
 }

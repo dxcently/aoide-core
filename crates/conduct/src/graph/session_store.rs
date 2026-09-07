@@ -510,14 +510,14 @@ pub(in crate::graph) fn stamp_spawned(id: &str) {
 /// record layer, distinct from the sealed credential below):
 ///   - `graph/conduct.rs::session_conduct`, for a LOCAL-CLASS origin off its
 ///     own inherited `AOIDE_SESSION_ORIGIN` env — and that call site now
-///     REFUSES a `peer:*` shape from that env read, because inherited env
+///     REFUSES a `node:*` shape from that env read, because inherited env
 ///     is exactly what a same-uid process can set on itself before invoking
 ///     `aoide conduct` directly.
 ///   - `aoide-server`'s `a2a::do_spawn` (`stamp_spawn_origin`), for a
-///     `peer:<name>` origin — called directly on the just-spawned session's
-///     record from the DOOR that authenticated the peer name, never
+///     `node:<name>` origin — called directly on the just-spawned session's
+///     record from the DOOR that authenticated the node name, never
 ///     threaded through the child's env at all. This is the only place a
-///     `peer:*` value may originate.
+///     `node:*` value may originate.
 /// The raw field is attribution, not authentication: a same-uid process
 /// can still forge a LOCAL-class origin. The authenticated form is the
 /// sealed credential (`stamp_seal` below, P-ID1/P-ID2) — a consumer gates
@@ -1903,8 +1903,8 @@ mod tests {
             pid: 999_999_999,
             opened_at: aoide_storage::time::now_iso_utc(),
         };
-        aoide_storage::tunnel::save(&tunnel_record("end-tunnel-1", "peer-a")).unwrap();
-        aoide_storage::tunnel::save(&tunnel_record("other-session", "peer-b")).unwrap();
+        aoide_storage::tunnel::save(&tunnel_record("end-tunnel-1", "node-a")).unwrap();
+        aoide_storage::tunnel::save(&tunnel_record("other-session", "node-b")).unwrap();
 
         let out = session_end(&flag_invocation(
             &["session", "end"],
@@ -1913,11 +1913,11 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
 
         assert!(
-            aoide_storage::tunnel::load("end-tunnel-1", "peer-a").is_none(),
+            aoide_storage::tunnel::load("end-tunnel-1", "node-a").is_none(),
             "the ended session's own tunnel record is closed",
         );
         assert!(
-            aoide_storage::tunnel::load("other-session", "peer-b").is_some(),
+            aoide_storage::tunnel::load("other-session", "node-b").is_some(),
             "another session's tunnel record is untouched",
         );
 
@@ -2339,14 +2339,14 @@ mod tests {
         let stage = unique_stage("stamp-origin");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        do_session_start("peer-spawned-1", Some("claude"), Some("/w"), None, None, None, None, None, None);
-        stamp_origin("peer-spawned-1", "peer:yomi-strix");
+        do_session_start("node-spawned-1", Some("claude"), Some("/w"), None, None, None, None, None, None);
+        stamp_origin("node-spawned-1", "node:yomi-strix");
 
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();
-        let rec = s.sessions.iter().find(|r| r.session_id == "peer-spawned-1").unwrap();
-        assert_eq!(rec.origin.as_deref(), Some("peer:yomi-strix"));
+        let rec = s.sessions.iter().find(|r| r.session_id == "node-spawned-1").unwrap();
+        assert_eq!(rec.origin.as_deref(), Some("node:yomi-strix"));
 
-        // A local (non-peer) registration never gets an origin at all.
+        // A local (non-node) registration never gets an origin at all.
         do_session_start("local-1", Some("claude"), Some("/w"), None, None, None, None, None, None);
         let s2: SessionsFile = load_stage(&sessions_path()).unwrap();
         let local = s2.sessions.iter().find(|r| r.session_id == "local-1").unwrap();
@@ -2354,7 +2354,7 @@ mod tests {
 
         // An empty origin string is a no-op, same as an unknown id.
         stamp_origin("local-1", "");
-        stamp_origin("no-such-session", "peer:ghost");
+        stamp_origin("no-such-session", "node:ghost");
         let s3: SessionsFile = load_stage(&sessions_path()).unwrap();
         assert_eq!(s3.sessions.iter().find(|r| r.session_id == "local-1").unwrap().origin, None);
 

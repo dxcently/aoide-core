@@ -484,7 +484,7 @@ pub(crate) fn unix_ts() -> u64 {
 ///
 /// `schemaVersion` is a STRING, `"0"` — matching every other schema-versioned
 /// shape in this codebase (`aoide_storage::records`' `ProjectsFile`/
-/// `SessionsFile`/`HooksFile`, `peer_store`, CONTRACTS.md §3/§4)
+/// `SessionsFile`/`HooksFile`, `node_store`, CONTRACTS.md §3/§4)
 /// rather than a bare number (khoa's Phase 1 review, Decision B: flagged by
 /// the executor, confirmed and directed by the reviewer). `"0"`, not `"1"`,
 /// because every OTHER first-cut schema in the repo starts at `"0"` — this

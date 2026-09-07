@@ -6,13 +6,13 @@
 //! (root `src/a2a.rs`): a flat `url` on the card, lowercase-kebab
 //! `TaskState`s, `message/send`/`tasks/get`/`message/stream`/
 //! `tasks/resubscribe` methods. [`AgentCard`] is also loose enough to
-//! deserialize a REMOTE peer's card in the v1.0 `interfaces[]` form
+//! deserialize a REMOTE node's card in the v1.0 `interfaces[]` form
 //! (`interfaces` is additive/optional here for that reason), though today
 //! only the OUTBOUND build side (`a2a.rs::agent_card_from_commands`) uses
-//! this type directly — a fetched remote card (`peer add`'s verification
+//! this type directly — a fetched remote card (`node add`'s verification
 //! fetch) is only ever checked for well-formed JSON, never deserialized
 //! field-by-field through this struct: a remote AgentCard is
-//! attacker-influenced input (any peer an operator registers), and a
+//! attacker-influenced input (any node an operator registers), and a
 //! single mistyped/extra field on it should never fail an all-or-nothing
 //! `Deserialize` for the whole card.
 
@@ -33,7 +33,7 @@ pub struct AgentCard {
     pub protocol_version: Option<String>,
     /// The A2A v0.3.x JSON-RPC binding's flat endpoint. A v1.0 card instead
     /// carries `interfaces[]` (below) — aoide's own card only ever emits
-    /// `url`, but a REMOTE peer's card may use either form.
+    /// `url`, but a REMOTE node's card may use either form.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -45,7 +45,7 @@ pub struct AgentCard {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub skills: Option<Vec<AgentSkill>>,
     /// The A2A v1.0 card form's endpoint list — absent on aoide's own card
-    /// (v0.3.x, flat `url` only); present on some remote peers' cards.
+    /// (v0.3.x, flat `url` only); present on some remote nodes' cards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub interfaces: Option<Vec<AgentInterface>>,
 }
@@ -71,7 +71,7 @@ pub struct AgentSkill {
 }
 
 /// One entry in the A2A v1.0 card form's `interfaces[]` — the transport +
-/// endpoint a remote peer's card may advertise instead of a flat `url`.
+/// endpoint a remote node's card may advertise instead of a flat `url`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct AgentInterface {
     #[serde(default, skip_serializing_if = "Option::is_none")]
