@@ -487,6 +487,25 @@
   without a real spawn — `do_spawn` itself is still never driven by a test
   in this file (the existing precedent, `spawn_inject_prompts_success_
   branch_...`'s own doc comment).
+- **`session_ref_lookup`'s `has_socket` is DERIVED at read time — the
+  stored socket path must exist ON DISK, never merely be a non-empty
+  string — while `SessionRef`/`decide_send_action` stay pure and disk-free
+  (the identical bug shape `e2758f7` fixed on the `graph` door,
+  `aoide-conduct`'s `graph::doc::is_conductable_now`).** `shellbridge.
+  service` owns `$XDG_RUNTIME_DIR/aoide` with `RuntimeDirectoryPreserve=no`,
+  so a rebuild deletes a live session's control socket without ever
+  touching `sessions.json` — a stored `conductable: true` plus a non-empty
+  `socket` string can long outlive the file it names. The disk check lives
+  ONLY in `session_ref_lookup`, the one place `decide_send_action`'s
+  injected `session_lookup` closure is instantiated against the stage file;
+  `decide_send_action` itself still takes no I/O and still gates on
+  `sref.conductable && sref.has_socket` unchanged. This matters more here
+  than on `graph`: a stale `Inject` would tell a remote node its message is
+  being delivered when nothing can reach the target, instead of the
+  existing `-32004` "session not conductable" refusal. Don't move this
+  check into `decide_send_action` or `SessionRef` "for locality" — both
+  types' own doc comments state the point of staying stage-file-free and
+  unit-testable with a bare closure, no socket or tempdir required.
 
 ## Extension points
 

@@ -798,12 +798,20 @@ fn unix_ts_now() -> u64 {
 }
 
 /// `session_lookup` for [`decide_send_action`]: read `sessions.json` off the
-/// stage and resolve one [`SessionRef`] by id.
+/// stage and resolve one [`SessionRef`] by id. `has_socket` means the socket
+/// path exists ON DISK right now, not merely that the stored string is
+/// non-empty — the impure check lives here so `SessionRef`/`decide_send_action`
+/// stay disk-free, the same split `conduct::graph::doc`'s `is_conductable_now`
+/// draws for the identical bug shape on the `graph` door.
 fn session_ref_lookup(id: &str) -> Option<SessionRef> {
     let sf: SessionsFile = load_stage(&sessions_path()).ok()?;
     sf.sessions.iter().find(|s| s.session_id == id).map(|s| SessionRef {
         conductable: s.conductable == Some(true),
-        has_socket: s.socket.as_deref().map(|v| !v.is_empty()).unwrap_or(false),
+        has_socket: s
+            .socket
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .is_some_and(|p| std::path::Path::new(p).exists()),
     })
 }
 
@@ -3635,6 +3643,63 @@ mod tests {
         );
     }
 
+    // ── `session_ref_lookup` — `has_socket` is disk-derived (the identical
+    // bug shape `e2758f7` fixed on the `graph` door,
+    // `conduct::graph::doc::is_conductable_now`) ─────────────────────────────
+
+    #[test]
+    fn session_ref_lookup_has_socket_tracks_the_file_on_disk_without_touching_the_stored_record() {
+        // `shellbridge.service` owns `$XDG_RUNTIME_DIR/aoide` with
+        // `RuntimeDirectoryPreserve=no`, so a rebuild deletes a live
+        // session's socket file without ever touching `sessions.json` — a
+        // stored socket STRING can long outlive the file it names.
+        // `has_socket` must track the file, not just non-emptiness.
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = std::env::temp_dir().join(format!(
+            "aoide-server-a2a-sessionref-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let socket = stage.join("session-a.sock");
+        std::fs::write(&socket, b"").unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session("a", &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let sref = session_ref_lookup("a").unwrap();
+        assert!(sref.conductable);
+        assert!(sref.has_socket, "an existing socket file reports has_socket");
+
+        // The socket vanishes (a rebuild tearing down the runtime dir) — the
+        // ORIGINAL record is never touched; only the REPORTED value changes.
+        std::fs::remove_file(&socket).unwrap();
+        let sref2 = session_ref_lookup("a").unwrap();
+        assert!(sref2.conductable, "conductable is untouched by the missing socket");
+        assert!(!sref2.has_socket, "a removed socket file reports NOT has_socket");
+
+        let after: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = after.sessions.iter().find(|s| s.session_id == "a").unwrap();
+        assert_eq!(rec.conductable, Some(true), "the stored flag is never modified by a read");
+        assert_eq!(
+            rec.socket,
+            Some(socket.to_string_lossy().into_owned()),
+            "the stored socket path is never cleared or migrated by a read"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
     // ── `message/send` param parsing (pure, no I/O) ──────────────────────────
 
     #[test]
@@ -5990,6 +6055,87 @@ mod tests {
 
         let log = std::fs::read_to_string(&audit_log).unwrap_or_default();
         assert!(log.contains("\"status\":\"delivered\""), "audited as delivered: {log}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+    }
+
+    #[test]
+    fn message_send_injects_with_an_existing_socket_and_refuses_once_it_is_removed() {
+        // The A2A-door half of the identical bug `e2758f7` fixed on `graph`:
+        // a stored `conductable` session whose control socket has since been
+        // deleted (`shellbridge.service` owns `$XDG_RUNTIME_DIR/aoide` with
+        // `RuntimeDirectoryPreserve=no`, so a rebuild deletes it out from
+        // under every live session) must take the EXISTING -32004 "session
+        // not conductable" arm — never `SendAction::Inject` reaching an
+        // address nothing can reach. Matters more here than on `graph`: this
+        // is the cross-node path, so a remote node would be told delivery is
+        // happening when it cannot be.
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-socket-gone-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        std::env::set_var("AOIDE_STATE_DIR", root.join("state"));
+        std::env::remove_var("AOIDE_CONDUCT_AUTOGATE");
+        std::env::remove_var("AOIDE_SESSION_ID");
+
+        let id = "socket-gone-target";
+        let socket = aoide_conduct::graph::conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![conductable_session(id, &socket)],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let audit_log = root.join("log");
+
+        // While the socket still exists, delivery is unaffected — byte-for-
+        // byte the same as `loopback_message_send_still_auto_delivers_
+        // exactly_as_before` above.
+        let acc = std::thread::spawn(move || {
+            let (mut conn, _) = listener.accept().unwrap();
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            let _ = conn.read_to_end(&mut buf);
+            buf
+        });
+        let params = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "still here" }], "contextId": id }
+        });
+        let result = message_send(&params, &audit_log, "", ConnOrigin::Loopback, "", None, None);
+        let got = acc.join().unwrap();
+        assert_eq!(String::from_utf8(got).unwrap(), "still here\n");
+        assert_eq!(result.unwrap()["id"], id);
+
+        // The socket file is deleted (a rebuild tearing down the runtime
+        // dir) — the STORED record is untouched, but the SAME contextId
+        // must now refuse rather than inject into a dead address.
+        std::fs::remove_file(&socket).unwrap();
+        let params2 = serde_json::json!({
+            "message": { "parts": [{ "kind": "text", "text": "too late" }], "contextId": id }
+        });
+        let err = message_send(&params2, &audit_log, "", ConnOrigin::Loopback, "", None, None)
+            .expect_err("a missing socket must be a structured error, not a failed connect");
+        assert_eq!(err.0, -32004);
+        assert_eq!(err.1, "session not conductable");
 
         let _ = std::fs::remove_dir_all(&root);
         match saved_stage {
