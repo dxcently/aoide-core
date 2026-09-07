@@ -887,7 +887,7 @@
   `resolve_graph_document`'s federation wire response) additionally
   requires the socket to still exist on disk, or the graph claims a session
   is reachable when nothing can reach it. A missing or empty socket path is
-  not-conductable, the same shape `send.rs`'s own gate already filters for.
+  not-conductable.
 
 ## Extension points
 
