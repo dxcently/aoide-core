@@ -1060,6 +1060,42 @@ mod tests {
     }
 
     #[test]
+    fn a_readers_own_read_all_names_leaves_a_second_readers_mark_untouched_across_names() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("all-names-cursor-per-reader");
+
+        file_letter("alice", "bob", "one").unwrap();
+        file_letter("alice", "bob", "two").unwrap();
+        file_letter("alice", "carol", "three").unwrap();
+
+        let got = read_all_names(false, Some("sess-1")).unwrap();
+        assert_eq!(got.len(), 3, "sess-1's first read_all_names sees every entry, across every name");
+
+        let cursors = load_cursors().unwrap();
+        assert_eq!(cursors.get("bob").unwrap().get("sess-1").unwrap().seq, 2);
+        assert_eq!(cursors.get("carol").unwrap().get("sess-1").unwrap().seq, 3);
+        assert!(cursors.get("bob").unwrap().get("sess-2").is_none(), "a second reader has no mark until it reads");
+        assert!(cursors.get("carol").unwrap().get("sess-2").is_none());
+
+        // A second reader, same names: still sees every entry — sess-1's
+        // read_all_names never touched it.
+        let got2 = read_all_names(false, Some("sess-2")).unwrap();
+        assert_eq!(got2.len(), 3, "a second reader consumes nothing sess-1 already read, across every name");
+
+        let cursors = load_cursors().unwrap();
+        assert_eq!(cursors.get("bob").unwrap().get("sess-1").unwrap().seq, 2, "sess-1's mark under bob is untouched by sess-2's read_all_names");
+        assert_eq!(cursors.get("carol").unwrap().get("sess-1").unwrap().seq, 3, "sess-1's mark under carol is untouched by sess-2's read_all_names");
+        assert_eq!(cursors.get("bob").unwrap().get("sess-2").unwrap().seq, 2);
+        assert_eq!(cursors.get("carol").unwrap().get("sess-2").unwrap().seq, 3);
+
+        // sess-1 reading again with nothing new returns nothing.
+        let again = read_all_names(false, Some("sess-1")).unwrap();
+        assert!(again.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn an_unconducted_read_advances_only_the_name_keyed_pseudo_reader() {
         let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let (_env, dir) = root("cursor-unconducted");
@@ -1136,6 +1172,43 @@ mod tests {
     }
 
     #[test]
+    fn a_reader_named_seq_is_not_confused_with_the_flat_shape_in_either_direction() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("cursor-migration-seq-reader");
+
+        std::fs::create_dir_all(mail_dir()).unwrap();
+        let flat = serde_json::json!({ "bob": { "seq": 5, "readers": ["seq"] } });
+        std::fs::write(cursors_path(), serde_json::to_string(&flat).unwrap()).unwrap();
+
+        // A legacy row naming a reader "seq" must migrate exactly like any
+        // other reader — the old-shape test looks at the per-NAME value's
+        // own `seq` field, never at what a reader happens to be called.
+        read_base().unwrap();
+        let once = load_cursors().unwrap();
+        let bob = once.get("bob").unwrap();
+        assert_eq!(bob.len(), 1, "the only listed reader is the one literally named \"seq\"");
+        assert_eq!(bob.get("seq").unwrap().seq, 5, "a reader named seq inherits the old seq like any other");
+
+        let raw = std::fs::read_to_string(cursors_path()).unwrap();
+        let raw_json: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            raw_json["bob"],
+            serde_json::json!({ "seq": { "seq": 5 } }),
+            "the migrated shape nests seq inside the reader object, never as a bare number"
+        );
+
+        // A second pass must not mistake this reader's own nested
+        // `{"seq":5}` for the old flat shape's bare `seq` field and
+        // re-migrate (or otherwise disturb) it.
+        read_base().unwrap();
+        let twice = load_cursors().unwrap();
+        assert_eq!(once, twice, "a reader named seq must be left untouched by a second migration pass");
+        assert_eq!(twice.get("bob").unwrap().get("seq").unwrap().seq, 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn reread_returns_everything_for_the_caller_without_moving_another_readers_mark() {
         let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let (_env, dir) = root("cursor-reread");
@@ -1176,6 +1249,31 @@ mod tests {
         // sess-2 still sees both letters as new — mark is scoped to sess-1.
         let got = read_for("bob", false, Some("sess-2")).unwrap();
         assert_eq!(got.len(), 2);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_name_fully_read_by_one_reader_is_still_unread_for_another_reader() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("names-unread-per-reader");
+
+        file_letter("alice", "bob", "one").unwrap();
+
+        // Reader A reads bob all the way to the end.
+        let got = read_for("bob", false, Some("sess-1")).unwrap();
+        assert_eq!(got.len(), 1);
+
+        assert_eq!(
+            names_with_unread(Some("sess-1")).unwrap(),
+            Vec::<String>::new(),
+            "sess-1 fully read bob and must not see it as unread"
+        );
+        assert_eq!(
+            names_with_unread(Some("sess-2")).unwrap(),
+            vec!["bob".to_string()],
+            "sess-2 has never read bob — it must still be unread for this reader"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
