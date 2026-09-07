@@ -623,7 +623,7 @@ fn handle_usage(_inv: &Invocation) -> Outcome {
 pub fn register_mail(r: &mut Registry) {
     r.insert(cmd!(
         path: ["mail"],
-        summary: "Names with unread mail in this box's mailbase (state/mail/). This phase shows the names half only — the caller's own new letters (reader binding) is a later phase.",
+        summary: "Names with mail unread by this reader in this box's mailbase (state/mail/). This phase shows the names half only — the caller's own new letters is a later phase (P-M5).",
         args: [],
         flags: [],
         gated: false,
@@ -712,9 +712,12 @@ fn mail_sender_attribution(inv: &Invocation) -> Option<String> {
 
 /// This process's own conducting session id, when set — the reader identity
 /// [`crate::mail::read_for`]/[`crate::mail::read_all_names`]/
-/// [`crate::mail::mark`] record on a cursor (MAIL.md "Store": "records the
-/// reader's session id"). `None` outside a conducted session; the cursor's
-/// `seq` still advances either way, only the `readers` list is skipped.
+/// [`crate::mail::mark`]/[`crate::mail::names_with_unread`] key a mark on
+/// (MAIL.md "Store": "a reader is identified by its conducting session
+/// id... and by the mailbox name itself when that is unset"). `None`
+/// outside a conducted session — the fallback to the mailbox name itself
+/// is those functions' own, not this helper's, so an unconducted caller
+/// still gets a real (pseudo-)reader with its own mark, never a shared one.
 fn mail_reader_session() -> Option<String> {
     std::env::var("AOIDE_SESSION_ID").ok().filter(|s| !s.is_empty())
 }
@@ -738,10 +741,13 @@ fn render_entry(e: &crate::mail::Entry) -> String {
     )
 }
 
-/// `aoide mail [--json]` — bare listing: names with unread mail.
+/// `aoide mail [--json]` — bare listing: names with mail unread by this
+/// reader (this process's own `AOIDE_SESSION_ID` via [`mail_reader_session`],
+/// or the mailbox name itself outside a conducted session — that fallback
+/// is `mail::names_with_unread`'s own).
 fn handle_mail_names(_inv: &Invocation) -> Outcome {
     let cmd = "mail";
-    match crate::mail::names_with_unread() {
+    match crate::mail::names_with_unread(mail_reader_session().as_deref()) {
         Ok(names) => {
             let n = names.len();
             let body = if n == 0 { "no unread mail".to_string() } else { names.join("\n") };

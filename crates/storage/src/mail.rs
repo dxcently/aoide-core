@@ -36,7 +36,7 @@
 //!
 //! ```text
 //! base.jsonl      append-only, one Entry per line, immutable once written
-//! cursors.json    { "<name>": { "seq": n, "readers": [sessionId, …] } }
+//! cursors.json    { "<name>": { "<reader>": { "seq": n } } }
 //! seen.jsonl      one {"msgid","receivedAt"} per line, append-only
 //! ```
 //!
@@ -61,11 +61,12 @@
 //! this lock **fails** (`Err`) rather than running anyway (architect's
 //! ruling 1) — the one behavioural change this phase makes to the locking
 //! story, confined to mail's own writers. `with_lock` also runs
-//! [`migrate_if_needed`] first, every time, so the very first store touch
-//! by ANY command — read or write — performs the one-shot `inbox.json` →
-//! `inbox.json.migrated` field-mapping under the SAME critical section
-//! (ruling 2), and every call after that sees the old file already gone
-//! and does nothing.
+//! [`migrate_if_needed`] and [`migrate_cursors_if_needed`] first, every
+//! time, so the very first store touch by ANY command — read or write —
+//! performs the one-shot `inbox.json` → `inbox.json.migrated` field-mapping
+//! AND the one-shot flat-to-per-reader `cursors.json` rewrite, both under
+//! the SAME critical section (ruling 2), and every call after that sees
+//! both already done and does nothing.
 //!
 //! ## Commands this phase ships
 //!
@@ -156,20 +157,23 @@ pub struct Entry {
     pub envelope: Envelope,
 }
 
-/// A reader's high-water mark over one name (MAIL.md "Store"; the NNTP
-/// `.newsrc` shape). `readers` records who has read this name — the P-M5
-/// doorbell's targeting list, populated starting now even though nothing
-/// reads it yet.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct Cursor {
+/// One reader's high-water mark, like an NNTP `.newsrc` line (MAIL.md
+/// "Store"). Nothing else is per-reader state yet.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct Mark {
     #[serde(default)]
     pub seq: u64,
-    #[serde(default)]
-    pub readers: Vec<String>,
 }
 
-/// `cursors.json`'s whole shape is this bare map — no wrapper, no schema
-/// version (MAIL.md shows it unwrapped; this module does not add one).
+/// One name's readers, each with its own high-water mark (MAIL.md "Store":
+/// "a name maps to a set of readers, each with its own high-water mark").
+/// The key set IS the P-M5 doorbell's targeting list, populated starting
+/// now even though nothing reads it yet.
+pub type Cursor = BTreeMap<String, Mark>;
+
+/// `cursors.json`'s whole shape is this bare map of maps — no wrapper, no
+/// schema version (MAIL.md shows it unwrapped; this module does not add
+/// one).
 pub type Cursors = BTreeMap<String, Cursor>;
 
 /// One `seen.jsonl` line — dedup memory, outlives `mail rm` pruning by
@@ -322,6 +326,7 @@ fn with_lock<T>(f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     match crate::fs::try_stage_lock(move || {
         ensure_mail_dir()?;
         migrate_if_needed()?;
+        migrate_cursors_if_needed()?;
         f()
     }) {
         Ok(inner) => inner,
@@ -401,6 +406,76 @@ fn migrate_if_needed() -> Result<(), String> {
         std::fs::rename(&old_path, &migrated_path).map_err(|e| {
             format!("{}: rename to {}: {e}", old_path.display(), migrated_path.display())
         })?;
+    }
+    Ok(())
+}
+
+/// One-shot, idempotent flat-to-per-reader `cursors.json` rewrite, run under
+/// the SAME lock acquisition as [`migrate_if_needed`] (MAIL.md "Store": "A
+/// `cursors.json` carrying the flat `{ "<name>": { "seq", "readers" } }`
+/// shape migrates on first open under the same lock: each recorded reader
+/// inherits the name's old `seq`, and a name with no recorded reader keeps
+/// its mark under the name itself"). Read as untyped JSON, never as
+/// [`Cursors`] — the old shape's `{"seq": n, "readers": [...]}` does not
+/// deserialize as a reader-keyed [`Cursor`], so a typed load here would
+/// error instead of migrate.
+///
+/// A name is old-shape iff its value has a `seq` field that is a bare JSON
+/// *number* — the new shape only ever nests `seq` inside a per-reader
+/// object, even for a reader literally named `"seq"`. That per-name shape
+/// check is what makes a second call a clean no-op with no sentinel file to
+/// consult: every name this rewrites no longer matches the old-shape test
+/// on the next pass, so nobody re-reads what they had already read.
+fn migrate_cursors_if_needed() -> Result<(), String> {
+    let path = cursors_path();
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(s) => s,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("{}: {e}", path.display())),
+    };
+    let top: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&raw)
+        .map_err(|e| format!("{}: unreadable cursors: {e}", path.display()))?;
+
+    let mut rewritten = false;
+    let mut out = Cursors::new();
+    for (name, value) in top {
+        match value.get("seq").and_then(serde_json::Value::as_u64) {
+            Some(old_seq) => {
+                // Old flat shape: `{ "seq": n, "readers": [...] }`.
+                rewritten = true;
+                let readers: Vec<String> = value
+                    .get("readers")
+                    .and_then(serde_json::Value::as_array)
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(serde_json::Value::as_str)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let mut cursor = Cursor::new();
+                if readers.is_empty() {
+                    cursor.insert(name.clone(), Mark { seq: old_seq });
+                } else {
+                    for reader in readers {
+                        cursor.insert(reader, Mark { seq: old_seq });
+                    }
+                }
+                out.insert(name, cursor);
+            }
+            None => {
+                // Already the new per-reader shape — parse it as such and
+                // pass it through untouched.
+                let cursor: Cursor = serde_json::from_value(value)
+                    .map_err(|e| format!("{}: unreadable cursor for {name:?}: {e}", path.display()))?;
+                out.insert(name, cursor);
+            }
+        }
+    }
+
+    if rewritten {
+        save_cursors(&out)?;
     }
     Ok(())
 }
@@ -508,16 +583,17 @@ fn save_cursors(c: &Cursors) -> Result<(), String> {
     write_stage(&cursors_path(), c)
 }
 
-/// Record `reader_session` as having read this cursor's name, if given and
-/// not already present — best-effort attribution the same way conduct's
-/// own `--from`/`AOIDE_SESSION_ID` is (house rule doc, `graph/send.rs`'s
-/// `resolve_sender`): a session id an absent caller simply has none of, in
-/// which case only `seq` still advances.
-fn record_reader(cursor: &mut Cursor, reader_session: Option<&str>) {
-    if let Some(s) = reader_session {
-        if !s.is_empty() && !cursor.readers.iter().any(|r| r == s) {
-            cursor.readers.push(s.to_string());
-        }
+/// The reader identity a cursor mutation is attributed to: `reader_session`
+/// when given and non-empty, and `name` itself otherwise (MAIL.md "Store":
+/// "a reader is identified by its conducting session id... and by the
+/// mailbox name itself when that is unset — so a stray read from an
+/// unconducted terminal advances a pseudo-reader and never a live agent's
+/// mark"). Every caller resolves this once per name, before looking at any
+/// entry under it — never re-derived per row.
+fn reader_id(name: &str, reader_session: Option<&str>) -> String {
+    match reader_session {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => name.to_string(),
     }
 }
 
@@ -589,29 +665,32 @@ pub fn read_base() -> Result<Vec<Entry>, String> {
 }
 
 /// `mail read --for <name> [--reread]`: entries filed to `name`, newest
-/// last, advancing that name's cursor to the highest `seq` returned
-/// (`--reread` widens what is PRINTED — every entry for `name`, not just
-/// the unread ones — but the cursor still only ever advances forward, so a
-/// plain `mail read --for X` right after never reprints what `--reread`
-/// just showed). Records `reader_session` on the cursor when given
-/// (MAIL.md "Store": "records the reader's session id").
+/// last, advancing ONLY the calling reader's mark under `name` to the
+/// highest `seq` returned (`--reread` widens what is PRINTED — every entry
+/// for `name`, not just the unread ones — but the mark still only ever
+/// advances forward, so a plain `mail read --for X` right after never
+/// reprints what `--reread` just showed). A second reader's mark under the
+/// same name is untouched, and it still sees every entry it has not itself
+/// read (MAIL.md "Store": "a read advances only the caller's... two agents
+/// sharing a mailbox never consume each other's mail").
 pub fn read_for(name: &str, reread: bool, reader_session: Option<&str>) -> Result<Vec<Entry>, String> {
     let name = name.to_string();
     let reader_session = reader_session.map(|s| s.to_string());
     with_lock(move || {
         let entries = read_entries_unlocked()?;
         let mut cursors = load_cursors()?;
+        let reader = reader_id(&name, reader_session.as_deref());
         let cursor = cursors.entry(name.clone()).or_default();
-        let floor = if reread { 0 } else { cursor.seq };
+        let mark = cursor.entry(reader).or_default();
+        let floor = if reread { 0 } else { mark.seq };
         let mut matched: Vec<Entry> =
             entries.into_iter().filter(|e| e.envelope.header.to.name == name && e.seq > floor).collect();
         matched.sort_by_key(|e| e.seq);
         if let Some(max_seq) = matched.iter().map(|e| e.seq).max() {
-            if max_seq > cursor.seq {
-                cursor.seq = max_seq;
+            if max_seq > mark.seq {
+                mark.seq = max_seq;
             }
         }
-        record_reader(cursor, reader_session.as_deref());
         save_cursors(&cursors)?;
         Ok(matched)
     })
@@ -619,7 +698,9 @@ pub fn read_for(name: &str, reread: bool, reader_session: Option<&str>) -> Resul
 
 /// `mail read --all-names [--reread]`: the same as [`read_for`], run once
 /// per name that appears anywhere in the base, results concatenated in
-/// `seq` order.
+/// `seq` order. Each name's reader identity is resolved separately (an
+/// unconducted caller's pseudo-reader differs per name, since it falls back
+/// to the name itself), but only ever once per name — never per entry.
 pub fn read_all_names(reread: bool, reader_session: Option<&str>) -> Result<Vec<Entry>, String> {
     let reader_session = reader_session.map(|s| s.to_string());
     with_lock(move || {
@@ -632,19 +713,20 @@ pub fn read_all_names(reread: bool, reader_session: Option<&str>) -> Result<Vec<
 
         let mut out = Vec::new();
         for name in names {
+            let reader = reader_id(&name, reader_session.as_deref());
             let cursor = cursors.entry(name.clone()).or_default();
-            let floor = if reread { 0 } else { cursor.seq };
+            let mark = cursor.entry(reader).or_default();
+            let floor = if reread { 0 } else { mark.seq };
             let mut matched: Vec<Entry> = entries
                 .iter()
                 .filter(|e| e.envelope.header.to.name == name && e.seq > floor)
                 .cloned()
                 .collect();
             if let Some(max_seq) = matched.iter().map(|e| e.seq).max() {
-                if max_seq > cursor.seq {
-                    cursor.seq = max_seq;
+                if max_seq > mark.seq {
+                    mark.seq = max_seq;
                 }
             }
-            record_reader(cursor, reader_session.as_deref());
             out.append(&mut matched);
         }
         out.sort_by_key(|e| e.seq);
@@ -653,10 +735,10 @@ pub fn read_all_names(reread: bool, reader_session: Option<&str>) -> Result<Vec<
     })
 }
 
-/// `mail mark --for <name>`: advance the cursor to the current max `seq`
-/// under `name` without printing anything. Returns the cursor's resulting
-/// `seq`. A name with nothing filed under it yet is a clean no-op (the
-/// cursor stays at 0), not an error — same "a mailbox exists by being
+/// `mail mark --for <name>`: advance ONLY the caller's mark under `name` to
+/// the current max `seq`, without printing anything. Returns that mark's
+/// resulting `seq`. A name with nothing filed under it yet is a clean no-op
+/// (the mark stays at 0), not an error — same "a mailbox exists by being
 /// named" tolerance MAIL.md's "Addressing and filing" section states for
 /// `mail send`/`mail read` alike.
 pub fn mark(name: &str, reader_session: Option<&str>) -> Result<u64, String> {
@@ -671,12 +753,13 @@ pub fn mark(name: &str, reader_session: Option<&str>) -> Result<u64, String> {
             .max()
             .unwrap_or(0);
         let mut cursors = load_cursors()?;
+        let reader = reader_id(&name, reader_session.as_deref());
         let cursor = cursors.entry(name.clone()).or_default();
-        if max_seq > cursor.seq {
-            cursor.seq = max_seq;
+        let reader_mark = cursor.entry(reader).or_default();
+        if max_seq > reader_mark.seq {
+            reader_mark.seq = max_seq;
         }
-        record_reader(cursor, reader_session.as_deref());
-        let result = cursor.seq;
+        let result = reader_mark.seq;
         save_cursors(&cursors)?;
         Ok(result)
     })
@@ -691,11 +774,14 @@ pub fn show(msgid: &str) -> Result<Option<Entry>, String> {
     with_lock(move || Ok(read_entries_unlocked()?.into_iter().find(|e| e.envelope.msgid == msgid)))
 }
 
-/// `aoide mail`'s bare listing: names with unread mail (MAIL.md ruling 11 —
-/// the "caller's own new letters" half needs the reader binding and is
-/// P-M5's; this is the names half only).
-pub fn names_with_unread() -> Result<Vec<String>, String> {
-    with_lock(|| {
+/// `aoide mail`'s bare listing: names with mail unread BY THIS READER
+/// (MAIL.md ruling 11 — the "caller's own new letters" half needs the
+/// reader binding and is P-M5's; this is the names half only). A peek, like
+/// [`show`] — it never mutates a cursor, only compares against the
+/// caller's own mark under each name.
+pub fn names_with_unread(reader_session: Option<&str>) -> Result<Vec<String>, String> {
+    let reader_session = reader_session.map(|s| s.to_string());
+    with_lock(move || {
         let entries = read_entries_unlocked()?;
         let cursors = load_cursors()?;
         let mut max_by_name: BTreeMap<String, u64> = BTreeMap::new();
@@ -707,7 +793,11 @@ pub fn names_with_unread() -> Result<Vec<String>, String> {
         }
         let mut names: Vec<String> = max_by_name
             .into_iter()
-            .filter(|(name, max_seq)| cursors.get(name).map(|c| c.seq).unwrap_or(0) < *max_seq)
+            .filter(|(name, max_seq)| {
+                let reader = reader_id(name, reader_session.as_deref());
+                let read_through = cursors.get(name).and_then(|c| c.get(&reader)).map(|m| m.seq).unwrap_or(0);
+                read_through < *max_seq
+            })
             .map(|(name, _)| name)
             .collect();
         names.sort();
@@ -935,9 +1025,9 @@ mod tests {
     }
 
     #[test]
-    fn cursor_advances_on_read_and_records_the_reader() {
+    fn a_readers_own_read_leaves_a_second_readers_mark_untouched() {
         let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let (_env, dir) = root("cursor-advance");
+        let (_env, dir) = root("cursor-per-reader");
 
         file_letter("alice", "bob", "one").unwrap();
         file_letter("alice", "bob", "two").unwrap();
@@ -946,16 +1036,146 @@ mod tests {
         assert_eq!(got.len(), 2);
 
         let cursors = load_cursors().unwrap();
-        let c = cursors.get("bob").unwrap();
-        assert_eq!(c.seq, 2);
-        assert_eq!(c.readers, vec!["sess-1".to_string()]);
+        let cursor = cursors.get("bob").unwrap();
+        assert_eq!(cursor.get("sess-1").unwrap().seq, 2);
+        assert!(cursor.get("sess-2").is_none(), "a second reader has no mark until it reads");
 
-        // A second read with nothing new returns nothing, and does not
-        // duplicate the reader.
+        // A second reader, same name: still sees every entry — sess-1's
+        // read never touched it.
+        let got2 = read_for("bob", false, Some("sess-2")).unwrap();
+        assert_eq!(got2.len(), 2, "a second reader consumes nothing sess-1 already read");
+
+        let cursors = load_cursors().unwrap();
+        let cursor = cursors.get("bob").unwrap();
+        assert_eq!(cursor.get("sess-1").unwrap().seq, 2, "sess-1's mark is untouched by sess-2's read");
+        assert_eq!(cursor.get("sess-2").unwrap().seq, 2);
+
+        // sess-1 reading again with nothing new returns nothing, and does
+        // not duplicate anything.
         let again = read_for("bob", false, Some("sess-1")).unwrap();
         assert!(again.is_empty());
+        assert_eq!(load_cursors().unwrap().get("bob").unwrap().len(), 2, "still exactly two readers");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_unconducted_read_advances_only_the_name_keyed_pseudo_reader() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("cursor-unconducted");
+
+        file_letter("alice", "bob", "one").unwrap();
+
+        // A conducted reader reads first.
+        let got = read_for("bob", false, Some("sess-1")).unwrap();
+        assert_eq!(got.len(), 1);
+
+        // An unconducted read (no session id) still sees the letter: its
+        // pseudo-reader, keyed by the mailbox name itself, has never read
+        // anything, and is not sess-1.
+        let got_unconducted = read_for("bob", false, None).unwrap();
+        assert_eq!(got_unconducted.len(), 1, "the pseudo-reader has its own, fresh mark");
+
         let cursors = load_cursors().unwrap();
-        assert_eq!(cursors.get("bob").unwrap().readers.len(), 1);
+        let cursor = cursors.get("bob").unwrap();
+        assert_eq!(cursor.get("sess-1").unwrap().seq, 1, "the conducted reader's mark is untouched");
+        assert_eq!(cursor.get("bob").unwrap().seq, 1, "the pseudo-reader is keyed by the mailbox name");
+
+        // A second unconducted read now sees nothing new.
+        let got_again = read_for("bob", false, None).unwrap();
+        assert!(got_again.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_flat_cursors_file_migrates_each_listed_reader_inheriting_the_old_seq() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("cursor-migration");
+
+        std::fs::create_dir_all(mail_dir()).unwrap();
+        let flat = serde_json::json!({
+            "bob": { "seq": 5, "readers": ["sess-1", "sess-2"] },
+            "carol": { "seq": 3, "readers": [] }
+        });
+        std::fs::write(cursors_path(), serde_json::to_string(&flat).unwrap()).unwrap();
+
+        // Any store touch migrates it, under the same lock.
+        read_base().unwrap();
+
+        let cursors = load_cursors().unwrap();
+        let bob = cursors.get("bob").unwrap();
+        assert_eq!(bob.get("sess-1").unwrap().seq, 5, "each listed reader inherits the name's old seq");
+        assert_eq!(bob.get("sess-2").unwrap().seq, 5);
+        let carol = cursors.get("carol").unwrap();
+        assert_eq!(carol.len(), 1, "no listed reader: exactly one reader, the name itself");
+        assert_eq!(carol.get("carol").unwrap().seq, 3, "a name with no listed reader keeps its mark under the name");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn migrating_cursors_twice_is_the_same_as_once() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("cursor-migration-idempotent");
+
+        std::fs::create_dir_all(mail_dir()).unwrap();
+        let flat = serde_json::json!({ "bob": { "seq": 5, "readers": ["sess-1"] } });
+        std::fs::write(cursors_path(), serde_json::to_string(&flat).unwrap()).unwrap();
+
+        read_base().unwrap();
+        let once = load_cursors().unwrap();
+
+        read_base().unwrap();
+        let twice = load_cursors().unwrap();
+
+        assert_eq!(once, twice, "a second open must not undo or redo the migration");
+        assert_eq!(twice.get("bob").unwrap().get("sess-1").unwrap().seq, 5);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reread_returns_everything_for_the_caller_without_moving_another_readers_mark() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("cursor-reread");
+
+        file_letter("alice", "bob", "one").unwrap();
+        file_letter("alice", "bob", "two").unwrap();
+
+        read_for("bob", false, Some("sess-1")).unwrap();
+        read_for("bob", false, Some("sess-2")).unwrap();
+
+        let reread = read_for("bob", true, Some("sess-1")).unwrap();
+        assert_eq!(reread.len(), 2, "--reread returns every entry for the caller, not just new ones");
+
+        let cursors = load_cursors().unwrap();
+        let cursor = cursors.get("bob").unwrap();
+        assert_eq!(cursor.get("sess-1").unwrap().seq, 2, "reread still only ever advances forward");
+        assert_eq!(cursor.get("sess-2").unwrap().seq, 2, "a reread by sess-1 never moves sess-2's mark");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn mark_advances_only_the_callers_mark() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("cursor-mark");
+
+        file_letter("alice", "bob", "one").unwrap();
+        file_letter("alice", "bob", "two").unwrap();
+
+        let seq = mark("bob", Some("sess-1")).unwrap();
+        assert_eq!(seq, 2);
+
+        let cursors = load_cursors().unwrap();
+        let cursor = cursors.get("bob").unwrap();
+        assert_eq!(cursor.get("sess-1").unwrap().seq, 2);
+        assert!(cursor.get("sess-2").is_none(), "mark never touches a reader that never called it");
+
+        // sess-2 still sees both letters as new — mark is scoped to sess-1.
+        let got = read_for("bob", false, Some("sess-2")).unwrap();
+        assert_eq!(got.len(), 2);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1070,12 +1290,12 @@ mod tests {
         let b1 = barrier.clone();
         let t1 = std::thread::spawn(move || {
             b1.wait();
-            names_with_unread()
+            names_with_unread(None)
         });
         let b2 = barrier.clone();
         let t2 = std::thread::spawn(move || {
             b2.wait();
-            names_with_unread()
+            names_with_unread(None)
         });
         t1.join().unwrap().unwrap();
         t2.join().unwrap().unwrap();
