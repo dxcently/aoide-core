@@ -113,7 +113,13 @@ fn attempt_deposit(node: &Node, envelope: &Envelope) -> DepositAttempt {
         return DepositAttempt::Refused(detail.to_string());
     }
     let result = parsed.get("result");
-    let status = result.and_then(|r| r.get("status")).and_then(Value::as_str).unwrap_or("accepted");
+    // A response with a `result` member but no (or non-string) `status` —
+    // or with neither `result` nor `error` at all — is weaker evidence of
+    // delivery than an unrecognised status string, and an unrecognised one
+    // already falls to the catch-all below. So this default must land
+    // there too, never on `"accepted"`: a malformed or non-conformant
+    // peer response must never be read as a confirmed deposit.
+    let status = result.and_then(|r| r.get("status")).and_then(Value::as_str).unwrap_or("missing-status");
     match status {
         "accepted" | "duplicate" => DepositAttempt::Delivered { status: status.to_string() },
         // MAIL.md §Wire's outcome vocabulary is closed to the three above —
@@ -327,6 +333,53 @@ mod tests {
         drain_node("elsewhere").unwrap();
         let after = aoide_storage::outbox::list_entries("elsewhere").unwrap();
         assert_eq!(after[0].tries, 1, "a parked entry is never retried by a later drain");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A 200 response whose `result` carries no `status` key at all is
+    /// WEAKER evidence of delivery than an unrecognised status string, and
+    /// the unrecognised one already parks (test above) — so this must park
+    /// too, on the same catch-all arm, never take a shortcut to
+    /// `Delivered`. Uses a RECEIPT-kind entry deliberately: `drain_node`'s
+    /// `Delivered` arm for a receipt calls `outbox::remove_entry` outright
+    /// (ruling 4 — a receipt's own successful deposit IS its confirmation),
+    /// so a receipt is the one entry kind where taking that arm by mistake
+    /// destroys the record rather than merely mis-annotating it. The
+    /// record surviving is the assertion that matters. Pins the fix for
+    /// the `unwrap_or("accepted")` default that used to bypass the
+    /// fail-closed match below it: this test fails against that code,
+    /// which read this exact response as `Delivered` and discarded the
+    /// receipt on a reply that confirmed nothing.
+    #[test]
+    fn a_missing_status_parks_the_entry_and_keeps_the_receipt_record() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("missing-status-parks");
+
+        let (listener, port) = fake_deposit_server(r#"{"jsonrpc":"2.0","id":1,"result":{}}"#);
+        let mut node = unpaired_node("elsewhere");
+        node.url = format!("http://127.0.0.1:{port}/");
+        aoide_storage::node_store::save_nodes(&[node]).unwrap();
+
+        let to = aoide_storage::mail::Address { node: "origin-node".to_string(), name: "bob".to_string() };
+        let env = aoide_storage::mail::mint_ack("alice", to, "some-acked-msgid").unwrap();
+        aoide_storage::outbox::write_entry("elsewhere", &OutboxEntry::fresh(env)).unwrap();
+
+        drain_node("elsewhere").unwrap();
+
+        let entries = aoide_storage::outbox::list_entries("elsewhere").unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "a missing status must park a receipt entry, never remove it — this is the data loss the fix prevents"
+        );
+        assert!(entries[0].refused, "a missing status must be parked exactly like an unrecognised one");
+        assert!(
+            entries[0].last_outcome.contains("missing-status"),
+            "the reason must say the status was absent, not imply the peer sent one: {}",
+            entries[0].last_outcome
+        );
 
         drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
