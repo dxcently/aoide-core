@@ -558,6 +558,25 @@ fn run_internal_reap() {
     let _ = aoide_conduct::reap::reap_and_announce(&internal_invocation(&["session", "reap"]));
 }
 
+/// How often [`run_internal_mail_drain`] fires — mirrors [`REAP_EVERY_TICKS`]
+/// exactly (messaging plan P-M2 ruling 7: the outbox's own backoff floor,
+/// [`aoide_storage::outbox::DRAIN_BACKOFF_FLOOR_SECS`], is already derived
+/// FROM this cadence rather than the other way around). A separate constant
+/// rather than reusing `REAP_EVERY_TICKS` directly: the two sweeps are
+/// unrelated, and only happen to share a cadence today.
+const DRAIN_EVERY_TICKS: u64 = 12;
+
+/// P-M2's in-daemon outbox sweep: [`aoide_conduct::mail_bridge::drain_all`]
+/// — every node with anything spooled gets one best-effort drain attempt
+/// per tick window. No hand-edit re-baseline needed afterward, unlike
+/// [`run_internal_reap`]: the outbox lives under `state/outbox/`, which
+/// [`crate::producers::HandEditWatcher`] never watches (its roster is
+/// exactly `sessions.json`/`hooks.json`/`graph.json` — the outbox was never
+/// in scope for that mechanism).
+fn run_internal_mail_drain() {
+    let _ = aoide_conduct::mail_bridge::drain_all();
+}
+
 /// Where [`run_boot_auto_resume`] remembers which boot it last fired
 /// under — a one-line text file holding a `boot_epoch()` value, under
 /// `state_dir` (durable operational state, not a stage/roster file the
@@ -1241,6 +1260,9 @@ pub fn run_loop(
                 w.note_own_write(&aoide_storage::stage::hooks_path());
                 w.note_own_write(&aoide_storage::stage::graph_path());
             }
+        }
+        if ticks % DRAIN_EVERY_TICKS == 0 {
+            run_internal_mail_drain();
         }
 
         std::thread::sleep(Duration::from_secs(1));

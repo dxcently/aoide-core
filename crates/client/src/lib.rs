@@ -38,11 +38,20 @@
 //! `commands::post_json`, the SAME curl transport `node` already uses — no
 //! new outbound protocol stack, just a new method vocabulary over the
 //! existing one.
+//!
+//! `mail_wire` (messaging plan P-M2, `docs/architecture/MAIL.md`) is the
+//! outbox drain: the one place a spooled envelope actually dials
+//! `aoide/mailDeposit` over `commands`' own signed-request machinery.
+//! `aoide_storage::outbox` owns the spool's file shape; this module owns
+//! the wire half, and tears its own tunnel down before it returns
+//! (`tunnel`'s "every tunnel stays open" default is deliberately NOT this
+//! module's rule).
 
 pub mod adapter;
 pub mod commands;
 pub mod daemon;
 pub mod discover;
+pub mod mail_wire;
 pub mod mcp_client;
 pub mod mesh;
 pub mod pair_watch;

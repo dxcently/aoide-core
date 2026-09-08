@@ -506,6 +506,49 @@
   check into `decide_send_action` or `SessionRef` "for locality" — both
   types' own doc comments state the point of staying stage-file-free and
   unit-testable with a bare closure, no socket or tempdir required.
+- **`aoide/mailDeposit` (P-M2) is the SECOND capability-gated A2A arm,
+  after Spawn, and the first not gated on `spawn` — `deposit_admitted`
+  mirrors `spawn_admitted` one capability over, but signature-only from
+  the start, with no Addr/Token fallback rung to migrate off of the way
+  Spawn once had.** `node_may_message` is `verified && allows.contains
+  ("message")`, checked only against `ctx.signed_node_name`'s KEY-resolved
+  node (`resolved: Option<&Node>`, `None` whenever the request carried no
+  verified signature at all). `deposit_refusal` returns `-32010` for
+  BOTH its shapes (paired-but-not-`message`-allowed, told the exact `node
+  allow … message on` fix; everything else, told to pair then allow) —
+  **`-32010` is deliberate and must never regress to `-32006` (Spawn's own
+  code) or `-32007` (already `verify_signed_request`'s own incomplete-
+  headers/signature-mismatch refusal code, CONTRACTS.md §6) — a new
+  capability-gated arm mints its own code, it never reuses one two
+  refusal families already own.** `mail_deposit` self-audits
+  UNCONDITIONALLY, under its own `a2a.aoide/mailDeposit` label, at TWO
+  points — the admission refusal, and again after `aoide_storage::mail::
+  deposit`'s own outcome — mirroring `pair_request`'s "audit every call"
+  shape, deliberately NOT `message_send`'s narrower "only the notable
+  branches" one: a deposit never passes through `cli/src/dispatch.rs`'s
+  own per-command audit, so this is the ONLY place a flood becomes
+  visible, and volume must show whether every one of those deposits
+  landed accepted, refused, or malformed. **Every `outbox` call
+  (`spool_and_drain_ack`'s spool, `retire_by_ack`) runs AFTER
+  `mail::deposit` has already returned and released its own lock — never
+  nested inside it.** `mail`'s and `outbox`'s stage locks wrap the
+  identical `fs::try_stage_lock`, a plain blocking `flock`, not
+  re-entrant; nesting them across a lock boundary would deadlock a
+  process against a lock it already holds, not merely contend for it. A
+  filed **letter** mints an ack addressed back to the origin, spools it,
+  and best-effort drains that node once, synchronously, reusing the SAME
+  `aoide_conduct::mail_bridge::drain_node` the daemon tick calls — one
+  drain implementation, never a duplicate dial built here. A filed
+  **receipt** instead calls `aoide_storage::outbox::retire_by_ack` (spec
+  item 7) — a pure lookup keyed on the receipt's own verified
+  `from.node`/acked-msgid, so a forged or stale ack finds no matching
+  entry and retires nothing; don't add a second, independent verification
+  step here, the lookup itself already proves both of spec item 7's
+  checks (see that function's own doc). A **duplicate** whose original
+  filing was a letter re-sends the ack (the sender's earlier ack evidently
+  never arrived); every other duplicate is a silent no-op — the
+  `letter`/`receipt` vocabulary has no third shape to stop an ack-of-an-ack
+  from ping-ponging forever, so don't ack a receipt.
 
 ## Extension points
 
@@ -521,6 +564,17 @@
   bounded `tick`/`sweep` method, constructed once in `daemon::run_loop`
   before its tick loop and called once per iteration — never a producer
   that spawns its OWN thread or sleeps internally (previous invariant).
+- **A new capability-gated A2A method (beyond Spawn/Message)** follows
+  `spawn_admitted`/`deposit_admitted`'s shape: a `node_may_<verb>`
+  predicate (`verified && allows.contains("<verb>")`) consulted only
+  against a `NodeRung::Signature` resolution, a dedicated `<verb>_refusal`
+  returning ONE NEW reserved code (never `-32006`/`-32007`/`-32010`,
+  already spoken for), and — if the method has no per-dispatch audit path
+  of its own the way a bare `message/send` command does — a self-audit at
+  the door, unconditional, covering every outcome, not just refusals. The
+  matching client-side gate (`aoide-client`'s `AGENTS.md`, the
+  shallow-local/deep-remote split) stays LOCAL-shallow: this crate's
+  predicate is the only place the capability itself is actually checked.
 
 ## Docs update required in the same commit
 

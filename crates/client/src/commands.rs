@@ -179,7 +179,7 @@ const BEARER_RESOLVE_TIMEOUT: Duration = Duration::from_secs(2);
 /// CACHING**: a fresh resolve runs on every call to this function; nothing
 /// it returns is stored anywhere beyond the caller's own local `Option<String>`
 /// for the span of the one outbound request it feeds.
-fn resolve_node_bearer(node: &aoide_storage::node_store::Node) -> Result<Option<String>, String> {
+pub(crate) fn resolve_node_bearer(node: &aoide_storage::node_store::Node) -> Result<Option<String>, String> {
     let Some(secret) = node.bearer_secret.as_deref().filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
@@ -336,7 +336,7 @@ pub(crate) fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_heade
 /// uniform "every tunnel this phase opens stays open" story is more honest
 /// than a partial close that only covers some call sites — P-S5 is where
 /// the real lifecycle (both kinds, both close paths) belongs, all at once.
-fn tunnel_session_id() -> String {
+pub(crate) fn tunnel_session_id() -> String {
     std::env::var("AOIDE_SESSION_ID")
         .ok()
         .filter(|s| !s.is_empty())
@@ -407,7 +407,7 @@ fn resolve_dial_url(
 /// hand-edited `nodes.json`) is a hard `Err`, never a silent direct-dial
 /// fallback — the same "malformed input refuses, never guesses" stance
 /// [`aoide_storage::tunnel::parse_via`] itself holds.
-fn post_json_to_node(
+pub(crate) fn post_json_to_node(
     node: &aoide_storage::node_store::Node,
     body: &str,
     bearer: Option<&str>,
@@ -432,7 +432,7 @@ fn post_json_to_node(
 /// exactly the same way), which is why [`post_json_to_node`] itself is
 /// NOT reimplemented in terms of this — the common, override-free path
 /// stays the simpler function.
-fn post_json_to_node_with_via_override(
+pub(crate) fn post_json_to_node_with_via_override(
     node: &aoide_storage::node_store::Node,
     body: &str,
     bearer: Option<&str>,
@@ -537,7 +537,7 @@ fn parse_via_flag(inv: &Invocation) -> Result<Option<aoide_storage::tunnel::Via>
 /// unsigned request to a node that has since upgraded to require signed
 /// spawn admission would otherwise fail opaquely on the far end instead of
 /// here, where the real cause is known.
-fn sign_headers_for_node(node: &aoide_storage::node_store::Node, body: &str) -> Result<Vec<(String, String)>, String> {
+pub(crate) fn sign_headers_for_node(node: &aoide_storage::node_store::Node, body: &str) -> Result<Vec<(String, String)>, String> {
     if !node.verified {
         return Ok(Vec::new());
     }
@@ -1385,7 +1385,7 @@ pub fn register_nodes(r: &mut Registry) {
         summary: "Flip one capability in a node's `allows` set (P-P3, PAIRING.md decision 5) — idempotent, reports exactly what changed.",
         args: [
             arg!("name", "string", true, "The registered node's name."),
-            arg!("cap", "string", true, "The capability — one of the closed set: read, spawn."),
+            arg!("cap", "string", true, "The capability — one of the closed set: read, spawn, message."),
             arg!("state", "string", true, "`on` or `off`."),
         ],
         flags: [],
@@ -3633,6 +3633,416 @@ pub fn register_post_graph(r: &mut Registry) {
         implemented: true,
         handler: handle_adapter_melete,
     ));
+}
+
+// ── `aoide mail` (messaging plan P-M1/P-M2, docs/architecture/MAIL.md) ─────
+
+/// `aoide mail[.send|.read|.show|.mark|.rm|.outbox|.outbox.rm]` commands.
+/// Registered here, in `aoide-client`, rather than in `aoide-storage` where
+/// the store itself ([`aoide_storage::mail`]/[`aoide_storage::outbox`])
+/// lives: from P-M2 on, `mail send` can dial another node ([`crate::
+/// mail_wire`]'s outbox drain), and `aoide-storage` sits below
+/// `aoide-client` in the crate DAG and must not depend on it (P-M2
+/// ruling 1). `mail outbox`/`mail outbox rm` are new at P-M2; `--hold`,
+/// `mail route`, and mesh-aware addressing are later phases (MAIL.md
+/// §Phases) and are not registered yet.
+pub fn register_mail(r: &mut Registry) {
+    r.insert(cmd!(
+        path: ["mail"],
+        summary: "Names with mail unread by this reader in this box's mailbase (state/mail/). This phase shows the names half only — the caller's own new letters is a later phase (P-M5).",
+        args: [],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_mail_names,
+        examples: ["mail"],
+    ));
+    r.insert(cmd!(
+        path: ["mail", "send"],
+        summary: "File a letter into the mailbase. --to self/<name> files locally — self never crosses the wire. --to <node>/<name> spools it into that (already verified/paired) node's outbox and makes one best-effort delivery attempt right away; this command reports the WRITE, never the delivery outcome — see `mail outbox` for that.",
+        args: [arg!("text", "string", true, "The letter's text — put it after `--` so its own words/flags pass through verbatim.")],
+        flags: [
+            flag!("to", "string", "Recipient address, self/<name> or <node>/<name> (required). <node> must already be a verified node for anything but self. <name> is free text — a role name, never a session petname."),
+            flag!("from", "string", "Sender attribution override (default: AOIDE_SESSION_ID). Attribution only, not authentication."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: handle_mail_send,
+        examples: ["mail send --to self/conductor -- status?", "mail send --to yomi-strix/conductor -- build finished"],
+    ));
+    r.insert(cmd!(
+        path: ["mail", "read"],
+        summary: "Print unread letters and advance the reader's cursor. --for <name> reads one mailbox; --all-names reads every name with anything unread; --reread also reprints already-read entries for the name(s) selected (the cursor still only ever advances forward).",
+        args: [],
+        flags: [
+            flag!("for", "string", "Read this mailbox name only. Mutually exclusive with --all-names."),
+            flag!("all-names", "bool", "Read every name that has unread mail. Mutually exclusive with --for."),
+            flag!("reread", "bool", "Also print already-read entries for the selected name(s)."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: handle_mail_read,
+        examples: ["mail read --for conductor", "mail read --all-names"],
+    ));
+    r.insert(cmd!(
+        path: ["mail", "show"],
+        summary: "Print one entry by its exact msgid. Does not touch any cursor.",
+        args: [arg!("msgid", "string", true, "The entry's msgid, as shown by `mail read`.")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_mail_show,
+        examples: ["mail show <msgid>"],
+    ));
+    r.insert(cmd!(
+        path: ["mail", "mark"],
+        summary: "Advance a mailbox's cursor to its latest entry without printing anything.",
+        args: [],
+        flags: [flag!("for", "string", "The mailbox name to mark (required).")],
+        gated: false,
+        implemented: true,
+        handler: handle_mail_mark,
+        examples: ["mail mark --for conductor"],
+    ));
+    r.insert(cmd!(
+        path: ["mail", "rm"],
+        summary: "Prune base.jsonl entries older than the given age. The only pruning there is — seen.jsonl (dedup memory) is never touched, so a pruned letter re-offered later is still recognised as a duplicate.",
+        args: [],
+        flags: [flag!("older-than", "string", "Age threshold, <N>d or <N>h (e.g. 30d, 12h). Required.")],
+        gated: false,
+        implemented: true,
+        handler: handle_mail_rm,
+        examples: ["mail rm --older-than 30d"],
+    ));
+    r.insert(cmd!(
+        path: ["mail", "outbox"],
+        summary: "List this box's own outbox: letters and acks spooled toward a node, not yet retired. Every listed entry is still waiting by definition (a retired entry is removed from the spool) — shows each one's own delivery bookkeeping (tries, last try, last outcome, refused).",
+        args: [arg!("node", "string", false, "List only this node's outbox; omit to list every node with anything waiting.")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_mail_outbox,
+        examples: ["mail outbox", "mail outbox yomi-strix"],
+    ));
+    r.insert(cmd!(
+        path: ["mail", "outbox", "rm"],
+        summary: "Explicitly retire one outbox entry by msgid, without waiting for a delivery ack. The only other way an entry retires is a destination-signed ack — the outbox itself is on the kill-list (no quota, no auto-eviction, no expiry).",
+        args: [arg!("msgid", "string", true, "The entry's msgid, as shown by `mail outbox`.")],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: handle_mail_outbox_rm,
+        examples: ["mail outbox rm <msgid>"],
+    ));
+}
+
+/// The sender attribution for `mail send` — mirrors `aoide-conduct`'s own
+/// `graph/send.rs::resolve_sender` shape (a tiny per-crate copy, not an
+/// import: neither crate depends on the other). `--from` wins when
+/// present, even empty (explicit anonymous, env fallback skipped on
+/// purpose); otherwise `AOIDE_SESSION_ID` when non-empty. **Attribution
+/// only, never authentication** — same caveat conduct's own copy
+/// documents: any same-uid process can set either to anything.
+fn mail_sender_attribution(inv: &Invocation) -> Option<String> {
+    match inv.flags.get("from") {
+        Some(f) if f.is_empty() => None,
+        Some(f) => Some(f.replace(['\n', '\r'], " ")),
+        None => std::env::var("AOIDE_SESSION_ID")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .map(|s| s.replace(['\n', '\r'], " ")),
+    }
+}
+
+/// This process's own conducting session id, when set — the reader identity
+/// [`aoide_storage::mail::read_for`]/[`aoide_storage::mail::read_all_names`]/
+/// [`aoide_storage::mail::mark`]/[`aoide_storage::mail::names_with_unread`]
+/// key a mark on. `None` outside a conducted session — the fallback to the
+/// mailbox name itself is those functions' own, not this helper's, so an
+/// unconducted caller still gets a real (pseudo-)reader with its own mark,
+/// never a shared one.
+fn mail_reader_session() -> Option<String> {
+    std::env::var("AOIDE_SESSION_ID").ok().filter(|s| !s.is_empty())
+}
+
+/// A basic, fixed rendering frame for one entry (MAIL.md "Reading"): a
+/// header line — msgid, from, mintedAt, mesh, via — then the text in a
+/// fence. **Not the hardened P-M5 form**: no field clamping, no
+/// backtick-length-adaptive fence (MAIL.md §Phases assigns "the reader
+/// frame's field clamps and adaptive fence" to P-M5) — this only ever
+/// renders entries already accepted into THIS box's own mailbase, never
+/// raw wire input directly.
+fn render_entry(e: &aoide_storage::mail::Entry) -> String {
+    let h = &e.envelope.header;
+    let mesh = if h.origin_mesh.is_empty() { "-" } else { h.origin_mesh.as_str() };
+    format!(
+        "msgid {}\nfrom {}/{}  mintedAt {}  mesh {}  via {}\n```\n{}\n```",
+        e.envelope.msgid, h.from.node, h.from.name, h.minted_at, mesh, e.via, e.envelope.text
+    )
+}
+
+/// `aoide mail [--json]` — bare listing: names with mail unread by this
+/// reader (this process's own `AOIDE_SESSION_ID` via [`mail_reader_session`],
+/// or the mailbox name itself outside a conducted session — that fallback
+/// is `names_with_unread`'s own).
+fn handle_mail_names(_inv: &Invocation) -> Outcome {
+    let cmd = "mail";
+    match aoide_storage::mail::names_with_unread(mail_reader_session().as_deref()) {
+        Ok(names) => {
+            let n = names.len();
+            let body = if n == 0 { "no unread mail".to_string() } else { names.join("\n") };
+            Outcome::ok(cmd, format!("{n} name{} with unread mail\n{body}", if n == 1 { "" } else { "s" }))
+                .with_data(json!({ "names": names }))
+        }
+        Err(e) => Outcome::error(cmd, format!("state/mail: {e}")),
+    }
+}
+
+/// `aoide mail send --to (self|<node>)/<name> [--from <who>] -- <text …> [--json]`.
+/// `self` files locally with no wire ([`aoide_storage::mail::file_letter`]).
+/// Any other `<node>` must already be a verified node — refused BEFORE
+/// anything is spooled otherwise (`unknown-node`/`unpaired-node`). Once
+/// verified, the entry is written to that node's outbox BEFORE any
+/// delivery is attempted (spec item 8: "write is the report, delivery is
+/// the spool's job"), and a best-effort [`crate::mail_wire::drain_node`]
+/// follows — its outcome is recorded on the outbox entry itself (`mail
+/// outbox` shows it), never surfaced by this command.
+fn handle_mail_send(inv: &Invocation) -> Outcome {
+    let cmd = "mail.send";
+    const USAGE: &str = "usage: aoide mail send --to (self|<node>)/<name> -- <text …>";
+    let to = match inv.flags.get("to").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return Outcome::usage(cmd, USAGE),
+    };
+    let (node, name) = match to.split_once('/') {
+        Some((n, rest)) if !n.is_empty() && !rest.is_empty() => (n, rest),
+        _ => {
+            return Outcome::usage(cmd, format!("`--to {to}` is not `<node>/<name>`"))
+                .with_data(json!({ "reason": "bad-address", "to": to }));
+        }
+    };
+    if inv.args.is_empty() {
+        return Outcome::usage(cmd, USAGE);
+    }
+    let text = inv.args.join(" ");
+    let from = mail_sender_attribution(inv).unwrap_or_default();
+
+    if node == "self" {
+        return match aoide_storage::mail::file_letter(&from, name, &text) {
+            Ok(entry) => Outcome::ok(cmd, format!("filed to self/{name} (msgid {})", entry.envelope.msgid))
+                .changed(vec![format!("state/mail/base.jsonl: +1 letter to {name}")])
+                .with_data(serde_json::to_value(&entry).unwrap_or_default()),
+            Err(e) => Outcome::error(cmd, format!("state/mail: {e}")),
+        };
+    }
+
+    match aoide_storage::node_store::load_nodes().iter().find(|p| p.name == node) {
+        Some(p) if p.verified => {}
+        Some(_) => {
+            return Outcome::error(
+                cmd,
+                format!(
+                    "node `{node}` is registered but not paired — mail requires a VERIFIED node; \
+                     pair first with `aoide pair <url> --name {node}`"
+                ),
+            )
+            .with_data(json!({ "reason": "unpaired-node", "name": node }));
+        }
+        None => {
+            return Outcome::error(cmd, format!("no node named `{node}`"))
+                .with_data(json!({ "reason": "unknown-node", "name": node }));
+        }
+    }
+
+    let envelope = match aoide_storage::mail::mint_outbound_letter(&from, node, name, &text) {
+        Ok(e) => e,
+        Err(e) => return Outcome::error(cmd, format!("state/mail: {e}")),
+    };
+    let msgid = envelope.msgid.clone();
+    if let Err(e) = aoide_storage::outbox::write_entry(node, &aoide_storage::outbox::OutboxEntry::fresh(envelope.clone())) {
+        return Outcome::error(cmd, format!("state/outbox: {e}"));
+    }
+    // Best-effort — this command already reported the WRITE above and
+    // never this outcome (spec item 8). A dead node, a policy refusal,
+    // anything at all: the entry stays spooled, `mail outbox` shows what
+    // happened, and the daemon's own periodic drain (or the next `mail
+    // send`/deposit from this node) tries again.
+    let _ = crate::mail_wire::drain_node(node);
+
+    Outcome::ok(cmd, format!("spooled to {node}/{name} (msgid {msgid})"))
+        .changed(vec![format!("state/outbox/{node}/: +1 entry")])
+        .with_data(serde_json::to_value(&envelope).unwrap_or_default())
+}
+
+/// `aoide mail read (--for <name> | --all-names) [--reread] [--json]`.
+fn handle_mail_read(inv: &Invocation) -> Outcome {
+    let cmd = "mail.read";
+    let reread = inv.flag_present("reread");
+    let all_names = inv.flag_present("all-names");
+    let for_name = inv.flags.get("for").map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let reader = mail_reader_session();
+
+    let result = match (&for_name, all_names) {
+        (Some(_), true) => {
+            return Outcome::usage(cmd, "usage: aoide mail read (--for <name> | --all-names) [--reread] — mutually exclusive")
+        }
+        (Some(name), false) => aoide_storage::mail::read_for(name, reread, reader.as_deref()),
+        (None, true) => aoide_storage::mail::read_all_names(reread, reader.as_deref()),
+        (None, false) => {
+            return Outcome::usage(cmd, "usage: aoide mail read (--for <name> | --all-names) [--reread]")
+        }
+    };
+
+    match result {
+        Ok(entries) => {
+            let n = entries.len();
+            let body = if n == 0 {
+                "nothing new".to_string()
+            } else {
+                entries.iter().map(render_entry).collect::<Vec<_>>().join("\n\n")
+            };
+            Outcome::ok(cmd, format!("{n} entr{}\n{body}", if n == 1 { "y" } else { "ies" }))
+                .with_data(json!({ "entries": entries }))
+        }
+        Err(e) => Outcome::error(cmd, format!("state/mail: {e}")),
+    }
+}
+
+/// `aoide mail show <msgid> [--json]`.
+fn handle_mail_show(inv: &Invocation) -> Outcome {
+    let cmd = "mail.show";
+    let msgid = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return Outcome::usage(cmd, "usage: aoide mail show <msgid>"),
+    };
+    match aoide_storage::mail::show(msgid) {
+        Ok(Some(entry)) => {
+            Outcome::ok(cmd, render_entry(&entry)).with_data(serde_json::to_value(&entry).unwrap_or_default())
+        }
+        Ok(None) => Outcome::error(cmd, format!("no entry with msgid {msgid}"))
+            .with_data(json!({ "reason": "not-found", "msgid": msgid })),
+        Err(e) => Outcome::error(cmd, format!("state/mail: {e}")),
+    }
+}
+
+/// `aoide mail mark --for <name> [--json]`.
+fn handle_mail_mark(inv: &Invocation) -> Outcome {
+    let cmd = "mail.mark";
+    let name = match inv.flags.get("for").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return Outcome::usage(cmd, "usage: aoide mail mark --for <name>"),
+    };
+    match aoide_storage::mail::mark(name, mail_reader_session().as_deref()) {
+        Ok(seq) => Outcome::ok(cmd, format!("{name}: cursor marked through seq {seq}"))
+            .changed(vec![format!("state/mail/cursors.json: {name} -> {seq}")])
+            .with_data(json!({ "name": name, "seq": seq })),
+        Err(e) => Outcome::error(cmd, format!("state/mail: {e}")),
+    }
+}
+
+/// `aoide mail rm --older-than <Nd|Nh> [--json]`.
+fn handle_mail_rm(inv: &Invocation) -> Outcome {
+    let cmd = "mail.rm";
+    let raw = match inv.flags.get("older-than").map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return Outcome::usage(cmd, "usage: aoide mail rm --older-than <Nd|Nh>"),
+    };
+    let secs = match aoide_storage::mail::parse_older_than(raw) {
+        Some(s) => s,
+        None => {
+            return Outcome::usage(cmd, format!("`--older-than {raw}` is not `<N>d` or `<N>h` (e.g. 30d, 12h)"))
+                .with_data(json!({ "reason": "bad-duration", "olderThan": raw }));
+        }
+    };
+    match aoide_storage::mail::rm_older_than(secs) {
+        Ok(n) => Outcome::ok(cmd, format!("{n} entr{} pruned", if n == 1 { "y" } else { "ies" }))
+            .changed(vec![format!("state/mail/base.jsonl: {n} entries pruned")])
+            .with_data(json!({ "pruned": n })),
+        Err(e) => Outcome::error(cmd, format!("state/mail: {e}")),
+    }
+}
+
+/// `aoide mail outbox [<node>] [--json]` — every entry still waiting,
+/// optionally filtered to one node. An unknown/empty node reports an empty
+/// list, never an error — the same "absent is just nothing there yet"
+/// stance [`aoide_storage::outbox::list_entries`] itself holds.
+fn handle_mail_outbox(inv: &Invocation) -> Outcome {
+    let cmd = "mail.outbox";
+    let target = inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty());
+    let nodes = match target {
+        Some(n) => vec![n.to_string()],
+        None => match aoide_storage::outbox::nodes_with_outbox() {
+            Ok(ns) => ns,
+            Err(e) => return Outcome::error(cmd, format!("state/outbox: {e}")),
+        },
+    };
+    let mut rows: Vec<Value> = Vec::new();
+    for node in &nodes {
+        let entries = match aoide_storage::outbox::list_entries(node) {
+            Ok(es) => es,
+            Err(e) => return Outcome::error(cmd, format!("state/outbox: {e}")),
+        };
+        for e in entries {
+            let to = &e.envelope.header.to;
+            rows.push(json!({
+                "node": node,
+                "msgid": e.envelope.msgid,
+                "to": format!("{}/{}", to.node, to.name),
+                "tries": e.tries,
+                "lastTryAt": e.last_try_at,
+                "lastOutcome": e.last_outcome,
+                "refused": e.refused,
+            }));
+        }
+    }
+    let n = rows.len();
+    let body = if n == 0 {
+        "outbox empty — nothing waiting".to_string()
+    } else {
+        rows.iter()
+            .map(|r| {
+                let outcome = r["lastOutcome"].as_str().filter(|s| !s.is_empty()).unwrap_or("-");
+                format!(
+                    "{} -> {}  tries {}  lastOutcome {outcome}",
+                    r["msgid"].as_str().unwrap_or(""),
+                    r["to"].as_str().unwrap_or(""),
+                    r["tries"],
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    Outcome::ok(cmd, format!("{n} entr{} waiting\n{body}", if n == 1 { "y" } else { "ies" }))
+        .with_data(json!({ "entries": rows }))
+}
+
+/// `aoide mail outbox rm <msgid> [--json]` — explicit retirement (spec item
+/// 7's other half, beside a valid ack). Searches every node's spool for
+/// `msgid`; in practice at most one holds it, since an entry always lives
+/// under the exact node its own `to.node` named at spool time.
+fn handle_mail_outbox_rm(inv: &Invocation) -> Outcome {
+    let cmd = "mail.outbox.rm";
+    let msgid = match inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()) {
+        Some(s) => s,
+        None => return Outcome::usage(cmd, "usage: aoide mail outbox rm <msgid>"),
+    };
+    let nodes = match aoide_storage::outbox::nodes_with_outbox() {
+        Ok(ns) => ns,
+        Err(e) => return Outcome::error(cmd, format!("state/outbox: {e}")),
+    };
+    for node in &nodes {
+        match aoide_storage::outbox::remove_entry(node, msgid) {
+            Ok(true) => {
+                return Outcome::ok(cmd, format!("removed {msgid} from {node}'s outbox"))
+                    .changed(vec![format!("state/outbox/{node}/: -1 entry")])
+                    .with_data(json!({ "node": node, "msgid": msgid }));
+            }
+            Ok(false) => continue,
+            Err(e) => return Outcome::error(cmd, format!("state/outbox: {e}")),
+        }
+    }
+    Outcome::error(cmd, format!("no outbox entry with msgid {msgid}"))
+        .with_data(json!({ "reason": "not-found", "msgid": msgid }))
 }
 
 #[cfg(test)]
@@ -6050,5 +6460,262 @@ mod tests {
         let (inv, _json) = aoide_protocol::door::parse(&argv, aoide_protocol::Door::Cli, "aoide", &r).unwrap();
         assert_eq!(inv.path, vec!["pair".to_string()]);
         assert_eq!(inv.args, vec!["yomi-strix".to_string()]);
+    }
+
+    // ── `aoide mail` (P-M1/P-M2) — moved here from `aoide-storage` at P-M2
+    // ── (ruling 1); `--to <node>/<name>` and `mail outbox[.rm]` are new. ────
+
+    fn mail_inv(path: &[&str], args: &[&str]) -> Invocation {
+        aoide_test_support::inv(path, args)
+    }
+    fn mail_inv_with_flag(path: &[&str], args: &[&str], flag: &str) -> Invocation {
+        let mut i = mail_inv(path, args);
+        i.flags.insert(flag.to_string(), String::new());
+        i
+    }
+    fn mail_inv_with_flags(path: &[&str], args: &[&str], flags: &[(&str, &str)]) -> Invocation {
+        let mut i = mail_inv(path, args);
+        for (k, v) in flags {
+            i.flags.insert(k.to_string(), v.to_string());
+        }
+        i
+    }
+
+    /// A verified node at a URL nothing ever listens on (`http://127.0.0.1:1`,
+    /// the codebase's established dead-loopback-port fixture) — for tests
+    /// that need `mail send`'s node branch to get PAST the verified check
+    /// and actually attempt (and fail fast at) a real drain dial.
+    fn verified_node(name: &str, url: &str) -> aoide_storage::node_store::Node {
+        aoide_storage::node_store::Node {
+            name: name.to_string(),
+            url: url.to_string(),
+            autogate: false,
+            token_file: None,
+            bearer_secret: None,
+            hub: false,
+            pubkey: None,
+            verified: true,
+            allows: vec!["message".to_string()],
+            via: None,
+            added_at: "2026-09-07T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn register_mail_wires_all_eight_commands() {
+        let mut r = Registry::new();
+        register_mail(&mut r);
+        let paths: Vec<String> = r.commands().map(|c| c.dotted()).collect();
+        for want in ["mail", "mail.send", "mail.read", "mail.show", "mail.mark", "mail.rm", "mail.outbox", "mail.outbox.rm"] {
+            assert!(paths.contains(&want.to_string()), "missing {want}");
+        }
+    }
+
+    #[test]
+    fn mail_send_requires_to_and_text() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-send-usage");
+
+        let out = handle_mail_send(&mail_inv(&["mail", "send"], &["hello"]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage, "missing --to");
+
+        let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &[], &[("to", "self/conductor")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage, "missing text");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mail_send_to_self_files_a_letter_and_shows_up_unread() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-send-ok");
+
+        let out = handle_mail_send(&mail_inv_with_flags(
+            &["mail", "send"],
+            &["build", "finished", "ok"],
+            &[("to", "self/conductor")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.unwrap();
+        assert_eq!(data["envelope"]["text"], "build finished ok", "args after -- join with spaces");
+        assert!(!data["envelope"]["msgid"].as_str().unwrap().is_empty());
+
+        let names = handle_mail_names(&mail_inv(&["mail"], &[]));
+        assert_eq!(names.data.unwrap()["names"], json!(["conductor"]));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P-M2's replacement for P-M1's `mail_send_rejects_a_non_self_node`
+    /// (deleted — a non-self node is no longer a blanket rejection, it is
+    /// the whole point of this phase). Covers both ways a node fails the
+    /// check: never registered at all, and registered but never paired —
+    /// either refuses BEFORE anything touches the outbox.
+    #[test]
+    fn mail_send_to_an_unverified_node_refuses_before_spooling() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-send-unverified");
+
+        aoide_storage::node_store::save_nodes(&[fixture_node(None)]).unwrap(); // registered, `verified: false`
+
+        let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi"], &[("to", "yomi-strix/bob")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error, "registered but never paired — refused, not spooled");
+        assert_eq!(out.data.unwrap()["reason"], "unpaired-node");
+        assert!(aoide_storage::outbox::list_entries("yomi-strix").unwrap().is_empty(), "nothing spooled before the refusal");
+
+        let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi"], &[("to", "ghost/bob")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error, "never registered at all — same refuse-before-spool shape");
+        assert_eq!(out.data.unwrap()["reason"], "unknown-node");
+        assert!(aoide_storage::outbox::list_entries("ghost").unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mail_send_to_a_verified_node_writes_the_entry_before_attempting_delivery() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-send-verified");
+
+        aoide_storage::node_store::save_nodes(&[verified_node("osaka", "http://127.0.0.1:1/")]).unwrap();
+
+        let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi", "osaka"], &[("to", "osaka/bob")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "the WRITE succeeding is what this command reports, msg: {}", out.message);
+
+        let spooled = aoide_storage::outbox::list_entries("osaka").unwrap();
+        assert_eq!(spooled.len(), 1, "the entry is written even though osaka's own address (127.0.0.1:1) refuses every connection");
+        assert_eq!(spooled[0].envelope.text, "hi osaka");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mail_outbox_reports_waiting_tries_and_last_outcome_per_entry() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-outbox-report");
+
+        let envelope = aoide_storage::mail::mint_outbound_letter("here", "osaka", "bob", "hi").unwrap();
+        let mut entry = aoide_storage::outbox::OutboxEntry::fresh(envelope);
+        entry.tries = 2;
+        entry.last_try_at = "2026-09-07T00:00:00Z".to_string();
+        entry.last_outcome = "transport-error: HTTP 0".to_string();
+        aoide_storage::outbox::write_entry("osaka", &entry).unwrap();
+
+        let out = handle_mail_outbox(&mail_inv(&["mail", "outbox"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let entries = out.data.unwrap()["entries"].as_array().unwrap().clone();
+        assert_eq!(entries.len(), 1, "the one entry spooled is still waiting — a retired entry is never listed");
+        assert_eq!(entries[0]["node"], "osaka");
+        assert_eq!(entries[0]["tries"], 2);
+        assert_eq!(entries[0]["lastOutcome"], "transport-error: HTTP 0");
+
+        let filtered = handle_mail_outbox(&mail_inv(&["mail", "outbox"], &["osaka"]));
+        assert_eq!(filtered.data.unwrap()["entries"].as_array().unwrap().len(), 1, "filtering to the one node with anything waiting still finds it");
+
+        let missing = handle_mail_outbox(&mail_inv(&["mail", "outbox"], &["nobody"]));
+        assert!(missing.data.unwrap()["entries"].as_array().unwrap().is_empty(), "a node with nothing waiting reports an empty list, not an error");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mail_read_for_one_name_advances_the_cursor_and_reread_reprints() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-read-for");
+
+        handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["one"], &[("to", "self/conductor")]));
+        handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["two"], &[("to", "self/conductor")]));
+
+        let out = handle_mail_read(&mail_inv_with_flags(&["mail", "read"], &[], &[("for", "conductor")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        assert_eq!(out.data.unwrap()["entries"].as_array().unwrap().len(), 2, "both letters are new");
+
+        let out = handle_mail_read(&mail_inv_with_flags(&["mail", "read"], &[], &[("for", "conductor")]));
+        assert_eq!(out.data.unwrap()["entries"].as_array().unwrap().len(), 0, "the cursor already advanced past both");
+
+        let out = handle_mail_read(&mail_inv_with_flags(
+            &["mail", "read"],
+            &[],
+            &[("for", "conductor"), ("reread", "")],
+        ));
+        assert_eq!(out.data.unwrap()["entries"].as_array().unwrap().len(), 2, "--reread reprints already-read entries");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mail_read_all_names_and_show_by_msgid() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-read-all-show");
+
+        handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["for-alice"], &[("to", "self/alice")]));
+        handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["for-bob"], &[("to", "self/bob")]));
+
+        let out = handle_mail_read(&mail_inv_with_flag(&["mail", "read"], &[], "all-names"));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let entries = out.data.unwrap()["entries"].as_array().unwrap().clone();
+        assert_eq!(entries.len(), 2, "--all-names reads every name with something unread");
+
+        let msgid = entries[0]["envelope"]["msgid"].as_str().unwrap().to_string();
+        let out = handle_mail_show(&mail_inv(&["mail", "show"], &[&msgid]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        assert_eq!(out.data.unwrap()["envelope"]["msgid"], msgid);
+
+        let out = handle_mail_show(&mail_inv(&["mail", "show"], &["not-a-real-msgid"]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.unwrap()["reason"], "not-found");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mail_read_requires_exactly_one_of_for_or_all_names() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-read-usage");
+
+        let out = handle_mail_read(&mail_inv(&["mail", "read"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage, "neither --for nor --all-names given");
+
+        let out = handle_mail_read(&mail_inv_with_flags(
+            &["mail", "read"],
+            &[],
+            &[("for", "conductor"), ("all-names", "")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage, "mutually exclusive");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mail_mark_advances_the_cursor_without_printing() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-mark");
+
+        handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi"], &[("to", "self/conductor")]));
+
+        let out = handle_mail_mark(&mail_inv_with_flags(&["mail", "mark"], &[], &[("for", "conductor")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.unwrap()["seq"], 1);
+
+        let out = handle_mail_read(&mail_inv_with_flags(&["mail", "read"], &[], &[("for", "conductor")]));
+        assert_eq!(out.data.unwrap()["entries"].as_array().unwrap().len(), 0, "mark already advanced past it");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mail_rm_prunes_by_age_and_rejects_a_bad_duration() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-rm");
+
+        handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi"], &[("to", "self/conductor")]));
+
+        let out = handle_mail_rm(&mail_inv_with_flags(&["mail", "rm"], &[], &[("older-than", "not-a-duration")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+
+        let out = handle_mail_rm(&mail_inv_with_flags(&["mail", "rm"], &[], &[("older-than", "30d")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.unwrap()["pruned"], 0, "the letter just sent is nowhere near 30 days old");
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

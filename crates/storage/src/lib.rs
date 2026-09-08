@@ -104,6 +104,16 @@
 //! `aoide-client::tunnel` (P-S3), the same split this crate already holds
 //! between `node_store` (storage) and `commands` (client) for node
 //! transport.
+//!
+//! `outbox` (messaging plan, P-M2) is the newest: `state/outbox/<node>/`,
+//! the per-node BSO-style spool a directly-paired node's mail waits in
+//! between `mail send`'s write and a drain's delivery — envelope files
+//! plus each link's own backoff state, guarded by the crate-wide stage
+//! lock for file mutations and a separate, non-blocking per-node `.bsy`
+//! flock across a drain's whole dial cycle. Pure spool CRUD only, same
+//! split as `tunnel` above: the actual dial+POST lives in
+//! `aoide-client::mail_wire`, a thin bridge in `aoide-conduct::mail_bridge`.
+//! See its own module doc for the two-lock model.
 
 pub mod addr;
 pub mod advertise;
@@ -119,6 +129,7 @@ pub mod ledger;
 pub mod mail;
 pub mod manifest;
 pub mod mode;
+pub mod outbox;
 pub mod pairing;
 pub mod node_store;
 pub mod petname;

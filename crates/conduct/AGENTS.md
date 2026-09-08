@@ -746,19 +746,26 @@
   open a socket. Row/mark grammar and `--json` shape are CONTRACTS.md
   §7-pinned — a rendering change is a contract edit first.
 - **`send::deliver_local`'s success path is ONE of exactly TWO mailbase-filing
-  calls in the whole tree — never a third.** Every consumer that delivers
-  into an ALREADY-REGISTERED session's socket (`send --id`, `--to`
-  resolving local, `pending approve`'s re-drive, `aoide-server`'s A2A
-  `do_inject`) reaches it through `session_send`; do NOT add a second
-  `aoide_storage::mail::file_receipt` call for any of those — `do_inject` in
-  particular reaches this exact function too, so a call there would
-  double-file every A2A message delivered into an existing session. The
-  OTHER filing call lives OUTSIDE this crate, in `aoide-server`'s
-  `spawn_inject_prompt` (`a2a.rs`) — a brand-new A2A-spawned session's first
-  turn is typed before that session has a `SessionRecord` at all, so it
-  can never reach `deliver_local`/`session_send` and has to file itself
-  (see `aoide_storage::mail`'s module doc for the full two-writer
-  reasoning).
+  calls reached through `session_send` — never add a second one on that
+  path.** Every consumer that delivers into an ALREADY-REGISTERED session's
+  socket (`send --id`, `--to` resolving local, `pending approve`'s
+  re-drive, `aoide-server`'s A2A `do_inject`) reaches it through
+  `session_send`; do NOT add a second `aoide_storage::mail::file_receipt`
+  call for any of those — `do_inject` in particular reaches this exact
+  function too, so a call there would double-file every A2A message
+  delivered into an existing session. The OTHER of these two lives OUTSIDE
+  this crate, in `aoide-server`'s `spawn_inject_prompt` (`a2a.rs`) — a
+  brand-new A2A-spawned session's first turn is typed before that session
+  has a `SessionRecord` at all, so it can never reach
+  `deliver_local`/`session_send` and has to file itself (see
+  `aoide_storage::mail`'s module doc for the full two-writer reasoning).
+  **A THIRD, orthogonal filing call exists since P-M2** — `aoide-server`'s
+  `mail_deposit` (`a2a.rs`) calls `aoide_storage::mail::deposit` directly
+  for a letter/receipt arriving over the wire FROM a peer node. It never
+  touches `session_send`/`deliver_local` (there is no local session on
+  either end of that path), so it does not widen this bullet's "exactly
+  two, never a second" rule — that rule is scoped to `session_send`'s own
+  callers, and wire-deposited mail was never one of them.
 - **`graph/spawn.rs`'s `build_conduct_args` is the ONE place the `aoide
   conduct -- <agent cmd>` argv gets built (P-D7).** Both `spawn`
   launch modes — headless (default) and `--windowed` (execs a real terminal
@@ -888,6 +895,18 @@
   requires the socket to still exist on disk, or the graph claims a session
   is reachable when nothing can reach it. A missing or empty socket path is
   not-conductable.
+- **`mail_bridge` carries NO logic of its own — it stays two passthrough
+  functions, forever (P-M2, ruling 1).** It exists only because
+  `aoide-server` may not carry a production `aoide-client` dependency
+  while this crate already does; growing a real decision, retry policy, or
+  new drain shape inside `mail_bridge` itself — rather than in
+  `aoide_client::mail_wire`, which owns the actual drain — would leave two
+  crates each partially responsible for one behavior. A change to WHEN or
+  HOW a node's outbox drains belongs in `mail_wire`; a change to WHICH
+  crates may reach it does not belong here either — that is the manifest's
+  job. Don't add a third function to this module without first checking
+  whether it truly cannot be `mail_wire::drain_node`/`drain_all` called
+  directly.
 
 ## Extension points
 

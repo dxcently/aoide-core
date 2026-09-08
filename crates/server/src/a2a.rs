@@ -1580,6 +1580,191 @@ fn graph_summary(node_name: &str, self_url: &str) -> Result<Value, (i64, String)
     }))
 }
 
+// ── `aoide/mailDeposit` (messaging plan P-M2, CONTRACTS.md §6) ─────────────
+//
+// The wire for directly-paired nodes: a caller identified via a verified
+// PER-REQUEST SIGNATURE (never an address or bare-token match — the same
+// signature-only narrowing `spawn_admitted` holds, applied to a new,
+// independent capability) deposits one sealed [`aoide_storage::mail::
+// Envelope`]. Admission answers ONE question — "is this signed caller a
+// paired node holding `message`" — and is entirely separate from the
+// envelope's OWN origin signature, which [`aoide_storage::mail::deposit`]
+// verifies against `header.from.node`'s own key (spec item 3: the HOP that
+// carried the request here and the ORIGIN that minted it are two
+// independent lookups, coincident only because P-M2 has no relay yet).
+
+/// The node-side half of the Message admission check — a paired node whose
+/// `allows` contains `"message"`. Mirrors [`node_may_spawn`] exactly, one
+/// capability over.
+fn node_may_message(node: &aoide_storage::node_store::Node) -> bool {
+    node.verified && node.allows.iter().any(|a| a == "message")
+}
+
+/// The Message arm's full admission check. Unlike [`spawn_admitted`], there
+/// is no now-superseded Token-rung history to migrate off of — `message`
+/// is introduced AFTER that narrowing already happened — so resolution
+/// here is signature-only from the start, with no Addr/Token fallback rung
+/// to even consider: `resolved` is `None` whenever the request carried no
+/// verified signature, or the signature verified against a name that
+/// (impossibly, absent a bug upstream) doesn't resolve to a registered
+/// node.
+fn deposit_admitted(resolved: Option<&aoide_storage::node_store::Node>) -> bool {
+    matches!(resolved, Some(node) if node_may_message(node))
+}
+
+/// The refusal every deposit attempt that fails [`deposit_admitted`]
+/// returns — a NEW, distinct code (never `-32006`, which stays `spawn`'s
+/// own; never `-32007`, already taken by `verify_signed_request`'s
+/// incomplete-headers/signature-mismatch refusals, CONTRACTS.md §6). Two
+/// shapes only (simpler than [`spawn_refusal`]'s three: no historical
+/// Token-rung caller to distinguish here) — paired-but-not-allowed, told
+/// the exact `node allow` fix; everything else (unpaired, unsigned, no
+/// resolution at all) told to pair and allow.
+fn deposit_refusal(resolved: Option<&aoide_storage::node_store::Node>) -> (i64, String) {
+    match resolved {
+        Some(node) => (
+            -32010,
+            format!(
+                "mail deposit refused: node `{}` is paired and this request is validly signed, but \
+                 `allows` does not include `message` — run `node allow {} message on`",
+                node.name, node.name
+            ),
+        ),
+        None => (
+            -32010,
+            "mail deposit refused: this method requires the caller be identified via a verified, \
+             per-request SIGNED request from a paired node — pair first via `aoide pair`, then \
+             `node allow <name> message on`"
+                .to_string(),
+        ),
+    }
+}
+
+/// `aoide/mailDeposit` (P-M2): `{envelope: <the sealed Envelope, exactly as
+/// aoide_storage::mail::Envelope serializes>}`. Admission first
+/// (signature-only, [`deposit_admitted`]), then the envelope's own content
+/// is [`aoide_storage::mail::deposit`]'s job — recompute `msgid`, verify
+/// the ORIGIN signature, dedup, file (spec item 4's short-circuiting
+/// order; the zone check MAIL.md's step 3 describes is P-M4's, skipped
+/// here, not stubbed).
+///
+/// **Self-audits under its own label, unconditionally** (spec item 11: a
+/// deposit never passes `cli/src/dispatch.rs`'s own audit, so this is the
+/// one place a flood becomes visible) — mirrors [`pair_request`]'s "audits
+/// every call, not only a refusal" shape, once for the admission refusal
+/// and once more after `deposit`'s own outcome, never
+/// [`message_send`]'s narrower "only the notable branches" one: a flood's
+/// signal is volume, and volume must show whether every one of those
+/// deposits was accepted, refused, or malformed.
+///
+/// **Never called from inside `deposit`'s own lock.** `deposit` returns
+/// before this function does anything else with the outcome — every
+/// `outbox` call below runs AFTER that lock has already released, never
+/// nested inside it: `outbox`'s own lock wraps the identical
+/// `fs::try_stage_lock` `mail`'s does, and that lock is a plain blocking
+/// `flock`, not re-entrant — nesting the two would deadlock a process
+/// against its own held lock, not merely contend.
+///
+/// A filed **letter** mints and spools an ack addressed back to the
+/// origin, then best-effort drains that node once, synchronously, reusing
+/// the SAME [`aoide_conduct::mail_bridge::drain_node`] the daemon tick
+/// calls — one drain implementation, no duplicate dial logic. A filed
+/// **receipt** is the opposite leg: [`aoide_storage::outbox::retire_by_ack`]
+/// retires the local outbox entry it confirms (spec item 7) — a pure
+/// storage-crate lookup keyed on the receipt's own verified `from.node`
+/// and `text` (the acked msgid), so a forged or stale ack simply finds no
+/// matching entry and retires nothing (see that function's own doc for
+/// why the lookup alone proves both of spec item 7's checks). A
+/// **duplicate** whose original filing was a letter re-sends the ack
+/// (spec item 5: the sender's earlier ack evidently never arrived);
+/// every other duplicate is a silent no-op — acking an ack would ping-pong
+/// forever, which the vocabulary (`letter`/`receipt` only) has no third
+/// shape to end.
+fn mail_deposit(params: &Value, ctx: &RequestCtx) -> Result<Value, (i64, String)> {
+    let envelope: aoide_storage::mail::Envelope =
+        match serde_json::from_value(params.get("envelope").cloned().unwrap_or(Value::Null)) {
+            Ok(e) => e,
+            Err(e) => return Err((-32602, format!("invalid params: envelope: {e}"))),
+        };
+
+    let nodes = aoide_storage::node_store::load_nodes();
+    let resolved = ctx.signed_node_name.and_then(|name| nodes.iter().find(|p| p.name == name));
+    if !deposit_admitted(resolved) {
+        let (code, msg) = deposit_refusal(resolved);
+        let _ = audit(ctx.audit_log, Door::A2a, EventClass::Audit, "a2a.aoide/mailDeposit", "unauthorized", &msg);
+        return Err((code, msg));
+    }
+    let hop_name = ctx.signed_node_name.expect("deposit_admitted only returns true when signed_node_name is Some");
+
+    let outcome = aoide_storage::mail::deposit(envelope.clone(), hop_name).map_err(|e| (-32603_i64, format!("internal error: {e}")))?;
+
+    // Spec item 11: mail self-audits at the door (the one place a deposit
+    // never passes `cli/src/dispatch.rs`'s own audit) — ONE line per call,
+    // covering every outcome uniformly, mirroring `pair_request`'s own
+    // "audits unconditionally, not just on refusal" shape (never
+    // `message/send`'s narrower "only the notable branches" one): a flood
+    // is a volume signal, and volume must be visible whether every one of
+    // those deposits was accepted, refused, or malformed.
+    let audit_detail = format!(
+        "from {}/{} to {}/{} via {hop_name}: {outcome:?}",
+        envelope.header.from.node, envelope.header.from.name, envelope.header.to.node, envelope.header.to.name
+    );
+    let audit_status = match &outcome {
+        aoide_storage::mail::DepositOutcome::BadMsgid | aoide_storage::mail::DepositOutcome::UnverifiedOrigin => "invalid",
+        _ => "ok",
+    };
+    let _ = audit(ctx.audit_log, Door::A2a, EventClass::Audit, "a2a.aoide/mailDeposit", audit_status, &audit_detail);
+
+    match &outcome {
+        aoide_storage::mail::DepositOutcome::Filed { msgid, kind } if kind == aoide_storage::mail::ENTRY_TYPE_LETTER => {
+            spool_and_drain_ack(&envelope, msgid);
+            Ok(json!({ "status": "accepted", "msgid": msgid }))
+        }
+        aoide_storage::mail::DepositOutcome::Filed { msgid, kind } if kind == aoide_storage::mail::ENTRY_TYPE_RECEIPT => {
+            let _ = aoide_storage::outbox::retire_by_ack(&envelope);
+            Ok(json!({ "status": "accepted", "msgid": msgid }))
+        }
+        aoide_storage::mail::DepositOutcome::Filed { msgid, .. } => {
+            // No third `Header.kind` exists today — kept as a fallthrough
+            // rather than an `unreachable!` so a future kind degrades to
+            // "filed, no side effect" instead of a panic.
+            Ok(json!({ "status": "accepted", "msgid": msgid }))
+        }
+        aoide_storage::mail::DepositOutcome::Duplicate { filed_letter: true } => {
+            spool_and_drain_ack(&envelope, &envelope.msgid);
+            Ok(json!({ "status": "duplicate" }))
+        }
+        aoide_storage::mail::DepositOutcome::Duplicate { filed_letter: false } => Ok(json!({ "status": "duplicate" })),
+        aoide_storage::mail::DepositOutcome::BadMsgid => {
+            Err((-32602, "invalid params: envelope msgid does not match the recomputed value".to_string()))
+        }
+        aoide_storage::mail::DepositOutcome::UnverifiedOrigin => Err((
+            -32602,
+            format!(
+                "invalid params: no key on record for `{}` verifies this envelope's origin signature",
+                envelope.header.from.node
+            ),
+        )),
+    }
+}
+
+/// Mint an ack for `acked_msgid` (destination is `envelope.header.to`,
+/// the mailbox that just received it; origin is `envelope.header.from`,
+/// who it goes back to), spool it into that origin's outbox, and
+/// best-effort drain that node once. Shared by `mail_deposit`'s `Filed`
+/// letter arm and its `Duplicate{filed_letter: true}` arm — the ack is
+/// identical either way, just re-sent on the duplicate path.
+fn spool_and_drain_ack(envelope: &aoide_storage::mail::Envelope, acked_msgid: &str) {
+    let Ok(ack) = aoide_storage::mail::mint_ack(&envelope.header.to.name, envelope.header.from.clone(), acked_msgid)
+    else {
+        return;
+    };
+    let origin_node = envelope.header.from.node.clone();
+    if aoide_storage::outbox::write_entry(&origin_node, &aoide_storage::outbox::OutboxEntry::fresh(ack)).is_ok() {
+        let _ = aoide_conduct::mail_bridge::drain_node(&origin_node);
+    }
+}
+
 // ── The pairing ceremony wire (CONTRACTS.md §6, P-P2,
 // ── `docs/architecture/PAIRING.md`) ─────────────────────────────────────────
 //
@@ -2103,6 +2288,7 @@ fn handle_jsonrpc(req: &Value, ctx: &RequestCtx) -> Value {
         "aoide/pairRequest" => pair_request(&params, ctx.origin, ctx.audit_log),
         "aoide/pairReveal" => pair_reveal(&params, ctx.audit_log),
         "aoide/pairPoll" => pair_poll(&params, ctx.audit_log),
+        "aoide/mailDeposit" => mail_deposit(&params, ctx),
         "" => Err((-32600, "invalid request: missing method".to_string())),
         other => Err((-32601, format!("method not found: {other}"))),
     };
@@ -2919,6 +3105,7 @@ fn route(
                     Some("aoide/pairRequest") => "aoide/pairRequest",
                     Some("aoide/pairReveal") => "aoide/pairReveal",
                     Some("aoide/pairPoll") => "aoide/pairPoll",
+                    Some("aoide/mailDeposit") => "aoide/mailDeposit",
                     _ => "rpc",
                 };
                 let self_url = self_url(bind, port);
@@ -8930,5 +9117,324 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── `aoide/mailDeposit` (messaging plan P-M2, CONTRACTS.md §6) ──────────
+
+    fn mail_deposit_root(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "aoide-a2a-maildeposit-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ))
+    }
+
+    /// Restores `AOIDE_STATE_DIR`/`AOIDE_STAGE_DIR` and removes `root` — the
+    /// closing half of every test below, matching `a_successfully_
+    /// delivered_message_send_files_into_the_mailbase`'s own inline shape
+    /// rather than introducing a new fixture struct for eight call sites.
+    fn mail_deposit_cleanup(root: &std::path::Path, saved_state: Option<String>, saved_stage: Option<String>) {
+        let _ = std::fs::remove_dir_all(root);
+        match saved_state {
+            Some(v) => std::env::set_var("AOIDE_STATE_DIR", v),
+            None => std::env::remove_var("AOIDE_STATE_DIR"),
+        }
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+    }
+
+    fn mail_deposit_ctx<'a>(audit_log: &'a std::path::Path, signed_node_name: Option<&'a str>) -> RequestCtx<'a> {
+        RequestCtx {
+            audit_log,
+            spawn_agent: "",
+            origin: ConnOrigin::Loopback,
+            node_name: "",
+            self_url: "",
+            expected_token: "",
+            presented_token: None,
+            signed_node_name,
+        }
+    }
+
+    #[test]
+    fn node_may_message_covers_paired_allowed_paired_denied_and_unpaired() {
+        let mut paired_allowed = fixture_node("box-b", "http://10.0.0.5:8710/", false);
+        paired_allowed.verified = true;
+        paired_allowed.allows = vec!["read".to_string(), "message".to_string()];
+        assert!(node_may_message(&paired_allowed), "paired + message in allows");
+
+        let mut paired_denied = paired_allowed.clone();
+        paired_denied.allows = vec!["read".to_string()]; // message revoked.
+        assert!(!node_may_message(&paired_denied), "paired but message NOT in allows");
+
+        let mut unpaired = paired_allowed.clone();
+        unpaired.verified = false; // never completed the ceremony.
+        assert!(!node_may_message(&unpaired), "allows populated but never verified — still refused");
+    }
+
+    #[test]
+    fn deposit_admitted_requires_the_signature_rung_specifically() {
+        // Unlike `spawn_admitted`, `deposit_admitted` takes a plain
+        // `Option<&Node>`, never `Option<(&Node, NodeRung)>` — `message` has
+        // no now-superseded Token-rung history to migrate off of
+        // (`node_may_message`'s own doc: "signature-only from the start"),
+        // so there is no THIRD rung to construct a case from. `resolved` is
+        // populated ONLY by `mail_deposit`'s own `ctx.signed_node_name.
+        // and_then(...)` line, so `Some` here already MEANS "resolved via a
+        // verified per-request signature" — this test pins that a
+        // paired+allowed node still refuses the instant resolution drops to
+        // `None`, the shape an unsigned, addr-only, or bare-token caller
+        // collapses to (proven at the integration level by
+        // `an_unsigned_caller_is_refused_by_mail_deposit`, below).
+        let mut paired_allowed = fixture_node("box-b", "http://10.0.0.5:8710/", false);
+        paired_allowed.verified = true;
+        paired_allowed.allows = vec!["message".to_string()];
+
+        assert!(deposit_admitted(Some(&paired_allowed)), "paired + message in allows + signature-resolved — admitted");
+        assert!(!deposit_admitted(None), "no signature resolution at all — refused, with no fallback rung to try instead");
+    }
+
+    #[test]
+    fn an_unsigned_caller_is_refused_by_mail_deposit() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = mail_deposit_root("unsigned");
+        act_as(&root, "here");
+
+        let audit_log = root.join("log");
+        let envelope = aoide_storage::mail::mint_outbound_letter("alice", "there", "bob", "hi").unwrap();
+        let ctx = mail_deposit_ctx(&audit_log, None);
+        let params = json!({ "envelope": envelope });
+        let err = mail_deposit(&params, &ctx).expect_err("no signature headers — must refuse, never file");
+        assert_eq!(err.0, -32010);
+
+        assert!(aoide_storage::mail::read_base().unwrap().is_empty(), "an unsigned caller's envelope is never filed");
+
+        mail_deposit_cleanup(&root, saved_state, saved_stage);
+    }
+
+    #[test]
+    fn a_paired_node_without_message_is_refused_with_a_taught_error() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = mail_deposit_root("noallow");
+        act_as(&root, "here");
+
+        setup_signed_node_with_allows("box-b", &["read"]); // verified, paired, but no "message"
+
+        let audit_log = root.join("log");
+        let envelope = aoide_storage::mail::mint_outbound_letter("alice", "there", "bob", "hi").unwrap();
+        let ctx = mail_deposit_ctx(&audit_log, Some("box-b"));
+        let params = json!({ "envelope": envelope });
+        let (code, msg) = mail_deposit(&params, &ctx).expect_err("paired but message not in allows — must refuse");
+        assert_eq!(code, -32010);
+        assert!(msg.contains("node allow box-b message on"), "names the exact fix: {msg}");
+
+        mail_deposit_cleanup(&root, saved_state, saved_stage);
+    }
+
+    /// Registers a node under `display::local_host_name()` — the only name
+    /// [`aoide_storage::mail::mint_outbound_letter`] will ever stamp as
+    /// `header.from.node` (P-M1 ruling: self never crosses the wire) — so an
+    /// envelope this test mints has a genuinely verifiable origin, using
+    /// this test process's own identity as BOTH the origin's and the hop's
+    /// key (the same "one process plays both roles" shortcut
+    /// [`setup_signed_node`] already documents). Origin and hop coincide in
+    /// P-M2, so this ALSO doubles as the connection's signed hop.
+    fn setup_verifiable_origin(allows: &[&str]) -> String {
+        let origin_name = aoide_storage::display::local_host_name();
+        setup_signed_node_with_allows(&origin_name, allows);
+        origin_name
+    }
+
+    #[test]
+    fn a_deposit_from_a_verified_message_holding_node_files_a_letter() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = mail_deposit_root("files");
+        act_as(&root, "here");
+
+        let origin_name = setup_verifiable_origin(&["message"]);
+        let envelope = aoide_storage::mail::mint_outbound_letter("alice", "here", "conductor", "hello from the wire").unwrap();
+        assert_eq!(envelope.header.from.node, origin_name);
+
+        let audit_log = root.join("log");
+        let ctx = mail_deposit_ctx(&audit_log, Some(&origin_name));
+        let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "aoide/mailDeposit", "params": { "envelope": envelope } });
+        let resp = handle_jsonrpc(&req, &ctx);
+        assert_eq!(resp["result"]["status"], "accepted", "{resp}");
+
+        let entries = aoide_storage::mail::read_base().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].envelope.header.to.name, "conductor");
+        assert_eq!(entries[0].via, origin_name, "via is the HOP's resolved name");
+
+        mail_deposit_cleanup(&root, saved_state, saved_stage);
+    }
+
+    #[test]
+    fn a_duplicate_deposit_returns_duplicate_and_files_nothing_twice() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = mail_deposit_root("dup");
+        act_as(&root, "here");
+
+        // `spool_and_drain_ack`'s best-effort drain must never hang or
+        // block this test — a dead loopback port refuses instantly, unlike
+        // the file's own `"http://node/"` placeholder (unresolvable
+        // hostname, fine for the pure-predicate tests above that never
+        // actually dial it, wrong for one that does).
+        let origin_name = setup_verifiable_origin(&["message"]);
+        let mut nodes = aoide_storage::node_store::load_nodes();
+        nodes[0].url = "http://127.0.0.1:1/".to_string();
+        aoide_storage::node_store::save_nodes(&nodes).unwrap();
+
+        let envelope = aoide_storage::mail::mint_outbound_letter("alice", "here", "conductor", "hello twice").unwrap();
+        let audit_log = root.join("log");
+        let ctx = mail_deposit_ctx(&audit_log, Some(&origin_name));
+        let params = json!({ "envelope": envelope });
+
+        let first = mail_deposit(&params, &ctx).unwrap();
+        assert_eq!(first["status"], "accepted");
+
+        let second = mail_deposit(&params, &ctx).unwrap();
+        assert_eq!(second["status"], "duplicate");
+
+        let entries = aoide_storage::mail::read_base().unwrap();
+        assert_eq!(entries.len(), 1, "the duplicate deposit files nothing a second time");
+
+        mail_deposit_cleanup(&root, saved_state, saved_stage);
+    }
+
+    #[test]
+    fn a_duplicate_of_a_filed_letter_respools_its_ack() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = mail_deposit_root("dup-respool");
+        act_as(&root, "here");
+
+        let origin_name = setup_verifiable_origin(&["message"]);
+        let mut nodes = aoide_storage::node_store::load_nodes();
+        nodes[0].url = "http://127.0.0.1:1/".to_string();
+        aoide_storage::node_store::save_nodes(&nodes).unwrap();
+
+        let envelope = aoide_storage::mail::mint_outbound_letter("alice", "here", "conductor", "hi").unwrap();
+        let audit_log = root.join("log");
+        let ctx = mail_deposit_ctx(&audit_log, Some(&origin_name));
+        let params = json!({ "envelope": envelope });
+
+        mail_deposit(&params, &ctx).unwrap();
+        let before = aoide_storage::outbox::list_entries(&origin_name).unwrap();
+        assert_eq!(before.len(), 1, "filing a letter spools an ack toward the origin");
+        aoide_storage::outbox::remove_entry(&origin_name, &before[0].envelope.msgid).unwrap();
+        assert!(aoide_storage::outbox::list_entries(&origin_name).unwrap().is_empty(), "ack removed, simulating an earlier successful drain");
+
+        mail_deposit(&params, &ctx).unwrap(); // the SAME envelope again — a duplicate.
+        let after = aoide_storage::outbox::list_entries(&origin_name).unwrap();
+        assert_eq!(after.len(), 1, "a duplicate of a filed LETTER respools its ack");
+        assert_eq!(after[0].envelope.header.kind, aoide_storage::mail::ENTRY_TYPE_RECEIPT);
+
+        mail_deposit_cleanup(&root, saved_state, saved_stage);
+    }
+
+    #[test]
+    fn filing_a_letter_spools_an_ack_signed_by_this_box() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = mail_deposit_root("ack-shape");
+        act_as(&root, "here");
+
+        let origin_name = setup_verifiable_origin(&["message"]);
+        let mut nodes = aoide_storage::node_store::load_nodes();
+        nodes[0].url = "http://127.0.0.1:1/".to_string();
+        aoide_storage::node_store::save_nodes(&nodes).unwrap();
+
+        let envelope = aoide_storage::mail::mint_outbound_letter("alice", "here", "conductor", "hi").unwrap();
+        let audit_log = root.join("log");
+        let ctx = mail_deposit_ctx(&audit_log, Some(&origin_name));
+        let params = json!({ "envelope": envelope });
+        let result = mail_deposit(&params, &ctx).unwrap();
+        let msgid = result["msgid"].as_str().unwrap().to_string();
+
+        let spooled = aoide_storage::outbox::list_entries(&origin_name).unwrap();
+        assert_eq!(spooled.len(), 1);
+        let ack = &spooled[0].envelope;
+        assert_eq!(ack.header.kind, aoide_storage::mail::ENTRY_TYPE_RECEIPT);
+        assert_eq!(ack.header.to.node, origin_name, "the ack's `to` is the origin");
+        assert_eq!(ack.text, msgid, "the ack's text is the acked msgid");
+        assert_eq!(ack.header.from.node, aoide_storage::display::local_host_name(), "signed by this box");
+
+        mail_deposit_cleanup(&root, saved_state, saved_stage);
+    }
+
+    #[test]
+    fn a_deposit_audits_under_its_own_method_label() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = mail_deposit_root("audit-label");
+        act_as(&root, "here");
+
+        let origin_name = setup_verifiable_origin(&["message"]);
+        let mut nodes = aoide_storage::node_store::load_nodes();
+        nodes[0].url = "http://127.0.0.1:1/".to_string();
+        aoide_storage::node_store::save_nodes(&nodes).unwrap();
+
+        let envelope = aoide_storage::mail::mint_outbound_letter("alice", "here", "conductor", "hi").unwrap();
+        let audit_log = root.join("log");
+        let ctx = mail_deposit_ctx(&audit_log, Some(&origin_name));
+        let params = json!({ "envelope": envelope });
+        mail_deposit(&params, &ctx).unwrap();
+
+        let log = std::fs::read_to_string(&audit_log).unwrap();
+        assert!(log.contains("a2a.aoide/mailDeposit"), "{log}");
+        assert!(!log.contains("a2a.rpc"), "never falls back to the generic label: {log}");
+
+        mail_deposit_cleanup(&root, saved_state, saved_stage);
+    }
+
+    #[test]
+    fn an_envelope_whose_origin_key_is_unknown_is_unverified_origin() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = mail_deposit_root("unverified-origin");
+        act_as(&root, "here");
+
+        // The HOP is a genuinely admitted, message-holding node — but
+        // registered under a DIFFERENT name than the envelope's own origin
+        // (`display::local_host_name()`, which `mint_outbound_letter`
+        // always stamps and which this test never registers), so admission
+        // succeeds while the origin lookup still has no key to try. This is
+        // the two-lookup split itself (spec item 3): the hop and the origin
+        // are read from two different places, and P-M2 having them usually
+        // coincide is not the same as them being the same read.
+        setup_signed_node_with_allows("box-hop", &["message"]);
+
+        let envelope = aoide_storage::mail::mint_outbound_letter("alice", "here", "conductor", "hi").unwrap();
+        let origin_name = envelope.header.from.node.clone();
+        assert!(
+            aoide_storage::node_store::load_nodes().iter().all(|n| n.name != origin_name),
+            "sanity: nothing is registered under the envelope's own origin name"
+        );
+
+        let audit_log = root.join("log");
+        let ctx = mail_deposit_ctx(&audit_log, Some("box-hop"));
+        let params = json!({ "envelope": envelope });
+        let (code, msg) = mail_deposit(&params, &ctx).expect_err("no key on record for the origin — must refuse");
+        assert_eq!(code, -32602);
+        assert!(msg.contains(&origin_name), "{msg}");
+
+        assert!(aoide_storage::mail::read_base().unwrap().is_empty(), "an unverified origin is never filed");
+
+        mail_deposit_cleanup(&root, saved_state, saved_stage);
     }
 }

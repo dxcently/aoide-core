@@ -10,10 +10,18 @@
 //! `pub use`, so no existing call site changes. Sits ABOVE `aoide-storage`
 //! (the durable session-record substrate) and `aoide-protocol` (the
 //! Invocation/Outcome/audit contract every door shares).
+//!
+//! `mail_bridge` (messaging plan P-M2, ruling 1) is a thin two-function
+//! shim onto `aoide_client::mail_wire`'s outbox drain — it exists only
+//! because `aoide-server` must not depend on `aoide-client` in
+//! production, while this crate already does (see `mail_bridge`'s own
+//! doc). The daemon tick and the A2A door both reach the drain through
+//! here.
 
 pub mod commands;
 pub mod graph;
 pub mod herald;
+pub mod mail_bridge;
 pub mod reap;
 pub mod shellbridge;
 

@@ -179,7 +179,12 @@ the inbound half of the two-door contract (the outbound half is
   receipt right after the write — a spawned session has no `SessionRecord`
   yet at that moment, so it cannot reach `session_send` at all (see
   `spawn_inject_prompt`'s doc comment for the race that rules it out).
-  These are the only two mailbase-filing call sites in the whole tree.
+  These were the only two mailbase-filing call sites until P-M2 added a
+  third, unrelated to either: `mail_deposit`'s own call into
+  `aoide_storage::mail::deposit` (below), which files a letter or receipt
+  arriving over the wire from a peer node — never a locally-typed or
+  locally-delivered message, so it shares no code path with `do_inject`/
+  `do_spawn` above.
   **`do_spawn`'s bounded liveness check (task #103)** gives the just-
   launched wrapper process (`aoide conduct`) a short window (400ms) to
   prove it's still alive via `Child::try_wait()` before acking `submitted`
@@ -342,6 +347,42 @@ the inbound half of the two-door contract (the outbound half is
   immediately-delivered payload's bytes stay untouched, so an
   already-autogated node's delivery is byte-identical to before this
   phase).
+  **`aoide/mailDeposit` (P-M2, `docs/architecture/MAIL.md`, CONTRACTS.md
+  §6's new subsection) is the SECOND capability-gated method, after
+  Spawn, and the first one not gated on `spawn`.** `mail_deposit` resolves
+  the caller the identical KEY-RESOLVED way Spawn does (`ctx.
+  signed_node_name` against the registry), then requires
+  `deposit_admitted` — `node_may_message` (`verified &&
+  allows.contains("message")`), mirroring `node_may_spawn` one capability
+  over, with no historical Addr/Token rung to migrate off since `message`
+  was introduced signature-only from the start. A refusal is `-32010` — a
+  NEW code, distinct from both `-32006` (Spawn's own) and `-32007`
+  (`verify_signed_request`'s own incomplete-headers/signature-mismatch
+  code) — in one of two shapes: paired-but-not-allowed (told the exact
+  `node allow <name> message on` fix) or anything else (told to pair, then
+  allow). Past the gate, the envelope's own content is entirely
+  `aoide_storage::mail::deposit`'s job — recomputing `msgid`, verifying the
+  ORIGIN signature (the two-lookup identity model: hop via
+  `signed_node_name`, origin via the one key on record for
+  `header.from.node`), deduping, and filing. `mail_deposit` self-audits
+  UNCONDITIONALLY under `a2a.aoide/mailDeposit`, at both the admission
+  refusal and the deposit outcome — mirroring `pair_request`'s "audit
+  every call" shape rather than `message_send`'s narrower one, since a
+  deposit never passes through `cli/src/dispatch.rs`'s own per-command
+  audit and this is the only place a flood becomes visible. A filed
+  **letter** mints an ack back to the origin, spools it, and best-effort
+  drains that node once through the SAME `aoide_conduct::mail_bridge::
+  drain_node` the daemon's own periodic tick uses — one drain
+  implementation; `aoide-server` never dials out on its own account. A
+  filed **receipt** instead retires the local outbox entry it confirms via
+  `aoide_storage::outbox::retire_by_ack` (spec item 7 — a pure lookup keyed
+  on the receipt's own verified origin and acked msgid, so a forged or
+  stale ack simply retires nothing). A **duplicate** re-sends the ack only
+  when the original filing was a letter, and is a silent no-op otherwise,
+  so an ack is never itself acked. Every `outbox` call here runs strictly
+  AFTER `mail::deposit` has already released its own lock — `mail` and
+  `outbox` share the identical non-reentrant stage-lock primitive, so
+  nesting one inside the other would deadlock a process against itself.
 - `discovery` — the discovery advertisement's SEND half (P-P6 + task
   #120, `docs/architecture/PAIRING.md`'s "Discovery
   (advertise-but-locked)" section, CONTRACTS.md §6's "Discovery

@@ -66,6 +66,14 @@
   those; the local refusal exists ONLY to save an obviously-doomed round
   trip (an unsigned request can never resolve `NodeRung::Signature`), never
   to second-guess the door's own authority (PAIRING.md decision 6).
+  **`handle_mail_send`'s non-self branch (P-M2, `commands.rs`) gates
+  identically — `verified` off `node_store::load_nodes()`, nothing else —
+  before minting and spooling.** Whether the node actually grants the
+  `message` capability is `aoide-server::a2a::node_may_message`'s own call,
+  the exact peer of `spawn_admitted`/`spawn_refusal` for this second
+  capability-gated arm; a future third mail-shaped or capability-gated
+  command follows this same shallow-local/deep-remote split rather than
+  inventing a client-side `allows` check.
 - **Forwarded event text from `adapter` is untrusted data**, same as root
   `AGENTS.md` house rule 4 — an adapter never lets forwarded text execute as
   a command.
@@ -453,6 +461,16 @@
   re-implemented there); a bare-shell `pid-<pid>` tunnel has no session
   lifecycle to hook, so it is left for that same sweep's ordinary dead-pid
   arm to collect once its one-shot CLI process has exited.
+  **`mail_wire::drain_node` (P-M2) is the one deliberate exception to
+  "this crate never closes a tunnel itself" — don't generalize it.** Its
+  dial is one-shot and self-contained, unlike the three functions above,
+  which are called from long-lived `aoide-conduct` handlers this crate
+  cannot wrap; `TunnelTeardownGuard`, a Drop guard mirroring
+  `commands::ScratchBodyFile`'s pattern, closes the tunnel unconditionally
+  via `tunnel::close` before `drain_node` returns, on every path (ruling
+  10). A future caller wanting the same convenience must show the same
+  one-shot, self-contained shape first — being merely "called less often"
+  than `pull_node_live`/`send_message_to_node`/`spawn_on_node` is not that.
 - **A tunneled request is safe against a real node, not merely possible.**
   Every request delivered through an ssh forward reaches the far A2A door
   as `ConnOrigin::Loopback` (`aoide-server::a2a::classify_origin`), which
@@ -556,6 +574,25 @@
     `aoide pair` runs write five. That coarsening is deliberate: a converge
     audit line belongs to the pairing-audit-sweep slice (design record §7,
     T4), which owns the three ceremony audit sites, not to this command.
+- **`mail_wire::drain_node` is the ONE place a spooled mail envelope is
+  ever dialed out (P-M2) — never re-implement `attempt_deposit`'s POST at
+  a second call site.** Three callers converge on it — the daemon's
+  periodic tick and a door's own post-heard best-effort drain, both via
+  `aoide_conduct::mail_bridge`, and `handle_mail_send`'s one-shot attempt
+  right after it spools — so there is exactly one `aoide/mailDeposit` wire
+  implementation to keep in sync with the server side.
+- **`handle_mail_send` reports the WRITE, never the drain's outcome (spec
+  item 8).** Minting and spooling the outbox entry is what the command's
+  `Outcome` describes; the best-effort `mail_wire::drain_node` call after
+  it is a latency shortcut only, its `Result` deliberately discarded
+  (`let _ =`). A dead node, a policy refusal, a transport failure — none
+  of these may change `mail send`'s own reported success, because the
+  entry is genuinely and durably spooled regardless of what the drain did;
+  `mail outbox` or the next periodic tick is where a caller checks what
+  actually happened to it. Don't thread the drain's `Err` back into this
+  command's own return value — that would make delivery latency (a
+  background daemon's schedule) leak into a command that already
+  succeeded at its own job.
 
 ## Extension points
 
@@ -582,6 +619,15 @@
   "kebab-case")]`) so `--json` keeps emitting one flat `{"node": …, "class":
   …}` object per row. Add the unit tests for the new class beside the
   existing per-class tests in `mesh::tests` before touching the handler.
+- **A new capability-gated federation command (beyond `spawn`/`message`)**
+  follows `handle_node_spawn`/`handle_mail_send`'s shallow-local/deep-remote
+  split: gate locally on `verified` alone, let the remote door's own
+  admission function own every other refusal shape, and surface its `Err`
+  verbatim rather than re-deriving or pre-checking `allows` on this side.
+  A caller that also needs to dial out on its own (as `mail send` does)
+  reuses `mail_wire::drain_node`'s shape — one wire function, called
+  best-effort, its outcome never gating the command's own report — rather
+  than opening a second ad hoc POST.
 
 ## Docs update required in the same commit
 

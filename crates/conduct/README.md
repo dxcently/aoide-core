@@ -640,6 +640,22 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `aoide-conduct`; `node status` (client) keeps the deep per-node
   registry view. CONTRACTS.md §7's CLI surface pins the row/mark grammar
   and the `--json` shape.
+- `mail_bridge` (P-M2, architect's ruling 1: "spool in storage, wire lane
+  in client, bridge through conduct") — a thin, two-function passthrough
+  onto `aoide_client::mail_wire`'s outbox drain, with no logic of its own.
+  It exists purely as a crate-DAG detour: `aoide-server` depends on
+  `aoide-client` only as a dev-dependency (a production edge is refused by
+  the manifest, not merely discouraged), but `aoide-conduct` already
+  carries a real one (`graph::who` → `pull_node_live`, `graph::resurrect`
+  → `spawn_on_node`), so the daemon tick and the A2A door both reach
+  `mail_wire::drain_node` through here instead of either depending on
+  `aoide-client` directly. `drain_node(name)` drains one node's outbox
+  once; `drain_all()` — the daemon tick's own call, mirroring
+  `daemon::run_internal_reap`'s "reach a sibling crate's handler on its
+  tick" shape — walks every node `aoide_storage::outbox::nodes_with_outbox`
+  reports, letting one node's `Err` (a genuine local I/O failure, never an
+  ordinary unreachable-node outcome) skip that node without stopping the
+  sweep.
 
 ## What it consumes
 
@@ -652,7 +668,10 @@ list`'s discovery sweep calls `aoide_client::discover::run_sweep` —
 P-P6's one sweep implementation, task #120 P2; `send --to`'s
 remote branch calls `aoide_client::commands::send_message_to_node`,
 workstream C3; every session-write handler calls `aoide_client::daemon::
-daemon_dispatch`, P-D6; see `client`'s own README for why that edge stays).
+daemon_dispatch`, P-D6; `mail_bridge`'s two functions call
+`aoide_client::mail_wire::drain_node`, P-M2, ruling 1 — the ONE other edge
+this crate carries specifically so `aoide-server` never has to; see
+`client`'s own README for why that edge stays).
 
 ## How it composes
 

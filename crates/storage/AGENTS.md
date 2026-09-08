@@ -537,6 +537,41 @@
   shape `valid_node_name` does (empty, `..`, `/`, a leading `.`), which is
   the actual invariant both exist to hold.
 
+- **`mail::verify_origin_signature` tries the ONE key `node_store` has on
+  record for `header.from.node`, never every verified node's key
+  (messaging plan P-M2, spec item 3).** This is deliberately NOT
+  `a2a::verify_signed_request`'s own pattern (which tries every verified
+  node's pubkey to discover WHICH node signed a connection) — origin
+  verification already knows the CLAIMED name from the envelope itself, so
+  the only question is whether THAT name's own key produced the
+  signature. Widening this to a multi-key search "for consistency" with
+  the connection-signature path would let any paired node forge mail
+  claiming to be a different paired node, which is the exact forgery this
+  function exists to rule out. No key on record for that name is a plain
+  `false` (`DepositOutcome::UnverifiedOrigin` at the caller), never a
+  fall-through to a default identity.
+- **`outbox`'s two locks are never conflated (P-M2).** The crate-wide
+  stage lock (`with_lock`, wrapping `fs::try_stage_lock`) guards file
+  mutations only and is held for microseconds; `.bsy`
+  (`try_take_link_lock`, `LOCK_EX|LOCK_NB`) is a SEPARATE, per-node lock a
+  drain holds across its entire dial+POST+record cycle. Don't widen the
+  stage lock's scope to cover a network call "to be safe" — that would
+  wedge every other `aoide` command on the box for the duration of one
+  ssh dial. Don't relax `.bsy` to blocking, either — ruling 3 (P-M2 brief)
+  is explicit that a busy link is SKIPPED, never queued behind, so one
+  wedged drain can never starve every later one.
+- **An outbox entry retires ONLY on a valid ack or explicit `mail outbox
+  rm` (P-M2) — never auto-evicted, never expired, never capped.**
+  `outbox::retire_by_ack` is the "valid ack" half — it trusts its caller
+  (`mail::deposit`) to have already proven the ack's origin signature
+  genuine, and never re-verifies; don't call it on an unverified envelope.
+  A
+  `refused: bool` entry (a JSON-RPC admission refusal, distinct from an
+  ordinary transport failure) stops a drain from retrying it but still
+  does not remove it — the kill-list discipline `undying`/`manifest`
+  above hold for their own state applies here too: only an explicit
+  human action or a genuine delivery confirmation removes a record.
+
 ## Extension points
 
 - **A new durable record shape** adds a type to `records` and a read/write
@@ -565,14 +600,17 @@
   validates the declaration.
   Updates CONTRACTS.md §4's `config.toml` subsection in the same commit,
   same as a settable section.
-- **A new CLI command** (this crate has four groups today, `usage`, `mail
-  send|read|show|mark|rm`, `identity`, and `config`/`config set`) adds a
-  `cmd!`/`register` entry in `commands.rs`, wired into the owning app
-  crate's `commands::all()`. The
+- **A new CLI command** (this crate has three groups today, `usage`,
+  `identity`, and `config`/`config set`) adds a `cmd!`/`register` entry in
+  `commands.rs`, wired into the owning app crate's `commands::all()`. The
   pairing ceremony's own CLI commands (`aoide pair`/`pair reject`/`pair
-  watch`) live in `aoide-client`
-  instead — this crate exposes the `pairing`/`node_store` library only,
-  since the ceremony needs outbound HTTP transport this crate never holds.
+  watch`) live in `aoide-client` instead — this crate exposes the
+  `pairing`/`node_store` library only, since the ceremony needs outbound
+  HTTP transport this crate never holds. `mail`'s commands (`mail
+  send|read|show|mark|rm|outbox|outbox rm`) moved there too at P-M2, for
+  the same reason — a command whose handler needs to DIAL another node
+  belongs in `aoide-client`, never here, regardless of which crate owns
+  the state it reads or writes.
 
 ## Docs update required in the same commit
 

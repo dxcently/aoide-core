@@ -134,7 +134,9 @@ by decision — no embedded database yet
   signature's canonical string binds to the exact same string on both
   ends. `allows` (P-P3, `docs/architecture/PAIRING.md`
   decision 5) is a CLOSED capability set (`NODE_CAPABILITIES`: `"read"`,
-  `"spawn"`) — never a per-capability serde bool scatter — additive,
+  `"spawn"`, `"message"` — the third joined at P-M2, gating
+  `aoide/mailDeposit` the way `"spawn"` gates `message/send`'s spawn arm) —
+  never a per-capability serde bool scatter — additive,
   empty for every unpaired/legacy node; `upsert_paired_node` stamps the
   grant its CALLER resolved (`config.toml`'s `[pairing] defaultGrant`, or a
   `--allow` typed on that one commit — never a literal here) the moment a
@@ -454,6 +456,40 @@ by decision — no embedded database yet
   delivered message through; `mail::file_letter` is `mail send`'s own
   engine. Keep-all: `mail rm --older-than` is the only pruning, and it
   never touches `seen.jsonl`.
+
+  P-M2 adds the wire for directly-paired nodes: `mint_outbound_letter`/
+  `mint_ack` seal a fresh envelope with THIS instance's own identity key
+  (`from.node` always `display::local_host_name()` — `self` never crosses
+  the wire); `verify_origin_signature` is the OTHER lookup a P-P4 caller
+  doesn't need — not the connection's signer (`ctx.signed_node_name`, a
+  door concern) but `header.from.node`'s own key, tried against the ONE
+  entry `node_store` has on record under that exact name, never every
+  verified node's key (a paired node signing as another paired node's
+  name must not verify); `deposit` is the receiving side's whole admitted
+  policy in one function — recompute `msgid`, verify the origin
+  signature, dedup against `seen.jsonl` (a filed `letter`'s duplicate
+  reports whether it was ever filed, so the caller knows to re-spool the
+  ack), then file via the new `file_received_entry`. Both mint functions
+  and `deposit` carry neither `mesh` nor `transit` — P-M2's envelope is
+  exactly P-M1's shape, addressed at a real node instead of `self`.
+- `outbox` — the per-node BSO-style spool (P-M2): `state/outbox/<node>/`,
+  one JSON file per pending envelope plus each link's own backoff state
+  (`link.json`), guarded by the same crate-wide stage lock `mail` uses for
+  file mutations and a SEPARATE, non-blocking per-node `.bsy` flock a
+  drain holds across its whole dial cycle — two locks, two jobs, never
+  conflated (this module's own doc has the full reasoning). Pure spool
+  CRUD only: `write_entry`/`list_entries`/`remove_entry`, `retire_by_ack`
+  (spec item 7's two checks — verified signer is the entry's `to.node`,
+  text names the entry's `msgid` — folded into ONE path lookup: an entry
+  is always spooled under its own `to.node`, so indexing by the ack's
+  already-origin-verified `from.node` IS the signer check, and keying by
+  `msgid` makes a wrong `text` a plain miss) and the link-state
+  trio (`read_link_state`/`back_off`/`clear_link_state`, backoff via
+  `aoide_protocol::dialog::next_spawn_backoff` off a
+  `DRAIN_BACKOFF_FLOOR_SECS` floor). No network, no HTTP, no tunnel — the
+  actual dial+POST lives in `aoide-client::mail_wire`, a thin bridge in
+  `aoide-conduct::mail_bridge`, the same split `tunnel` above already
+  holds between record CRUD (here) and the ssh child process (`client`).
 - `identity` — this instance's lazily-minted ed25519 keypair (pairing
   workstream P-P1, `docs/architecture/PAIRING.md`, CONTRACTS.md §4's
   `state/identity/` subsection): `state/identity/ed25519.key` (the raw
@@ -565,15 +601,18 @@ by decision — no embedded database yet
   and no write path into `node_store` — discovery grants nothing, by
   construction, since this module cannot write a node record even if a
   caller wanted it to.
-- `commands` — this crate's CLI commands: `usage` (local token/cost rollup),
-  `mail send|read|show|mark|rm` (the store above's CLI surface), `identity`
-  (the module above's CLI surface), and `config`/`config set` (the config
-  module's — `config` prints the effective values, the path they resolved
-  from, and whether it is managed or unmanaged; `config set` is the one
-  schema-validated write). `aoide pair`/`pair reject`/`pair watch`
-  lives in `aoide-client` instead (outbound transport crosses the
-  `client → storage` DAG edge; this crate exposes `pairing`/`node_store`
-  as the library, `client` drives the wire).
+- `commands` — this crate's CLI commands: `usage` (local token/cost
+  rollup), `identity` (the module above's CLI surface), and
+  `config`/`config set` (the config module's — `config` prints the
+  effective values, the path they resolved from, and whether it is
+  managed or unmanaged; `config set` is the one schema-validated write).
+  `aoide pair`/`pair reject`/`pair watch` lives in `aoide-client` instead
+  (outbound transport crosses the `client → storage` DAG edge; this crate
+  exposes `pairing`/`node_store` as the library, `client` drives the
+  wire). `mail`'s CLI surface (`mail send|read|show|mark|rm|outbox|outbox
+  rm`) moved there too at P-M2, for the same reason: a directly-paired
+  node's mail dials out through the outbox drain, which only
+  `aoide-client` can reach.
 
 ## What it consumes
 

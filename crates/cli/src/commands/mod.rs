@@ -44,9 +44,11 @@ use crate::registry::Registry;
 /// `[mesh.<name>]` against the live node registry and reports drift without
 /// writing either side; the converge closes that drift by running the
 /// ordinary `pair` ceremony against every declared node with no verified
-/// record, and never touches a verified one), mail send/read/show/mark/rm
-/// (the addressed, signed, append-only mailbase — the durable per-host
-/// message store, messaging plan P-M1, `docs/architecture/MAIL.md`).
+/// record, and never touches a verified one), mail send/read/show/mark/rm/
+/// outbox/outbox rm (the addressed, signed, append-only mailbase — the
+/// durable per-host message store — plus its outbox spool for delivery to
+/// a directly paired node, messaging plan P-M1/P-M2,
+/// `docs/architecture/MAIL.md`).
 ///
 /// P-A5 (binary-split workstream) removed the register lines for the
 /// graphical bundle — rice/draft/mode/cover/livery/rice-late-stubs/
@@ -86,7 +88,7 @@ pub fn all() -> Registry {
     aoide_client::commands::register_pair(&mut r); // pair + pair reject/watch — the pairing ceremony's whole CLI face, one smart command (task #135 P3', superseding the node pair family — hard cutover)
     aoide_storage::commands::register_config(&mut r); // config, config set — the portable runtime config file (task #135 P-C, appended newest)
     aoide_client::mesh::register(&mut r); // mesh + mesh pair — the declared-mesh-vs-live-registry drift report and the converge that closes it (task #135 P4/P5, appended newest)
-    aoide_storage::commands::register_mail(&mut r); // mail send/read/show/mark/rm — the addressed, signed, append-only mailbase (messaging plan P-M1, docs/architecture/MAIL.md, appended newest, supersedes register_inbox)
+    aoide_client::commands::register_mail(&mut r); // mail send/read/show/mark/rm/outbox/outbox.rm — the addressed, signed, append-only mailbase plus its outbox spool for a directly paired node (messaging plan P-M1/P-M2, docs/architecture/MAIL.md, appended newest)
 
     r
 }

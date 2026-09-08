@@ -246,6 +246,10 @@ mod tests {
         // `mail`, `mail.mark`, `mail.read`, `mail.rm`, `mail.send`,
         // `mail.show` (+6) — same alphabetical slot the retired `inbox.*`
         // trio held, between `identity` and `make`. Net: 81 - 3 + 6 = 84.
+        //
+        // P-M2 adds the outbox spool's own two commands, `mail.outbox` and
+        // `mail.outbox.rm` (+2) — sorting between `mail.mark` and
+        // `mail.read`, same mailbase family. Net: 84 + 2 = 86.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -267,6 +271,8 @@ mod tests {
             "identity",
             "mail",
             "mail.mark",
+            "mail.outbox",
+            "mail.outbox.rm",
             "mail.read",
             "mail.rm",
             "mail.send",

@@ -1,12 +1,16 @@
 //! `state/mail/` — the addressed, signed, append-only mailbase
-//! (`docs/architecture/MAIL.md`, phase P-M1). Absorbs the old per-host
-//! `inbox.json` receipt log (MAIL.md decision 8): today's two delivery
-//! seams (`conduct/graph/send.rs`, `server/a2a.rs`) file a `receipt` entry
-//! here instead, and a box's own `mail send --to self/<name>` files a
-//! `letter`. **No wire, no outbox, no transit, no zones, no doorbell, no
-//! `--hold` — those are P-M2 through P-M5** (MAIL.md's own Phases section);
-//! nothing here reads a mesh declaration, opens a socket, or injects a byte
-//! into a pty.
+//! (`docs/architecture/MAIL.md`). Absorbs the old per-host `inbox.json`
+//! receipt log (MAIL.md decision 8): today's two LOCAL delivery seams
+//! (`conduct/graph/send.rs`, `server/a2a.rs`) file a `receipt` entry here,
+//! and `mail send` files a `letter` — locally via [`file_letter`] for
+//! `self/<name>`, or over the wire for a direct paired edge (P-M2): the
+//! sender mints with [`mint_outbound_letter`] and spools the sealed
+//! [`Envelope`] into [`crate::outbox`]; the far door's `aoide/mailDeposit`
+//! arm calls [`deposit`] here to verify and file it, ONLY ever via a
+//! [`file_received_entry`] (never re-minted — the envelope arrives already
+//! sealed). **No transit, no zones, no doorbell, no `--hold`** — those are
+//! P-M3 through P-M5 (MAIL.md's own Phases section); nothing here reads a
+//! mesh declaration or injects a byte into a pty.
 //!
 //! ## The envelope
 //!
@@ -19,10 +23,11 @@
 //! and `msgid` (hex sha256 over `sig ‖ header ‖ 0x00 ‖ text` — no separator
 //! before `header`, one before `text`; see [`seal`]). Deliberately absent:
 //! the wire envelope's sibling `mesh`/`transit` fields — those are routing
-//! facts that mean nothing until a mesh declaration exists (P-M4), and
-//! `header.origin_mesh` (always `""` here, since P-M1 has no mesh config)
-//! stands in for them wherever P-M1 renders a "mesh" column, since mesh and
-//! originMesh are defined to start equal and nothing in this phase can ever
+//! facts nothing here consults yet (P-M4's zone check, MAIL.md step 3,
+//! still skipped entirely rather than stubbed even now that a mesh CAN be
+//! declared, task #135), and `header.origin_mesh` (always `""` here) stands
+//! in for them wherever P-M1/P-M2 render a "mesh" column, since mesh and
+//! originMesh are defined to start equal and nothing before P-M4 can ever
 //! diverge them.
 //!
 //! `self` resolves at mint time through [`crate::display::local_host_name`]
@@ -68,12 +73,31 @@
 //! the SAME critical section (ruling 2), and every call after that sees
 //! both already done and does nothing.
 //!
-//! ## Commands this phase ships
+//! ## Origin, hop, and hop-forgery
 //!
-//! `storage/src/commands.rs::register_mail` wires `mail`, `mail send`
-//! (`--to self/<name>` only), `mail read`, `mail show`, `mail mark`,
-//! `mail rm`. `mail outbox`/`mail route`/`--hold`/`--transit` are later
-//! phases and are not registered yet.
+//! Two independent lookups (P-M2 spec item 3), on purpose: the HOP (the
+//! caller of `aoide/mailDeposit`) is whichever node record's stored pubkey
+//! verified the *connection* signature (`a2a::verify_signed_request`,
+//! threaded through as `ctx.signed_node_name`) — this module never
+//! consults it directly, only receives it as `via`. The ORIGIN is
+//! `header.from.node`, checked in [`verify_origin_signature`] against the
+//! ONE key `nodes.json` has on record under that exact name — never the
+//! connection path's try-every-verified-key ladder, or a paired node
+//! signing as another paired node's name would verify and file under the
+//! wrong identity. Origin and hop always coincide today (only direct edges
+//! exist); the split is written now for P-M4's transit hops, where they
+//! will not.
+//!
+//! ## Commands
+//!
+//! `aoide_client::commands::register_mail` wires `mail`, `mail send`
+//! (`--to self/<name>` or `--to <node>/<name>` for a direct verified edge),
+//! `mail read`, `mail show`, `mail mark`, `mail rm`, `mail outbox`, `mail
+//! outbox rm` — moved out of this crate's own `commands.rs` at P-M2 because
+//! sending over a direct edge needs the wire lane (`aoide-client`'s own
+//! domain); this module stays the mailbase's storage layer regardless of
+//! which crate dispatches into it. `mail route`/`--hold`/`--transit` are
+//! later phases and are not registered yet.
 
 use crate::display;
 use crate::fs::{atomic_write, state_dir};
@@ -597,12 +621,16 @@ fn reader_id(name: &str, reader_session: Option<&str>) -> String {
     }
 }
 
-/// Mint + seal + file one entry (letter or receipt), always `via: "self"`
-/// (P-M1 has no other hop) — the one place [`append_base_line`] and
-/// [`append_seen_line`] are called together, in that order. Raw — called
-/// only from inside [`with_lock`]'s closure (`file_letter`/`file_receipt`/
-/// [`migrate_if_needed`]'s own inline copy of this same shape).
-fn file_entry(kind: &str, from: Address, to: Address, text: &str) -> Result<Entry, String> {
+/// Mint + seal + file one entry (letter or receipt) ORIGINATING on this box
+/// — `via` names the hop that deposited it, `"self"` for everything this
+/// box mints for itself (P-M1's every caller; a remotely-deposited envelope
+/// is filed by [`file_received_entry`] instead, which skips minting
+/// entirely since the envelope already arrived sealed). The one place
+/// [`append_base_line`] and [`append_seen_line`] are called together, in
+/// that order. Raw — called only from inside [`with_lock`]'s closure
+/// (`file_letter`/`file_receipt`/[`migrate_if_needed`]'s own inline copy of
+/// this same shape).
+fn file_entry(kind: &str, from: Address, to: Address, text: &str, via: &str) -> Result<Entry, String> {
     let (kp, _) = identity::load_or_mint().map_err(|e| e.to_string())?;
     let header = Header {
         version: ENVELOPE_VERSION.to_string(),
@@ -618,11 +646,32 @@ fn file_entry(kind: &str, from: Address, to: Address, text: &str) -> Result<Entr
         seq: next_seq()?,
         received_at: now_iso_utc(),
         kind: kind.to_string(),
-        via: "self".to_string(),
+        via: via.to_string(),
         envelope,
     };
     append_base_line(&entry)?;
     append_seen_line(&msgid, &entry.received_at)?;
+    Ok(entry)
+}
+
+/// File an envelope that arrived ALREADY SEALED over the wire (P-M2,
+/// `aoide/mailDeposit`) — the received-mail counterpart to [`file_entry`]:
+/// no minting, no signing, the envelope's own `sig`/`msgid` are filed
+/// verbatim exactly as the origin produced them. `via` is the HOP's
+/// resolved name (`ctx.signed_node_name`, never a name read out of the
+/// envelope itself — the door already resolved this by key before calling
+/// here). Raw — called only from inside [`with_lock`]'s closure
+/// ([`deposit`]'s own).
+fn file_received_entry(envelope: Envelope, via: &str) -> Result<Entry, String> {
+    let entry = Entry {
+        seq: next_seq()?,
+        received_at: now_iso_utc(),
+        kind: envelope.header.kind.clone(),
+        via: via.to_string(),
+        envelope,
+    };
+    append_base_line(&entry)?;
+    append_seen_line(&entry.envelope.msgid, &entry.received_at)?;
     Ok(entry)
 }
 
@@ -636,24 +685,157 @@ fn file_entry(kind: &str, from: Address, to: Address, text: &str) -> Result<Entr
 /// design at BOTH call sites, same as before — a failed filing must never
 /// turn an already-succeeded delivery into a reported failure, which is why
 /// this still returns a real `Result` rather than swallowing the error
-/// itself: the caller decides whether/how to surface it.
+/// itself: the caller decides whether/how to surface it. Always `via:
+/// "self"` — both call sites file a LOCAL delivery, never a remote one.
 pub fn file_receipt(from: &str, to_name: &str, text: &str) -> Result<(), String> {
     let node = display::local_host_name();
     let from_addr = Address { node: node.clone(), name: from.to_string() };
     let to_addr = Address { node, name: to_name.to_string() };
     let text = text.to_string();
-    with_lock(move || file_entry(ENTRY_TYPE_RECEIPT, from_addr, to_addr, &text).map(|_| ()))
+    with_lock(move || file_entry(ENTRY_TYPE_RECEIPT, from_addr, to_addr, &text, "self").map(|_| ()))
 }
 
-/// File one letter — `mail send`'s engine. P-M1 only ever calls this with
-/// `to_name` resolved from `--to self/<name>`; the command layer is what
-/// refuses any other node (there is nowhere else to route to yet).
+/// File one letter locally — `mail send --to self/<name>`'s engine, and the
+/// same-node-loopback path of a `--to <node>/<name>` send whose `<node>` is
+/// this box's own name (P-M2's `--to` resolution happens one layer up, in
+/// the command handler). Always `via: "self"`.
 pub fn file_letter(from_name: &str, to_name: &str, text: &str) -> Result<Entry, String> {
     let node = display::local_host_name();
     let from_addr = Address { node: node.clone(), name: from_name.to_string() };
     let to_addr = Address { node, name: to_name.to_string() };
     let text = text.to_string();
-    with_lock(move || file_entry(ENTRY_TYPE_LETTER, from_addr, to_addr, &text))
+    with_lock(move || file_entry(ENTRY_TYPE_LETTER, from_addr, to_addr, &text, "self"))
+}
+
+/// File a letter ADDRESSED TO A REMOTE NODE — mints and seals exactly like
+/// [`file_letter`] (this box IS the origin), but the caller supplies
+/// `to_node` directly rather than this box's own name, since the whole
+/// point is a `to` that names somewhere else. Returns the sealed
+/// [`Envelope`] (not an [`Entry`] — nothing is filed into THIS box's own
+/// mailbase; a letter to another node is never also a local copy) for the
+/// caller to hand to the outbox. `mail send`'s command layer is what
+/// decides self vs. remote and calls the matching one of these two.
+pub fn mint_outbound_letter(from_name: &str, to_node: &str, to_name: &str, text: &str) -> Result<Envelope, String> {
+    let (kp, _) = identity::load_or_mint().map_err(|e| e.to_string())?;
+    let header = Header {
+        version: ENVELOPE_VERSION.to_string(),
+        from: Address { node: display::local_host_name(), name: from_name.to_string() },
+        to: Address { node: to_node.to_string(), name: to_name.to_string() },
+        kind: ENTRY_TYPE_LETTER.to_string(),
+        minted_at: now_iso_utc(),
+        origin_mesh: String::new(),
+    };
+    let (sig, msgid) = seal(&header, text, &kp);
+    Ok(Envelope { header, text: text.to_string(), sig, msgid })
+}
+
+/// Mint a receipt envelope ACKing `acked_msgid` back to `to` — the ack this
+/// box spools to its own outbox once it has filed someone else's letter
+/// (MAIL.md, spec item 6: "acks are ordinary envelopes, type=receipt,
+/// to=origin, text=acked msgid, signed by destination"). `from_name` is the
+/// mailbox that received the letter (the identity doing the acking);
+/// `to` is the original letter's own `header.from` (origin, not hop —
+/// P-M2's two lookups stay distinct even here). Not filed into this box's
+/// own mailbase (an ack is outbound-only until IT is deposited somewhere,
+/// same as [`mint_outbound_letter`]).
+pub fn mint_ack(from_name: &str, to: Address, acked_msgid: &str) -> Result<Envelope, String> {
+    let (kp, _) = identity::load_or_mint().map_err(|e| e.to_string())?;
+    let header = Header {
+        version: ENVELOPE_VERSION.to_string(),
+        from: Address { node: display::local_host_name(), name: from_name.to_string() },
+        to,
+        kind: ENTRY_TYPE_RECEIPT.to_string(),
+        minted_at: now_iso_utc(),
+        origin_mesh: String::new(),
+    };
+    let (sig, msgid) = seal(&header, acked_msgid, &kp);
+    Ok(Envelope { header, text: acked_msgid.to_string(), sig, msgid })
+}
+
+/// Verify `envelope`'s origin signature against the ONE key `nodes.json`
+/// has on record for `header.from.node` (P-M2 spec item 3) — a DIFFERENT
+/// question from `a2a::verify_signed_request`'s "which verified node's key
+/// verifies this connection," and deliberately not reused for it: this
+/// tries EXACTLY the one key on record under the CLAIMED origin name, never
+/// every verified key, so a paired node signing as another paired node's
+/// name is refused rather than silently verifying and filing under the
+/// wrong identity. Collapses "no node named `from.node`," "that node has no
+/// recorded key," and "the key on record doesn't verify" into the SAME
+/// `false` — same non-oracle discipline `verify_signed_request`'s own doc
+/// states for its ladder ("never an existence oracle over the registry").
+/// In P-M2 the origin and the hop always coincide (only direct edges
+/// exist); this two-lookup shape is written now for P-M4's transit hops,
+/// where they will not.
+pub fn verify_origin_signature(envelope: &Envelope) -> bool {
+    let nodes = crate::node_store::load_nodes();
+    let Some(node) = nodes.iter().find(|n| n.name == envelope.header.from.node) else {
+        return false;
+    };
+    let Some(pubkey_hex) = node.pubkey.as_deref() else {
+        return false;
+    };
+    let mut sig_input = canonical_header_bytes(&envelope.header);
+    sig_input.push(0u8);
+    sig_input.extend_from_slice(envelope.text.as_bytes());
+    crate::wire_auth::verify_signature_hex(pubkey_hex, &sig_input, &envelope.sig)
+}
+
+/// The outcome of [`deposit`]'s policy chain, once the caller has already
+/// cleared admission (verified + `message` — the door's job, before ever
+/// calling here; MAIL.md's zone check, step 3, is P-M4's and is skipped
+/// entirely, not stubbed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepositOutcome {
+    /// A fresh envelope, filed. `msgid` is its own, for the caller to ack
+    /// (a letter) or simply acknowledge process (a receipt).
+    Filed { msgid: String, kind: String },
+    /// A `msgid` already in `seen.jsonl`. `filed_letter` is `true` when the
+    /// ORIGINAL filing was a `letter` — the destination re-spools its ack
+    /// in that case (spec item 5: "a lost ack is the ordinary reason for a
+    /// re-offer"), never for a duplicate receipt (nothing acks an ack).
+    Duplicate { filed_letter: bool },
+    /// `msgid` does not recompute from `(header, text, sig)` — tampered or
+    /// corrupt in transit.
+    BadMsgid,
+    /// [`verify_origin_signature`] returned `false`.
+    UnverifiedOrigin,
+}
+
+/// `aoide/mailDeposit`'s policy chain from "msgid recomputes" onward (spec
+/// item 4) — admission (verified caller holding `message`) already ran in
+/// the door, above this. Runs entirely under [`with_lock`]: recompute,
+/// verify, dedup, and file are all local-disk checks, never network I/O, so
+/// holding the lock across all four costs nothing a caller need avoid
+/// (contrast the OUTBOX drain, which must never hold this lock across an
+/// ssh dial). `via` is the hop's resolved name (`ctx.signed_node_name`).
+pub fn deposit(envelope: Envelope, via: &str) -> Result<DepositOutcome, String> {
+    with_lock(move || {
+        let Some(recomputed) = compute_msgid(&envelope.header, &envelope.text, &envelope.sig) else {
+            return Ok(DepositOutcome::BadMsgid);
+        };
+        if recomputed != envelope.msgid {
+            return Ok(DepositOutcome::BadMsgid);
+        }
+        if !verify_origin_signature(&envelope) {
+            return Ok(DepositOutcome::UnverifiedOrigin);
+        }
+        let seen = read_seen_msgids_unlocked()?;
+        if seen.contains(&envelope.msgid) {
+            // Re-derive whether the already-filed entry was a letter,
+            // without a second full parse of `base.jsonl` beyond what a
+            // tolerant scan already costs — `read_entries_unlocked` skips
+            // malformed lines the same way `read_seen_msgids_unlocked`
+            // does, so this stays consistent with what's actually on disk.
+            let filed_letter = read_entries_unlocked()?
+                .iter()
+                .any(|e| e.envelope.msgid == envelope.msgid && e.kind == ENTRY_TYPE_LETTER);
+            return Ok(DepositOutcome::Duplicate { filed_letter });
+        }
+        let kind = envelope.header.kind.clone();
+        let msgid = envelope.msgid.clone();
+        file_received_entry(envelope, via)?;
+        Ok(DepositOutcome::Filed { msgid, kind })
+    })
 }
 
 /// The whole base, tolerantly parsed, in file order. The one PUBLIC,
@@ -890,6 +1072,107 @@ mod tests {
             !base_path().to_string_lossy().contains("/.aoide/"),
             "must never resolve into a real ~/.aoide tree"
         );
+
+        let envelope = mint_outbound_letter("alice", "elsewhere", "carol", "hi").unwrap();
+        crate::outbox::write_entry("elsewhere", &crate::outbox::OutboxEntry::fresh(envelope)).unwrap();
+        let outbox_dir = crate::outbox::outbox_dir();
+        assert!(outbox_dir.starts_with(&dir), "state/outbox must land under the isolated root");
+        assert!(
+            !outbox_dir.to_string_lossy().contains("/.aoide/"),
+            "must never resolve into a real ~/.aoide tree"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn origin_verification_is_bound_to_the_key_on_record_for_from_node() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("origin-verification");
+
+        let alice_kp = identity::mint_ephemeral().unwrap();
+        let mallory_kp = identity::mint_ephemeral().unwrap();
+        let mut nodes = Vec::new();
+        crate::node_store::upsert_paired_node(
+            &mut nodes,
+            "alice-host",
+            "https://alice",
+            &alice_kp.info().pubkey_hex,
+            "2026-09-06T00:00:00Z",
+            &["message".to_string()],
+        );
+        crate::node_store::upsert_paired_node(
+            &mut nodes,
+            "mallory-host",
+            "https://mallory",
+            &mallory_kp.info().pubkey_hex,
+            "2026-09-06T00:00:00Z",
+            &["message".to_string()],
+        );
+        crate::node_store::save_nodes(&nodes).unwrap();
+
+        let mut genuine_header = header("alice", "bob", ENTRY_TYPE_LETTER, "2026-09-06T00:00:00Z");
+        genuine_header.from.node = "alice-host".to_string();
+        let (genuine_sig, genuine_msgid) = seal(&genuine_header, "hello", &alice_kp);
+        let genuine = Envelope {
+            header: genuine_header.clone(),
+            text: "hello".to_string(),
+            sig: genuine_sig,
+            msgid: genuine_msgid,
+        };
+        assert!(verify_origin_signature(&genuine), "alice-host signing as itself must verify");
+
+        // Mallory signs a header CLAIMING to be alice-host — the exact
+        // forgery spec item 3 rules out: only the ONE key on record for
+        // that exact `from.node` is ever tried, never every verified
+        // node's key.
+        let (forged_sig, forged_msgid) = seal(&genuine_header, "hello", &mallory_kp);
+        let forged = Envelope { header: genuine_header, text: "hello".to_string(), sig: forged_sig, msgid: forged_msgid };
+        assert!(
+            !verify_origin_signature(&forged),
+            "a different paired node signing as alice-host must NOT verify"
+        );
+
+        // No key on record at all for this `from.node`.
+        let mut unknown_header = header("alice", "bob", ENTRY_TYPE_LETTER, "2026-09-06T00:00:00Z");
+        unknown_header.from.node = "nobody-host".to_string();
+        let (unknown_sig, unknown_msgid) = seal(&unknown_header, "hello", &alice_kp);
+        let unknown =
+            Envelope { header: unknown_header, text: "hello".to_string(), sig: unknown_sig, msgid: unknown_msgid };
+        assert!(
+            !verify_origin_signature(&unknown),
+            "no key on record for from.node must refuse, never fall back to any other key"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_msgid_that_does_not_recompute_is_rejected() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("deposit-bad-msgid");
+
+        let kp = identity::mint_ephemeral().unwrap();
+        let mut nodes = Vec::new();
+        crate::node_store::upsert_paired_node(
+            &mut nodes,
+            "alice-host",
+            "https://alice",
+            &kp.info().pubkey_hex,
+            "2026-09-06T00:00:00Z",
+            &["message".to_string()],
+        );
+        crate::node_store::save_nodes(&nodes).unwrap();
+
+        let mut h = header("alice", "bob", ENTRY_TYPE_LETTER, "2026-09-06T00:00:00Z");
+        h.from.node = "alice-host".to_string();
+        let (sig, msgid) = seal(&h, "hello", &kp);
+        let mut envelope = Envelope { header: h, text: "hello".to_string(), sig, msgid };
+        envelope.msgid = "not-the-real-msgid".to_string(); // tampered after sealing
+
+        let outcome = deposit(envelope, "alice-host").unwrap();
+        assert_eq!(outcome, DepositOutcome::BadMsgid);
+        assert!(read_base().unwrap().is_empty(), "a bad-msgid deposit must never file");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1453,6 +1736,33 @@ mod tests {
             compute_msgid(&tampered_header, "hello", &sig).unwrap(),
             msgid,
             "a tampered header field must change the recomputed msgid"
+        );
+    }
+
+    #[test]
+    fn sign_and_verify_round_trip_over_the_canonical_header() {
+        // Pure/in-memory only — exercises exactly the bytes
+        // `verify_origin_signature` binds itself to (canonical header ‖
+        // 0x00 ‖ text), independent of any node lookup; the lookup half is
+        // `origin_verification_is_bound_to_the_key_on_record_for_from_node`'s
+        // job.
+        let h = header("alice", "bob", ENTRY_TYPE_LETTER, "2026-09-06T00:00:00Z");
+        let kp = identity::mint_ephemeral().unwrap();
+        let (sig, _msgid) = seal(&h, "hello", &kp);
+
+        let mut sig_input = canonical_header_bytes(&h);
+        sig_input.push(0u8);
+        sig_input.extend_from_slice(b"hello");
+
+        assert!(
+            crate::wire_auth::verify_signature_hex(&kp.info().pubkey_hex, &sig_input, &sig),
+            "a correctly-sealed envelope's signature must verify against its own signer's pubkey"
+        );
+
+        let other = identity::mint_ephemeral().unwrap();
+        assert!(
+            !crate::wire_auth::verify_signature_hex(&other.info().pubkey_hex, &sig_input, &sig),
+            "the same signature must not verify against a DIFFERENT signer's pubkey"
         );
     }
 

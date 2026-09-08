@@ -103,8 +103,11 @@ pub struct Node {
     /// decision 5) — a CLOSED vocabulary ([`NODE_CAPABILITIES`]), never a
     /// per-capability serde bool scatter (the kill-list). `"spawn"` gates
     /// the A2A door's spawn arm (decision 6); `"read"` is reserved for a
-    /// future graph/who-summary gate over A2A, not read by anything yet.
-    /// Empty for every unpaired node (today's every `node add` entry) and
+    /// future graph/who-summary gate over A2A, not read by anything yet;
+    /// `"message"` (messaging plan P-M2, `docs/architecture/MAIL.md`) gates
+    /// `aoide/mailDeposit` — a paired node lacking it is refused before its
+    /// envelope is ever looked at (`a2a.rs::deposit_admitted`). Empty for
+    /// every unpaired node (today's every `node add` entry) and
     /// for a legacy `nodes.json` predating this field — same
     /// `#[serde(default)]`+`skip_serializing_if` discipline `hub`/`verified`
     /// already hold. Set ONLY by [`upsert_paired_node`] (the ceremony's
@@ -136,10 +139,10 @@ pub struct Node {
 }
 
 /// The closed capability vocabulary `allows` may ever contain (P-P3,
-/// PAIRING.md decision 5) — the ONLY valid strings; [`valid_capability`] and
-/// [`set_node_allow`]'s taught refusal both name this set directly rather
-/// than duplicating it.
-pub const NODE_CAPABILITIES: &[&str] = &["read", "spawn"];
+/// PAIRING.md decision 5; `"message"` joined the set at P-M2, MAIL.md) — the
+/// ONLY valid strings; [`valid_capability`] and [`set_node_allow`]'s taught
+/// refusal both name this set directly rather than duplicating it.
+pub const NODE_CAPABILITIES: &[&str] = &["read", "spawn", "message"];
 
 /// Is `cap` one of [`NODE_CAPABILITIES`]? Pure.
 pub fn valid_capability(cap: &str) -> bool {
@@ -1223,6 +1226,7 @@ mod tests {
     fn valid_capability_accepts_only_the_closed_set() {
         assert!(valid_capability("read"));
         assert!(valid_capability("spawn"));
+        assert!(valid_capability("message"));
         assert!(!valid_capability("write"));
         assert!(!valid_capability(""));
         assert!(!valid_capability("Spawn"), "case-sensitive — the closed set is exact strings");

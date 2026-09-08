@@ -274,6 +274,16 @@ never the inbound/serve half (that's `aoide-server`).
   (`origin_for_inject`, CONTRACTS.md §6) — a signed caller is a remote node
   by construction and never rides Loopback's trust, so tunneled delivery is
   safe against a real, non-autogate node, not merely possible.
+  **`mail_wire`'s drain (P-M2) is the one deliberate exception to "this
+  crate never closes a tunnel itself."** A rarely-contacted outbox target
+  should not accumulate a standing forward just because a background daemon
+  tick happened to touch it once — `drain_node` closes its own tunnel
+  unconditionally before returning, on every path, via a Drop guard
+  (`TunnelTeardownGuard`) rather than the session/pid lifecycle above. This
+  is safe specifically because a drain's dial is one-shot and self-contained
+  (unlike `pull_node_live`/`send_message_to_node`/`spawn_on_node`, which are
+  called from long-lived `aoide-conduct` handlers this crate cannot wrap) —
+  don't generalize this exception to any other caller in this module.
 - `mesh` (task #135 P4/P5) — `aoide mesh` and `aoide mesh pair`, the read
   and the converge over a declared `[mesh.<name>]`
   (`aoide_storage::config::Mesh`, validated but not a `config
@@ -317,10 +327,85 @@ never the inbound/serve half (that's `aoide-server`).
   says about it afterward — never a `data.reason` string — so `UNREACHABLE`
   is exactly "nothing committed and nothing parked" and structurally
   carries no resumable id.
+- `mail_wire` (P-M2, `docs/architecture/MAIL.md`) — the outbox drain: the
+  ONE place a spooled mail envelope actually dials out.
+  `aoide_storage::outbox` owns the spool as pure file CRUD with no network;
+  this module owns the wire half. `drain_node(node_name)` is called from
+  three places that all converge here so there is exactly one dial
+  implementation: the daemon's periodic tick (`aoide-server::daemon` via
+  `aoide_conduct::mail_bridge`, a thin passthrough that exists only because
+  `aoide-server` must not carry a hard `aoide-client` dependency in
+  production while `aoide-conduct` already does), a door's own best-effort
+  drain of the node it just heard from (`aoide-server::a2a::mail_deposit`,
+  same bridge), and `mail send`'s own one-shot attempt right after it
+  writes the outbox entry (`handle_mail_send` in `commands`, below — spec
+  item 8: the write is the report, delivery is the spool's job).
+  `attempt_deposit` builds and sends one `aoide/mailDeposit` POST,
+  mirroring `spawn_on_node_via`'s exact shape (resolve bearer, sign, POST,
+  parse, check `error`) with no `--via` override — a drain only ever dials
+  `node.via` as recorded. Its `DepositAttempt` has three arms:
+  `Delivered{status}` (no `error` member — `"accepted"` or `"duplicate"`),
+  `Refused(reason)` (a JSON-RPC `error` — the far end's own policy call,
+  e.g. `-32010` lacks-message; the link is fine, this ONE entry isn't
+  currently deliverable), and `TransportFailed(reason)` (no response at
+  all — the LINK is the suspect). `drain_node`'s loop walks every
+  non-refused entry oldest first, stopping outright on the first
+  `TransportFailed` (hammering the rest of the queue against a dead link
+  gains nothing) but continuing past a `Refused` (that one entry is the
+  problem, not the link). A receipt's own successful deposit — accepted OR
+  duplicate, either way the far end has it now — IS its confirmation
+  (ruling 4: no separate ack-of-an-ack), so `drain_node` removes it
+  outright; an ordinary letter waits for a REAL ack instead, only having
+  its `tries`/`last_try_at`/`last_outcome` bookkeeping updated. **Two
+  locks, never nested** (mirrors `aoide_storage::outbox`'s own module
+  doc): `drain_node` takes `.bsy` via `try_take_link_lock` — non-blocking,
+  per-node, held across the whole function, safe to span network I/O — and
+  leaves every individual `outbox::*` call as its own short,
+  independently-locked operation around the POST, never holding the STAGE
+  lock across the POST itself (spec item 9: network I/O never happens
+  under the stage lock). `Ok(())` covers every ordinary non-error path —
+  nothing registered under `node_name`, `.bsy` already held by a
+  concurrent drain (ruling 3: skipped, never queued), a held-off link, an
+  empty spool, or a completed pass regardless of outcome mix; `Err` is
+  reserved for a genuine local I/O failure, never for "the remote node was
+  unreachable," which is an ordinary outcome recorded in entry/link state
+  instead of surfaced as an error to the caller. **A drain tears its own
+  tunnel down before returning, unconditionally, on every path (ruling
+  10)** — `TunnelTeardownGuard` is a Drop guard mirroring
+  `commands::ScratchBodyFile`'s pattern; see the `tunnel` bullet above for
+  why this is the one deliberate exception to that module's "never closes
+  a tunnel itself" default, and why it doesn't generalize to any other
+  caller.
 - `commands` — this crate's CLI commands:
   `node add/remove/pull/status/hub/allow/spawn/discover`,
   `aoide pair` + `pair.reject`/`pair.watch` (P-P2, P-PV2, task #135 P3',
-  CONTRACTS.md §6/§7 —
+  CONTRACTS.md §6/§7 — **`register_mail`'s eight commands (`mail
+  send/read/show/mark/rm/outbox/outbox.rm`, P-M1/P-M2, `docs/architecture/
+  MAIL.md`) moved here from `aoide-storage` at P-M2, because
+  `handle_mail_send`'s non-self branch now dials out and only this crate
+  may hold that dial:** `handle_mail_send` mints and spools an outbound
+  letter through `aoide_storage::mail`/`outbox` exactly as before, then —
+  new at P-M2, for a non-self `to` — makes ONE best-effort call into
+  `mail_wire::drain_node` before returning, reporting only the WRITE
+  regardless of what that attempt did (spec item 8; the periodic daemon
+  tick and the door's own post-heard drain are what actually guarantee
+  delivery, this call is purely a latency shortcut). Its node-branch gate
+  is deliberately shallow — it requires `verified` off `node_store::
+  load_nodes()` and nothing more, the SAME "the client checks reachability
+  of a record, never a granular capability" precedent `handle_node_spawn`
+  already sets; whether this node actually GRANTS `message` is exclusively
+  the remote door's own call (`node_may_message`), surfaced back as an
+  ordinary taught JSON-RPC refusal if it says no, never pre-empted locally.
+  `handle_mail_outbox` (`mail outbox [node]`) is the spool's own read-only
+  status view — an optional node arg narrows to one, otherwise every node
+  `outbox::nodes_with_outbox` reports — rendering each `list_entries` row's
+  msgid/to/tries/lastTryAt/lastOutcome/refused, "outbox empty" when there is
+  nothing waiting anywhere. `handle_mail_outbox_rm` (`mail outbox rm
+  <msgid>`) is an exact-msgid removal, NOT the mailbase `mail rm`'s
+  age-based prune — it walks `nodes_with_outbox` and calls
+  `outbox::remove_entry(node, msgid)` on each until one actually held that
+  msgid, erroring `not-found` if none did; neither command touches the
+  mailbase (`aoide_storage::mail`) at all —
   `handle_node_allow` (`node allow <name> <cap> on|off`, P-P3, `docs/
   architecture/PAIRING.md` decision 5) is a thin wire around
   `aoide_storage::node_store::set_node_allow` — idempotent, refuses an
