@@ -1735,16 +1735,19 @@ fn mail_deposit(params: &Value, ctx: &RequestCtx) -> Result<Value, (i64, String)
             Ok(json!({ "status": "duplicate" }))
         }
         aoide_storage::mail::DepositOutcome::Duplicate { filed_letter: false } => Ok(json!({ "status": "duplicate" })),
-        aoide_storage::mail::DepositOutcome::BadMsgid => {
-            Err((-32602, "invalid params: envelope msgid does not match the recomputed value".to_string()))
-        }
-        aoide_storage::mail::DepositOutcome::UnverifiedOrigin => Err((
-            -32602,
-            format!(
-                "invalid params: no key on record for `{}` verifies this envelope's origin signature",
+        aoide_storage::mail::DepositOutcome::BadMsgid => Ok(json!({
+            "status": "refused",
+            "reason": "bad-msgid",
+            "detail": "envelope msgid does not match the recomputed value",
+        })),
+        aoide_storage::mail::DepositOutcome::UnverifiedOrigin => Ok(json!({
+            "status": "refused",
+            "reason": "unverified-origin",
+            "detail": format!(
+                "no key on record for `{}` verifies this envelope's origin signature",
                 envelope.header.from.node
             ),
-        )),
+        })),
     }
 }
 
@@ -9429,11 +9432,50 @@ mod tests {
         let audit_log = root.join("log");
         let ctx = mail_deposit_ctx(&audit_log, Some("box-hop"));
         let params = json!({ "envelope": envelope });
-        let (code, msg) = mail_deposit(&params, &ctx).expect_err("no key on record for the origin — must refuse");
-        assert_eq!(code, -32602);
-        assert!(msg.contains(&origin_name), "{msg}");
+        // MAIL.md §Wire: admission (step 1) is a JSON-RPC error; what
+        // becomes of a well-formed envelope (steps 2 onward, this one) is a
+        // RESULT — a refused outcome is not the same answer as "you may
+        // not speak to this method at all."
+        let result = mail_deposit(&params, &ctx).expect("no key on record for the origin is an OUTCOME, not a protocol error");
+        assert_eq!(result["status"], "refused");
+        assert_eq!(result["reason"], "unverified-origin");
+        assert!(result["detail"].as_str().unwrap().contains(&origin_name), "{result}");
+
+        let log = std::fs::read_to_string(&audit_log).unwrap();
+        assert!(log.contains("\"status\":\"invalid\""), "a refused RESULT still audits as invalid, unconditionally: {log}");
 
         assert!(aoide_storage::mail::read_base().unwrap().is_empty(), "an unverified origin is never filed");
+
+        mail_deposit_cleanup(&root, saved_state, saved_stage);
+    }
+
+    #[test]
+    fn a_deposit_with_a_mismatched_msgid_is_a_refused_result_not_a_protocol_error() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = mail_deposit_root("bad-msgid");
+        act_as(&root, "here");
+
+        // A genuinely verifiable origin (unlike the sibling test above) —
+        // this proves the msgid check is what refuses, not a side effect of
+        // an origin this test never bothered to register.
+        let origin_name = setup_verifiable_origin(&["message"]);
+        let mut envelope = aoide_storage::mail::mint_outbound_letter("alice", "here", "conductor", "hi").unwrap();
+        envelope.msgid = "0".repeat(64); // well-formed hex, does not recompute
+
+        let audit_log = root.join("log");
+        let ctx = mail_deposit_ctx(&audit_log, Some(&origin_name));
+        let params = json!({ "envelope": envelope });
+        let result = mail_deposit(&params, &ctx).expect("a tampered msgid is an OUTCOME, not a protocol error");
+        assert_eq!(result["status"], "refused");
+        assert_eq!(result["reason"], "bad-msgid");
+        assert!(result["detail"].as_str().unwrap().contains("recomputed"), "{result}");
+
+        let log = std::fs::read_to_string(&audit_log).unwrap();
+        assert!(log.contains("\"status\":\"invalid\""), "a refused RESULT still audits as invalid, unconditionally: {log}");
+
+        assert!(aoide_storage::mail::read_base().unwrap().is_empty(), "a bad msgid is never filed");
 
         mail_deposit_cleanup(&root, saved_state, saved_stage);
     }

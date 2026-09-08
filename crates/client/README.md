@@ -344,11 +344,16 @@ never the inbound/serve half (that's `aoide-server`).
   mirroring `spawn_on_node_via`'s exact shape (resolve bearer, sign, POST,
   parse, check `error`) with no `--via` override — a drain only ever dials
   `node.via` as recorded. Its `DepositAttempt` has three arms:
-  `Delivered{status}` (no `error` member — `"accepted"` or `"duplicate"`),
-  `Refused(reason)` (a JSON-RPC `error` — the far end's own policy call,
-  e.g. `-32010` lacks-message; the link is fine, this ONE entry isn't
-  currently deliverable), and `TransportFailed(reason)` (no response at
-  all — the LINK is the suspect). `drain_node`'s loop walks every
+  `Delivered{status}` (a result whose `status` is `"accepted"` or
+  `"duplicate"`), `Refused(reason)` (the far end's own policy call, e.g.
+  `-32010` lacks-message as a JSON-RPC `error` for an ADMISSION refusal,
+  or a result whose `status` is `"refused"` for an OUTCOME one, e.g.
+  `bad-msgid`/`unverified-origin` — MAIL.md §Wire's admission/outcome
+  split means the two travel differently on the wire but collapse into
+  this one arm here, since a drain only ever needs "not currently
+  deliverable," never which shape carried that news; the link is fine
+  either way, this ONE entry isn't), and `TransportFailed(reason)` (no
+  response at all — the LINK is the suspect). `drain_node`'s loop walks every
   non-refused entry oldest first, stopping outright on the first
   `TransportFailed` (hammering the rest of the queue against a dead link
   gains nothing) but continuing past a `Refused` (that one entry is the

@@ -57,13 +57,19 @@ impl Drop for TunnelTeardownGuard {
 /// richer shape: a drain only ever needs to know which of the three
 /// buckets an attempt landed in, never a programmatic reason code.
 enum DepositAttempt {
-    /// A JSON-RPC result came back with no `error` member — `status` is
-    /// `"accepted"` or `"duplicate"` (mail::deposit's own vocabulary,
-    /// wire-projected verbatim by `aoide-server::a2a::mail_deposit`).
+    /// A result whose `status` is `"accepted"` or `"duplicate"`
+    /// (mail::deposit's own vocabulary, wire-projected verbatim by
+    /// `aoide-server::a2a::mail_deposit`).
     Delivered { status: String },
-    /// A JSON-RPC `error` member — the far end's OWN policy refusal
-    /// (`-32010` lacks-message, `-32602` bad envelope, …). The link
-    /// itself is fine; this ONE entry is not currently deliverable.
+    /// The far end's OWN policy refusal — MAIL.md §Wire's admission/outcome
+    /// split means this arrives as either a JSON-RPC `error` (admission,
+    /// e.g. `-32010` lacks-message: the caller may not speak to the method
+    /// at all) or a result whose `status` is `"refused"` (a well-formed
+    /// envelope MAIL.md §Transit rejected, e.g. `bad-msgid`/
+    /// `unverified-origin`) — both collapse into this one bucket because a
+    /// drain only ever needs to know "not currently deliverable," never
+    /// which of the two shapes carried that news. The link itself is fine
+    /// either way; this ONE entry is the problem.
     Refused(String),
     /// No JSON-RPC response at all — dial/tunnel/HTTP/parse failure. The
     /// LINK is the suspect, not this entry.
@@ -106,13 +112,26 @@ fn attempt_deposit(node: &Node, envelope: &Envelope) -> DepositAttempt {
         let detail = err.get("message").and_then(Value::as_str).unwrap_or("(no message)");
         return DepositAttempt::Refused(detail.to_string());
     }
-    let status = parsed
-        .get("result")
-        .and_then(|r| r.get("status"))
-        .and_then(Value::as_str)
-        .unwrap_or("accepted")
-        .to_string();
-    DepositAttempt::Delivered { status }
+    let result = parsed.get("result");
+    let status = result.and_then(|r| r.get("status")).and_then(Value::as_str).unwrap_or("accepted");
+    match status {
+        "accepted" | "duplicate" => DepositAttempt::Delivered { status: status.to_string() },
+        // MAIL.md §Wire's outcome vocabulary is closed to the three above —
+        // `"refused"` and any string this client does not recognise both
+        // mean the entry did NOT land, never that it did. Assuming success
+        // for an unrecognised status is the exact failure this arm exists
+        // to close: a letter waiting forever for an ack the far end was
+        // never going to send.
+        other => {
+            let reason = result.and_then(|r| r.get("reason")).and_then(Value::as_str).unwrap_or(other);
+            let detail = result.and_then(|r| r.get("detail")).and_then(Value::as_str);
+            let msg = match detail {
+                Some(d) => format!("{reason}: {d}"),
+                None => reason.to_string(),
+            };
+            DepositAttempt::Refused(msg)
+        }
+    }
 }
 
 /// Drain `node_name`'s outbox once: every spooled, non-refused entry,
@@ -237,6 +256,79 @@ mod tests {
         let link = aoide_storage::outbox::read_link_state("elsewhere").unwrap();
         assert!(link.is_some(), "the link backs off after an unreachable attempt");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A minimal fake `aoide/mailDeposit` door: answers every connection
+    /// with the same fixed JSON-RPC body, forever — mirrors
+    /// `commands::spawn_fake_card_server`'s exact shape (that copy is
+    /// private to `commands.rs`'s own test module, so this is a second,
+    /// module-local instance rather than a cross-module reach).
+    fn fake_deposit_server(body: &'static str) -> (std::net::TcpListener, u16) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepter = listener.try_clone().unwrap();
+        std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            loop {
+                let Ok((mut stream, _)) = accepter.accept() else { break };
+                let mut buf = [0u8; 1024];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                if n == 0 {
+                    continue;
+                }
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    body.len(),
+                    body
+                );
+                let _ = stream.write_all(response.as_bytes());
+            }
+        });
+        (listener, port)
+    }
+
+    /// MAIL.md §Wire/§Transit: a well-formed envelope's rejection is a
+    /// RESULT (`{"status":"refused","reason":…}`), never a JSON-RPC error —
+    /// so `attempt_deposit` must recognise this shape as a refusal on its
+    /// own, not rely on an `error` member that a spec-conformant peer never
+    /// sends for this outcome. Pins the client half of that split directly:
+    /// this test fails against the client code that reads `status` with
+    /// `.unwrap_or("accepted")` and returns `Delivered` for anything that
+    /// isn't literally `"error"` at the JSON-RPC envelope level, because
+    /// that code leaves `refused` false and `tries` incrementing forever
+    /// (`drain_node`'s `Delivered` arm for a letter never sets `refused`).
+    #[test]
+    fn a_refused_result_parks_the_entry_and_a_later_drain_skips_it() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("refused-result-parks");
+
+        let (listener, port) = fake_deposit_server(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"refused","reason":"bad-msgid","detail":"envelope msgid does not match the recomputed value"}}"#,
+        );
+        let mut node = unpaired_node("elsewhere");
+        node.url = format!("http://127.0.0.1:{port}/");
+        aoide_storage::node_store::save_nodes(&[node]).unwrap();
+
+        let env = aoide_storage::mail::mint_outbound_letter("alice", "elsewhere", "bob", "hi").unwrap();
+        aoide_storage::outbox::write_entry("elsewhere", &OutboxEntry::fresh(env)).unwrap();
+
+        drain_node("elsewhere").unwrap();
+
+        let entries = aoide_storage::outbox::list_entries("elsewhere").unwrap();
+        assert_eq!(entries.len(), 1, "a refused entry stays in the spool — no auto-eviction (kill-list)");
+        assert!(entries[0].refused, "a refused RESULT must park the entry exactly like a refused ERROR does");
+        assert!(entries[0].last_outcome.contains("bad-msgid"), "the reason is recorded: {}", entries[0].last_outcome);
+        assert_eq!(entries[0].tries, 1);
+
+        // A second drain must SKIP a refused entry outright (`if entry.refused
+        // { continue }`) rather than retry it — `tries` staying at 1 is the
+        // proof, since the fake door would happily answer a second POST too.
+        drain_node("elsewhere").unwrap();
+        let after = aoide_storage::outbox::list_entries("elsewhere").unwrap();
+        assert_eq!(after[0].tries, 1, "a parked entry is never retried by a later drain");
+
+        drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
