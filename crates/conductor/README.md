@@ -88,10 +88,17 @@ screen, never a stale index.
 
 Rows are `App::projects` (the live-loaded `projects.json`, already read for
 the DAG panel's own anchoring), sorted by name (`sorted_project_names`) for
-a stable, deterministic row order independent of file-write order. `j`/`k`
-walk the rows; `a` opens the same inline `Input` line editor ROSTER's
-compose flow uses to `project add <path>`; `d` dispatches `project
-remove <name>` for the row under the cursor; `r` (P-D8,
+a stable, deterministic row order independent of file-write order. A row is
+ONE selectable item per project regardless of how many roots it has —
+`proj_sel` indexes projects, never roots — rendered as its head line (name,
+meter, first root) plus one dim line per extra root. `j`/`k` walk the rows;
+`a` opens the same inline `Input` line editor ROSTER's compose flow uses to
+`project add <path>` — naming a project that already exists ADDS that path
+as a root rather than creating a second project; `d` dispatches `project
+remove <name>` (the whole project, every root) for the row under the
+cursor. Growing a project past its first root this way is the only path
+the TUI offers; replacing a root list outright is `project edit`, CLI-only
+this slice — no key binding claims it here. `r` (P-D8,
 `docs/architecture/AOIDED.md`'s "L5") dispatches `resurrect --project
 <name>` through `App::dispatch_with_flags` — the SAME single dispatch seam
 every other action uses, just with the project name riding as a flag

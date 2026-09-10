@@ -49,6 +49,14 @@
   proj_sel)`, the same resolution every existing binding in
   `handle_projects_key` uses — never a second way to find "the project
   under the cursor."
+- **A project spans several roots** (`Project::roots()`, path first). A
+  PROJECTS row stays ONE selectable multi-line `ListItem` per project no
+  matter how many roots it has — `proj_sel` indexes projects, so a new root
+  is a new line inside the existing item, never a new row. The SESSION
+  panel's DAG group header deliberately shows only a project's first root
+  (D6 of the multi-root-projects lane) — extra roots are the PROJECTS
+  panel's job alone; do not duplicate them into the DAG header, which has
+  no row for them in `dag_rows`.
 
 ## Docs update required in the same commit
 

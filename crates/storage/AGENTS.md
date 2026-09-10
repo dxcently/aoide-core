@@ -1,5 +1,14 @@
 # AGENTS.md — aoide-storage
 
+- **Explicit project membership survives UPSERT.** `SessionRecord.project`
+  names a registered project independently of cwd. The exit ledger retains
+  it; an unset field means automatic cwd anchoring.
+- **A project is a set of anchor roots.** `Project.path` is always the
+  first root; `Project.roots` holds the second and later, additive and off
+  the wire when empty. Read roots through `Project::roots()`, never the raw
+  fields directly — that is the one place the path-first, deduped ordering
+  is guaranteed.
+
 ## Invariants
 
 - **Enduring identity is independent of knowledge configuration.** Bind an

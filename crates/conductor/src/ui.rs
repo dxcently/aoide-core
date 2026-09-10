@@ -115,9 +115,9 @@ fn keymap_hint(panel: Panel) -> &'static str {
             "j/k walk · g/G ends · Enter jump · p prune · Tab panel · ? help · q quit"
         }
         Panel::Session => {
-            "j/k select · Enter jump/fold · h/l fold · L link · a add · d rm · p prune · ? help · q quit"
+            "j/k select · Enter jump/fold · h/l fold · L link · a add root · d rm · p prune · ? help · q quit"
         }
-        Panel::Projects => "j/k select · a add · d remove · Tab panel · ? help · q quit",
+        Panel::Projects => "j/k select · a add root · d remove · Tab panel · ? help · q quit",
         Panel::Log => "Tab panel · ? help · q quit",
         Panel::Status => "Tab panel · ? help · q quit",
         Panel::Roster => {
@@ -445,16 +445,29 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
             let anchored = merged
                 .iter()
                 .filter(|s| {
-                    graph::anchor_for(&s.cwd, &projects)
+                    graph::project_for(s, &projects)
                         .map(|idx| projects[idx].name == p.name)
                         .unwrap_or(false)
                 })
                 .count();
             let bar = theme::ascii_bar(anchored, 6);
-            ListItem::new(Line::from(format!(
+            let mut lines = vec![Line::from(format!(
                 "◆ {:<12} {bar} {:>2}  {}",
                 p.name, anchored, p.path
-            )))
+            ))];
+            for r in p.roots().into_iter().skip(1) {
+                lines.push(
+                    Line::from(format!(
+                        "  {:<12} {} {:>2}  {}",
+                        "",
+                        " ".repeat(bar.chars().count()),
+                        "",
+                        r
+                    ))
+                    .style(theme::dim()),
+                );
+            }
+            ListItem::new(lines)
         })
         .collect();
 
@@ -867,11 +880,11 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "    Esc / q          close the log tail (Enter also closes it)",
         "    h / l            fold / unfold the group",
         "    L                link the session under a parent",
-        "    a / d            add / remove a project anchor",
+        "    a / d            add a root / remove a project",
         "    p                prune done sessions (restages the DAG)",
         "    ♪ 𝄐 𝄁 𝄽 𝄂        working · awaiting · stopped · idle · done   ‣ fresh",
         "",
-        "  PROJECTS: a add · d remove",
+        "  PROJECTS: a add root · d remove",
         "",
         "  ROSTER: j/k select · s compose (send to the selected session)",
         "    r forces a refresh; auto-probes every ~15s while the pane is",
@@ -940,6 +953,7 @@ mod tests {
         SessionRecord {
             session_id: id.into(),
             enduring_agent_id: None,
+            project: None,
             agent: "claude".into(),
             window_address: format!("0x{id}"),
             cwd: cwd.into(),
@@ -1211,6 +1225,33 @@ mod tests {
         let ai = out.find("alpha").unwrap();
         let zi = out.find("zeta").unwrap();
         assert!(ai < zi, "roster sorted by name");
+        assert!(out.contains('░'), "ascii meter drawn");
+    }
+
+    #[test]
+    fn the_projects_panel_lists_every_root_under_its_project() {
+        let app = app_with(
+            vec![
+                Project {
+                    name: "aoide".into(),
+                    path: "/a".into(),
+                    roots: vec!["/second-root".into()],
+                    ..Default::default()
+                },
+                Project {
+                    name: "zeta".into(),
+                    path: "/z".into(),
+                    ..Default::default()
+                },
+            ],
+            vec![],
+        );
+        let out = render_panel(&app, Panel::Projects, 90, 20);
+        assert!(out.contains("/a"), "the primary root still renders: {out}");
+        assert!(out.contains("/second-root"), "the extra root renders too: {out}");
+        let ai = out.find("aoide").unwrap();
+        let zi = out.find("zeta").unwrap();
+        assert!(ai < zi, "sort/meter for the neighbour still holds");
         assert!(out.contains('░'), "ascii meter drawn");
     }
 

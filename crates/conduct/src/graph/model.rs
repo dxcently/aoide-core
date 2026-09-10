@@ -43,14 +43,27 @@ fn cwd_under(cwd: &str, root: &str) -> bool {
     cwd == root || cwd.starts_with(&format!("{}/", root))
 }
 
-/// The anchoring project for a cwd: longest matching root wins, so nested
-/// projects anchor correctly. Returns an index into `projects`.
+/// Explicit membership takes precedence over automatic cwd anchoring.
+pub fn project_for(session: &SessionRecord, projects: &[Project]) -> Option<usize> {
+    session.project.as_ref().map_or_else(|| anchor_for(&session.cwd, projects), |name| projects.iter().position(|p| &p.name == name))
+}
+
+/// The anchoring project for a cwd: the longest matching root wins across
+/// EVERY root of EVERY project, so nested projects and a project's own
+/// second root anchor correctly. Returns an index into `projects`.
 pub fn anchor_for(cwd: &str, projects: &[Project]) -> Option<usize> {
     projects
         .iter()
         .enumerate()
-        .filter(|(_, p)| cwd_under(cwd, &p.path))
-        .max_by_key(|(_, p)| p.path.trim_end_matches('/').len())
+        .filter_map(|(i, p)| {
+            p.roots()
+                .into_iter()
+                .filter(|r| cwd_under(cwd, r))
+                .map(|r| r.trim_end_matches('/').len())
+                .max()
+                .map(|len| (i, len))
+        })
+        .max_by_key(|(_, len)| *len)
         .map(|(i, _)| i)
 }
 
@@ -159,6 +172,46 @@ mod tests {
         // Component-aware: /home/k/Aoide-extra is NOT under /home/k/Aoide.
         assert_eq!(anchor_for("/home/k/Aoide-extra", &p), None);
         assert_eq!(anchor_for("/tmp/elsewhere", &p), None);
+    }
+    #[test]
+    fn anchoring_spans_every_root_of_one_project() {
+        let p = vec![Project {
+            name: "aoide".into(),
+            path: "/home/k/Aoide".into(),
+            roots: vec!["/srv/docs".into()],
+            ..Default::default()
+        }];
+        assert_eq!(
+            anchor_for("/srv/docs/x", &p).map(|i| p[i].name.as_str()),
+            Some("aoide"),
+            "a session under the SECOND root anchors too"
+        );
+        assert_eq!(anchor_for("/srv/other", &p), None);
+    }
+    #[test]
+    fn anchoring_longest_root_wins_across_projects() {
+        let p = vec![
+            Project {
+                name: "outer".into(),
+                path: "/home/k/Aoide".into(),
+                roots: vec!["/srv/x".into()],
+                ..Default::default()
+            },
+            Project {
+                name: "inner".into(),
+                path: "/srv/x/deep".into(),
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            anchor_for("/srv/x/deep/y", &p).map(|i| p[i].name.as_str()),
+            Some("inner"),
+            "the deeper root — even though it belongs to the second project — wins"
+        );
+        assert_eq!(
+            anchor_for("/srv/x/other", &p).map(|i| p[i].name.as_str()),
+            Some("outer")
+        );
     }
     #[test]
     fn canonical_state_folds_every_producer_onto_the_five_state_vocabulary() {

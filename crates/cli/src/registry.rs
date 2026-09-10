@@ -250,6 +250,11 @@ mod tests {
         // P-M2 adds the outbox spool's own two commands, `mail.outbox` and
         // `mail.outbox.rm` (+2) — sorting between `mail.mark` and
         // `mail.read`, same mailbase family. Net: 84 + 2 = 86.
+        //
+        // Bumped by 1 for `project.edit` (multi-root projects) — the
+        // exact-replacement editor for a project's root list, the
+        // `project edit` that `records.rs`'s `Project.auto_resume` doc
+        // used to say did not exist.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -300,6 +305,7 @@ mod tests {
             "pair.reject",
             "pair.watch",
             "project.add",
+            "project.edit",
             "project.list",
             "project.remove",
             "resurrect",
@@ -324,6 +330,8 @@ mod tests {
             "send",
             "session",
             "session.bind",
+            "session.kill",
+            "session.project",
             "session.end",
             "session.grant",
             "session.hook",

@@ -926,7 +926,7 @@ impl App {
         let mut per_project: Vec<Vec<&SessionRecord>> = vec![Vec::new(); projects.len()];
         let mut loose: Vec<&SessionRecord> = Vec::new();
         for r in &roots {
-            match graph::anchor_for(&r.cwd, &projects) {
+            match graph::project_for(r, &projects) {
                 Some(i) => per_project[i].push(r),
                 None => loose.push(r),
             }
@@ -1397,7 +1397,7 @@ impl App {
 
     fn open_project_add(&mut self) {
         self.input = Some(Input {
-            label: "project name".to_string(),
+            label: "project name (an existing name adds a root)".to_string(),
             buffer: String::new(),
             step: 0,
             collected: Vec::new(),
@@ -1768,6 +1768,7 @@ mod tests {
         SessionRecord {
             session_id: id.into(),
             enduring_agent_id: None,
+            project: None,
             agent: "claude".into(),
             window_address: format!("0x{id}"),
             cwd: cwd.into(),

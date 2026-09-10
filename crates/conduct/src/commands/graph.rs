@@ -47,12 +47,15 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["project", "add"],
-        summary: "Register or update a project anchor root in state/stage/projects.json (atomic, idempotent).",
+        summary: "Register a project anchor root in state/stage/projects.json, or ADD roots to an existing project (atomic, idempotent per root).",
         args: [
             arg!("name", "string", true, "Project name (its node id becomes project:<name>)."),
-            arg!("path", "string", false, "Project root path (defaults to the current working directory); sessions anchor by cwd prefix (longest wins)."),
+            arg!("path", "string", false, "Project root path; give one or more (defaults to the current working directory). Each is appended as a root — a name that already exists gains roots rather than losing the ones it has. Sessions anchor by cwd prefix, longest root wins."),
         ],
-        flags: [flag!("auto-resume", "bool", "Opt this project into the daemon's boot-time auto-resume sweep (`resurrect --project <name>` on `run_loop` entry, once per boot). Only ever sets it true — hand-edit projects.json to clear it.")],
+        flags: [
+            flag!("auto-resume", "bool", "Opt this project into the daemon's boot-time auto-resume sweep (`resurrect --project <name>` on `run_loop` entry, once per boot). Only ever sets it true — hand-edit projects.json to clear it."),
+            flag!("new", "bool", "Refuse if the project name already exists instead of adding roots to it."),
+        ],
         gated: false,
         implemented: true,
         handler: crate::graph::project_add,
@@ -60,12 +63,17 @@ pub fn register(r: &mut Registry) {
             "project add aoide ~/Aoide",
             "project add aoide",
             "project add aoide ~/Aoide --auto-resume",
+            "project add aoide ~/Aoide ~/Aoide-docs",
+            "project add aoide ~/Aoide --new",
         ],
     ));
     r.insert(cmd!(
         path: ["project", "remove"],
-        summary: "Unregister a project anchor root (ok + no-op if absent).",
-        args: [arg!("name", "string", true, "Project name to remove.")],
+        summary: "Unregister a project anchor root, or one root of a multi-root project (ok + no-op if absent).",
+        args: [
+            arg!("name", "string", true, "Project name to remove."),
+            arg!("path", "string", false, "One root to remove instead of the whole project; removing the last root removes the project."),
+        ],
         flags: [],
         gated: false,
         implemented: true,
@@ -73,7 +81,7 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["project", "list"],
-        summary: "List the registered project anchor roots.",
+        summary: "List the registered project anchor roots, with every root.",
         args: [],
         flags: [],
         gated: false,
@@ -364,7 +372,22 @@ pub fn register(r: &mut Registry) {
         handler: crate::graph::session_bind,
         examples: ["session bind --id executor-1 --agent-id 7e3f5976-98b2-44a4-827c-c687a0d9526e"],
     ));
-
+    r.insert(cmd!(
+        path: ["project", "edit"],
+        summary: "Replace a project's anchor roots outright (the name is immutable; autoResume is untouched).",
+        args: [
+            arg!("name", "string", true, "Project name to edit; must already be registered."),
+            arg!("path", "string", true, "The project's new root path; give one or more. The first becomes the project's primary root, the rest follow in order."),
+        ],
+        flags: [],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::project_edit,
+        examples: [
+            "project edit aoide ~/Aoide ~/Aoide-docs",
+            "project edit aoide ~/Aoide",
+        ],
+    ));
 }
 
 /// `mail ring` (P-M5a-2, MAIL.md "Delivery and the doorbell") — registered
@@ -388,4 +411,23 @@ pub fn register_mail_ring(r: &mut Registry) {
         handler: crate::graph::mail_ring,
         examples: ["mail ring --for claude-mail"],
     ));
+    r.insert(cmd!(
+        path: ["session", "project"],
+        summary: "Assign a local session to a registered project without changing its cwd; --clear restores automatic path anchoring.",
+        args: [],
+        flags: [flag!("id", "string", "Exact local session id."), flag!("project", "string", "Registered project name."), flag!("clear", "bool", "Restore automatic cwd anchoring.")],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::session_project,
+    ));
+    r.insert(cmd!(
+        path: ["session", "kill"],
+        summary: "Send SIGTERM to the verified local session-owning process. Refuses shared, desktop, unsealed, stale, or unsupported targets. Does not mark completion; the reaper observes exit.",
+        args: [],
+        flags: [flag!("id", "string", "Exact local session id.")],
+        gated: true,
+        implemented: true,
+        handler: crate::graph::session_kill,
+    ));
+
 }

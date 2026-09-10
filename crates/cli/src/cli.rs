@@ -264,7 +264,7 @@ mod tests {
             err.message
         );
         assert!(
-            err.message.contains("Register or update a project anchor root"),
+            err.message.contains("Register a project anchor root"),
             "the summary rides along: {}",
             err.message
         );
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn a_partial_path_lists_its_subgroup_instead_of_crying_unknown() {
         // `project` (ex-`graph project`) has no bare command of its own, only
-        // the three children below — `project` alone must list the group.
+        // the four children below — `project` alone must list the group.
         let err = parse(&argv(&["project"]), Door::Cli).unwrap_err();
         assert_eq!(err.status, Status::Usage);
         assert!(
@@ -286,7 +286,7 @@ mod tests {
             "names it a group: {}",
             err.message
         );
-        for command in ["project add", "project remove", "project list"] {
+        for command in ["project add", "project edit", "project remove", "project list"] {
             assert!(err.message.contains(command), "lists {command}: {}", err.message);
         }
         assert!(err.message.contains("aoide --help"), "{}", err.message);

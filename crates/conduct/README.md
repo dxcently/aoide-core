@@ -1,5 +1,13 @@
 # aoide-conduct
 
+`session project --id ID --project NAME` assigns an explicit registered project;
+`--clear` restores cwd anchoring. The override is preserved in exit history and
+restored on resurrection when the project remains registered. `session kill
+--id ID` requests SIGTERM for a dedicated conducted process using a Linux pidfd
+and a fresh daemon-seal verification. Shared app processes, unsealed records,
+and stale identities refuse. Both operations require the local daemon; exit
+is observed by the existing reaper, never fabricated by the kill response.
+
 Registered Codex sessions refresh their native conversation titles during the
 reaper metadata pass. The pass reads `CODEX_HOME/session_index.jsonl` (default
 `~/.codex/session_index.jsonl`) once, retaining the latest valid nonempty name
@@ -341,7 +349,16 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   self-check, and the four historical backfill call sites.
 - `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
-  below).
+  below). The socket answers exactly one command with a reply,
+  `sessionaction`: a closed five-action whitelist (`undying`, `project`,
+  `kill`, `createproject`, `editproject`) that re-execs `aoide session
+  project|kill|grant undying` or `aoide project add|edit` through aoided
+  with `--json` and writes one JSON reply line before the connection
+  closes. `createproject` is two invocations in order — `project add
+  <name> <paths…> --new`, then `session project --id <id> --project
+  <name>` to assign it — that stop at the first failure and report a
+  partial honestly rather than rolling back. Every other socket command
+  stays fire-and-forget.
 - `commands` — this crate's CLI commands: 19 paths registered in one
   `register()` call (`conduct/src/commands/graph.rs`, still that file's name
   post-cutover) — the `graph` family narrowed at task #101 R1 to the bare
@@ -361,7 +378,11 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `graph/resurrect.rs::session_resurrect` (`resurrect --project
   <name> [--all | --id <ledgerSessionId>]`) reads that ledger and anchors
   entries to a project by the SAME `anchor_for` longest-prefix rule bare
-  `graph` uses. Selection then branches on the flags: `--all` widens to every
+  `graph` uses — longest-prefix across EVERY root of the project, not just
+  its first, since a project is a set of anchor roots (`project add`
+  appends to that set, `project edit` replaces it outright, `project
+  remove` drops one root or the whole project; see `Project::roots()`,
+  `aoide-storage`'s own docs). Selection then branches on the flags: `--all` widens to every
   anchored entry, `--id` narrows to one specific `sessionId`, and bare
   (neither flag) resumes the project's WHOLE undying set
   (`aoide_storage::undying`, `state/undying.json`, durable-sessions plan

@@ -27,6 +27,13 @@ pub struct Project {
     pub name: String,
     #[serde(default)]
     pub path: String,
+    /// The project's SECOND and later anchor roots. `path` is the first and
+    /// is never repeated here, so a one-root project stays byte-identical on
+    /// the wire to a pre-`roots` record — the same additive discipline
+    /// `autoResume` above and `SessionRecord.headless` set the precedent for.
+    /// Read through [`Project::roots`], never directly.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub roots: Vec<String>,
     /// Additive/v0-safe (P-D8, `docs/architecture/AOIDED.md`'s "L5"): when
     /// true, the daemon's `run_loop` entry (once per BOOT, boot-epoch
     /// guarded — `aoide-server`'s `daemon.rs`) resurrects this project's
@@ -34,11 +41,32 @@ pub struct Project {
     /// has no live one. Default `false`; `skip_serializing_if` keeps a
     /// `false` value off the wire, same discipline `SessionRecord.headless`
     /// set the precedent for. Set via `graph project add --auto-resume`
-    /// (idempotent-upsert; no `project set`/`project edit` command exists to
-    /// clear it back to `false` today — hand-edit `projects.json` in the
-    /// meantime).
+    /// (idempotent-upsert). `project edit` replaces a project's roots and
+    /// never touches `autoResume`; clearing it back to `false` still means
+    /// hand-editing `projects.json`.
     #[serde(rename = "autoResume", default, skip_serializing_if = "is_false")]
     pub auto_resume: bool,
+}
+
+impl Project {
+    /// Every anchor root of this project: `path` first, then `roots`,
+    /// deduped. The ONE way new code enumerates a project's roots —
+    /// `p.path` alone is the legacy single-root read and stays correct
+    /// because `path` always equals the first root. A hand-edited record
+    /// whose `roots[0]` differs from `path`, or that repeats `path` inside
+    /// `roots`, is READ this way and never rewritten on read.
+    pub fn roots(&self) -> Vec<&str> {
+        let mut out: Vec<&str> = Vec::new();
+        if !self.path.is_empty() {
+            out.push(self.path.as_str());
+        }
+        for r in &self.roots {
+            if !r.is_empty() && !out.contains(&r.as_str()) {
+                out.push(r.as_str());
+            }
+        }
+        out
+    }
 }
 
 /// A conducted TERMINAL's continuously-captured restore snapshot (P-C5,
@@ -98,6 +126,9 @@ pub struct SessionRecord {
     /// Explicit continuity binding; not a harness name or an authorization grant.
     #[serde(rename = "enduringAgentId", default, skip_serializing_if = "Option::is_none")]
     pub enduring_agent_id: Option<String>,
+    /// Explicit project membership; absent means automatic cwd anchoring.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project: Option<String>,
     #[serde(default)]
     pub agent: String,
     #[serde(rename = "windowAddress", default)]
@@ -562,6 +593,59 @@ mod tests {
         assert!(json.contains("\"autoResume\":true"), "serialised: {json}");
         let back: Project = serde_json::from_str(&json).unwrap();
         assert!(back.auto_resume, "a set autoResume persists through the round trip");
+    }
+    #[test]
+    fn a_projects_root_list_puts_path_first_and_dedupes() {
+        let p = Project { path: "/a".into(), roots: vec!["/b".into()], ..Default::default() };
+        assert_eq!(p.roots(), vec!["/a", "/b"]);
+
+        let p = Project { path: "/a".into(), roots: vec![], ..Default::default() };
+        assert_eq!(p.roots(), vec!["/a"]);
+
+        let p = Project {
+            path: "/a".into(),
+            roots: vec!["/a".into(), "/b".into(), "/b".into()],
+            ..Default::default()
+        };
+        assert_eq!(p.roots(), vec!["/a", "/b"]);
+
+        let p = Project { path: String::new(), roots: vec!["/b".into()], ..Default::default() };
+        assert_eq!(p.roots(), vec!["/b"]);
+    }
+    #[test]
+    fn a_project_with_extra_roots_round_trips_and_stays_off_the_wire_when_empty() {
+        let bare = Project { name: "aoide".into(), path: "/a".into(), ..Default::default() };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("\"roots\""), "serialised: {bare_json}");
+
+        let populated = Project {
+            name: "aoide".into(),
+            path: "/a".into(),
+            roots: vec!["/b".into()],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&populated).unwrap();
+        assert!(json.contains("\"roots\":[\"/b\"]"), "serialised: {json}");
+
+        let back_bare: Project = serde_json::from_str(&bare_json).unwrap();
+        let back_populated: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(back_bare.roots(), bare.roots());
+        assert_eq!(back_populated.roots(), populated.roots());
+    }
+    #[test]
+    fn a_legacy_project_without_roots_reads_as_one_root() {
+        let p: Project =
+            serde_json::from_str(r#"{"name":"aoide","path":"/home/x/Aoide"}"#).unwrap();
+        assert!(p.roots.is_empty());
+        assert_eq!(p.roots(), vec!["/home/x/Aoide"]);
+    }
+    #[test]
+    fn a_hand_edited_project_whose_first_root_differs_from_path_is_read_not_rewritten() {
+        let p: Project =
+            serde_json::from_str(r#"{"name":"a","path":"/a","roots":["/b","/a"]}"#).unwrap();
+        assert_eq!(p.roots(), vec!["/a", "/b"]);
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"roots\":[\"/b\",\"/a\"]"), "serialised: {json}");
     }
     #[test]
     fn session_record_harness_session_id_round_trips_and_stays_absent_when_unset() {

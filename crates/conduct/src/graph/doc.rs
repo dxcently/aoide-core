@@ -5,7 +5,7 @@
 //! pure function of the registries.
 
 use super::model::{
-    anchor_for, graph_path, hooks_path, load_stage, merged_sessions, projects_path,
+    graph_path, hooks_path, load_stage, merged_sessions, projects_path,
     resolved_parent, sessions_path, sorted_projects, write_stage, HookRecord, HooksFile, Project,
     ProjectsFile, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
 };
@@ -59,6 +59,7 @@ pub fn build_graph(
             "kind": "project",
             "name": p.name,
             "path": p.path,
+            "roots": p.roots(),
         }));
     }
     for s in &sessions {
@@ -147,6 +148,7 @@ pub fn build_graph(
         if let Some(true) = s.needs_sudo {
             node["needsSudo"] = json!(true);
         }
+        if let Some(project) = &s.project { node["project"] = json!(project); }
         nodes.push(node);
         if let Some(parent) = resolved_parent(s, &ids) {
             edges.push(json!({
@@ -154,7 +156,7 @@ pub fn build_graph(
                 "to": format!("session:{}", s.session_id),
                 "kind": "spawned",
             }));
-        } else if let Some(i) = anchor_for(&s.cwd, &projects) {
+        } else if let Some(i) = super::model::project_for(s, &projects) {
             edges.push(json!({
                 "from": format!("project:{}", projects[i].name),
                 "to": format!("session:{}", s.session_id),
@@ -364,7 +366,7 @@ pub fn render(
     let mut unanchored: Vec<&SessionRecord> = Vec::new();
     let mut per_project: Vec<Vec<&SessionRecord>> = vec![Vec::new(); projects.len()];
     for s in &roots {
-        match anchor_for(&s.cwd, &projects) {
+        match super::model::project_for(s, &projects) {
             Some(i) => per_project[i].push(s),
             None => unanchored.push(s),
         }
@@ -397,7 +399,10 @@ pub fn render(
 
     for (i, p) in projects.iter().enumerate() {
         let id = format!("project:{}", p.name);
-        let head = format!("{}◆ {}  {}", marker(focus, &id, &p.name), p.name, p.path);
+        let mut head = format!("{}◆ {}  {}", marker(focus, &id, &p.name), p.name, p.path);
+        for r in p.roots().into_iter().skip(1) {
+            head.push_str(&format!("\n   {r}"));
+        }
         render_group(&mut out, head, &per_project[i]);
     }
     if !unanchored.is_empty() {
@@ -574,6 +579,7 @@ pub(crate) fn ledger_session_exit(rec: &SessionRecord, ended_at: &str) {
         v: 0,
         session_id: rec.session_id.clone(),
         enduring_agent_id: rec.enduring_agent_id.clone(),
+        project: rec.project.clone(),
         agent: rec.agent.clone(),
         harness_session_id: rec.harness_session_id.clone(),
         cwd: rec.cwd.clone(),
@@ -757,6 +763,52 @@ mod tests {
             && e["kind"] == "spawned"));
         assert_eq!(edges.len(), 2);
         assert_eq!(doc["schemaVersion"], "0");
+    }
+    #[test]
+    fn the_graph_project_node_carries_every_root() {
+        let projects = vec![
+            Project {
+                name: "two-root".into(),
+                path: "/a".into(),
+                roots: vec!["/b".into()],
+                ..Default::default()
+            },
+            Project {
+                name: "one-root".into(),
+                path: "/a".into(),
+                ..Default::default()
+            },
+        ];
+        let doc = build_graph(&projects, &[], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let two = nodes.iter().find(|n| n["id"] == "project:two-root").unwrap();
+        assert_eq!(two["path"], "/a");
+        assert_eq!(two["roots"], json!(["/a", "/b"]));
+        let one = nodes.iter().find(|n| n["id"] == "project:one-root").unwrap();
+        assert_eq!(
+            one["roots"],
+            json!(["/a"]),
+            "roots is ALWAYS present, even for a one-root project"
+        );
+    }
+    #[test]
+    fn render_shows_a_projects_extra_roots_under_its_head() {
+        let projects = vec![Project {
+            name: "aoide".into(),
+            path: "/a".into(),
+            roots: vec!["/b".into()],
+            ..Default::default()
+        }];
+        let tree = render(&projects, &[], &[], None);
+        let lines: Vec<&str> = tree.lines().collect();
+        let head_idx = lines
+            .iter()
+            .position(|l| l.contains("◆ aoide") && l.contains("/a"))
+            .expect("head line present");
+        assert!(
+            lines[head_idx + 1].contains("/b"),
+            "the second root follows the head line: {tree}"
+        );
     }
     #[test]
     fn resumed_from_projects_an_additive_resumed_edge_beside_anchors() {

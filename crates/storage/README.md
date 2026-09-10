@@ -1,5 +1,9 @@
 # aoide-storage
 
+`SessionRecord.project` is an optional explicit project name; absence selects
+automatic cwd anchoring. UPSERT preserves it. The exit ledger stores it as
+`project` (null on old/unassigned records) so resurrection can retain membership.
+
 Durable session data + memory persistence: stage-file record shapes, atomic
 stage I/O, session/hook upsert ops, the staging/declarative mode marker, the
 node-federation registry + pull cache (CONTRACTS.md §7), and the one INTENT
@@ -68,6 +72,12 @@ by decision — no embedded database yet
   resolver uses, applied to a directory instead of an executable. Returns
   `None` (never a default that might not exist) when neither resolves; the
   caller turns that into a taught error naming both locations.
+- `records::Project` — a project is a set of anchor roots, not one
+  directory: `path` is always the first, `roots` the second and later
+  (optional, additive, off the wire when empty). `Project::roots()` is the
+  one enumeration path every reader uses (path first, then `roots`,
+  deduplicated) — a hand-edited record whose `path` disagrees with
+  `roots[0]` is read as given, never silently rewritten.
 - `config` — the portable runtime config (task #135 P-C, CONTRACTS.md §4's
   `config.toml` subsection): `$AOIDE_ROOT/config.toml`, the one file here
   that records INTENT rather than state. It exists because core is portable

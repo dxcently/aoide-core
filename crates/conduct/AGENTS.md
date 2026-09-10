@@ -1,5 +1,11 @@
 # AGENTS.md — aoide-conduct
 
+- **Session actions preserve identity and scope.** Project assignment changes
+  `project`, never `cwd` or ancestry. Termination is local daemon-only and
+  requires a dedicated conductable process, exclusive live PID ownership,
+  fresh seal verification, and pidfd signaling. Never fall back to `kill(pid)`
+  or infer completion from successful signal delivery.
+
 ## Invariants
 
 - **Codex titles use exact native thread IDs.** The reaper reads the configured
@@ -25,6 +31,25 @@
   socket path `shellbridge` owns. Don't move the files to chase the commands —
   see `docs/architecture/PACKAGE-LAYOUT.md`'s "Charter exceptions" for the
   full reasoning before touching either.
+- **`sessionaction`'s five-action whitelist never becomes a translator.**
+  `session_action_args` is the ONE authority for the whitelist and the ONE
+  call site for the gate; nothing else builds argv from wire values it did
+  not validate. `safe_action_value` (session ids, project/create/edit
+  names) rejects empty, `-`-prefixed, whitespaced, or control-charactered
+  strings before they reach an argv; `safe_action_path` is a deliberately
+  separate, looser rule for path arguments — a path is absolute and
+  control-free, whitespace included, with the list length bounded
+  (`MAX_ACTION_PATHS`). The reply is one JSON line on its own dedicated
+  connection and the QML callback contract is exactly-once. A multi-step
+  action (`createproject`'s add-then-assign) stops at its first failure and
+  reports the partial state honestly rather than rolling back. The bridge
+  never pre-checks what the CLI already refuses — `project add --new` owns
+  "this name exists," not this file. No reply channel on the connection
+  means no dispatch at all. The audit line carries only the action name and
+  status, never an argument value. The accept loop gives every connection
+  its own thread, with no read timeout added: a client is allowed to idle
+  (the bar's own shared socket does, between human gestures), and one that
+  does must never starve another's.
 - **`normalize_addr` is `pub`, not `pub(crate)`, on purpose** — `screen`
   reaches it directly rather than duplicating it. Don't narrow it back
   without checking that dependency first.
@@ -744,6 +769,22 @@
   different thing) — `project_bucket` must attribute EVERY session by its
   OWN cwd, local or node, or a multi-session listing would silently
   misattribute every session but the first.
+- **A project is a set of anchor roots — `anchor_for` is longest-root-wins
+  across EVERY root of EVERY project, not just each project's first.**
+  `cwd_under` itself stays single-root (unchanged) and is simply called
+  once per root; only its caller spans the set. `project add NAME PATH…`
+  ADDS one or more roots to a name — registering it if new, growing it if
+  not — and never replaces what is already there; `--new` is the guard
+  against a typo'd name silently joining an existing project instead of
+  registering its own. `project edit NAME PATH…` is the ONLY command that
+  REPLACES a project's whole root list outright (first path → `path`, rest
+  → `roots`); it never touches the name or `autoResume` — `add`/`remove`
+  stay the only ways a project appears or disappears. `project remove NAME
+  [PATH]` drops one root, promoting the next remaining one into `path` so
+  `path` always equals the first root, or with no `PATH` drops the whole
+  project (unchanged behaviour). `project add` and `project edit` both
+  validate EVERY given path (absolute, an existing directory) BEFORE
+  mutating anything — one bad path in a multi-path call writes nothing.
 - **`node list` (`graph/node_list.rs`, task #120 P2) is the roster core's
   probe under a wider fold — never a fork of it.** Its presence/session data
   comes ONLY from `who.rs`'s `pub(super)` seam (`probe_nodes`/
@@ -1026,3 +1067,7 @@
 - `doorbell.rs` changes update `docs/architecture/MAIL.md`'s "Delivery and
   the doorbell" section — that document is the design's canonical prose
   statement, this file only the invariants an editor must hold.
+- A change to shellbridge's `sessionaction` whitelist or reply shape
+  updates `ShellBridge.qml`'s protocol comment and
+  `concepts/cli/Doors-and-Nodes.md`'s socket-command list, in the same
+  commit.

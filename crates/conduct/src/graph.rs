@@ -13,6 +13,8 @@
 //! restructure, docs/architecture/PACKAGE-LAYOUT.md); the root module is now
 //! a pure re-export shim onto this crate.
 
+mod actions;
+pub use actions::{session_kill, session_project};
 mod common;
 mod conduct;
 mod doc;
@@ -61,7 +63,7 @@ pub use self::doc::{build_graph, render, resolve_graph_document};
 // on a Stop hook, the CLI on `mail ring`, `aoide-server`'s deposit arm).
 pub use self::doorbell::{mail_ring, ring, RingReport};
 pub use self::model::{
-    anchor_for, canonical_state, merged_sessions, HookRecord, HooksFile, Project, ProjectsFile,
+    anchor_for, project_for, canonical_state, merged_sessions, HookRecord, HooksFile, Project, ProjectsFile,
     SessionRecord, SessionsFile,
 };
 pub use self::pending::{pending_approve, pending_deny, pending_list};
@@ -98,7 +100,7 @@ pub use self::resurrect::session_resurrect;
 // `session undying` command this absorbs is retired — see
 // `graph/grant.rs`'s module doc.
 pub use self::grant::session_grant;
-pub use self::manage::{link, project_add, project_list, project_remove, prune, view};
+pub use self::manage::{link, project_add, project_edit, project_list, project_remove, prune, view};
 // Bare `session` (session-surface redesign, command-defrag lane X): the
 // ROSTER — grouped by PROJECT bare, by HOST under `--hosts` (byte-identical
 // to the retired standalone `aoide who` command's own rendering) — see
