@@ -9,12 +9,16 @@ then requests SIGTERM for that dedicated conducted process using a Linux
 pidfd and a fresh daemon-seal verification. A card that is already a
 conducted wrap resolves to itself; a native hook-fed record (the only kind
 the desktop menu ever names) resolves to the terminal that hosts it. Shared
-app processes, an ancestry walk that never reaches a conducted process,
-unsealed records, and stale identities refuse. The response names both the
-requested id and the resolved target (`sessionId`/`target`/`pid`), and its
-message says which terminal is being terminated when the two differ. Both
-operations require the local daemon; exit is observed by the existing
-reaper, never fabricated by the kill response.
+app processes, an ancestry walk that never reaches a conducted process, a
+subagent record (it shares its executor's process rather than owning one),
+an ancestor terminal that has already ended, unsealed records, and stale
+identities refuse. A `SessionStart` hook fired outside any wrap clears a
+resumed record's stale `parentSessionId`, so a kill after a resume outside
+any wrap refuses rather than reaching the earlier terminal. The response
+names both the requested id and the resolved target (`sessionId`/`target`/
+`pid`), and its message says which terminal is being terminated when the
+two differ. Both operations require the local daemon; exit is observed by
+the existing reaper, never fabricated by the kill response.
 
 Registered Codex sessions refresh their native conversation titles during the
 reaper metadata pass. The pass reads `CODEX_HOME/session_index.jsonl` (default

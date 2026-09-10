@@ -45,8 +45,8 @@ use super::model::{
     STAGE_GRAPH_VERSION,
 };
 use super::session_store::{
-    do_session_end, do_session_phase, do_session_phase_if, do_session_start, do_subagent_end,
-    do_subagent_rekey, do_subagent_spawn, ensure_session_ceiling, now_iso_utc,
+    clear_stale_parent, do_session_end, do_session_phase, do_session_phase_if, do_session_start,
+    do_subagent_end, do_subagent_rekey, do_subagent_spawn, ensure_session_ceiling, now_iso_utc,
     refresh_subagent_says, refresh_transcript_fields, set_owner_activity, stamp_attested_parent,
     stamp_harness_session_id, stamp_hook_ancestry, stored_phase,
 };
@@ -1860,8 +1860,17 @@ fn hook_for_profile_gated(
             // in `aoide-storage`), so resolving the attested wrap HERE — not
             // only on the next per-turn hook via `hook_ensure_session` — is
             // what closes the window where a `--resume` under a new wrap
-            // leaves a `session kill` resolving through the STALE one.
+            // leaves a `session kill` resolving through the STALE one. The
+            // other half of that same window (P-QOL-C4 §2): no attested wrap
+            // AND no env parent means no host at all, so the stale parent a
+            // resumed record still carries from its PREVIOUS run is cleared
+            // below rather than left standing — `session kill` then refuses
+            // (`NO_DEDICATED_PROCESS`) instead of resolving through the
+            // terminal that hosted that earlier run.
             let parent = start_parent(real_attested_wrap(hook_pid), env_parent);
+            if parent.is_none() {
+                clear_stale_parent(&id);
+            }
             // Windowless by construction (task #89): this (about-to-be-set)
             // parent's own lineage running through an unwindowed conducted
             // wrap means THIS session has no window either — skip discovery
@@ -2325,6 +2334,7 @@ pub fn session_hook(inv: &Invocation) -> Outcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::graph::actions::{kill_target, NO_DEDICATED_PROCESS};
     use crate::graph::common::load_inputs;
     use crate::graph::conduct::conduct_socket_path;
     use crate::graph::doc::prune_done;
@@ -6276,5 +6286,81 @@ mod tests {
             Some("new-wrap"),
             "an existing record re-parents onto the newly attested wrap"
         );
+    }
+
+    /// P-QOL-C4 §2: outside any wrap there is no host, so a `--resume` must
+    /// not leave a resumed record following the terminal that hosted its
+    /// PREVIOUS run. `real_attested_wrap` resolves `None` under this crate's
+    /// fixtures (`isolated_mail_root`'s dead `AOIDE_DAEMON_SOCKET`), and with
+    /// `AOIDE_SESSION_ID` unset `env_parent` is `None` too — the exact "both
+    /// sources empty" case [`clear_stale_parent`] exists for.
+    #[test]
+    fn a_resume_outside_any_wrap_clears_the_stale_parent_so_kill_refuses() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env_sid = EnvVars::save(&["AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (_env, _root) = aoide_test_support::isolated_mail_root("resume-outside-wrap-clears");
+
+        do_session_start(
+            "w", Some("claude"), Some("/p"), None, None, Some(true), None, None, Some(4242),
+        );
+        do_session_start(
+            "c1", Some("claude"), Some("/p"), None, Some("w"), None, None, None, None,
+        );
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            s.sessions.iter().find(|s| s.session_id == "c1").unwrap().parent_session_id.as_deref(),
+            Some("w"),
+            "setup: c1 starts parented under the wrap that hosted it"
+        );
+
+        hook_from_str(
+            r#"{ "session_id": "c1", "hook_event_name": "SessionStart", "cwd": "/p", "source": "resume" }"#,
+        );
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            s.sessions.iter().find(|s| s.session_id == "c1").unwrap().parent_session_id,
+            None,
+            "a resume outside any wrap clears the stale parent from c1's previous run"
+        );
+        assert_eq!(
+            kill_target("c1", &s.sessions).unwrap_err(),
+            NO_DEDICATED_PROCESS,
+            "with the stale parent gone, session kill refuses c1 outright"
+        );
+    }
+
+    /// The other half of the same window: a `--resume` fired INSIDE a wrap
+    /// (`AOIDE_SESSION_ID` set) still resolves `env_parent` and must not
+    /// have its parent cleared out from under it — `session kill` keeps
+    /// resolving `c1` to the wrap that hosts it.
+    #[test]
+    fn a_resume_inside_a_wrap_keeps_the_env_parent() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env_sid = EnvVars::save(&["AOIDE_SESSION_ID"]);
+        std::env::set_var("AOIDE_SESSION_ID", "w");
+        let (_env, _root) = aoide_test_support::isolated_mail_root("resume-inside-wrap-keeps");
+
+        do_session_start(
+            "w", Some("claude"), Some("/p"), None, None, Some(true), None, None, Some(4242),
+        );
+        do_session_start(
+            "c1", Some("claude"), Some("/p"), None, Some("w"), None, None, None, None,
+        );
+
+        hook_from_str(
+            r#"{ "session_id": "c1", "hook_event_name": "SessionStart", "cwd": "/p", "source": "resume" }"#,
+        );
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            s.sessions.iter().find(|s| s.session_id == "c1").unwrap().parent_session_id.as_deref(),
+            Some("w"),
+            "a resume inside a wrap keeps the env parent"
+        );
+        let (target, _chain) = kill_target("c1", &s.sessions)
+            .expect("c1 must still resolve through the wrap that hosts it");
+        assert_eq!(target.session_id, "w");
     }
 }

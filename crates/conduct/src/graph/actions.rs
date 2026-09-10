@@ -78,8 +78,20 @@ pub(super) fn assign_project(id: &str, project: Option<&str>) -> Outcome {
 /// what this function always returned before the walk existed, so a caller
 /// (and every existing test) that only ever saw the direct-record shape sees
 /// the identical string for the identical class of refusal.
-const NO_DEDICATED_PROCESS: &str =
+pub(super) const NO_DEDICATED_PROCESS: &str =
     "no dedicated conducted process; refusing to terminate a shared app or unverified harness";
+
+/// A `sub:`-prefixed record is a subagent: it runs inside its spawning
+/// session's own harness turn and never owns a process of its own. It never
+/// resolves as a kill target, and the walk never climbs THROUGH one on the
+/// way to some further ancestor — a subagent hop ends the walk right there.
+const SUBAGENT_SHARES_EXECUTOR: &str =
+    "a subagent has no process of its own; kill its executor session instead";
+
+/// An ANCESTOR hop (never the requested record itself, which keeps its own
+/// "session has already ended") whose `canonical_state` is `"done"`: the
+/// terminal a kill would have resolved through no longer exists to signal.
+const HOST_HAS_ENDED: &str = "the hosting terminal has already ended";
 
 /// Resolve `id` to the record whose process a kill actually stops (P-QOL-C
 /// §2): `id` itself when it's already a conducted wrap with a dedicated pid
@@ -87,6 +99,12 @@ const NO_DEDICATED_PROCESS: &str =
 /// that is. The desktop menu and the CLI both pass whatever card the user
 /// clicked — a native hook-fed record, never necessarily a wrap — so this is
 /// what makes "Kill process" resolve at all (`§0`'s whole problem statement).
+///
+/// Every hop, the requested record included, is checked at the TOP of the
+/// walk before `is_wrap`: a `sub:` hop refuses with
+/// [`SUBAGENT_SHARES_EXECUTOR`] outright (P-QOL-C4 §1), and a `"done"` hop
+/// refuses too — [`HOST_HAS_ENDED`] for an ancestor, the requested record's
+/// own long-standing "session has already ended" for the first hop.
 ///
 /// Returns the target record plus the walked CHAIN (`id` first, the target
 /// last) so the shared-pid check below can exclude every hop the walk
@@ -104,7 +122,7 @@ const NO_DEDICATED_PROCESS: &str =
 /// re-verifies it fresh against the resolved target, and a stale seal must
 /// surface ITS OWN "session process identity is stale or unsealed" message,
 /// never get pre-empted by a misleading ancestry refusal from this walk.
-fn kill_target<'a>(
+pub(super) fn kill_target<'a>(
     id: &str,
     sessions: &'a [SessionRecord],
 ) -> Result<(&'a SessionRecord, Vec<String>), &'static str> {
@@ -112,9 +130,6 @@ fn kill_target<'a>(
         .iter()
         .find(|s| s.session_id == id)
         .ok_or("session is not registered locally")?;
-    if canonical_state(&rec.state) == "done" {
-        return Err("session has already ended");
-    }
     let is_wrap = |s: &SessionRecord| {
         s.conductable == Some(true)
             && s.pid.is_some_and(|pid| pid > 1 && pid != std::process::id())
@@ -122,7 +137,20 @@ fn kill_target<'a>(
     let mut chain = vec![rec.session_id.clone()];
     let mut seen: HashSet<String> = [rec.session_id.clone()].into_iter().collect();
     let mut current = rec;
-    while !is_wrap(current) {
+    loop {
+        if current.session_id.starts_with("sub:") {
+            return Err(SUBAGENT_SHARES_EXECUTOR);
+        }
+        if canonical_state(&current.state) == "done" {
+            return Err(if chain.len() == 1 {
+                "session has already ended"
+            } else {
+                HOST_HAS_ENDED
+            });
+        }
+        if is_wrap(current) {
+            break;
+        }
         let parent_id = current.parent_session_id.as_deref().ok_or(NO_DEDICATED_PROCESS)?;
         if chain.len() >= 32 || !seen.insert(parent_id.to_string()) {
             return Err(NO_DEDICATED_PROCESS);
@@ -318,6 +346,44 @@ mod tests {
         b.pid = None;
         b.parent_session_id = Some("a".into());
         assert_eq!(kill_target("a", &[a, b]).unwrap_err(), NO_DEDICATED_PROCESS);
+    }
+    #[test]
+    fn kill_target_refuses_a_subagent_id() {
+        let mut sub = rec("sub:t1");
+        sub.conductable = None;
+        sub.pid = None;
+        sub.parent_session_id = Some("w".into());
+        let w = rec("w"); // a valid wrap — irrelevant, `sub:t1` never resolves.
+        assert_eq!(
+            kill_target("sub:t1", &[sub, w]).unwrap_err(),
+            SUBAGENT_SHARES_EXECUTOR
+        );
+    }
+    #[test]
+    fn kill_target_never_walks_through_a_subagent() {
+        let mut c = rec("c");
+        c.conductable = None;
+        c.pid = None;
+        c.parent_session_id = Some("sub:t1".into());
+        let mut sub = rec("sub:t1");
+        sub.conductable = None;
+        sub.pid = None;
+        sub.parent_session_id = Some("w".into());
+        let w = rec("w"); // a valid wrap, but unreachable through a subagent hop.
+        assert_eq!(
+            kill_target("c", &[c, sub, w]).unwrap_err(),
+            SUBAGENT_SHARES_EXECUTOR
+        );
+    }
+    #[test]
+    fn kill_target_refuses_an_ended_host() {
+        let mut c = rec("c");
+        c.conductable = None;
+        c.pid = None;
+        c.parent_session_id = Some("w".into());
+        let mut w = rec("w");
+        w.state = "done".into();
+        assert_eq!(kill_target("c", &[c, w]).unwrap_err(), HOST_HAS_ENDED);
     }
     #[test]
     fn kill_target_selects_a_wrap_with_a_stale_seal() {

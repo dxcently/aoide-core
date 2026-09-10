@@ -6,14 +6,21 @@
   `parentSessionId` ancestor that is itself a dedicated conducted process
   (walking up to 32 hops, cycle-guarded, the requested id itself the first
   candidate) — the card a caller names and the process a kill actually stops
-  are not always the same record. The seal is checked exactly ONCE, by
-  `terminate_verified` against the RESOLVED target, never inside the walk
-  itself — a stale seal must surface its own refusal, never get pre-empted
-  by a misleading ancestry message. The shared-pid refusal excludes every
-  session in the walked chain (a wrap and its own hook-fed descendants
-  legitimately share one process's pid); only a record OUTSIDE that chain
-  holding the target's live pid trips it. Never fall back to `kill(pid)`
-  or infer completion from successful signal delivery.
+  are not always the same record. A `sub:` record never resolves and the walk
+  never climbs through one (a subagent shares its executor's process rather
+  than owning one: "kill its executor session instead"), and an ancestor hop
+  that has already ended refuses as "the hosting terminal has already ended".
+  The seal is checked exactly ONCE, by `terminate_verified` against the
+  RESOLVED target, never inside the walk itself — a stale seal must surface
+  its own refusal, never get pre-empted by a misleading ancestry message.
+  The shared-pid refusal excludes every session in the walked chain (a wrap
+  and its own hook-fed descendants legitimately share one process's pid);
+  only a record OUTSIDE that chain holding the target's live pid trips it.
+  Never fall back to `kill(pid)` or infer completion from successful signal
+  delivery. A `SessionStart` fired outside any wrap (no attested wrap, no
+  `AOIDE_SESSION_ID`) clears the `parentSessionId` a resumed record still
+  carries, so a later kill refuses instead of resolving through the terminal
+  that hosted the previous run.
 
 ## Invariants
 

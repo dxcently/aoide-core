@@ -481,6 +481,39 @@ pub(in crate::graph) fn stamp_attested_parent(id: &str, parent: &str) {
     });
 }
 
+/// Clear a stale `parentSessionId` on `id` (P-QOL-C4 §2): outside any wrap —
+/// no attested wrap, no `AOIDE_SESSION_ID` — there is no host, so a resumed
+/// record must not keep following the terminal that hosted its PREVIOUS run.
+/// The `HookAction::Start` arm of `hook_for_profile_gated` (send.rs) calls
+/// this the moment both parent sources resolve to `None`, before its own
+/// `do_session_start` upsert, so a later `session kill` refuses
+/// (`kill_target`'s `NO_DEDICATED_PROCESS`) instead of resolving through
+/// that stale terminal. Change-only, same posture as
+/// [`stamp_attested_parent`] just above: no record, or one already
+/// parentless, is a silent no-op.
+pub(in crate::graph) fn clear_stale_parent(id: &str) {
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        let Some(s) = file
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == id && s.parent_session_id.is_some())
+        else {
+            return;
+        };
+        s.parent_session_id = None;
+        if file.schema_version.is_empty() {
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        }
+        if write_stage(&sessions_path(), &file).is_ok() {
+            let _ = restage_graph();
+        }
+    });
+}
+
 /// Stamp `headless = true` on a headless `aoide conduct` wrap's OWN record —
 /// a PERMANENT registration fact (task #89, review round 2), called
 /// unconditionally right after `do_session_start` whenever `--headless` was
