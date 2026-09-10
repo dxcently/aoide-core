@@ -58,6 +58,30 @@
   address by construction, and focusing any of them raises the app, which
   is the only thing the app lets anyone do.
 
+- **Codex-app liveness is a try-flock, never `/proc`.** `lock_is_held`
+  (`codex_app.rs`) answers "is this thread live" by attempting
+  `LOCK_EX|LOCK_NB` on the thread's writer-lock file and reading
+  `EWOULDBLOCK` as held; the file is 0 bytes and carries no pid, and a
+  missing file is opened `O_RDONLY` only, never created. No code path may
+  substitute a `/proc` read, a pid file, or a heuristic for this signal.
+
+- **Discovery is the one parsed `ps` table; Linux gets no separate path.**
+  `codex_app_servers` keys ownership on the app-server argv (`argv0` basename
+  `codex` plus a bare `app-server` token) against a single
+  `ps -axo pid=,ppid=,command=` table shared by every OS. The only
+  `cfg(target_os = "linux")` branch this design permits is
+  `holder_via_proc_fd`, a tie-break for when the table yields two or more
+  servers — never a second discovery implementation, and never consulted for
+  liveness.
+
+- **An ambiguous owner enrols with no pid and no window, never a guess.**
+  When two or more app-servers exist and the platform cannot disambiguate
+  (no Linux tie-break, or the tie-break itself misses), the thread still
+  enrols — `CodexThread.pid: None` — with one audit line
+  ("codex app-server owner ambiguous (<n> servers)") and no window address.
+  Losing the window is the only cost; staleness and dedup stay closed to the
+  record regardless (see the `kind:"app"` invariant above).
+
 - **`session bind` assigns continuity, never authority.** Keep the operation
   daemon-owned and local-only; no missing-daemon fallback. It does not load
   optional Mneme config, change grants, or replace executor-specific mail

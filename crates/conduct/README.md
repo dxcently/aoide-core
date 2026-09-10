@@ -388,8 +388,29 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `agent:"codex"`/`kind:"app"`/`state:"idle"` identity, re-applied on every
   upsert; `windowAddress`/`workspace` are left empty for the existing
   `resolve_pending_session_windows` sweep to fill — this module has no
-  compositor access. See AGENTS.md's invariants for why `kind:"app"` exists
-  and what it must never gain.
+  compositor access.
+
+  Discovery (P-CX-2) is two portable primitives, the same on every OS.
+  `lock_is_held` try-flocks (`LOCK_EX|LOCK_NB`) each
+  `~/.codex/thread-writer-locks/*.lock` — the flock itself is the liveness
+  signal, `/proc` is never consulted, and the probe opens `O_RDONLY` only so
+  it can never bring a missing lock file into existence. `codex_app_servers`
+  parses ONE `ps -axo pid=,ppid=,command=` table, read only once at least one
+  lock comes back held, keyed on the app-server argv (`argv0`'s basename
+  `codex` plus a bare `app-server` token) — never the "ChatGPT" brand, a
+  window class, or a store path, so a renamed, resigned or relocated build is
+  found the same way. The `sessions/**` rollout walk that resolves a
+  thread's cwd runs once per NEW thread id only — an id an existing
+  `kind:"app"` record already carries a non-empty cwd for is passed through
+  unchanged, never re-walked on a later tick. `lock_holder` resolves the
+  owner: one server owns every held lock; two or more fall to
+  `holder_via_proc_fd`, the ONE `cfg(target_os = "linux")` tie-break in this
+  design, and anywhere it can't disambiguate (a non-Linux unix, or a Linux
+  fd-scan miss) the thread enrols with `pid: None` and no window — one audit
+  line, never a guess. `codex_home` (`$CODEX_HOME` else `$HOME/.codex`) is
+  the one authority for the root path; `reap.rs::refresh_codex_titles` calls
+  the same function rather than a second copy. See AGENTS.md's invariants
+  for why `kind:"app"` exists and what it must never gain.
 - `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below). The socket answers exactly one command with a reply,

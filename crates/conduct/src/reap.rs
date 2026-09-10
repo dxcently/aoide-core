@@ -67,8 +67,8 @@
 use aoide_protocol::Invocation;
 use aoide_protocol::agents::{agent_profile, AgentProfile, CLAUDE_PROFILE};
 use crate::graph::{
-    canonical_state, drop_sessions, hooks_path, hyprctl_clients, ledger_session_exit, lineage_of,
-    load_stage, normalize_addr, now_iso_utc, prune_done, refresh_subagent_says,
+    canonical_state, codex_home, drop_sessions, hooks_path, hyprctl_clients, ledger_session_exit,
+    lineage_of, load_stage, normalize_addr, now_iso_utc, prune_done, refresh_subagent_says,
     refresh_transcript_fields, restage_graph, sessions_path, stage_error, upsert_hook,
     write_stage, HookRecord, HooksFile, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
 };
@@ -1300,11 +1300,7 @@ fn apply_codex_titles(sessions: &mut [SessionRecord], titles: &HashMap<String, S
 }
 
 fn refresh_codex_titles() -> Vec<String> {
-    let home = std::env::var_os("CODEX_HOME")
-        .filter(|v| !v.is_empty())
-        .map(std::path::PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex")));
-    let Some(home) = home else { return Vec::new() };
+    let Some(home) = codex_home() else { return Vec::new() };
     let Ok(index) = std::fs::File::open(home.join("session_index.jsonl")) else { return Vec::new() };
     let titles = codex_titles(std::io::BufReader::new(index));
     if titles.is_empty() { return Vec::new() }
