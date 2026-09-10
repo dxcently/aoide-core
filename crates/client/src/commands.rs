@@ -3821,6 +3821,10 @@ fn handle_mail_send(inv: &Invocation) -> Outcome {
                 .with_data(json!({ "reason": "bad-address", "to": to }));
         }
     };
+    if !aoide_storage::node_store::valid_node_name(name) {
+        return Outcome::error(cmd, "mailbox name must match ^[a-z0-9][a-z0-9-]*$")
+            .with_data(json!({ "reason": "invalid-name" }));
+    }
     if inv.args.is_empty() {
         return Outcome::usage(cmd, USAGE);
     }
@@ -6567,6 +6571,22 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Error, "never registered at all — same refuse-before-spool shape");
         assert_eq!(out.data.unwrap()["reason"], "unknown-node");
         assert!(aoide_storage::outbox::list_entries("ghost").unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mail_send_to_an_invalid_name_is_refused_with_reason_invalid_name() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-send-invalid-name");
+
+        let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi"], &[("to", "self/Bob")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error, "msg: {}", out.message);
+        assert!(!out.message.contains("Bob"), "the offending bytes must never be echoed");
+        assert_eq!(out.data.unwrap()["reason"], "invalid-name");
+
+        let names = handle_mail_names(&mail_inv(&["mail"], &[]));
+        assert_eq!(names.data.unwrap()["names"], json!([]), "a refused name must never be filed");
 
         let _ = std::fs::remove_dir_all(&root);
     }

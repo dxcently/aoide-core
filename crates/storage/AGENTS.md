@@ -550,6 +550,36 @@
   function exists to rule out. No key on record for that name is a plain
   `false` (`DepositOutcome::UnverifiedOrigin` at the caller), never a
   fall-through to a default identity.
+
+- **`stamp_rung` is called only after the caller's socket write returned
+  `Ok` — never before (messaging plan P-M5a-1).** A ring that never
+  reached the socket must leave the reader armed for the next trigger (a
+  new arming entry, the reader's own Stop hook, or a manual `mail ring`)
+  — latching first and writing second would strand a reader that a crash
+  or a failed write never actually reached, silent and unrung until the
+  next unrelated letter arrives.
+- **The mailbase stage lock is held only inside `ring_targets`/
+  `stamp_rung`/`enrol_reader`/`armed_names_for_reader` themselves, never
+  by a caller across I/O (P-M5a-1; ruling R2).** Each call is a single
+  `with_lock` closure measured in milliseconds; a ringer's own socket
+  write, and the submit gap it holds, happen OUTSIDE every one of these,
+  serialized instead by conduct's own process-wide ring mutex. Don't
+  widen a mailbase lock to cover a socket write "to be safe" — that would
+  wedge every other mail command on the box for the length of one nudge.
+- **The pseudo-reader (a cursor key equal to the mailbox name itself) is
+  never a ring target and never counts as enrolled (ruling R1).**
+  `ring_targets`/`armed_names_for_reader` both exclude the key `name ==
+  reader` outright, and `enrol_reader` refuses to create it. It is the
+  identity an unconducted read falls back to, not anybody's terminal —
+  counting it toward `enrolled` would suppress the ringer's petname
+  fallback for a mailbox nobody has actually claimed.
+- **`arms(kind)` is the ONE place that decides which entry kinds ring —
+  currently `letter` only.** `ring_targets`/`armed_names_for_reader` call
+  it rather than repeating the kind check inline, so a future kind
+  joining the arming set (ruling R5: a `fetched` receipt arms the
+  origin's readers like a letter; an ordinary `receipt` never does) is a
+  one-line change in one function, never a grep-and-fix across every
+  caller.
 - **`outbox`'s two locks are never conflated (P-M2).** The crate-wide
   stage lock (`with_lock`, wrapping `fs::try_stage_lock`) guards file
   mutations only and is held for microseconds; `.bsy`

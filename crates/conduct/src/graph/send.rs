@@ -650,15 +650,18 @@ fn deliver_local_with(
         audit_send(inv, "error", &out.message, &text);
         return out;
     };
-    let is_conductable = rec.conductable == Some(true);
+    let is_conductable = super::doc::is_conductable_now(rec);
     let socket = rec.socket.clone().filter(|s| !s.is_empty());
     let target_parent = rec.parent_session_id.clone();
-    if !is_conductable || socket.is_none() {
-        let out = Outcome::error(
-            cmd,
-            format!("session `{id}` is not conductable (no control socket)"),
-        )
-        .with_data(json!({ "reason": "not-conductable", "id": id }));
+    if !is_conductable {
+        let message = match (rec.conductable == Some(true), socket.as_deref()) {
+            (true, Some(path)) => {
+                format!("session `{id}` is not conductable (control socket file `{path}` is gone)")
+            }
+            _ => format!("session `{id}` is not conductable (no control socket)"),
+        };
+        let out = Outcome::error(cmd, message)
+            .with_data(json!({ "reason": "not-conductable", "id": id }));
         audit_send(inv, "error", &out.message, &text);
         return out;
     }
@@ -3942,6 +3945,40 @@ mod tests {
         let out = session_send(&send_invocation(&["hi"], &[("id", "plain"), ("yes", "true")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Error);
         assert_eq!(out.data.as_ref().unwrap()["reason"], "not-conductable");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn send_to_a_wrap_whose_socket_file_is_gone_is_not_conductable() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("send-socket-gone");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        // `conductable: true` and a stored socket path — but nothing ever
+        // bound that path, the shellbridge-rebuild scenario `is_conductable_now`
+        // exists to catch.
+        let never_bound = root.join("never-bound.sock");
+        do_session_start(
+            "gone",
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(never_bound.to_str().unwrap()),
+            None,
+            None,
+        );
+
+        let out = session_send(&send_invocation(&["hi"], &[("id", "gone"), ("yes", "true")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "not-conductable");
+        assert!(out.message.contains("is gone"), "msg: {}", out.message);
 
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -29,8 +29,8 @@ use std::path::PathBuf;
 /// of conductability additionally needs the socket to still exist on disk, or
 /// the graph tells a caller it can reach a session nothing can actually reach.
 /// A missing or empty socket path is not-conductable, the same shape
-/// `send.rs`'s own gate already filters for.
-fn is_conductable_now(s: &SessionRecord) -> bool {
+/// `send.rs`'s own gate now calls this to get.
+pub(in crate::graph) fn is_conductable_now(s: &SessionRecord) -> bool {
     s.conductable == Some(true)
         && s.socket
             .as_deref()

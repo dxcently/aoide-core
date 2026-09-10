@@ -880,21 +880,28 @@
   absent `from` explicit-empty rather than let it fall through to their own
   process's ambient `AOIDE_SESSION_ID`), not the gate's own identity
   resolution.
-- **`build_graph`'s `conductable` node field is DERIVED at read time
-  (`doc.rs::is_conductable_now`), never the stored flag echoed verbatim.**
-  The STORED `SessionRecord.conductable` is a permanent fact about a
-  session's NATURE — it IS a conducted PTY wrap — and `window.rs`/`reap.rs`
-  classification (`is_agent_kind`, the lineage checks) keeps reading that
-  field directly; a session does not stop being a conducted wrap just
-  because its socket briefly vanished, so don't migrate or clear the stored
-  field to "fix" a stale report. But `shellbridge.service` owns
-  `$XDG_RUNTIME_DIR/aoide` with `RuntimeDirectoryPreserve=no`, so a rebuild
-  deletes a live session's socket file without ever touching the record —
-  every caller-facing report of conductability (`graph`'s JSON/tree,
-  `resolve_graph_document`'s federation wire response) additionally
-  requires the socket to still exist on disk, or the graph claims a session
-  is reachable when nothing can reach it. A missing or empty socket path is
-  not-conductable.
+- **Conductability is `is_conductable_now` (`doc.rs`: the stored flag AND
+  the socket file's own existence on disk) at every reporting AND acting
+  boundary, never the stored flag echoed verbatim.** `build_graph`'s
+  `conductable` node field derives it at read time (`graph`'s JSON/tree,
+  `resolve_graph_document`'s federation wire response); `send.rs`'s own
+  gate (`deliver_local_with`) calls the SAME function before ever dialing
+  a socket, so a caller never acts on a staler answer than a reporter
+  would give. The STORED `SessionRecord.conductable` is a permanent fact
+  about a session's NATURE — it IS a conducted PTY wrap — and
+  `window.rs`/`reap.rs` classification (`is_agent_kind`, the lineage
+  checks) keeps reading that field directly; a session does not stop
+  being a conducted wrap just because its socket briefly vanished, so
+  don't migrate or clear the stored field to "fix" a stale report.
+  `shellbridge.service` owns `$XDG_RUNTIME_DIR/aoide` with
+  `RuntimeDirectoryPreserve=yes` (`modules/nucleus/shellbridge.nix`), so
+  an ordinary service restart no longer deletes a live session's socket
+  file out from under it — but the on-disk check stays regardless,
+  because a socket file can still outlive or predate its process (a
+  crashed wrap, a record restored from stage, a runtime directory
+  cleared at logout): liveness is judged at every boundary, never from
+  the stored flag or a remembered path alone. A missing or empty socket
+  path is not-conductable.
 - **`mail_bridge` carries NO logic of its own — it stays two passthrough
   functions, forever (P-M2, ruling 1).** It exists only because
   `aoide-server` may not carry a production `aoide-client` dependency

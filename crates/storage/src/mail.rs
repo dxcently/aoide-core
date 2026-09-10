@@ -8,9 +8,12 @@
 //! [`Envelope`] into [`crate::outbox`]; the far door's `aoide/mailDeposit`
 //! arm calls [`deposit`] here to verify and file it, ONLY ever via a
 //! [`file_received_entry`] (never re-minted — the envelope arrives already
-//! sealed). **No transit, no zones, no doorbell, no `--hold`** — those are
-//! P-M3 through P-M5 (MAIL.md's own Phases section); nothing here reads a
-//! mesh declaration or injects a byte into a pty.
+//! sealed). **No transit, no zones, no `--hold`** — those are P-M3/P-M4
+//! (MAIL.md's own Phases section); nothing here reads a mesh declaration.
+//! The doorbell's own latch and its targeting queries ([`arms`],
+//! [`ring_targets`], [`stamp_rung`], [`armed_names_for_reader`],
+//! [`enrol_reader`]) live here (P-M5a-1); the ring itself — injecting a byte
+//! into a pty — is `aoide-conduct`'s (P-M5a-2).
 //!
 //! ## The envelope
 //!
@@ -120,9 +123,17 @@ pub const ENTRY_TYPE_LETTER: &str = "letter";
 /// `inbox.json` carried, per MAIL.md "Store").
 pub const ENTRY_TYPE_RECEIPT: &str = "receipt";
 
-/// `<node>/<name>` — one side of a header. Free text on both sides; nothing
-/// here validates against a mesh declaration (P-M1 has none) or clamps
-/// grammar (rendering's job, P-M5).
+/// Which entry kinds ARM a reader's doorbell. A `receipt` (a delivery
+/// record, or a deposit ack filed under the origin's name) never does.
+pub fn arms(kind: &str) -> bool {
+    kind == ENTRY_TYPE_LETTER
+}
+
+/// `<node>/<name>` — one side of a header. `from.name` and a receipt's
+/// `to.name` stay free text — attribution only, nothing here validates
+/// them against a mesh declaration (P-M1 has none). A letter's `to.name`
+/// is grammar-validated at filing instead ([`file_letter`],
+/// [`mint_outbound_letter`]), never clamped.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Address {
     pub node: String,
@@ -182,17 +193,28 @@ pub struct Entry {
 }
 
 /// One reader's high-water mark, like an NNTP `.newsrc` line (MAIL.md
-/// "Store"). Nothing else is per-reader state yet.
+/// "Store").
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
 pub struct Mark {
     #[serde(default)]
     pub seq: u64,
+    /// The doorbell latch (MAIL.md "Delivery and the doorbell"): the highest
+    /// arming `seq` this reader has been rung for. Armed again only once
+    /// `seq` (the reader's own read) reaches it. Zero = never rung; omitted
+    /// from disk while zero so an unrung file is byte-identical to before.
+    #[serde(default, skip_serializing_if = "u64_is_zero")]
+    pub rung: u64,
+}
+
+fn u64_is_zero(v: &u64) -> bool {
+    *v == 0
 }
 
 /// One name's readers, each with its own high-water mark (MAIL.md "Store":
 /// "a name maps to a set of readers, each with its own high-water mark").
-/// The key set IS the P-M5 doorbell's targeting list, populated starting
-/// now even though nothing reads it yet.
+/// The key set IS the doorbell's enrolment list: a reader is enrolled by
+/// having a key here, [`Mark::rung`] is that reader's latch, and
+/// [`ring_targets`] reads both to decide who is armed.
 pub type Cursor = BTreeMap<String, Mark>;
 
 /// `cursors.json`'s whole shape is this bare map of maps — no wrapper, no
@@ -480,10 +502,10 @@ fn migrate_cursors_if_needed() -> Result<(), String> {
                     .unwrap_or_default();
                 let mut cursor = Cursor::new();
                 if readers.is_empty() {
-                    cursor.insert(name.clone(), Mark { seq: old_seq });
+                    cursor.insert(name.clone(), Mark { seq: old_seq, rung: 0 });
                 } else {
                     for reader in readers {
-                        cursor.insert(reader, Mark { seq: old_seq });
+                        cursor.insert(reader, Mark { seq: old_seq, rung: 0 });
                     }
                 }
                 out.insert(name, cursor);
@@ -700,6 +722,9 @@ pub fn file_receipt(from: &str, to_name: &str, text: &str) -> Result<(), String>
 /// this box's own name (P-M2's `--to` resolution happens one layer up, in
 /// the command handler). Always `via: "self"`.
 pub fn file_letter(from_name: &str, to_name: &str, text: &str) -> Result<Entry, String> {
+    if !crate::node_store::valid_node_name(to_name) {
+        return Err("invalid mailbox name: must match ^[a-z0-9][a-z0-9-]*$".to_string());
+    }
     let node = display::local_host_name();
     let from_addr = Address { node: node.clone(), name: from_name.to_string() };
     let to_addr = Address { node, name: to_name.to_string() };
@@ -716,6 +741,9 @@ pub fn file_letter(from_name: &str, to_name: &str, text: &str) -> Result<Entry, 
 /// caller to hand to the outbox. `mail send`'s command layer is what
 /// decides self vs. remote and calls the matching one of these two.
 pub fn mint_outbound_letter(from_name: &str, to_node: &str, to_name: &str, text: &str) -> Result<Envelope, String> {
+    if !crate::node_store::valid_node_name(to_name) {
+        return Err("invalid mailbox name: must match ^[a-z0-9][a-z0-9-]*$".to_string());
+    }
     let (kp, _) = identity::load_or_mint().map_err(|e| e.to_string())?;
     let header = Header {
         version: ENVELOPE_VERSION.to_string(),
@@ -984,6 +1012,141 @@ pub fn names_with_unread(reader_session: Option<&str>) -> Result<Vec<String>, St
             .collect();
         names.sort();
         Ok(names)
+    })
+}
+
+/// One doorbell poll's targets for `name` (MAIL.md "Delivery and the
+/// doorbell") — the ringer's one read of "who do I wake, and how many real
+/// readers even exist to wake." `armed` pairs each armed reader with the
+/// arming high-water mark it is armed FOR, so a caller's own
+/// [`stamp_rung`] has the exact `seq` to latch without a second scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RingTargets {
+    /// (reader key, highest arming seq) for every reader that is armed.
+    pub armed: Vec<(String, u64)>,
+    /// Reader keys under this name other than the pseudo-reader.
+    pub enrolled: usize,
+}
+
+/// Who is armed under `name`, and how many real (non-pseudo) readers are
+/// enrolled at all (MAIL.md "Delivery and the doorbell"). The pseudo-reader
+/// (cursor key == `name` itself, the identity an unconducted caller reads
+/// under) is never armed and never counts toward `enrolled` — it is
+/// nobody's terminal to ring, and its presence must never suppress the
+/// ringer's petname fallback. A reader is armed once unread arming mail
+/// ([`arms`], currently `letter` only) exists beyond both what it has read
+/// (`mark.seq`) and what it was last rung for (`mark.rung`): rung once, a
+/// reader stays latched until its own read catches up to that point, and
+/// re-arms only on the next arming entry after that. Read-only.
+pub fn ring_targets(name: &str) -> Result<RingTargets, String> {
+    let name = name.to_string();
+    with_lock(move || {
+        let entries = read_entries_unlocked()?;
+        let max_arm = entries
+            .iter()
+            .filter(|e| e.envelope.header.to.name == name && arms(&e.kind))
+            .map(|e| e.seq)
+            .max()
+            .unwrap_or(0);
+        let cursors = load_cursors()?;
+        let mut armed = Vec::new();
+        let mut enrolled = 0usize;
+        if let Some(cursor) = cursors.get(&name) {
+            for (reader, mark) in cursor {
+                if *reader == name {
+                    continue;
+                }
+                enrolled += 1;
+                if max_arm > mark.seq && mark.rung <= mark.seq {
+                    armed.push((reader.clone(), max_arm));
+                }
+            }
+        }
+        Ok(RingTargets { armed, enrolled })
+    })
+}
+
+/// Latch `reader`'s ring for `name` at `seq` (MAIL.md "Delivery and the
+/// doorbell") — the ringer's own write, made only once a nudge has actually
+/// reached a socket and never before (a failed write must leave the reader
+/// armed for the next trigger). `rung` only ever advances (`rung =
+/// max(rung, seq)`); `seq` — the reader's own read mark — is never touched
+/// here, since reading and being rung are two different events on the same
+/// [`Mark`]. `reader` must already be a key under `name`'s cursor map: this
+/// stamps an existing mark, it never inserts one — an unenrolled reader is
+/// an error, never a silent enrolment. [`enrol_reader`] is the seam that
+/// enrols.
+pub fn stamp_rung(name: &str, reader: &str, seq: u64) -> Result<(), String> {
+    let name = name.to_string();
+    let reader = reader.to_string();
+    with_lock(move || {
+        let mut cursors = load_cursors()?;
+        let mark = cursors
+            .get_mut(&name)
+            .and_then(|c| c.get_mut(&reader))
+            .ok_or_else(|| format!("{reader}: not an enrolled reader of {name}"))?;
+        if seq > mark.rung {
+            mark.rung = seq;
+        }
+        save_cursors(&cursors)?;
+        Ok(())
+    })
+}
+
+/// Every name where `reader` (a session/wrap id) is currently armed, paired
+/// with the arming high-water mark it is armed for, sorted by name — the
+/// Stop-hook replay's own read (MAIL.md "Delivery and the doorbell"): the
+/// reader that just went idle asks "what should ring me now" across every
+/// mailbox at once, not one name at a time. The same armed rule as
+/// [`ring_targets`]; a name under which `reader` is that name's OWN
+/// pseudo-reader (`reader == name`) is excluded there exactly as it would
+/// be from that name's own [`ring_targets`] call.
+pub fn armed_names_for_reader(reader: &str) -> Result<Vec<(String, u64)>, String> {
+    let reader = reader.to_string();
+    with_lock(move || {
+        let entries = read_entries_unlocked()?;
+        let cursors = load_cursors()?;
+        let mut out = Vec::new();
+        for (name, cursor) in &cursors {
+            if name == &reader {
+                continue;
+            }
+            let Some(mark) = cursor.get(&reader) else { continue };
+            let max_arm = entries
+                .iter()
+                .filter(|e| &e.envelope.header.to.name == name && arms(&e.kind))
+                .map(|e| e.seq)
+                .max()
+                .unwrap_or(0);
+            if max_arm > mark.seq && mark.rung <= mark.seq {
+                out.push((name.clone(), max_arm));
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Enrol `reader` under `name` with a fresh, unread, unrung [`Mark`] —
+/// idempotent, and never moves a mark already there (MAIL.md "Delivery and
+/// the doorbell"): the ringer's petname fallback calls this on its resolved
+/// target BEFORE stamping, so a fallback target latches on its next ring
+/// exactly like any reader that arrived by reading. Refuses `reader ==
+/// name` (the pseudo-reader is never enrolled — it is not a target) and an
+/// invalid `name`; writes nothing in either case.
+pub fn enrol_reader(name: &str, reader: &str) -> Result<(), String> {
+    if !crate::node_store::valid_node_name(name) {
+        return Err("invalid mailbox name: must match ^[a-z0-9][a-z0-9-]*$".to_string());
+    }
+    if reader == name {
+        return Err(format!("{reader}: the pseudo-reader is never enrolled"));
+    }
+    let name = name.to_string();
+    let reader = reader.to_string();
+    with_lock(move || {
+        let mut cursors = load_cursors()?;
+        cursors.entry(name).or_default().entry(reader).or_default();
+        save_cursors(&cursors)?;
+        Ok(())
     })
 }
 
@@ -1787,5 +1950,298 @@ mod tests {
             canonical_header_bytes(&h2),
             "the two headers' verbatim bytes must differ"
         );
+    }
+
+    #[test]
+    fn a_ring_target_is_armed_only_while_unread_arming_mail_exists_beyond_the_last_ring() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("ring-armed-basic");
+
+        enrol_reader("bob", "sess-1").unwrap();
+        let before = ring_targets("bob").unwrap();
+        assert!(before.armed.is_empty(), "no arming mail at all: nothing armed");
+        assert_eq!(before.enrolled, 1);
+
+        file_letter("alice", "bob", "one").unwrap();
+        let after = ring_targets("bob").unwrap();
+        assert_eq!(
+            after.armed,
+            vec![("sess-1".to_string(), 1)],
+            "unread arming mail beyond the last ring arms the reader"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_readers_own_read_rearms_the_ring() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("ring-rearm");
+
+        read_for("bob", false, Some("sess-1")).unwrap(); // enrols sess-1, seq 0
+        file_letter("alice", "bob", "one").unwrap(); // seq 1, arming
+        let t1 = ring_targets("bob").unwrap();
+        assert_eq!(t1.armed, vec![("sess-1".to_string(), 1)], "an unread letter arms");
+
+        stamp_rung("bob", "sess-1", 1).unwrap();
+        let t2 = ring_targets("bob").unwrap();
+        assert!(t2.armed.is_empty(), "latched at seq 1 with no newer arming mail: not armed");
+
+        read_for("bob", false, Some("sess-1")).unwrap(); // seq catches up to 1
+        file_letter("alice", "bob", "two").unwrap(); // seq 2, new arming mail
+        let t3 = ring_targets("bob").unwrap();
+        assert_eq!(
+            t3.armed,
+            vec![("sess-1".to_string(), 2)],
+            "the reader's own read caught up to the rung point; the next arming entry re-arms it"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_hundred_letters_ring_once_until_mail_read() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("ring-hundred");
+
+        enrol_reader("bob", "sess-1").unwrap();
+        file_letter("alice", "bob", "seed").unwrap(); // seq 1
+        stamp_rung("bob", "sess-1", 1).unwrap();
+
+        for i in 0..100 {
+            file_letter("alice", "bob", &format!("letter {i}")).unwrap();
+        }
+        let t = ring_targets("bob").unwrap();
+        assert!(t.armed.is_empty(), "a hundred more arming letters never re-arm a latched, still-unread reader");
+
+        read_for("bob", false, Some("sess-1")).unwrap(); // seq catches up to 101
+        file_letter("alice", "bob", "the one that rings").unwrap(); // seq 102
+        let t2 = ring_targets("bob").unwrap();
+        assert_eq!(t2.armed, vec![("sess-1".to_string(), 102)], "only mail after the read re-arms");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_pseudo_reader_is_never_a_ring_target_and_does_not_count_as_enrolled() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("ring-pseudo-reader");
+
+        file_letter("alice", "bob", "one").unwrap();
+        read_for("bob", false, None).unwrap(); // enrols only the pseudo-reader, key "bob"
+
+        let t = ring_targets("bob").unwrap();
+        assert_eq!(t.enrolled, 0, "the pseudo-reader is never counted as enrolled");
+        assert!(t.armed.is_empty(), "the pseudo-reader is never a ring target");
+
+        // Unread arming mail piles up for it too — still never a target.
+        file_letter("alice", "bob", "two").unwrap();
+        let t2 = ring_targets("bob").unwrap();
+        assert!(t2.armed.is_empty(), "still never a target, even with unread arming mail outstanding");
+        assert_eq!(t2.enrolled, 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_latched_reader_still_counts_as_enrolled() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("ring-latched-enrolled");
+
+        enrol_reader("bob", "sess-1").unwrap();
+        file_letter("alice", "bob", "one").unwrap();
+        stamp_rung("bob", "sess-1", 1).unwrap();
+
+        let t = ring_targets("bob").unwrap();
+        assert!(t.armed.is_empty(), "latched immediately after stamping, before any read: not armed");
+        assert_eq!(t.enrolled, 1, "a latched reader is still enrolled");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_mark_without_rung_reads_as_armed_and_the_file_gains_no_rung_until_stamped() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("ring-legacy-mark");
+
+        std::fs::create_dir_all(mail_dir()).unwrap();
+        let legacy = serde_json::json!({ "bob": { "sess-1": { "seq": 0 } } });
+        std::fs::write(cursors_path(), serde_json::to_string(&legacy).unwrap()).unwrap();
+
+        file_letter("alice", "bob", "one").unwrap();
+
+        let t = ring_targets("bob").unwrap();
+        assert_eq!(
+            t.armed,
+            vec![("sess-1".to_string(), 1)],
+            "a mark with no `rung` on disk defaults to 0, which is <= seq(0): armed"
+        );
+
+        read_for("bob", false, Some("sess-1")).unwrap();
+        let raw = std::fs::read_to_string(cursors_path()).unwrap();
+        assert!(!raw.contains("rung"), "a read alone must never write an unrung mark's `rung` field");
+
+        stamp_rung("bob", "sess-1", 1).unwrap();
+        let raw = std::fs::read_to_string(cursors_path()).unwrap();
+        assert!(raw.contains("rung"), "stamping a nonzero rung must appear on disk");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamping_a_rung_never_moves_seq_and_a_second_reader_is_untouched() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("stamp-seq-untouched");
+
+        file_letter("alice", "bob", "one").unwrap();
+        read_for("bob", false, Some("sess-1")).unwrap(); // seq 1
+        enrol_reader("bob", "sess-2").unwrap(); // seq 0, rung 0
+
+        stamp_rung("bob", "sess-1", 5).unwrap(); // stamped beyond the current seq, on purpose
+
+        let cursors = load_cursors().unwrap();
+        let cursor = cursors.get("bob").unwrap();
+        assert_eq!(cursor.get("sess-1").unwrap().seq, 1, "stamp_rung never moves seq");
+        assert_eq!(cursor.get("sess-1").unwrap().rung, 5);
+        assert_eq!(cursor.get("sess-2").unwrap().seq, 0, "a second reader is untouched by another reader's stamp");
+        assert_eq!(cursor.get("sess-2").unwrap().rung, 0);
+
+        stamp_rung("bob", "sess-1", 2).unwrap(); // lower than the current rung
+        let cursors = load_cursors().unwrap();
+        assert_eq!(cursors.get("bob").unwrap().get("sess-1").unwrap().rung, 5, "rung only ever advances");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn stamping_an_unenrolled_reader_is_an_error_not_an_insertion() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("stamp-unenrolled");
+
+        // No cursor map for "bob" at all yet.
+        let err = stamp_rung("bob", "sess-1", 1).unwrap_err();
+        assert!(!err.is_empty());
+        assert!(load_cursors().unwrap().get("bob").is_none(), "stamping an unenrolled reader must insert nothing");
+
+        // A cursor map exists for the name, but not this reader.
+        enrol_reader("bob", "sess-2").unwrap();
+        let err2 = stamp_rung("bob", "sess-1", 1).unwrap_err();
+        assert!(!err2.is_empty());
+        let cursors = load_cursors().unwrap();
+        assert!(cursors.get("bob").unwrap().get("sess-1").is_none(), "stamping an unenrolled reader must never insert one");
+        assert_eq!(cursors.get("bob").unwrap().len(), 1, "only the already-enrolled reader exists");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_receipt_never_arms_a_reader() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("ring-receipt-never-arms");
+
+        read_for("bob", false, Some("sess-1")).unwrap();
+        file_receipt("x", "bob", "t").unwrap();
+
+        let t = ring_targets("bob").unwrap();
+        assert!(t.armed.is_empty(), "a receipt never arms a reader");
+
+        file_letter("alice", "bob", "a real letter").unwrap();
+        let t2 = ring_targets("bob").unwrap();
+        assert_eq!(t2.armed, vec![("sess-1".to_string(), 2)], "a letter arms; the receipt filed before it never counted");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn armed_names_for_reader_lists_only_names_where_this_reader_is_armed() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("armed-names-for-reader");
+
+        read_for("bob", false, Some("sess-1")).unwrap();
+        read_for("carol", false, Some("sess-1")).unwrap();
+        file_letter("alice", "bob", "one").unwrap(); // arms bob for sess-1; carol gets nothing new
+
+        let armed = armed_names_for_reader("sess-1").unwrap();
+        assert_eq!(armed, vec![("bob".to_string(), 1)], "only the name with unread arming mail for this reader is listed");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_letter_to_an_invalid_name_is_refused_before_anything_is_written() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("invalid-name-refused");
+
+        for bad in ["Bob", "$(x)", "-lead", "a\nb"] {
+            assert!(file_letter("alice", bad, "hi").is_err(), "file_letter must refuse {bad:?}");
+            assert!(
+                mint_outbound_letter("alice", "elsewhere", bad, "hi").is_err(),
+                "mint_outbound_letter must refuse {bad:?}"
+            );
+        }
+
+        assert!(!base_path().exists(), "a refused name must never write base.jsonl");
+        assert!(!seen_path().exists(), "a refused name must never write seen.jsonl");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn an_old_letter_to_a_name_outside_the_grammar_stays_readable() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("old-name-outside-grammar");
+
+        let h = header("alice", "Old_Name", ENTRY_TYPE_LETTER, &now_iso_utc());
+        let (kp, _) = identity::load_or_mint().unwrap();
+        let (sig, msgid) = seal(&h, "grandfathered", &kp);
+        let envelope = Envelope { header: h, text: "grandfathered".to_string(), sig, msgid: msgid.clone() };
+        let entry = Entry {
+            seq: 1,
+            received_at: now_iso_utc(),
+            kind: ENTRY_TYPE_LETTER.to_string(),
+            via: "self".to_string(),
+            envelope,
+        };
+        std::fs::create_dir_all(mail_dir()).unwrap();
+        append_base_line(&entry).unwrap();
+        append_seen_line(&msgid, &entry.received_at).unwrap();
+
+        let got = read_for("Old_Name", false, None).unwrap();
+        assert_eq!(got.len(), 1, "a pre-existing off-grammar name stays filed and readable forever");
+        assert_eq!(got[0].envelope.msgid, msgid);
+
+        let shown = show(&msgid).unwrap();
+        assert!(shown.is_some(), "show must still find a grandfathered entry by msgid");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enrolling_a_reader_is_idempotent_and_starts_unread_and_unrung() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("enrol-idempotent");
+
+        enrol_reader("bob", "sess-1").unwrap();
+        enrol_reader("bob", "sess-1").unwrap();
+        let cursors = load_cursors().unwrap();
+        let cursor = cursors.get("bob").unwrap();
+        assert_eq!(cursor.len(), 1, "enrolling twice creates exactly one key");
+        assert_eq!(cursor.get("sess-1").unwrap().seq, 0);
+        assert_eq!(cursor.get("sess-1").unwrap().rung, 0);
+
+        file_letter("alice", "bob", "one").unwrap();
+        read_for("bob", false, Some("sess-1")).unwrap(); // seq -> 1
+        enrol_reader("bob", "sess-1").unwrap(); // must not reset the mark
+        let cursors = load_cursors().unwrap();
+        assert_eq!(
+            cursors.get("bob").unwrap().get("sess-1").unwrap().seq,
+            1,
+            "enrolling an already-enrolled reader never moves its mark"
+        );
+
+        let err = enrol_reader("bob", "bob").unwrap_err();
+        assert!(!err.is_empty(), "the pseudo-reader is never enrolled");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -472,6 +472,21 @@ by decision — no embedded database yet
   ack), then file via the new `file_received_entry`. Both mint functions
   and `deposit` carry neither `mesh` nor `transit` — P-M2's envelope is
   exactly P-M1's shape, addressed at a real node instead of `self`.
+
+  P-M5a-1 adds the doorbell's own state and its safety floor: `arms(kind)`
+  is the one place that decides which entry kinds ring (`letter` only,
+  until P-M5b's `fetched`); `ring_targets(name)` reads who is armed under
+  a name and how many real readers are enrolled at all (`RingTargets {
+  armed, enrolled }`, MAIL.md "Delivery and the doorbell") — the
+  pseudo-reader (cursor key == `name`) is excluded from both counts;
+  `stamp_rung`/`enrol_reader` are its paired mutations, latching an
+  already-enrolled reader and enrolling a fresh one respectively, never
+  the other's job; `armed_names_for_reader` is the same armed rule run
+  for one reader across every name, the shape the Stop-hook replay reads.
+  `file_letter`/`mint_outbound_letter` refuse a `to_name` outside
+  `^[a-z0-9][a-z0-9-]*$` (`node_store::valid_node_name`) before taking
+  the lock — validated, never clamped; a letter already on disk under an
+  off-grammar name from before this rule stays filed and readable.
 - `outbox` — the per-node BSO-style spool (P-M2): `state/outbox/<node>/`,
   one JSON file per pending envelope plus each link's own backoff state
   (`link.json`), guarded by the same crate-wide stage lock `mail` uses for
