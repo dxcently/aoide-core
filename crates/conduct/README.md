@@ -357,11 +357,17 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   ALREADY-registered session whenever kernel process evidence
   (`identity::attested_wrap`, the same nearest-first `/proc` walk, narrowed to
   a sealed CONDUCTED ancestor) resolves a different wrap than the one
-  currently stamped — a harness id that survives `--resume` under a new
-  terminal keeps following its CURRENT wrap, caught on its next per-turn
-  hook. Unlike `hookAncestry` (write-once, a birth fact) this is change-only
-  on difference; no daemon reachable or no conducted ancestor found leaves it
-  untouched, fail-closed.
+  currently stamped. `HookAction::Start` (SessionStart itself, in
+  `hook_for_profile_gated`) resolves the SAME attested walk directly —
+  `send.rs`'s `start_parent` (`attested.or(env_parent)`) feeds the result
+  straight into `do_session_start`'s own parent upsert, not through
+  `stamp_attested_parent` — so a harness id that survives `--resume` under a
+  new terminal re-parents onto its CURRENT wrap at SessionStart, not on its
+  next per-turn hook. Unlike `hookAncestry` (write-once, a birth fact),
+  `stamp_attested_parent`'s re-stamp is change-only on difference, and
+  `do_session_start`'s upsert writes the resolved parent as it does every
+  other field on a re-start. Either way, no daemon reachable or no
+  conducted ancestor found leaves the parent untouched, fail-closed.
   `session_store::lineage_of`
   (ancestors + descendants) is the matching widened carve-out for the
   same-window registration-time eviction, reused by `reap.rs`'s dedup pass
