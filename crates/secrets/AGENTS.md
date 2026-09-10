@@ -2,6 +2,11 @@
 
 ## Invariants
 
+- Timeout fixtures hold `crate::env_lock()` before changing
+  `BACKEND_TIMEOUT_ENV` and before starting elapsed-time measurements.
+  The order is test environment lock, then broker `put_lock`; temporary
+  homes do not isolate the shared timeout or deliberately hanging puts.
+
 - **A secret's VALUE never appears on a `Serialize`/`Deserialize` type in
   this crate.** `policy::Policy` is still the only such type, and it holds
   no value. P-V2's resolve response and both audit lines are the exact

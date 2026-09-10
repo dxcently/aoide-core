@@ -2842,6 +2842,7 @@ mod tests {
     /// note describes.
     #[test]
     fn a_hung_set_template_no_longer_wedges_put_lock_forever() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("put-hung-set-bounded");
         let p = Policy::new("t", "scratch", "k");
         seed_with_set(&home, &[p], "false", "sleep 60");
@@ -2873,6 +2874,7 @@ mod tests {
     /// first call's own thread gave up waiting on it.
     #[test]
     fn put_lock_is_free_for_the_next_caller_right_after_a_timeout() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let home = tmp_home("put-lock-freed-for-next-caller");
         let out = home.join("out.txt");
         let p1 = Policy::new("hangs", "hangs", "k");
