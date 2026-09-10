@@ -568,10 +568,27 @@
   `stamp_rung`/`enrol_reader`/`armed_names_for_reader` themselves, never
   by a caller across I/O (P-M5a-1; ruling R2).** Each call is a single
   `with_lock` closure measured in milliseconds; a ringer's own socket
-  write, and the submit gap it holds, happen OUTSIDE every one of these,
-  serialized instead by conduct's own process-wide ring mutex. Don't
-  widen a mailbase lock to cover a socket write "to be safe" — that would
-  wedge every other mail command on the box for the length of one nudge.
+  write, and the submit gap it holds, happen OUTSIDE every one of these.
+  Don't widen a mailbase lock to cover a socket write "to be safe" — that
+  would wedge every other mail command on the box for the length of one
+  nudge.
+- **`with_ring_lock` is a dedicated, cross-process `.ring.lock` file in
+  `mail_dir()` — never the stage lock, and never an in-process mutex
+  (P-M5a-2, superseding this bullet's own earlier "a process-wide ring
+  mutex" — no such mutex exists; the real serializer is this file).**
+  `aoide-conduct`'s `graph::doorbell::ring` wraps its ENTIRE
+  select-inject-stamp sequence for one name in this one closure, holding
+  it across the real socket connect, write, and submit-keystroke delay —
+  the opposite of every stage-lock closure above, which is why it is a
+  separate file rather than a wider stage-lock scope. Built on the same
+  `fs::lock_path` primitive `try_stage_lock` itself now calls (P-M5a-2
+  generalized the one flock-a-path routine both share, rather than
+  duplicating it), so the two lock files behave identically (block for
+  `LOCK_EX`, `Err` only when the lock file itself cannot be opened or
+  created) while never being the same file. Any process on the box may
+  ring concurrently; two overlapping rings for the same name simply
+  serialize on this file, the second always selecting after the first
+  has already stamped.
 - **The pseudo-reader (a cursor key equal to the mailbox name itself) is
   never a ring target and never counts as enrolled (ruling R1).**
   `ring_targets`/`armed_names_for_reader` both exclude the key `name ==

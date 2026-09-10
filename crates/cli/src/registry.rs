@@ -274,6 +274,7 @@ mod tests {
             "mail.outbox",
             "mail.outbox.rm",
             "mail.read",
+            "mail.ring",
             "mail.rm",
             "mail.send",
             "mail.show",

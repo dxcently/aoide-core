@@ -538,7 +538,16 @@
   filed **letter** mints an ack addressed back to the origin, spools it,
   and best-effort drains that node once, synchronously, reusing the SAME
   `aoide_conduct::mail_bridge::drain_node` the daemon tick calls — one
-  drain implementation, never a duplicate dial built here. A filed
+  drain implementation, never a duplicate dial built here. **The SAME
+  Filed-letter arm also rings the doorbell in-process, best-effort**
+  (P-M5a-2: `aoide_conduct::graph::ring(&envelope.header.to.name, None)`
+  — this crate already depends on `aoide-conduct`, so a remotely-deposited
+  letter arms and rings exactly like a locally-filed one, under `ring`'s
+  own dedicated `.ring.lock`, never this process's copy of the stage
+  lock). **A filed receipt must never call `ring` — it is not arming
+  mail** (`aoide_storage::mail`'s `arms` predicate already enforces this
+  at the storage layer; the deposit arm must not duplicate or bypass that
+  by ringing on a receipt's behalf). A filed
   **receipt** instead calls `aoide_storage::outbox::retire_by_ack` (spec
   item 7) — a pure lookup keyed on the receipt's own verified
   `from.node`/acked-msgid, so a forged or stale ack finds no matching

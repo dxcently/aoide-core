@@ -16,6 +16,7 @@
 mod common;
 mod conduct;
 mod doc;
+mod doorbell;
 // LANE IDENTITY P-ID3: `pub(crate)`, not private — `shellbridge.rs` (a
 // SIBLING of this module, not a descendant) reuses `peer_cred`/`PeerCred`
 // for its own cross-uid accept floor rather than hand-rolling a second
@@ -55,6 +56,10 @@ pub use self::conduct::session_conduct;
 // the same path `graph send`/`conduct` derive internally.
 pub use self::conduct::conduct_socket_path;
 pub use self::doc::{build_graph, render, resolve_graph_document};
+// `mail ring` (P-M5a-2, MAIL.md "Delivery and the doorbell"): the ring
+// itself, callable in-process by any door that has this crate (the daemon
+// on a Stop hook, the CLI on `mail ring`, `aoide-server`'s deposit arm).
+pub use self::doorbell::{mail_ring, ring, RingReport};
 pub use self::model::{
     anchor_for, canonical_state, merged_sessions, HookRecord, HooksFile, Project, ProjectsFile,
     SessionRecord, SessionsFile,

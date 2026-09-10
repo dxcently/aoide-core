@@ -366,3 +366,26 @@ pub fn register(r: &mut Registry) {
     ));
 
 }
+
+/// `mail ring` (P-M5a-2, MAIL.md "Delivery and the doorbell") — registered
+/// separately from [`register`] because its home command family (`mail`)
+/// lives in the CLIENT crate's `commands.rs`, which cannot depend on this
+/// crate; `aoide-cli`'s own `commands::all()` calls this alongside
+/// `aoide_client::commands::register`/`aoide_client::context::register`
+/// instead, at the end of that function, so the doorbell's one command
+/// slots in last rather than reordering the client's own `mail` family.
+pub fn register_mail_ring(r: &mut Registry) {
+    r.insert(cmd!(
+        path: ["mail", "ring"],
+        summary: "Ring every armed reader of a mailbox that is headless and at the prompt; latched until the reader reads. Local, runs in-process.",
+        args: [],
+        flags: [
+            flag!("for", "string", "Mailbox name to ring (required)."),
+            flag!("from", "string", "The filer's own session — excluded from the ring, never rung for its own letter."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::mail_ring,
+        examples: ["mail ring --for claude-mail"],
+    ));
+}

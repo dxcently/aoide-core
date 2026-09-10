@@ -1150,6 +1150,29 @@ pub fn enrol_reader(name: &str, reader: &str) -> Result<(), String> {
     })
 }
 
+/// Cross-process serializer for the ring (`conduct::graph::doorbell`,
+/// MAIL.md "Delivery and the doorbell"): `flock`s a DEDICATED `.ring.lock`
+/// file in [`mail_dir`] for the whole closure — never the `.stage.lock`
+/// [`with_lock`]'s callers take. A ring holds this lock across real socket
+/// I/O (one write per armed target, plus the submit-keystroke delay), which
+/// can run for tens of milliseconds per target; every OTHER mail primitive
+/// in this module holds `.stage.lock` only for an in-memory read-modify-write
+/// of `base.jsonl`/`cursors.json`, microseconds at most. Sharing one lock
+/// file would make a single slow ring stall every unrelated stage writer on
+/// the desktop (session starts, hook phases, the reaper) for its whole
+/// duration — a hazard nothing before the ring created, so the ring gets its
+/// own file rather than widening `.stage.lock`'s blast radius.
+///
+/// Blocking (`LOCK_EX`): a second filer's ring queues behind the first
+/// rather than racing it, so two letters filed to the same name in quick
+/// succession still ring the target at most once each, in order (P-M5a-2
+/// "a concurrent burst of filers rings once"). Fail-closed like
+/// [`crate::fs::try_stage_lock`]: if the lock file can't be opened or
+/// locked, the ring is refused rather than run unlocked.
+pub fn with_ring_lock<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    crate::fs::lock_path(mail_dir().join(".ring.lock"), f)
+}
+
 /// `mail rm --older-than <Nd|Nh>`: the only pruning (MAIL.md "Store",
 /// "Keep-all"). Rewrites `base.jsonl` atomically with the survivors,
 /// preserving each one's original `seq` — never renumbers, so a reader's

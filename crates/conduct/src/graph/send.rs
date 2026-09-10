@@ -85,10 +85,13 @@ use std::path::{Path, PathBuf};
 /// `cfg(test)` so the unit suite doesn't pay it — a real delay is only
 /// meaningful against a real pty reader; [`write_delivery`]'s own tests
 /// pass a real, explicit delay when they need to observe the boundary.
+// `pub(in crate::graph)`: the ring (`graph/doorbell.rs`, P-M5a-2) is a
+// SECOND production caller of `write_delivery`, alongside `deliver_local_with`
+// below — both raw-inject, both want the exact same submit-keystroke gap.
 #[cfg(not(test))]
-const SUBMIT_KEYSTROKE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
+pub(in crate::graph) const SUBMIT_KEYSTROKE_DELAY: std::time::Duration = std::time::Duration::from_millis(300);
 #[cfg(test)]
-const SUBMIT_KEYSTROKE_DELAY: std::time::Duration = std::time::Duration::from_millis(0);
+pub(in crate::graph) const SUBMIT_KEYSTROKE_DELAY: std::time::Duration = std::time::Duration::from_millis(0);
 
 // ── `send`: the gated injection door ──────────────────────────────────
 
@@ -596,7 +599,11 @@ fn deliver_local(inv: &Invocation, id: &str) -> Outcome {
 /// hardcoded read of the constant, so a test can pass a real, observable gap
 /// directly — [`deliver_local_with`] is the one production caller, and it
 /// always passes [`SUBMIT_KEYSTROKE_DELAY`].
-fn write_delivery(
+///
+/// `pub(in crate::graph)`: the ring (`graph/doorbell.rs`, P-M5a-2) is the
+/// second production caller — raw injection into a target wrap's socket,
+/// no gate, no provenance prefix, exactly this function's own contract.
+pub(in crate::graph) fn write_delivery(
     stream: &mut UnixStream,
     payload: &[u8],
     submit: bool,
@@ -1865,6 +1872,35 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
             if phase == "stopped" {
                 if let Some(cwd_str) = payload.get("cwd").and_then(Value::as_str).filter(|s| !s.is_empty()) {
                     aoide_upkeep::checklane::on_stop(&id, Path::new(cwd_str));
+                }
+                // The doorbell's Stop-hook replay trigger (P-M5a-2, MAIL.md
+                // "Delivery and the doorbell", trigger (b)): the reader that
+                // just went idle asks "what should ring me now" across every
+                // mailbox it is armed under, rather than waiting for the next
+                // letter to arrive. `id` here is the hook-fed AGENT CHILD,
+                // never the wrap itself — a ring targets and injects into the
+                // WRAP's own socket, and `armed_names_for_reader` keys on the
+                // reader id `enrol_reader`/the petname fallback always enrol
+                // (the wrap id), so this walks the child's own
+                // `parentSessionId` and replays on the WRAP's behalf. No
+                // parent (a bare terminal's own hook-fed session, never
+                // conducted) means nothing to replay. Best-effort throughout,
+                // exactly like the check lane above: a ring failure here must
+                // never change this hook's own outcome, and a session-store
+                // read that comes back empty is silently a no-op.
+                if let Ok(file) = load_stage::<SessionsFile>(&sessions_path()) {
+                    if let Some(parent) = file
+                        .sessions
+                        .iter()
+                        .find(|s| s.session_id == id)
+                        .and_then(|s| s.parent_session_id.clone())
+                    {
+                        if let Ok(armed) = aoide_storage::mail::armed_names_for_reader(&parent) {
+                            for (name, _) in armed {
+                                let _ = super::ring(&name, None);
+                            }
+                        }
+                    }
                 }
             }
             out

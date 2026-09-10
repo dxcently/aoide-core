@@ -772,6 +772,44 @@
   either end of that path), so it does not widen this bullet's "exactly
   two, never a second" rule — that rule is scoped to `session_send`'s own
   callers, and wire-deposited mail was never one of them.
+- **The doorbell's `.ring.lock` is never `.stage.lock`, and it is the
+  ONLY lock this crate ever holds across real socket I/O** (P-M5a-2,
+  `graph::doorbell`). `with_ring_lock` and `try_stage_lock` are separate
+  files for exactly that reason — the stage lock's every other holder
+  only ever does a brief in-memory read-modify-write, and a ring's own
+  socket connect, write, and submit-keystroke delay must never make one
+  of those wait. Don't fold them into one lock, and don't add a second
+  socket-holding critical section under `.stage.lock`.
+- **A ring only ever stamps its latch (`stamp_rung`) AFTER a socket write
+  that returned `Ok`, never before and never on a write failure.** The
+  reader stays armed on any failure — unreachable socket, dead process,
+  a transient write error — so a target that misses one nudge is still
+  caught by the next trigger. Do not reorder the stamp ahead of the
+  write, and do not stamp inside a `Result`-discarding path that can't
+  tell success from failure.
+- **A ring never writes to a non-headless (interactive) wrap, full stop
+  — there is no override flag, no `--force`.** An interactive composer is
+  someone's own terminal; auto-submitting into it needs a control-layer
+  guard that does not exist yet (P-M5a-3, the labeled residual
+  `docs/architecture/MAIL.md` "Delivery and the doorbell" leaves open).
+  Don't lift this check without landing that guard first, and update
+  MAIL.md's doorbell section in the same commit that does.
+- **A ring's readiness signal is the CHILD's hook state, checked with
+  `aoide_protocol::agents::agent_profile` (returns `None` for an
+  unrecognized harness) — never `profile_for_agent` (its `CLAUDE_PROFILE`
+  fallback always succeeds and would hide the "never hooked" signal a
+  ring needs).** And the keystroke a ring submits with is the CHILD's own
+  harness key, never the wrap's — a `kimi` child under a `claude` wrap
+  submits with `\r`, not `\n`.
+- **The Stop-hook ring replay (`graph/send.rs`) is best-effort and never
+  changes the hook's own outcome.** It runs after the hook's real work is
+  already decided, discards its `Result`, and never turns a successful
+  Stop hook into a reported failure just because a deferred ring's socket
+  write failed.
+- **`doorbell.rs` changes update `docs/architecture/MAIL.md`'s "Delivery
+  and the doorbell" section in the same commit** (house rule 8) — that
+  section is the design's canonical prose statement; this file states
+  only the invariants an editor must hold while changing the code.
 - **`graph/spawn.rs`'s `build_conduct_args` is the ONE place the `aoide
   conduct -- <agent cmd>` argv gets built (P-D7).** Both `spawn`
   launch modes — headless (default) and `--windowed` (execs a real terminal
@@ -958,3 +996,6 @@
 - `CONTRACTS.md` when a graph/session wire shape changes.
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants — not restated
   here.
+- `doorbell.rs` changes update `docs/architecture/MAIL.md`'s "Delivery and
+  the doorbell" section — that document is the design's canonical prose
+  statement, this file only the invariants an editor must hold.

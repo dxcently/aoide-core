@@ -3903,9 +3903,50 @@ fn handle_mail_send(inv: &Invocation) -> Outcome {
 
     if node == "self" {
         return match aoide_storage::mail::file_letter(&from, name, &text) {
-            Ok(entry) => Outcome::ok(cmd, format!("filed to self/{name} (msgid {})", entry.envelope.msgid))
-                .changed(vec![format!("state/mail/base.jsonl: +1 letter to {name}")])
-                .with_data(serde_json::to_value(&entry).unwrap_or_default()),
+            Ok(entry) => {
+                let mut data = serde_json::to_value(&entry).unwrap_or_default();
+                // The doorbell (P-M5a-2, MAIL.md "Delivery and the
+                // doorbell"): this crate cannot see `aoide-conduct` (the DAG
+                // constraint `pkgs/aoide/crates/AGENTS.md` documents), so a
+                // self-filed letter forwards `mail ring` through the
+                // resident daemon rather than ringing in-process — the
+                // daemon's own dispatch handler runs `aoide_conduct::graph::
+                // mail_ring` under the SAME `.ring.lock` file any other
+                // ringer takes. No daemon reachable (or this invocation is
+                // itself already running INSIDE the daemon, `inv.door ==
+                // Door::Daemon`, which `daemon_dispatch` always answers
+                // `None` for) degrades to `"ring": "no-daemon"` — filing
+                // still succeeded, so the outcome's own status stays Ok
+                // either way; nothing rang, but nothing was lost either
+                // (the next real ring trigger — another letter, or the
+                // reader's own Stop hook — still finds the latch armed).
+                let ring_inv = Invocation {
+                    path: vec!["mail".to_string(), "ring".to_string()],
+                    args: Vec::new(),
+                    flags: {
+                        let mut f = std::collections::BTreeMap::new();
+                        f.insert("for".to_string(), name.to_string());
+                        if let Some(reader) = mail_reader_session() {
+                            f.insert("from".to_string(), reader);
+                        }
+                        f
+                    },
+                    door: inv.door,
+                };
+                let ring_value = match crate::daemon::daemon_dispatch(&ring_inv) {
+                    None => json!("no-daemon"),
+                    Some(out) if out.status == aoide_protocol::output::Status::Ok => {
+                        out.data.unwrap_or(Value::Null)
+                    }
+                    Some(_) => json!("error"),
+                };
+                if let Some(obj) = data.as_object_mut() {
+                    obj.insert("ring".to_string(), ring_value);
+                }
+                Outcome::ok(cmd, format!("filed to self/{name} (msgid {})", entry.envelope.msgid))
+                    .changed(vec![format!("state/mail/base.jsonl: +1 letter to {name}")])
+                    .with_data(data)
+            }
             Err(e) => Outcome::error(cmd, format!("state/mail: {e}")),
         };
     }
@@ -6616,6 +6657,76 @@ mod tests {
 
         let names = handle_mail_names(&mail_inv(&["mail"], &[]));
         assert_eq!(names.data.unwrap()["names"], json!(["conductor"]));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// P-M5a-2: this crate cannot see `aoide-conduct` (the DAG constraint
+    /// `pkgs/aoide/crates/AGENTS.md` documents), so a self-filed letter's
+    /// ring can only ever be FORWARDED, through `daemon_dispatch` — never
+    /// run in-process the way `aoide-server`'s own deposit handler runs it.
+    /// `isolated_mail_root` pins `AOIDE_DAEMON_SOCKET` at a path nothing
+    /// binds, so this is the ordinary (no resident daemon) case: filing
+    /// still succeeds, and the reported `ring` is the literal string
+    /// `"no-daemon"` — never an error, never silently dropped.
+    #[test]
+    fn mail_send_to_self_reports_no_daemon_without_ringing() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-send-ring-no-daemon");
+
+        let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi"], &[("to", "self/conductor")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        assert_eq!(out.data.unwrap()["ring"], json!("no-daemon"));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half: a resident daemon IS reachable, so the self branch
+    /// forwards a real `mail ring --for <name>` dispatch request through it
+    /// (`crate::daemon::daemon_dispatch`) rather than ringing in-process —
+    /// proven the same way `daemon.rs`'s own
+    /// `daemon_dispatch_round_trips_against_a_fake_daemon` proves an
+    /// ordinary forwarded dispatch: a real `UnixListener` standing in for
+    /// the daemon, read back and asserted on directly.
+    #[test]
+    fn mail_send_to_self_forwards_a_ring_through_the_daemon() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-send-ring-daemon");
+
+        let socket_path = root.join("fake-daemon.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
+        std::env::set_var("AOIDE_DAEMON_SOCKET", &socket_path);
+
+        let handle = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let (mut conn, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 4096];
+            let n = conn.read(&mut buf).unwrap();
+            let req: serde_json::Value = serde_json::from_slice(&buf[..n]).unwrap();
+            assert_eq!(req["op"], "dispatch");
+            assert_eq!(req["path"], json!(["mail", "ring"]));
+            assert_eq!(req["flags"]["for"], "conductor");
+            let outcome = aoide_protocol::output::Outcome::ok("mail.ring", "rang 0 reader(s) for conductor").with_data(json!({
+                "name": "conductor",
+                "rung": Vec::<String>::new(),
+                "deferred": Vec::<(String, String)>::new(),
+                "skipped": Vec::<(String, String)>::new(),
+            }));
+            let reply = json!({ "outcome": outcome });
+            let mut line = reply.to_string();
+            line.push('\n');
+            conn.write_all(line.as_bytes()).unwrap();
+            req
+        });
+
+        let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi"], &[("to", "self/conductor")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.unwrap();
+        assert_eq!(data["ring"]["name"], "conductor");
+        assert_eq!(data["ring"]["rung"], json!([]));
+
+        let req = handle.join().unwrap();
+        assert_eq!(req["path"], json!(["mail", "ring"]), "forwards `mail ring`, never rings in-process");
 
         let _ = std::fs::remove_dir_all(&root);
     }

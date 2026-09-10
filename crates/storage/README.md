@@ -497,6 +497,17 @@ by decision — no embedded database yet
   `^[a-z0-9][a-z0-9-]*$` (`node_store::valid_node_name`) before taking
   the lock — validated, never clamped; a letter already on disk under an
   off-grammar name from before this rule stays filed and readable.
+
+  P-M5a-2 adds `with_ring_lock` — a dedicated `.ring.lock` file in
+  `mail_dir()`, `flock`ed by `fs::lock_path` (the same primitive
+  `try_stage_lock` itself now calls, generalized rather than duplicated)
+  for the WHOLE select-inject-stamp sequence a ring runs in
+  `aoide-conduct`'s `graph::doorbell`. This is a SEPARATE file from
+  `.stage.lock` on purpose: a ring holds its lock across a real socket
+  connect, write, and submit-keystroke delay (tens of milliseconds), while
+  every `.stage.lock` holder in this crate takes it only for a brief
+  in-memory read-modify-write — asking the mailbase's ordinary writers to
+  wait behind a socket op would be a real regression, not a refactor.
 - `outbox` — the per-node BSO-style spool (P-M2): `state/outbox/<node>/`,
   one JSON file per pending envelope plus each link's own backoff state
   (`link.json`), guarded by the same crate-wide stage lock `mail` uses for

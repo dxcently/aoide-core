@@ -373,11 +373,17 @@ the inbound half of the two-door contract (the outbound half is
   **letter** mints an ack back to the origin, spools it, and best-effort
   drains that node once through the SAME `aoide_conduct::mail_bridge::
   drain_node` the daemon's own periodic tick uses — one drain
-  implementation; `aoide-server` never dials out on its own account. A
-  filed **receipt** instead retires the local outbox entry it confirms via
-  `aoide_storage::outbox::retire_by_ack` (spec item 7 — a pure lookup keyed
-  on the receipt's own verified origin and acked msgid, so a forged or
-  stale ack simply retires nothing). A **duplicate** re-sends the ack only
+  implementation; `aoide-server` never dials out on its own account. It
+  ALSO rings the doorbell in-process, in that same arm, best-effort
+  (P-M5a-2: `aoide_conduct::graph::ring(&envelope.header.to.name, None)`
+  — this crate already depends on `aoide-conduct`, so a remotely-deposited
+  letter arms and rings exactly like a locally-filed one, under `ring`'s
+  own `.ring.lock`, never this process's copy of the stage lock). A filed
+  **receipt** never rings — it is not arming mail (`aoide_storage::mail`'s
+  own `arms` predicate) — and instead retires the local outbox entry it
+  confirms via `aoide_storage::outbox::retire_by_ack` (spec item 7 — a pure
+  lookup keyed on the receipt's own verified origin and acked msgid, so a
+  forged or stale ack simply retires nothing). A **duplicate** re-sends the ack only
   when the original filing was a letter, and is a silent no-op otherwise,
   so an ack is never itself acked. Every `outbox` call here runs strictly
   AFTER `mail::deposit` has already released its own lock — `mail` and

@@ -116,6 +116,17 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   prompt unsubmitted; see `SUBMIT_KEYSTROKE_DELAY`'s doc comment (AGENTS.md
   has the full invariant) for the empirically-pinned delay between the two
   writes. `deliver_local_with` is the one production caller.
+- **`graph::doorbell`** (`ring`, `mail_ring`, `RingReport`; P-M5a-2,
+  `docs/architecture/MAIL.md` "Delivery and the doorbell") is the mailbase
+  latch's actual ringer: filing an arming letter nudges every armed,
+  headless, hook-fed-and-at-the-prompt reader, raw-injected through the
+  SAME `send.rs::write_delivery` this crate's ordinary deliveries use, under
+  a dedicated `.ring.lock` file (`aoide_storage::mail::with_ring_lock`) —
+  never `.stage.lock`. `ring` is callable by any process linking this
+  crate (the CLI's `mail ring`, `aoide-server`'s A2A deposit arm, this
+  crate's own Stop-hook replay); `aoide-client` sits below this crate and
+  forwards `mail ring` through `daemon_dispatch` instead of calling `ring`
+  directly.
 - **The undying mark (P-C2/P-C3, durable-sessions plan; renamed from "carry"
   at command-defrag lane U1, 2026-08-27; relocated under `session grant` at
   the session-surface redesign, command-defrag lane X, 2026-08-28):**

@@ -842,18 +842,38 @@ pub fn with_stage_lock<T>(f: impl FnOnce() -> T) -> T {
 /// writer queues rather than races) — it only returns `Err` when the lock file
 /// itself can't be opened or created, not when another writer briefly holds it.
 pub fn try_stage_lock<T>(f: impl FnOnce() -> T) -> Result<T, String> {
+    lock_path(stage_dir().join(".stage.lock"), f)
+}
+
+/// Fail-closed `flock(LOCK_EX)` on a dedicated file at `path`, held for the
+/// closure's duration: open-or-create, lock (blocking — a concurrent opener
+/// waits rather than races), run `f`, unlock. Shared by [`try_stage_lock`]
+/// (its lock file is always `stage_dir()/.stage.lock`) and mail's doorbell
+/// ring (`aoide_storage::mail::with_ring_lock`, whose lock file is
+/// `mail_dir()/.ring.lock` — a SEPARATE file: the ring is held across socket
+/// I/O for the whole select-inject-stamp sequence, far longer than any stage
+/// mutator ever holds `.stage.lock`, so the two must never share one file or
+/// a slow ring would stall every session-graph writer on the desktop).
+/// Not re-entrant (each call opens its own fd) — a caller must never nest two
+/// calls against the same path.
+pub(crate) fn lock_path<T>(path: std::path::PathBuf, f: impl FnOnce() -> T) -> Result<T, String> {
     use std::os::unix::io::AsRawFd;
-    let dir = stage_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
     let lock = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(dir.join(".stage.lock"))
-        .map_err(|e| format!("cannot open stage lock: {e}"))?;
+        .open(&path)
+        .map_err(|e| format!("cannot open lock file {}: {e}", path.display()))?;
     let rc = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) };
     if rc != 0 {
-        return Err(format!("cannot lock stage dir: {}", std::io::Error::last_os_error()));
+        return Err(format!(
+            "cannot lock {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        ));
     }
     let out = f();
     unsafe {

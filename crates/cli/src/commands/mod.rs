@@ -48,7 +48,11 @@ use crate::registry::Registry;
 /// outbox/outbox rm (the addressed, signed, append-only mailbase — the
 /// durable per-host message store — plus its outbox spool for delivery to
 /// a directly paired node, messaging plan P-M1/P-M2,
-/// `docs/architecture/MAIL.md`).
+/// `docs/architecture/MAIL.md`), mail ring (the doorbell, P-M5a-2 —
+/// registered last, from the conduct crate rather than alongside the rest
+/// of the `mail` family in the client crate, since it is the one `mail`
+/// command that runs in-process off `aoide-conduct` rather than
+/// `aoide-client`).
 ///
 /// P-A5 (binary-split workstream) removed the register lines for the
 /// graphical bundle — rice/draft/mode/cover/livery/rice-late-stubs/
@@ -91,6 +95,7 @@ pub fn all() -> Registry {
     aoide_client::commands::register_mail(&mut r); // mail send/read/show/mark/rm/outbox/outbox.rm — the addressed, signed, append-only mailbase plus its outbox spool for a directly paired node (messaging plan P-M1/P-M2, docs/architecture/MAIL.md, appended newest)
 
     aoide_client::context::register(&mut r); // explicit shared persona/memory retrieval
+    aoide_conduct::commands::graph::register_mail_ring(&mut r); // the local doorbell (MAIL.md "Delivery and the doorbell", P-M5a-2)
 
     r
 }

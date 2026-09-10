@@ -427,6 +427,17 @@ never the inbound/serve half (that's `aoide-server`).
   already sets; whether this node actually GRANTS `message` is exclusively
   the remote door's own call (`node_may_message`), surfaced back as an
   ordinary taught JSON-RPC refusal if it says no, never pre-empted locally.
+  **The `self` branch forwards the doorbell instead of ringing it**
+  (P-M5a-2: this crate sits below `aoide-conduct` in the crate graph and
+  cannot call `aoide_conduct::graph::ring` directly) — after `file_letter`
+  succeeds, `handle_mail_send` builds a `mail ring --for <name> [--from
+  <reader>]` `Invocation` and runs it through `daemon::daemon_dispatch`,
+  the SAME forwarding mechanism every other daemon-first write already
+  uses. No daemon reachable (or `inv.door == Door::Daemon`, which
+  `daemon_dispatch` always answers `None` for) reports the outcome's own
+  `ring` field as the literal string `"no-daemon"`, never an error — the
+  letter is filed and the latch stays armed for the next trigger either
+  way, so a self-send's own status never depends on ring's success.
   `handle_mail_outbox` (`mail outbox [node]`) is the spool's own read-only
   status view — an optional node arg narrows to one, otherwise every node
   `outbox::nodes_with_outbox` reports — rendering each `list_entries` row's

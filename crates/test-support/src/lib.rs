@@ -70,17 +70,30 @@ impl Drop for EnvSaver {
 /// `aoide-storage` test that touches `mail` must use this, never
 /// `AOIDE_STATE_DIR` alone.
 ///
+/// Also pins `AOIDE_DAEMON_SOCKET` at a path inside the isolated root that
+/// nothing ever binds (P-M5a-2: `mail send`'s self branch now forwards
+/// `mail ring` through `aoide_client::daemon::daemon_dispatch`, which
+/// resolves the daemon socket from `AOIDE_DAEMON_SOCKET` or else
+/// `$XDG_RUNTIME_DIR/aoide/aoided.sock` — falling all the way back to the
+/// hardcoded `/run/user/1000` when even `XDG_RUNTIME_DIR` is unset). Without
+/// this, a `mail send --to self/...` test on a machine with a REAL resident
+/// `aoided` dials that live daemon for real and can inject a real nudge
+/// line into a real conducted session. `daemon_dispatch` treats a dead
+/// socket as an ordinary, silent "no daemon" — exactly the outcome these
+/// tests want — so pointing it at a guaranteed-dead path costs nothing.
+///
 /// Caller must already hold [`env_lock`] (the same convention every other
 /// env-touching test here follows — acquired once, at the top of the test,
 /// before constructing any guard). Owns the environment only, not the
 /// directory: the caller still removes it at the end of the test, the same
 /// way every `unique_tmp` caller already does.
 pub fn isolated_mail_root(tag: &str) -> (EnvSaver, PathBuf) {
-    let env = EnvSaver::capture(&["AOIDE_ROOT", "AOIDE_STATE_DIR", "AOIDE_STAGE_DIR"]);
+    let env = EnvSaver::capture(&["AOIDE_ROOT", "AOIDE_STATE_DIR", "AOIDE_STAGE_DIR", "AOIDE_DAEMON_SOCKET"]);
     let root = unique_tmp(tag);
     std::env::set_var("AOIDE_ROOT", &root);
     std::env::remove_var("AOIDE_STATE_DIR");
     std::env::remove_var("AOIDE_STAGE_DIR");
+    std::env::set_var("AOIDE_DAEMON_SOCKET", root.join("no-daemon.sock"));
     (env, root)
 }
 
