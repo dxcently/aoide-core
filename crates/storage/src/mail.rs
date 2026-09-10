@@ -1016,7 +1016,7 @@ pub fn names_with_unread(reader_session: Option<&str>) -> Result<Vec<String>, St
 }
 
 /// One doorbell poll's targets for `name` (MAIL.md "Delivery and the
-/// doorbell") — the ringer's one read of "who do I wake, and how many real
+/// doorbell") — the ringer's one read of "who do I wake, and which real
 /// readers even exist to wake." `armed` pairs each armed reader with the
 /// arming high-water mark it is armed FOR, so a caller's own
 /// [`stamp_rung`] has the exact `seq` to latch without a second scan.
