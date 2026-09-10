@@ -3,10 +3,18 @@
 `session project --id ID --project NAME` assigns an explicit registered project;
 `--clear` restores cwd anchoring. The override is preserved in exit history and
 restored on resurrection when the project remains registered. `session kill
---id ID` requests SIGTERM for a dedicated conducted process using a Linux pidfd
-and a fresh daemon-seal verification. Shared app processes, unsealed records,
-and stale identities refuse. Both operations require the local daemon; exit
-is observed by the existing reaper, never fabricated by the kill response.
+--id ID` first resolves `ID` to the nearest conducted ancestor — walking
+`parentSessionId` up to 32 hops, cycle-guarded, starting with `ID` itself —
+then requests SIGTERM for that dedicated conducted process using a Linux
+pidfd and a fresh daemon-seal verification. A card that is already a
+conducted wrap resolves to itself; a native hook-fed record (the only kind
+the desktop menu ever names) resolves to the terminal that hosts it. Shared
+app processes, an ancestry walk that never reaches a conducted process,
+unsealed records, and stale identities refuse. The response names both the
+requested id and the resolved target (`sessionId`/`target`/`pid`), and its
+message says which terminal is being terminated when the two differ. Both
+operations require the local daemon; exit is observed by the existing
+reaper, never fabricated by the kill response.
 
 Registered Codex sessions refresh their native conversation titles during the
 reaper metadata pass. The pass reads `CODEX_HOME/session_index.jsonl` (default
@@ -341,7 +349,17 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   headless wrap never even attempts discovery. `ancestry_parent`/
   `resolve_registration_parent` (the `--parent` flag > `/proc` ancestry ↔
   `hookAncestry` > `AOIDE_SESSION_ID` env precedence `wrap`/`conduct`/`spawn`
-  registration resolve their parent through). `session_store::lineage_of`
+  registration resolve their parent through).
+  A sibling mechanism (`session_store::stamp_attested_parent`, called from
+  `send.rs`'s `hook_ensure_session` on every hook, not only at registration)
+  re-parents an ALREADY-registered session whenever kernel process evidence
+  (`identity::attested_wrap`, the same nearest-first `/proc` walk, narrowed to
+  a sealed CONDUCTED ancestor) resolves a different wrap than the one
+  currently stamped — a harness id that survives `--resume` under a new
+  terminal keeps following its CURRENT wrap. Unlike `hookAncestry`
+  (write-once, a birth fact) this is change-only on difference; no daemon
+  reachable or no conducted ancestor found leaves it untouched, fail-closed.
+  `session_store::lineage_of`
   (ancestors + descendants) is the matching widened carve-out for the
   same-window registration-time eviction, reused by `reap.rs`'s dedup pass
   as defense in depth. See AGENTS.md's invariants for the full reasoning

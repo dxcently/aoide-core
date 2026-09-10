@@ -1,9 +1,18 @@
 # AGENTS.md — aoide-conduct
 
 - **Session actions preserve identity and scope.** Project assignment changes
-  `project`, never `cwd` or ancestry. Termination is local daemon-only and
-  requires a dedicated conductable process, exclusive live PID ownership,
-  fresh seal verification, and pidfd signaling. Never fall back to `kill(pid)`
+  `project`, never `cwd` or ancestry. Termination is local daemon-only:
+  `kill_target` first resolves the requested id to the nearest
+  `parentSessionId` ancestor that is itself a dedicated conducted process
+  (walking up to 32 hops, cycle-guarded, the requested id itself the first
+  candidate) — the card a caller names and the process a kill actually stops
+  are not always the same record. The seal is checked exactly ONCE, by
+  `terminate_verified` against the RESOLVED target, never inside the walk
+  itself — a stale seal must surface its own refusal, never get pre-empted
+  by a misleading ancestry message. The shared-pid refusal excludes every
+  session in the walked chain (a wrap and its own hook-fed descendants
+  legitimately share one process's pid); only a record OUTSIDE that chain
+  holding the target's live pid trips it. Never fall back to `kill(pid)`
   or infer completion from successful signal delivery.
 
 ## Invariants
@@ -682,6 +691,22 @@
   explicit `--parent` > ancestry walk > env, in that order, for all three of
   `wrap`/`conduct`/`spawn` (spawn re-execs `conduct --headless`, so fixing
   `conduct`'s own call covers it).
+- **`parentSessionId` on a hook record is re-stamped from ATTESTED kernel
+  process evidence on every hook, not only at registration — unlike
+  `hookAncestry` above, which stays write-once.** `send.rs::hook_ensure_
+  session` walks the hook-firing process's real `/proc` ancestry
+  (`identity::attested_wrap`, narrowed to a sealed, `conductable` ancestor)
+  on every event, BEFORE its exists/fresh split — so an EXISTING record
+  gets this too, not only a freshly-registered one — and re-stamps
+  `parentSessionId` via `session_store::stamp_attested_parent` whenever the
+  resolved wrap differs from what's currently stored. This is what makes a
+  harness id that survives `--resume` (the same session id, hosted by a
+  DIFFERENT terminal after the resume) keep following its CURRENT wrap:
+  change-only on difference, cycle-guarded (`would_cycle`), never a guess
+  from cwd/title/workspace. No daemon reachable, or no conducted ancestor
+  found, leaves the field untouched — fail-closed. The ordinary
+  `AOIDE_SESSION_ID` env fallback still exists, but only behind this: a
+  genuinely fresh record with no attested wrap at all.
 - **`who` and bare `session`'s old undying-picker meaning are BOTH retired
   (session-surface redesign, command-defrag lane X, 2026-08-28 — hard
   cutover, no alias).** Bare `session` is now the ROSTER (`who.rs`'s
