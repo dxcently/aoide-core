@@ -1,5 +1,14 @@
 # aoide-conduct
 
+Registered Codex sessions refresh their native conversation titles during the
+reaper metadata pass. The pass reads `CODEX_HOME/session_index.jsonl` (default
+`~/.codex/session_index.jsonl`) once, retaining the latest valid nonempty name
+for each exact thread ID. Native renames update `title`; petnames, lifecycle,
+control sockets and window mappings remain unchanged. Historical index entries
+do not enroll sessions. This metadata reader supplies neither Codex lifecycle
+tracking nor a control transport; Codex is not sent through Claude's transcript
+extractors.
+
 Aoide's session core: the PTY multiplexer (`aoide conduct`), the session DAG
 (bare `aoide graph`), Claude-Code hook plumbing, and liveness reaping. Makes
 every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting

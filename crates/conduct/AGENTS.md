@@ -2,6 +2,13 @@
 
 ## Invariants
 
+- **Codex titles use exact native thread IDs.** The reaper reads the configured
+  Codex session index once per metadata pass and updates only already registered
+  `agent == "codex"` records. The latest valid nonempty index title owns that
+  field, including renames; every other field is preserved. Never enroll index
+  history or infer a window, lifecycle event, or control channel from a title.
+  Other harnesses retain their existing title precedence.
+
 - **`session bind` assigns continuity, never authority.** Keep the operation
   daemon-owned and local-only; no missing-daemon fallback. It does not load
   optional Mneme config, change grants, or replace executor-specific mail

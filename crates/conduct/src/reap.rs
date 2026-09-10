@@ -1248,16 +1248,20 @@ fn announce_reap(message: &str) -> bool {
 /// report (and toast) how many it brought current — an empty vec on a desktop
 /// where nothing has been said since the last pass.
 fn refresh_live_agents() -> Vec<String> {
+    let mut refreshed = refresh_codex_titles();
     let Ok(file) = load_stage::<SessionsFile>(&sessions_path()) else {
-        return Vec::new();
+        return refreshed;
     };
     let live: Vec<&SessionRecord> = file
         .sessions
         .iter()
         .filter(|s| s.state != "done" && is_agent_kind(s))
         .collect();
-    let mut refreshed = Vec::new();
     for s in live {
+        // Codex metadata lives in its native index, not Claude's transcript.
+        if s.agent == "codex" {
+            continue;
+        }
         let profile = profile_for(s);
         let cwd = (!s.cwd.is_empty()).then_some(s.cwd.as_str());
         let own = refresh_transcript_fields(profile, &s.session_id, cwd, None, None);
@@ -1267,6 +1271,57 @@ fn refresh_live_agents() -> Vec<String> {
         }
     }
     refreshed
+}
+
+fn codex_titles(reader: impl std::io::BufRead) -> HashMap<String, String> {
+    let mut titles = HashMap::new();
+    for line in reader.lines().map_while(Result::ok) {
+        let Ok(row) = serde_json::from_str::<Value>(&line) else { continue };
+        let (Some(id), Some(title)) = (row["id"].as_str(), row["thread_name"].as_str()) else { continue };
+        let title = title.trim();
+        if !id.is_empty() && !title.is_empty() {
+            titles.insert(id.to_owned(), title.to_owned());
+        }
+    }
+    titles
+}
+
+fn apply_codex_titles(sessions: &mut [SessionRecord], titles: &HashMap<String, String>) -> Vec<String> {
+    let mut changed = Vec::new();
+    for session in sessions.iter_mut().filter(|s| s.agent == "codex") {
+        if let Some(title) = titles.get(&session.session_id) {
+            if session.title.as_ref() != Some(title) {
+                session.title = Some(title.clone());
+                changed.push(session.session_id.clone());
+            }
+        }
+    }
+    changed
+}
+
+fn refresh_codex_titles() -> Vec<String> {
+    let home = std::env::var_os("CODEX_HOME")
+        .filter(|v| !v.is_empty())
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".codex")));
+    let Some(home) = home else { return Vec::new() };
+    let Ok(index) = std::fs::File::open(home.join("session_index.jsonl")) else { return Vec::new() };
+    let titles = codex_titles(std::io::BufReader::new(index));
+    if titles.is_empty() { return Vec::new() }
+    aoide_storage::fs::with_stage_lock(|| {
+        let Ok(mut file) = load_stage::<SessionsFile>(&sessions_path()) else { return Vec::new() };
+        let changed = apply_codex_titles(&mut file.sessions, &titles);
+        if !changed.is_empty() {
+            if let Err(error) = write_stage(&sessions_path(), &file) {
+                eprintln!("[aoide/reap] Codex title update failed: {error}");
+                return Vec::new();
+            }
+            if let Err(error) = restage_graph() {
+                eprintln!("[aoide/reap] Codex title graph refresh failed: {error}");
+            }
+        }
+        changed
+    })
 }
 /// Returns the sweep's `Outcome` PLUS the ssh tunnel candidates gathered
 /// under the stage lock (`orphan_tunnel_candidates`) — this function never
@@ -1322,7 +1377,9 @@ fn reap_inner(
     // absence of evidence, which `is_session_dead` treats as "not stale, not
     // dead", never as staleness itself.
     let last_seen = |s: &SessionRecord| -> Option<i64> {
-        let transcript_mtime = (profile_for(s).transcript.locate)(&s.session_id, Some(s.cwd.as_str()), None)
+        let transcript_mtime = (s.agent != "codex")
+            .then(|| (profile_for(s).transcript.locate)(&s.session_id, Some(s.cwd.as_str()), None))
+            .flatten()
             .and_then(|p| std::fs::metadata(p).ok())
             .and_then(|m| m.modified().ok())
             .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
@@ -1363,7 +1420,8 @@ fn reap_inner(
             .unwrap_or(false) // an unparseable/empty startedAt is treated as old
     };
     let has_transcript = |s: &SessionRecord| {
-        (profile_for(s).transcript.locate)(&s.session_id, Some(s.cwd.as_str()), None).is_some()
+        s.agent != "codex"
+            && (profile_for(s).transcript.locate)(&s.session_id, Some(s.cwd.as_str()), None).is_some()
     };
     for id in superseded_agent_duplicates(&s_file.sessions, is_recent, has_transcript) {
         if !reaped.contains(&id) {
@@ -1716,6 +1774,68 @@ fn reap_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_titles_follow_exact_ids_and_latest_nonempty_rename() {
+        let index = concat!(
+            "{\"id\":\"a\",\"thread_name\":\"Original\"}\n",
+            "{\"id\":\"b\",\"thread_name\":\"Shared title\"}\n",
+            "{\"id\":\"a\",\"thread_name\":\" Shared title \"}\n",
+            "{\"id\":\"a\",\"thread_name\":\"  \"}\n",
+            "broken line\n",
+            "{\"id\":\"unregistered\",\"thread_name\":\"History only\"}\n",
+            "{\"id\":\"a\","
+        );
+        let titles = codex_titles(std::io::Cursor::new(index));
+        assert_eq!(titles.get("a").map(String::as_str), Some("Shared title"));
+        assert_eq!(titles.get("b").map(String::as_str), Some("Shared title"));
+        let mut first = agent("a", "window-a", "2026-09-10T00:00:00Z");
+        first.agent = "codex".into();
+        first.title = Some("Old title".into());
+        first.petname = Some("steady-wren".into());
+        first.socket = Some("/tmp/not-a-real-socket".into());
+        let mut second = agent("b", "", "2026-09-09T00:00:00Z");
+        second.agent = "codex".into();
+        second.state = "done".into();
+        let other = agent("unregistered", "window-c", "2026-09-08T00:00:00Z");
+        let mut sessions = vec![first, second, other];
+        let before = serde_json::to_value(&sessions).unwrap();
+        assert_eq!(apply_codex_titles(&mut sessions, &titles), vec!["a", "b"]);
+        let mut expected = before;
+        expected[0]["title"] = json!("Shared title");
+        expected[1]["title"] = json!("Shared title");
+        assert_eq!(serde_json::to_value(&sessions).unwrap(), expected);
+        assert!(apply_codex_titles(&mut sessions, &titles).is_empty());
+        assert_eq!(sessions.len(), 3);
+    }
+
+    #[test]
+    fn codex_titles_refresh_configured_index_without_rewriting_unchanged_stage() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "CODEX_HOME", "HOME"]);
+        let stage = crate::graph::testutil::unique_stage("codex-titles");
+        let home = stage.join("codex");
+        std::fs::create_dir_all(&home).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("CODEX_HOME", &home);
+        std::env::set_var("HOME", stage.join("unused-home"));
+        let mut rec = agent("native-id", "", "2026-09-10T00:00:00Z");
+        rec.agent = "codex".into();
+        write_stage(&sessions_path(), &SessionsFile {
+            schema_version: "0".into(), sessions: vec![rec],
+        }).unwrap();
+        std::fs::write(home.join("session_index.jsonl"),
+            "{\"id\":\"native-id\",\"thread_name\":\"Native name\"}\n").unwrap();
+        assert_eq!(refresh_codex_titles(), vec!["native-id"]);
+        let before = std::fs::read(sessions_path()).unwrap();
+        let modified = std::fs::metadata(sessions_path()).unwrap().modified().unwrap();
+        assert!(refresh_codex_titles().is_empty());
+        assert_eq!(std::fs::read(sessions_path()).unwrap(), before);
+        assert_eq!(std::fs::metadata(sessions_path()).unwrap().modified().unwrap(), modified);
+        let persisted: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(persisted.sessions[0].title.as_deref(), Some("Native name"));
+        std::fs::remove_dir_all(stage).unwrap();
+    }
 
     fn agent(id: &str, win: &str, started: &str) -> SessionRecord {
         SessionRecord {
