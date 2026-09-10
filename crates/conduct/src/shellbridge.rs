@@ -78,6 +78,8 @@ pub enum BridgeCommand {
     /// `graph.json` writes through their own FileView watches. See
     /// [`dispatch_recheck_sessions`].
     RecheckSessions,
+    /// Acknowledged session-menu action, routed through the core CLI.
+    SessionAction { session_id: String, action: String, fields: Value },
     /// `{ "cmd": "heraldpush", "notification": { … } }` — file one notification
     /// into `stage/herald.json`. Sent by `aoide herald push` (dunst's `script`
     /// hook) and by `graph permit` for a summons; NOT by QML, which only reads
@@ -160,6 +162,13 @@ impl PowerAction {
 pub fn parse_command(line: &str) -> Option<BridgeCommand> {
     let v: Value = serde_json::from_str(line.trim()).ok()?;
     match v.get("cmd").and_then(Value::as_str)? {
+        "sessionaction" => {
+            let session_id = v.get("sessionId")?.as_str()?.trim().to_string();
+            let action = v.get("action")?.as_str()?.to_string();
+            let fields = v.get("fields").cloned().unwrap_or_else(|| json!({}));
+            session_action_args(&session_id, &action, &fields)?;
+            Some(BridgeCommand::SessionAction { session_id, action, fields })
+        }
         "focuswindow" => {
             let address = v
                 .get("address")
@@ -432,9 +441,10 @@ fn classify_usage_refresh(exited_ok: bool, stdout: &str, stderr: &str) -> Result
 ///
 /// Runs on a DETACHED thread. Unlike the rice-mode toggle (a fast local switch,
 /// safe to `.output()` inline), `aoide usage`'s live fetch is `curl --max-time
-/// 15`, so waiting for it inline would freeze the whole accept loop
-/// (session-jumps, power, ricemode all queue behind one usage click) for up to
-/// 15 s. So this SPAWNS and returns immediately — the same no-block posture
+/// 15`, so waiting for it inline would tie up this connection's own thread for
+/// up to 15 s for no reason (§3b's thread-per-connection accept loop keeps
+/// that from starving anyone else, but there is still no reason to hold it).
+/// So this SPAWNS and returns immediately — the same no-block posture
 /// [`dispatch_power`] takes — and the thread collects the child and audits the
 /// result so it neither lingers nor blocks. The gadget updates itself off the
 /// resulting `state/usage.json` write through its own FileView watch regardless
@@ -534,8 +544,9 @@ fn classify_recheck(exited_ok: bool, stdout: &str, stderr: &str) -> Result<Strin
 ///
 /// Runs on a DETACHED thread. `session reap` shells out to `hyprctl clients -j`
 /// for window liveness; that is normally instant, but a hung compositor query
-/// must never freeze the single-threaded accept loop (session-jumps, power,
-/// ricemode all queue behind one recheck click). So this SPAWNS and returns
+/// must never tie up this connection's own thread waiting on it (§3b's
+/// thread-per-connection accept loop keeps a stuck query from starving anyone
+/// else, but there is still no reason to hold it). So this SPAWNS and returns
 /// immediately — the same no-block posture [`dispatch_usage_refresh`] takes —
 /// and the thread collects the child and audits the outcome via
 /// [`classify_recheck`]. The Terminals/Conductor gadgets update themselves off
@@ -569,6 +580,323 @@ fn dispatch_recheck_sessions() {
             &detail,
         );
     });
+}
+
+// ── session actions (the acknowledged session-menu bridge) ─────────────────
+
+/// A wire value that becomes a bare argv token: a session id, a project name.
+fn safe_action_value(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && s.chars().all(|c| !c.is_whitespace() && !c.is_control())
+}
+
+/// A wire value that becomes a filesystem path argument. Whitespace IS legal
+/// here — `/home/khoa/My Documents` is a real directory, and an argv element
+/// is passed to `Command::arg` whole, never through a shell — so this is a
+/// separate rule, not a reuse of the one above. Absolute by requirement,
+/// which also settles the leading-dash question: a string starting with `/`
+/// can never be read as a flag, so no `-` check is needed here.
+fn safe_action_path(s: &str) -> bool {
+    s.starts_with('/') && !s.chars().any(char::is_control)
+}
+
+/// The path-list length cap for `createproject`/`editproject`. The list is
+/// built from a wire value, so its length is bounded on principle: 16 is far
+/// above any real project's root count and stops one hostile line from
+/// building a ten-thousand-element argv.
+const MAX_ACTION_PATHS: usize = 16;
+
+/// The closed, five-action session-menu whitelist — a PLAN, not one argv.
+/// One action is one or two invocations, run in order, stopping at the first
+/// failure; `Option<Vec<Vec<String>>>` is deliberate over a single-argv
+/// function plus a second for the two-step case: `parse_command`'s own
+/// `"sessionaction"` arm gates on `session_action_args(…)?`, which only ever
+/// needs *an* `Option`, so this shape keeps that call site compiling
+/// unedited AND keeps ONE authority for the whitelist and one call site for
+/// the gate (CRAFT: one authority per fact).
+///
+/// A strict whitelist, not a translator: exactly five actions, anything else
+/// is `None`. No generic exec, no arbitrary argv, ever — every element of
+/// every returned vector is either a literal from this function or a value
+/// that passed [`safe_action_value`]/[`safe_action_path`] below.
+///
+/// The field shapes are the song-side session menu's own, exactly — they are
+/// not the shapes an API designer would pick in isolation, and the bridge
+/// matching the UI is the whole point of this slice. Do not "normalize"
+/// them.
+fn session_action_args(session_id: &str, action: &str, fields: &Value) -> Option<Vec<Vec<String>>> {
+    if !safe_action_value(session_id) {
+        return None;
+    }
+    let id = session_id.to_string();
+    match action {
+        "undying" => {
+            let state = fields.get("state").and_then(Value::as_str)?;
+            if !matches!(state, "on" | "off") {
+                return None;
+            }
+            Some(vec![vec![
+                "session".to_string(),
+                "grant".to_string(),
+                "undying".to_string(),
+                state.to_string(),
+                "--id".to_string(),
+                id,
+            ]])
+        }
+        "project" => {
+            // No `clear` field: an empty name IS the clear request, which is
+            // what the menu's "Automatic from directory" row sends. A
+            // non-string `project` reads as absent and therefore clears —
+            // lax, deliberate, and harmless: the worst a malformed value can
+            // do is restore the default anchoring.
+            let name = fields
+                .get("project")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .unwrap_or("");
+            if name.is_empty() {
+                Some(vec![vec![
+                    "session".to_string(),
+                    "project".to_string(),
+                    "--id".to_string(),
+                    id,
+                    "--clear".to_string(),
+                ]])
+            } else if safe_action_value(name) {
+                Some(vec![vec![
+                    "session".to_string(),
+                    "project".to_string(),
+                    "--id".to_string(),
+                    id,
+                    "--project".to_string(),
+                    name.to_string(),
+                ]])
+            } else {
+                None
+            }
+        }
+        // `fields` is not consulted at all: extra keys are accepted and
+        // ignored rather than refused, since rejecting unknown keys would
+        // break the menu the first time it grew a field.
+        "kill" => Some(vec![vec![
+            "session".to_string(),
+            "kill".to_string(),
+            "--id".to_string(),
+            id,
+        ]]),
+        "createproject" | "editproject" => {
+            let name = fields.get("name").and_then(Value::as_str)?.trim();
+            if !safe_action_value(name) {
+                return None;
+            }
+            let raw_paths = fields.get("paths").and_then(Value::as_array)?;
+            // An empty list is `None`, not an instruction to erase: an
+            // "exact replacement" with nothing to replace with is a mistake.
+            if raw_paths.is_empty() || raw_paths.len() > MAX_ACTION_PATHS {
+                return None;
+            }
+            let mut paths = Vec::with_capacity(raw_paths.len());
+            for p in raw_paths {
+                // One bad element rejects the whole action; never filter and
+                // proceed. A non-string element fails the same way here.
+                let p = p.as_str()?;
+                if !safe_action_path(p) {
+                    return None;
+                }
+                paths.push(p.to_string());
+            }
+            if action == "createproject" {
+                // Two invocations, order load-bearing: `--new` is slice A's
+                // refuse-when-the-name-exists flag — the bridge never
+                // pre-checks whether a name is taken, the CLI is the one
+                // authority for that.
+                let mut add = vec!["project".to_string(), "add".to_string(), name.to_string()];
+                add.extend(paths);
+                add.push("--new".to_string());
+                let assign = vec![
+                    "session".to_string(),
+                    "project".to_string(),
+                    "--id".to_string(),
+                    id,
+                    "--project".to_string(),
+                    name.to_string(),
+                ];
+                Some(vec![add, assign])
+            } else {
+                // The roots are replaced exactly; the name is immutable (the
+                // lookup key, never a rename) — an unknown name is refused
+                // by the CLI, not by the bridge.
+                let mut edit = vec!["project".to_string(), "edit".to_string(), name.to_string()];
+                edit.extend(paths);
+                Some(vec![edit])
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The `status`-is-ok flag and `message` of one `--json` envelope, from
+/// whichever stream carried it.
+fn outcome_envelope(stream: &str) -> Option<(bool, String)> {
+    let v: Value = serde_json::from_str(stream.trim()).ok()?;
+    let ok = v.get("status").and_then(Value::as_str)? == "ok";
+    let message = v.get("message").and_then(Value::as_str).unwrap_or("").trim().to_string();
+    Some((ok, message))
+}
+
+/// Shape the ONE JSON reply line for an acknowledged session action — pure
+/// and total, mirroring [`classify_recheck`]'s own rule: success is the real
+/// output, not the exit status. `--json` puts its envelope on a DIFFERENT
+/// stream depending on where the command failed: a dispatched command
+/// prints it on stdout, but a usage error the parser refused BEFORE dispatch
+/// prints it on stderr with an empty stdout (`protocol/src/door.rs:800-814`)
+/// — exactly the path `createproject`/`editproject` take until slice A
+/// lands, so reading stdout alone would hand QML a raw JSON blob as its
+/// "message".
+fn session_action_reply(
+    session_id: &str,
+    action: &str,
+    exited_ok: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Value {
+    let (ok, message) = match outcome_envelope(stdout).or_else(|| outcome_envelope(stderr)) {
+        Some((status_ok, msg)) => {
+            let ok = exited_ok && status_ok;
+            let message = if !msg.is_empty() {
+                msg
+            } else if ok {
+                format!("session {action} done")
+            } else {
+                format!("session {action} failed")
+            };
+            (ok, message)
+        }
+        None => {
+            let stderr = stderr.trim();
+            let stdout = stdout.trim();
+            let message = if !stderr.is_empty() {
+                stderr.to_string()
+            } else if !stdout.is_empty() {
+                stdout.to_string()
+            } else {
+                format!("`aoide {action}` printed no parseable envelope")
+            };
+            (false, message)
+        }
+    };
+    json!({
+        "ok": ok,
+        "message": message,
+        "action": action,
+        "sessionId": session_id,
+    })
+}
+
+/// One step, spawned: exec the core `aoide` binary
+/// (`daemon::bin::core_bin()`, protocol's sibling resolver — never a bare
+/// `"aoide"` relying on PATH alone) with `argv` plus `--json`, the exact
+/// pattern `dispatch_usage_refresh`/`dispatch_recheck_sessions` already use.
+/// This call is NOT inside `with_stage_lock` — see `protocol::bin`'s module
+/// doc for why that would matter if it ever were.
+fn run_session_step(session_id: &str, action: &str, argv: &[String]) -> Value {
+    match std::process::Command::new(daemon::bin::core_bin())
+        .args(argv)
+        .arg("--json")
+        .output()
+    {
+        Ok(out) => session_action_reply(
+            session_id,
+            action,
+            out.status.success(),
+            &String::from_utf8_lossy(&out.stdout),
+            &String::from_utf8_lossy(&out.stderr),
+        ),
+        // The first TWO argv elements only — always the command path, never
+        // a value — same discipline every audit line here holds.
+        Err(e) => json!({
+            "ok": false,
+            "message": format!("spawning `aoide {} {}`: {e}", argv[0], argv[1]),
+            "action": action,
+            "sessionId": session_id,
+        }),
+    }
+}
+
+/// One audit line per ACTION, never per step: detail is the action name and
+/// the status, and nothing else — never a project name, a path, or a
+/// session id. This deliberately departs from `dispatch_usage_refresh`/
+/// `dispatch_recheck_sessions`, which reuse the CLI's own `message`: those
+/// two commands take no arguments, this one does, and a `message` could grow
+/// to quote one — house rule, an audit line never carries argument values.
+/// `partial` gets its own event name so an operator scanning the log can see
+/// a half-applied action without reading the message. The dispatched
+/// commands are separately audited by the child processes' own `dispatch`
+/// inside `aoided`; this line records only that the desk asked.
+fn audit_session_action(action: &str, event: &str, outcome: &str) {
+    let _ = daemon::audit(
+        &daemon::default_audit_log(),
+        daemon::Door::Daemon,
+        daemon::EventClass::Audit,
+        "shellbridge",
+        event,
+        &format!("session action {action}: {outcome}"),
+    );
+}
+
+/// The sequencer: run one acknowledged session action's whole plan, on the
+/// CALLER's thread — `handle_conn` is what detaches it. Rebuilds the plan
+/// through [`session_action_args`], the SAME authority `parse_command`'s
+/// wire gate already consulted; a `None` here is unreachable through the
+/// wire but total by construction, never a panic. Steps run in order,
+/// stopping at the first failure: a failing FIRST step returns that reply
+/// unchanged (nothing ran, nothing changed); a failing LATER step means an
+/// earlier step already changed the world, so the reply says so honestly
+/// (`partial: true`) rather than rolling back — deleting a project the
+/// operator may already want, to tidy up a failure they can see and fix in
+/// one click, is worse than the partial state. No retries, no queueing: one
+/// spawn per step, one reply per action.
+fn dispatch_session_action(session_id: &str, action: &str, fields: &Value) -> Value {
+    let Some(plan) = session_action_args(session_id, action, fields) else {
+        return json!({
+            "ok": false,
+            "message": "unsupported session action",
+            "action": action,
+            "sessionId": session_id,
+        });
+    };
+
+    let mut last = Value::Null;
+    for (i, argv) in plan.iter().enumerate() {
+        let reply = run_session_step(session_id, action, argv);
+        let step_ok = reply.get("ok").and_then(Value::as_bool).unwrap_or(false);
+        if !step_ok {
+            if i == 0 {
+                audit_session_action(action, "sessionaction-failed", "failed");
+                return reply;
+            }
+            // Take the created name from the PLAN, never re-reading
+            // `fields`, so the plan stays the single authority for what
+            // actually ran.
+            let name = plan[0].get(2).map(String::as_str).unwrap_or("");
+            let cli_message = reply.get("message").and_then(Value::as_str).unwrap_or("");
+            audit_session_action(action, "sessionaction-partial", "partial");
+            return json!({
+                "ok": false,
+                "message": format!(
+                    "project {name} created; assigning the session failed: {cli_message}"
+                ),
+                "partial": true,
+                "action": action,
+                "sessionId": session_id,
+            });
+        }
+        last = reply;
+    }
+    audit_session_action(action, "sessionaction", "ok");
+    last
 }
 
 /// Run shellbridge: seed the `sessions.json`/`hooks.json` stage files (v0
@@ -672,32 +1000,39 @@ pub fn run() -> serde_json::Value {
     })
 }
 
-/// The accept loop: one connection at a time (commands are rare). A failed
-/// `accept()` is logged and the loop continues — a transient accept error must
-/// never end the service.
 // ── the herald ledger ─────────────────────────────────────────────────────
 
 /// Read `stage/herald.json`, apply `f`, write it back atomically.
 ///
-/// Every ledger mutation goes through here, in the daemon, single-threaded by
-/// the accept loop — the serialisation the whole socket hop exists to buy. A
-/// missing or corrupt file is not an error: it reads as an empty ledger and is
+/// Every ledger mutation goes through here. §3b made the accept loop
+/// thread-per-connection (it used to be one connection at a time, which is
+/// what let this read-modify-write get away with no lock of its own), so two
+/// herald pushes landing on the same instant are now a real race; the
+/// read-modify-write is wrapped in `with_stage_lock` to close it. Never call
+/// this from inside a CLI re-exec path (`dispatch_session_action`,
+/// `dispatch_recheck_sessions`, `dispatch_usage_refresh`,
+/// `dispatch_rice_mode_toggle`) — holding the stage lock across a blocking
+/// child-process wait is a deadlock waiting to happen; none of those paths
+/// touch the herald ledger today, and that must stay true. A missing or
+/// corrupt file is not an error: it reads as an empty ledger and is
 /// rewritten whole, so a truncated write can never wedge notifications shut.
 fn edit_ledger<F, T>(f: F) -> std::io::Result<T>
 where
     F: FnOnce(&mut Vec<crate::herald::Notification>) -> T,
 {
-    let path = crate::herald::herald_path();
-    let mut file: crate::herald::HeraldFile = std::fs::read_to_string(&path)
-        .ok()
-        .and_then(|s| serde_json::from_str(&s).ok())
-        .unwrap_or_default();
-    let out = f(&mut file.notifications);
-    file.schema_version = crate::herald::HERALD_SCHEMA.to_string();
-    let text = serde_json::to_string_pretty(&file)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    aoide_storage::fs::atomic_write(&path, &format!("{text}\n"))?;
-    Ok(out)
+    aoide_storage::fs::with_stage_lock(|| {
+        let path = crate::herald::herald_path();
+        let mut file: crate::herald::HeraldFile = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|s| serde_json::from_str(&s).ok())
+            .unwrap_or_default();
+        let out = f(&mut file.notifications);
+        file.schema_version = crate::herald::HERALD_SCHEMA.to_string();
+        let text = serde_json::to_string_pretty(&file)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        aoide_storage::fs::atomic_write(&path, &format!("{text}\n"))?;
+        Ok(out)
+    })
 }
 
 /// File one notification. Sender text is DATA: it is deserialised into the
@@ -838,18 +1173,25 @@ fn serve(listener: &UnixListener) {
                     );
                     continue; // Dropped, unconditionally — never reaches `handle_conn`.
                 }
-                handle_conn(stream)
+                std::thread::spawn(move || handle_conn(stream));
             }
             Err(e) => eprintln!("[aoide/shellbridge] accept error (continuing): {e}"),
         }
     }
 }
 
-/// Handle ONE client connection: read newline-delimited JSON lines and act on
-/// each. Every failure is contained — a read error (dropped connection) ends
-/// only THIS connection, an unparseable/unknown line is logged and skipped, and
-/// a focus dispatch failure is logged. Nothing here can unwind into `serve`.
+/// Handle ONE client connection, on its OWN thread (`serve` spawns one per
+/// accepted connection): read newline-delimited JSON lines and act on each.
+/// Containment is now per-connection, not per-process — a panic here dies
+/// with its own thread instead of unwinding into `serve`, and a slow or idle
+/// connection can no longer starve any other. A read error (dropped
+/// connection) ends only THIS connection, an unparseable/unknown line is
+/// audited and skipped, and a focus dispatch failure is logged. No read
+/// timeout is set on the accepted stream: the shared QML socket legitimately
+/// idles between human gestures, and idleness was never the fault here —
+/// serial accept was.
 fn handle_conn(stream: UnixStream) {
+    let mut reply = stream.try_clone().ok();
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let line = match line {
@@ -861,6 +1203,28 @@ fn handle_conn(stream: UnixStream) {
             continue;
         }
         match parse_command(&line) {
+            Some(BridgeCommand::SessionAction { session_id, action, fields }) => {
+                // The connection is dedicated to this one action and its reply clone is
+                // the only channel the acknowledgement has. Without it the action would
+                // run unacknowledged — a kill firing while the caller is told nothing
+                // happened — so it does not run at all.
+                let Some(mut reply) = reply.take() else {
+                    let _ = daemon::audit(
+                        &daemon::default_audit_log(),
+                        daemon::Door::Daemon,
+                        daemon::EventClass::Audit,
+                        "shellbridge",
+                        "sessionaction-noreply",
+                        &format!("session action {action}: no reply channel; not dispatched"),
+                    );
+                    return;
+                };
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let _ = writeln!(reply, "{}", dispatch_session_action(&session_id, &action, &fields));
+                });
+                return;
+            }
             Some(BridgeCommand::Focus { address }) => match crate::graph::focus_window(&address) {
                 Ok(()) => {
                     let _ = daemon::audit(
@@ -962,8 +1326,9 @@ fn handle_conn(stream: UnixStream) {
             // loop). The gadgets refresh off the resulting stage writes.
             Some(BridgeCommand::RecheckSessions) => dispatch_recheck_sessions(),
             // The ledger writes are inline: they are a read-modify-write of one
-            // small local file, and running them ON the accept loop is exactly
-            // what serialises concurrent notifications.
+            // small local file. Concurrent pushes from different connections'
+            // threads (§3b) are serialised by `edit_ledger`'s own
+            // `with_stage_lock`, not by the accept loop.
             Some(BridgeCommand::HeraldPush { notification }) => {
                 dispatch_herald_push(*notification)
             }
@@ -973,7 +1338,16 @@ fn handle_conn(stream: UnixStream) {
             Some(BridgeCommand::HeraldVerdict { id, verdict }) => {
                 dispatch_herald_verdict(id, verdict)
             }
-            None => eprintln!("[aoide/shellbridge] ignoring unknown/malformed command: {line}"),
+            None => {
+                let _ = daemon::audit(
+                    &daemon::default_audit_log(),
+                    daemon::Door::Daemon,
+                    daemon::EventClass::Audit,
+                    "shellbridge",
+                    "unparseable",
+                    &format!("dropped one unparseable or unknown command line ({} bytes)", line.len()),
+                );
+            }
         }
     }
 }
@@ -1382,5 +1756,523 @@ mod tests {
         assert_eq!(parse_command("{ broken"), None);
         assert_eq!(parse_command(""), None);
         assert_eq!(parse_command("[1,2,3]"), None);
+    }
+
+    // ── session actions (the acknowledged session-menu bridge) ─────────────
+
+    /// Build a `Vec<String>` argv/plan-row from string literals — test-only
+    /// sugar so the argv-exactness assertions below read as plain literals.
+    fn sv(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    // -- parse gate: acceptance --
+
+    #[test]
+    fn parse_command_accepts_a_session_project_assignment() {
+        match parse_command(
+            r#"{"cmd":"sessionaction","sessionId":"s1","action":"project","fields":{"project":"aoide"}}"#,
+        ) {
+            Some(BridgeCommand::SessionAction { session_id, action, fields }) => {
+                assert_eq!(session_id, "s1");
+                assert_eq!(action, "project");
+                assert_eq!(fields["project"], "aoide");
+            }
+            other => panic!("expected a session project assignment, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_command_accepts_a_session_project_clear() {
+        // An empty name IS the clear request, not a rejection.
+        assert!(matches!(
+            parse_command(
+                r#"{"cmd":"sessionaction","sessionId":"s1","action":"project","fields":{"project":""}}"#
+            ),
+            Some(BridgeCommand::SessionAction { .. })
+        ));
+        // So is an absent `fields` key.
+        assert!(matches!(
+            parse_command(r#"{"cmd":"sessionaction","sessionId":"s1","action":"project"}"#),
+            Some(BridgeCommand::SessionAction { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_command_accepts_a_session_kill() {
+        assert!(matches!(
+            parse_command(r#"{"cmd":"sessionaction","sessionId":"s1","action":"kill"}"#),
+            Some(BridgeCommand::SessionAction { .. })
+        ));
+        // Extra unknown keys are accepted and ignored.
+        assert!(matches!(
+            parse_command(
+                r#"{"cmd":"sessionaction","sessionId":"s1","action":"kill","fields":{"force":true}}"#
+            ),
+            Some(BridgeCommand::SessionAction { .. })
+        ));
+    }
+
+    #[test]
+    fn parse_command_accepts_a_session_undying_toggle() {
+        for state in ["on", "off"] {
+            match parse_command(&format!(
+                r#"{{"cmd":"sessionaction","sessionId":"s1","action":"undying","fields":{{"state":"{state}"}}}}"#
+            )) {
+                Some(BridgeCommand::SessionAction { fields, .. }) => {
+                    assert_eq!(fields["state"], state);
+                }
+                other => panic!("expected an undying toggle for {state}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn parse_command_accepts_a_createproject_and_an_editproject() {
+        for action in ["createproject", "editproject"] {
+            let line = format!(
+                r#"{{"cmd":"sessionaction","sessionId":"s1","action":"{action}","fields":{{"name":"aoide","paths":["/home/khoa/Aoide"]}}}}"#
+            );
+            assert!(
+                matches!(parse_command(&line), Some(BridgeCommand::SessionAction { .. })),
+                "{action} must parse"
+            );
+        }
+    }
+
+    // -- parse gate: rejection --
+
+    #[test]
+    fn parse_command_rejects_an_unknown_session_action() {
+        for action in ["reboot", "", "removeproject"] {
+            assert_eq!(
+                parse_command(&format!(
+                    r#"{{"cmd":"sessionaction","sessionId":"s1","action":"{action}"}}"#
+                )),
+                None,
+                "{action} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_command_rejects_a_session_action_with_no_session_id() {
+        assert_eq!(parse_command(r#"{"cmd":"sessionaction","action":"kill"}"#), None);
+        assert_eq!(
+            parse_command(r#"{"cmd":"sessionaction","sessionId":"","action":"kill"}"#),
+            None
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"sessionaction","sessionId":"   ","action":"kill"}"#),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_command_rejects_a_flag_shaped_session_id_or_name() {
+        assert_eq!(
+            parse_command(r#"{"cmd":"sessionaction","sessionId":"--id","action":"kill"}"#),
+            None
+        );
+        assert_eq!(
+            parse_command(r#"{"cmd":"sessionaction","sessionId":"-x","action":"kill"}"#),
+            None
+        );
+        assert_eq!(
+            parse_command(
+                r#"{"cmd":"sessionaction","sessionId":"s1","action":"createproject","fields":{"name":"-rf","paths":["/a"]}}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_command_rejects_an_undying_state_that_is_not_on_or_off() {
+        for fields in [r#"{"state":"yes"}"#, r#"{"state":true}"#, r#"{"on":true}"#, r#"{}"#] {
+            assert_eq!(
+                parse_command(&format!(
+                    r#"{{"cmd":"sessionaction","sessionId":"s1","action":"undying","fields":{fields}}}"#
+                )),
+                None,
+                "{fields} must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_command_rejects_a_project_edit_with_no_paths() {
+        // An "exact replacement" with nothing to replace with is a mistake,
+        // never an instruction to erase.
+        for action in ["createproject", "editproject"] {
+            assert_eq!(
+                parse_command(&format!(
+                    r#"{{"cmd":"sessionaction","sessionId":"s1","action":"{action}","fields":{{"name":"aoide","paths":[]}}}}"#
+                )),
+                None,
+                "{action} with an empty paths list must be refused"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_command_rejects_a_relative_or_control_charactered_path() {
+        // One bad element rejects the whole action.
+        let cases = ["[\"work/aoide\"]", "[\"~/Aoide\"]", "[\"/home/khoa/a\\nb\"]", "[123]"];
+        for paths in cases {
+            let line = format!(
+                "{{\"cmd\":\"sessionaction\",\"sessionId\":\"s1\",\"action\":\"createproject\",\"fields\":{{\"name\":\"aoide\",\"paths\":{paths}}}}}"
+            );
+            assert_eq!(parse_command(&line), None, "{paths} must be refused");
+        }
+    }
+
+    #[test]
+    fn parse_command_rejects_a_createproject_with_no_name() {
+        assert_eq!(
+            parse_command(
+                r#"{"cmd":"sessionaction","sessionId":"s1","action":"createproject","fields":{"paths":["/a"]}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            parse_command(
+                r#"{"cmd":"sessionaction","sessionId":"s1","action":"createproject","fields":{"name":"","paths":["/a"]}}"#
+            ),
+            None
+        );
+        assert_eq!(
+            parse_command(
+                r#"{"cmd":"sessionaction","sessionId":"s1","action":"createproject","fields":{"name":"   ","paths":["/a"]}}"#
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn parse_command_rejects_more_paths_than_the_cap() {
+        let paths17: Vec<String> = (0..17).map(|i| format!("\"/p{i}\"")).collect();
+        let paths16: Vec<String> = (0..16).map(|i| format!("\"/p{i}\"")).collect();
+        let line17 = format!(
+            r#"{{"cmd":"sessionaction","sessionId":"s1","action":"createproject","fields":{{"name":"aoide","paths":[{}]}}}}"#,
+            paths17.join(",")
+        );
+        let line16 = format!(
+            r#"{{"cmd":"sessionaction","sessionId":"s1","action":"createproject","fields":{{"name":"aoide","paths":[{}]}}}}"#,
+            paths16.join(",")
+        );
+        assert_eq!(parse_command(&line17), None, "17 paths must exceed the cap");
+        assert!(
+            matches!(parse_command(&line16), Some(BridgeCommand::SessionAction { .. })),
+            "16 paths must be accepted"
+        );
+    }
+
+    // -- argv exactness --
+
+    #[test]
+    fn session_action_args_builds_the_exact_undying_argv_for_both_states() {
+        assert_eq!(
+            session_action_args("s1", "undying", &json!({"state":"on"})),
+            Some(vec![sv(&["session", "grant", "undying", "on", "--id", "s1"])])
+        );
+        assert_eq!(
+            session_action_args("s1", "undying", &json!({"state":"off"})),
+            Some(vec![sv(&["session", "grant", "undying", "off", "--id", "s1"])])
+        );
+    }
+
+    #[test]
+    fn session_action_args_builds_the_exact_project_assignment_argv() {
+        assert_eq!(
+            session_action_args("s1", "project", &json!({"project":"aoide"})),
+            Some(vec![sv(&["session", "project", "--id", "s1", "--project", "aoide"])])
+        );
+    }
+
+    #[test]
+    fn session_action_args_builds_the_exact_project_clear_argv() {
+        let want = Some(vec![sv(&["session", "project", "--id", "s1", "--clear"])]);
+        assert_eq!(session_action_args("s1", "project", &json!({"project":""})), want);
+        assert_eq!(session_action_args("s1", "project", &json!({})), want);
+    }
+
+    #[test]
+    fn session_action_args_builds_the_exact_kill_argv() {
+        assert_eq!(
+            session_action_args("s1", "kill", &json!({})),
+            Some(vec![sv(&["session", "kill", "--id", "s1"])])
+        );
+    }
+
+    #[test]
+    fn session_action_args_builds_createprojects_two_argvs_in_order() {
+        let plan = session_action_args(
+            "s1",
+            "createproject",
+            &json!({"name":"aoide","paths":["/a","/b"]}),
+        )
+        .expect("createproject must build a plan");
+        assert_eq!(
+            plan,
+            vec![
+                sv(&["project", "add", "aoide", "/a", "/b", "--new"]),
+                sv(&["session", "project", "--id", "s1", "--project", "aoide"]),
+            ]
+        );
+        assert_eq!(plan[0].last().map(String::as_str), Some("--new"));
+    }
+
+    #[test]
+    fn session_action_args_builds_the_exact_editproject_argv() {
+        assert_eq!(
+            session_action_args("s1", "editproject", &json!({"name":"aoide","paths":["/a","/b"]})),
+            Some(vec![sv(&["project", "edit", "aoide", "/a", "/b"])])
+        );
+    }
+
+    #[test]
+    fn session_action_args_never_admits_whitespace_or_control_characters_in_a_name() {
+        assert_eq!(session_action_args("a b", "kill", &json!({})), None);
+        assert_eq!(session_action_args("a\nb", "kill", &json!({})), None);
+        assert_eq!(session_action_args("a\tb", "kill", &json!({})), None);
+        assert_eq!(
+            session_action_args("s1", "project", &json!({"project":"my project"})),
+            None
+        );
+        assert_eq!(
+            session_action_args("s1", "project", &json!({"project":"a\u{1b}b"})),
+            None
+        );
+        // A PATH containing a space is a DIFFERENT rule and IS accepted.
+        assert_eq!(
+            session_action_args(
+                "s1",
+                "editproject",
+                &json!({"name":"aoide","paths":["/home/khoa/My Documents"]})
+            ),
+            Some(vec![sv(&["project", "edit", "aoide", "/home/khoa/My Documents"])])
+        );
+    }
+
+    // -- reply shaping --
+
+    #[test]
+    fn a_session_action_reply_reports_an_ok_outcome_with_its_own_message() {
+        let reply = session_action_reply(
+            "s1",
+            "project",
+            true,
+            r#"{"status":"ok","command":"session.project","message":"session project updated","gated":false}"#,
+            "",
+        );
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["message"], "session project updated");
+        assert_eq!(reply["action"], "project");
+        assert_eq!(reply["sessionId"], "s1");
+    }
+
+    #[test]
+    fn a_session_action_reply_reports_an_error_outcome_as_not_ok() {
+        let reply = session_action_reply(
+            "s1",
+            "kill",
+            false,
+            r#"{"status":"error","command":"session.kill","message":"session is not registered locally","gated":true}"#,
+            "",
+        );
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["message"], "session is not registered locally");
+        // The `gated` marker never reaches QML and never makes a reply ok.
+        assert!(reply.get("gated").is_none());
+    }
+
+    #[test]
+    fn a_session_action_reply_reads_a_usage_envelope_off_stderr() {
+        let reply = session_action_reply(
+            "s1",
+            "createproject",
+            false,
+            "",
+            r#"{"status":"usage","command":"project.add","message":"unrecognized flag `--new` for `aoide project add`","gated":false}"#,
+        );
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["message"], "unrecognized flag `--new` for `aoide project add`");
+    }
+
+    #[test]
+    fn a_session_action_reply_falls_back_when_neither_stream_is_an_envelope() {
+        let reply =
+            session_action_reply("s1", "kill", false, "boom", "aoided must be running for session management");
+        assert_eq!(reply["ok"], false);
+        assert_eq!(reply["message"], "aoided must be running for session management");
+
+        let reply = session_action_reply("s1", "kill", false, "", "");
+        assert_eq!(reply["ok"], false);
+        assert_ne!(reply["message"].as_str().unwrap_or(""), "");
+    }
+
+    #[test]
+    fn a_session_action_reply_is_one_wire_line() {
+        let reply = session_action_reply(
+            "s1",
+            "project",
+            true,
+            r#"{"status":"ok","command":"session.project","message":"a\nb"}"#,
+            "",
+        );
+        assert!(!reply.to_string().contains('\n'));
+        assert_eq!(reply["action"], "project");
+        assert_eq!(reply["sessionId"], "s1");
+    }
+
+    // ── the accept loop (§3b): idleness must never starve another connection ──
+
+    /// Confirms `serve` spawns a thread per connection rather than serving
+    /// serially: an idle, persistent client — exactly what Quickshell's own
+    /// shared socket is, held open between human gestures — must never block
+    /// a later client's line from ever being dispatched. This test binds its
+    /// OWN listener, so `socket_path()` is never consulted and the live
+    /// shellbridge socket is never touched.
+    ///
+    /// Client 2 sends an action the whitelist REFUSES, so the observable is
+    /// the `unparseable` audit line landing in `<root>/log` — a refused line
+    /// spawns no child process at all, so this test cannot reach a real
+    /// binary or a live daemon under any env mishap. `daemon::bin::core_bin()`
+    /// *is* redirectable via `AOIDE_CORE_BIN` for a future test wanting a
+    /// real reply line, but a unit test spawning it here would be exactly the
+    /// "fresh binary against the live system" this slice's hard rules forbid.
+    ///
+    /// This test MUST fail on the pre-§3b serial `serve`: client 2's line
+    /// never reaches `handle_conn` while client 1 sits open, so the accept
+    /// loop is blocked in `handle_conn(client 1)` forever.
+    #[test]
+    fn an_idle_persistent_client_never_blocks_the_next_one() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = aoide_test_support::EnvSaver::capture(&[
+            "AOIDE_ROOT",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_STATE_DIR",
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+        ]);
+        let root = aoide_test_support::unique_tmp("shellbridge-idle-client");
+        std::env::set_var("AOIDE_ROOT", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::set_var("AOIDE_STATE_DIR", &root);
+        std::env::set_var("AOIDE_STAGE_DIR", &root);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let sock = root.join("test-shellbridge.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || serve(&listener)); // never joined
+
+        // Client 1: connect and hold the link open, writing nothing — the
+        // exact shape of Quickshell's own shared socket idling between human
+        // gestures.
+        let _client1 = UnixStream::connect(&sock).unwrap();
+
+        // Client 2: a refused sessionaction — the whitelist drops it before
+        // any child process is ever spawned.
+        {
+            use std::io::Write;
+            let mut client2 = UnixStream::connect(&sock).unwrap();
+            client2
+                .write_all(b"{\"cmd\":\"sessionaction\",\"sessionId\":\"s1\",\"action\":\"reboot\"}\n")
+                .unwrap();
+            client2.flush().unwrap();
+        }
+
+        let log = root.join("log");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut seen = false;
+        while std::time::Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(&log) {
+                if text.contains("unparseable") {
+                    seen = true;
+                    break;
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            seen,
+            "client 2's line was never audited within 2s — an idle client 1 is blocking \
+             the accept loop (the pre-3b serial-accept regression)"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // §3b's thread-per-connection accept loop means N herald pushes on N
+    // distinct connections can now run `edit_ledger` from N different
+    // threads at once. `edit_ledger` wraps its read-modify-write in
+    // `with_stage_lock` for exactly this reason — this test is the one that
+    // would go red (a lost update: fewer than N notifications land) if that
+    // lock were ever dropped.
+    #[test]
+    fn n_concurrent_herald_pushes_all_land_in_the_ledger() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = aoide_test_support::EnvSaver::capture(&[
+            "AOIDE_ROOT",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_STATE_DIR",
+            "AOIDE_STAGE_DIR",
+            "XDG_RUNTIME_DIR",
+        ]);
+        let root = aoide_test_support::unique_tmp("shellbridge-herald-race");
+        std::env::set_var("AOIDE_ROOT", &root);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+        std::env::set_var("AOIDE_STATE_DIR", &root);
+        std::env::set_var("AOIDE_STAGE_DIR", &root);
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let sock = root.join("test-shellbridge-herald.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+        std::thread::spawn(move || serve(&listener)); // never joined, own listener
+
+        const N: usize = 12;
+        let senders: Vec<_> = (0..N)
+            .map(|i| {
+                let sock = sock.clone();
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let mut client = UnixStream::connect(&sock).unwrap();
+                    let line = format!(
+                        "{{\"cmd\":\"heraldpush\",\"notification\":{{\"id\":\"race-{i}\",\
+                         \"app\":\"test\",\"summary\":\"s\",\"body\":\"b\",\
+                         \"urgency\":\"normal\",\"progress\":-1,\"timeoutMs\":0,\
+                         \"receivedAt\":\"now\",\"kind\":\"toast\"}}}}\n"
+                    );
+                    client.write_all(line.as_bytes()).unwrap();
+                    client.flush().unwrap();
+                })
+            })
+            .collect();
+        for s in senders {
+            s.join().unwrap();
+        }
+
+        let path = root.join("herald.json");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let mut count = 0;
+        while std::time::Instant::now() < deadline {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                if let Ok(file) = serde_json::from_str::<crate::herald::HeraldFile>(&text) {
+                    count = file.notifications.len();
+                    if count == N {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert_eq!(
+            count, N,
+            "expected all {N} concurrent herald pushes to land in the ledger, found \
+             {count} instead — a lost update means edit_ledger's read-modify-write is \
+             racing under the thread-per-connection accept loop"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 }
