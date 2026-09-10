@@ -260,6 +260,18 @@ fn add_roots(name: &str, paths: &[String], new: bool, auto_resume: bool) -> Outc
     })
 }
 
+/// The onboarding-only bootstrap entry: `aoide onboard`'s `register_clone`
+/// is its SOLE caller. Onboarding registers the clone as a project before
+/// any daemon exists to answer a dispatch — the documented first-run path
+/// is `git clone … && cd ~/Aoide && aoide onboard`, no daemon step — so
+/// unlike `project_add`/`project_edit`/`project_remove` this never checks
+/// `local_daemon` and never forwards; it goes straight to the same locked
+/// mutation [`add_roots`] a live daemon runs once one exists, with the same
+/// validation. Every other project mutation goes through `local_daemon`.
+pub fn register_bootstrap_project(name: &str, path: &str, auto_resume: bool) -> Outcome {
+    add_roots(name, &[path.to_string()], false, auto_resume)
+}
+
 /// `project remove <name> [<path>]` — unregister a whole project, or one of
 /// its roots (dropping the project when that root was its last). No PATH is
 /// today's behaviour byte-for-byte. Matching is exact string equality
@@ -1097,6 +1109,44 @@ mod tests {
         let data = out.data.as_ref().unwrap();
         assert_eq!(data["path"], a);
         assert_eq!(data["roots"], json!([a, b, c]));
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn register_bootstrap_project_writes_under_the_lock_with_cli_equivalent_validation() {
+        // The onboarding-only entry point (`register_clone`'s sole caller):
+        // never touches `local_daemon`, so it writes locally with no daemon
+        // reachable at all -- and still refuses the same invalid root
+        // `project_add`'s CLI path refuses, writing nothing.
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("bootstrap-writes-and-validates");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let a = stage.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let a = a.to_string_lossy().into_owned();
+
+        let out = register_bootstrap_project("aoide", &a, false);
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        let p = file.projects.iter().find(|p| p.name == "aoide").unwrap();
+        assert_eq!(p.path, a);
+        assert_eq!(p.roots(), vec![a.as_str()]);
+
+        // One bad root -- the CLI-equivalent validation `add_roots` already
+        // applies -- refuses the whole call and writes nothing.
+        let out = register_bootstrap_project("bogus", "not-absolute", false);
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        assert!(
+            !file.projects.iter().any(|p| p.name == "bogus"),
+            "the bad root wrote nothing"
+        );
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

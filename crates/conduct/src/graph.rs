@@ -100,7 +100,10 @@ pub use self::resurrect::session_resurrect;
 // `session undying` command this absorbs is retired — see
 // `graph/grant.rs`'s module doc.
 pub use self::grant::session_grant;
-pub use self::manage::{link, project_add, project_edit, project_list, project_remove, prune, view};
+pub use self::manage::{
+    link, project_add, project_edit, project_list, project_remove, prune,
+    register_bootstrap_project, view,
+};
 // Bare `session` (session-surface redesign, command-defrag lane X): the
 // ROSTER — grouped by PROJECT bare, by HOST under `--hosts` (byte-identical
 // to the retired standalone `aoide who` command's own rendering) — see

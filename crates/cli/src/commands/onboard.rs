@@ -74,7 +74,8 @@ fn handle_onboard(inv: &Invocation) -> Outcome {
     let mut changed: Vec<String> = Vec::new();
 
     say(&format!("onboard: registering the clone ({})...", root.display()));
-    let (clone_changed, clone_notes) = register_clone(&root, inv.door);
+    let (clone_changed, clone_notes) = register_clone(&root);
+    let project_registered = !clone_notes.iter().any(|n| n.starts_with("project registration failed:"));
     for n in &clone_notes {
         say(&format!("  {n}"));
     }
@@ -116,13 +117,26 @@ fn handle_onboard(inv: &Invocation) -> Outcome {
         println!("{}", crate::guide::render(crate::dispatch::registry()));
     }
 
-    let message = format!("onboard: clone registered, {} harness(es) wired -- {lyra_note}", harnesses.len());
-    Outcome::ok(cmd, message).changed(changed).with_data(json!({
+    let message = if project_registered {
+        format!("onboard: clone registered, {} harness(es) wired -- {lyra_note}", harnesses.len())
+    } else {
+        format!(
+            "onboard: project registration failed (see notes above), {} harness(es) wired -- {lyra_note}",
+            harnesses.len()
+        )
+    };
+    let data = json!({
         "root": root.display().to_string(),
         "harnesses": harnesses,
         "hooks": hook_reports,
         "lyra": lyra_note,
-    }))
+        "projectRegistered": project_registered,
+    });
+    if project_registered {
+        Outcome::ok(cmd, message).changed(changed).with_data(data)
+    } else {
+        Outcome::error(cmd, message).changed(changed).with_data(data)
+    }
 }
 
 /// The invoking checkout's root: `hooks::skill_source()`'s own walk-up (the
@@ -137,23 +151,32 @@ fn checkout_root() -> Option<PathBuf> {
 /// "register the clone" (ONBOARD.md's stub-summary contract, decision 1):
 /// two shell-only, idempotent acts the wiki already documents as onboard's
 /// job. `project.add`'s own schema example (`project add aoide
-/// ~/Aoide`) is the existing "register X as known" mechanism this reuses
-/// rather than inventing a new marker file or state format; Song-Anatomy.md/
+/// ~/Aoide`) is the existing "register X as known" mechanism this reuses --
+/// but onboarding runs before any daemon exists to dispatch to, so this
+/// calls `register_bootstrap_project` (the onboarding-only bootstrap entry,
+/// `conduct/src/graph/manage.rs`) directly rather than `project_add`, which
+/// is daemon-owned and would error with no daemon running; Song-Anatomy.md/
 /// Song-Vocabulary.md/Clone-and-Run.md all separately state "onboard links
 /// `~/song` -> `~/Aoide/song`", so the second act is the symlink they
 /// already document, made real. Never a clobber: an existing correct link
-/// is a no-op, anything else at either path is left alone with a note.
-fn register_clone(root: &Path, door: Door) -> (Vec<String>, Vec<String>) {
+/// is a no-op, anything else at either path is left alone with a note. A
+/// failed registration is never silent: the note is prefixed
+/// `"project registration failed: "` so `handle_onboard` can tell success
+/// from failure without inventing a third return value.
+fn register_clone(root: &Path) -> (Vec<String>, Vec<String>) {
     let mut changed = Vec::new();
     let mut notes = Vec::new();
 
-    let out = crate::graph::project_add(&Invocation {
-        path: vec!["project".into(), "add".into()],
-        args: vec!["aoide".into(), root.display().to_string()],
-        flags: BTreeMap::new(),
-        door,
+    let out = crate::conduct::graph::register_bootstrap_project(
+        "aoide",
+        &root.display().to_string(),
+        false,
+    );
+    notes.push(if out.status == Status::Ok {
+        out.message.clone()
+    } else {
+        format!("project registration failed: {}", out.message)
     });
-    notes.push(out.message.clone());
     changed.extend(out.changed);
 
     let home_song = aoide_home().join("song");
@@ -356,7 +379,7 @@ mod tests {
         std::env::set_var("AOIDE_STAGE_DIR", home.join("Aoide/song/stage"));
         let home_song = home.join("song");
 
-        let (changed, notes) = register_clone(&root, Door::Cli);
+        let (changed, notes) = register_clone(&root);
         let meta = std::fs::symlink_metadata(&home_song).unwrap();
         assert!(meta.file_type().is_symlink(), "~/song was not created as a symlink");
         assert_eq!(
@@ -367,7 +390,7 @@ mod tests {
         assert!(changed.iter().any(|c| c.starts_with("~/song ->")), "changed: {changed:?}");
 
         // Re-run: no-op, reported present, never re-listed as changed.
-        let (changed2, notes2) = register_clone(&root, Door::Cli);
+        let (changed2, notes2) = register_clone(&root);
         assert!(notes2.iter().any(|n| n.contains("already links to")), "notes2: {notes2:?}");
         assert!(
             !changed2.iter().any(|c| c.starts_with("~/song ->")),
@@ -391,7 +414,7 @@ mod tests {
         let elsewhere = unique_tmp("onboard-clone-wrong-elsewhere");
         std::os::unix::fs::symlink(&elsewhere, &home_song).unwrap();
 
-        let (changed, notes) = register_clone(&root, Door::Cli);
+        let (changed, notes) = register_clone(&root);
         assert!(
             notes.iter().any(|n| n.contains("is already a symlink to") && n.contains(&elsewhere.display().to_string())),
             "notes: {notes:?}"
@@ -416,7 +439,7 @@ mod tests {
         let home_song = home.join("song");
         std::fs::write(&home_song, "not a symlink").unwrap();
 
-        let (changed, notes) = register_clone(&root, Door::Cli);
+        let (changed, notes) = register_clone(&root);
         assert!(
             notes.iter().any(|n| n.contains("already exists and is not a symlink")),
             "notes: {notes:?}"
@@ -444,8 +467,51 @@ mod tests {
         let home_song = home.join("song");
         std::os::unix::fs::symlink(root.join("song"), &home_song).unwrap();
 
-        let (_changed, notes) = register_clone(&root, Door::Cli);
+        let (_changed, notes) = register_clone(&root);
         assert!(notes.iter().any(|n| n.contains("already links to")), "notes: {notes:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    // ── register_clone: registers locally, no daemon required ────────────
+
+    #[test]
+    fn register_clone_registers_the_project_with_no_daemon_reachable() {
+        // The 18e5dd5 regression this pins: `project add` became
+        // daemon-owned (`manage.rs`'s `local_daemon`), but onboarding runs
+        // before any daemon exists -- the documented first-run path is
+        // `git clone … && cd ~/Aoide && aoide onboard`, no daemon step.
+        // `register_clone` must land the clone in `projects.json` itself,
+        // even with `AOIDE_DAEMON_SOCKET` pointed at a dead path under a
+        // stage nothing else touches -- never a silent no-op because
+        // nothing answered.
+        let _g = env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvSaver::capture(&["HOME", "AOIDE_STAGE_DIR", "AOIDE_DAEMON_SOCKET"]);
+        let root = unique_tmp("onboard-register-clone-no-daemon-root");
+        let home = unique_tmp("onboard-register-clone-no-daemon-home");
+        let stage = home.join("Aoide/song/stage");
+        std::env::set_var("HOME", &home);
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_DAEMON_SOCKET", stage.join("no-such-daemon.sock"));
+
+        let (_changed, notes) = register_clone(&root);
+        assert!(
+            !notes.iter().any(|n| n.starts_with("project registration failed:")),
+            "notes: {notes:?}"
+        );
+
+        let raw = std::fs::read_to_string(stage.join("projects.json"))
+            .expect("projects.json written locally with no daemon reachable");
+        let doc: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let projects = doc["projects"].as_array().unwrap();
+        let clone_path = root.display().to_string();
+        let p = projects
+            .iter()
+            .find(|p| p["name"] == "aoide")
+            .expect("the clone registered as project `aoide`");
+        assert_eq!(p["path"], clone_path);
+        assert_eq!(p["roots"][0], clone_path);
 
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&home);
