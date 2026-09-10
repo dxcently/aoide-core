@@ -30,6 +30,33 @@
   field, including renames; every other field is preserved. Never enroll index
   history or infer a window, lifecycle event, or control channel from a title.
   Other harnesses retain their existing title precedence.
+- **A Codex-app record is keyed by the native thread id, never a synthesized
+  one.** `graph/codex_app.rs::reconcile_codex_app_threads` writes `sessionId`
+  as the Codex thread id verbatim — the same id `session_index.jsonl`, the
+  writer-lock filename, and the rollout's `session_meta.id` all agree on.
+  No `codex:`/`app:`-style wrapper prefix, and no aoide-minted id: the
+  native id is already the stable identity, and preserving it verbatim is
+  what lets the reaper's `apply_codex_titles` name the card for free.
+
+- **`kind:"app"` means "a task inside an app aoide does not conduct" and
+  must stay closed to every agent-shaped signal.** It is why
+  `reap::is_agent_kind` reads false for these records — keeping them out of
+  BOTH `superseded_agent_duplicates` (N threads of one desktop app
+  legitimately share one window address; that dedup would otherwise retire
+  N−1 of them) and `is_session_dead`'s staleness arm (the record's `pid` is
+  a SHARED app-server process, never proof any one thread is alive). Do not
+  give an `"app"` record a registered agent profile, a hook, or a
+  `conductable`/`socket` — there is no transport and no lifecycle event to
+  back any of them.
+
+- **No path may synthesize a per-thread window address.** A Codex-app
+  record's `windowAddress` is the window owning the process that holds that
+  thread's writer lock, stamped ONLY by the existing
+  `resolve_pending_session_windows` sweep — the one window resolver in this
+  crate. `reconcile_codex_app_threads` itself never touches
+  `windowAddress`/`workspace`; N threads of one app therefore share one
+  address by construction, and focusing any of them raises the app, which
+  is the only thing the app lets anyone do.
 
 - **`session bind` assigns continuity, never authority.** Keep the operation
   daemon-owned and local-only; no missing-daemon fallback. It does not load

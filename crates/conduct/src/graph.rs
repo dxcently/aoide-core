@@ -15,6 +15,12 @@
 
 mod actions;
 pub use actions::{session_kill, session_project};
+// The pure core of the P-CX desktop Codex/ChatGPT association design
+// (`docs/architecture/CODEX-INTEGRATION.md`) — `reconcile_codex_app_threads`
+// plus its `CodexThread` input. No re-export yet: like `window`'s own pure
+// core (`reconcile_untracked_terminals`, never re-exported), it has no
+// caller outside its own tests until the discovery/call-site slice lands.
+mod codex_app;
 mod common;
 mod conduct;
 mod doc;

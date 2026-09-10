@@ -378,6 +378,18 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   as defense in depth. See AGENTS.md's invariants for the full reasoning
   and every site that must agree: the discovery gate, the listener
   self-check, and the four historical backfill call sites.
+- `graph/codex_app.rs` — desktop Codex/ChatGPT task association (P-CX,
+  `docs/architecture/CODEX-INTEGRATION.md`). `reconcile_codex_app_threads`
+  is the pure core, mirroring `window.rs::reconcile_untracked_terminals`
+  rule for rule (upsert in place, remove what is no longer desired,
+  change-only writes) but keyed DIRECTLY by the Codex thread's own native
+  id — no synthetic `win:`-style prefix, because the thread id is already a
+  stable identity. Every record it writes carries a fixed
+  `agent:"codex"`/`kind:"app"`/`state:"idle"` identity, re-applied on every
+  upsert; `windowAddress`/`workspace` are left empty for the existing
+  `resolve_pending_session_windows` sweep to fill — this module has no
+  compositor access. See AGENTS.md's invariants for why `kind:"app"` exists
+  and what it must never gain.
 - `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below). The socket answers exactly one command with a reply,
