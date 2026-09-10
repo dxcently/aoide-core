@@ -692,21 +692,31 @@
   `wrap`/`conduct`/`spawn` (spawn re-execs `conduct --headless`, so fixing
   `conduct`'s own call covers it).
 - **`parentSessionId` on a hook record is re-stamped from ATTESTED kernel
-  process evidence on every hook, not only at registration — unlike
-  `hookAncestry` above, which stays write-once.** `send.rs::hook_ensure_
-  session` walks the hook-firing process's real `/proc` ancestry
-  (`identity::attested_wrap`, narrowed to a sealed, `conductable` ancestor)
-  on every event, BEFORE its exists/fresh split — so an EXISTING record
-  gets this too, not only a freshly-registered one — and re-stamps
-  `parentSessionId` via `session_store::stamp_attested_parent` whenever the
-  resolved wrap differs from what's currently stored. This is what makes a
-  harness id that survives `--resume` (the same session id, hosted by a
-  DIFFERENT terminal after the resume) keep following its CURRENT wrap:
-  change-only on difference, cycle-guarded (`would_cycle`), never a guess
-  from cwd/title/workspace. No daemon reachable, or no conducted ancestor
-  found, leaves the field untouched — fail-closed. The ordinary
-  `AOIDE_SESSION_ID` env fallback still exists, but only behind this: a
-  genuinely fresh record with no attested wrap at all.
+  process evidence on every per-turn hook, not only at registration —
+  unlike `hookAncestry` above, which stays write-once.**
+  `send.rs::hook_ensure_session` walks the hook-firing process's real
+  `/proc` ancestry (`identity::attested_wrap`, narrowed to a sealed,
+  `conductable` ancestor) on the `Phase` arm's registration self-heal and
+  `PhaseIfRunning` — each fires once per turn, BEFORE the exists/fresh
+  split, so an EXISTING record gets this too, not only a freshly-registered
+  one — and re-stamps `parentSessionId` via
+  `session_store::stamp_attested_parent` whenever the resolved wrap differs
+  from what's currently stored. `ToolStart`/`ToolEnd`/`SubRekey`/
+  `SubEnsure` — PreToolUse/PostToolUse and their subagent siblings, fired
+  on every tool call — skip the walk outright (`attest: None`): a
+  terminal's wrap only ever changes across a process restart or a
+  `--resume`, never mid-tool-call, and the next per-turn hook re-checks
+  regardless. This is what makes a harness id that survives `--resume`
+  (the same session id, hosted by a DIFFERENT terminal after the resume)
+  keep following its CURRENT wrap: change-only on difference, cycle-guarded
+  (`would_cycle`), never a guess from cwd/title/workspace. No daemon
+  reachable, or no conducted ancestor found, leaves the field untouched —
+  fail-closed. The ordinary `AOIDE_SESSION_ID` env fallback still exists,
+  but only behind this: a genuinely fresh record with no attested wrap at
+  all. `hook_ensure_session_with` is the injection seam (the
+  `deliver_local_with` precedent): production wires `real_attested_wrap`,
+  tests inject a resolver — the composed hook→re-stamp path is proven
+  in-crate through it, never against a live daemon.
 - **`who` and bare `session`'s old undying-picker meaning are BOTH retired
   (session-surface redesign, command-defrag lane X, 2026-08-28 — hard
   cutover, no alias).** Bare `session` is now the ROSTER (`who.rs`'s

@@ -351,14 +351,17 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `hookAncestry` > `AOIDE_SESSION_ID` env precedence `wrap`/`conduct`/`spawn`
   registration resolve their parent through).
   A sibling mechanism (`session_store::stamp_attested_parent`, called from
-  `send.rs`'s `hook_ensure_session` on every hook, not only at registration)
-  re-parents an ALREADY-registered session whenever kernel process evidence
+  `send.rs`'s `hook_ensure_session` on the per-turn registration self-heal
+  and the idle phase hook — never a tool/subagent hook, which fires on every
+  tool call and would pay the walk for nothing) re-parents an
+  ALREADY-registered session whenever kernel process evidence
   (`identity::attested_wrap`, the same nearest-first `/proc` walk, narrowed to
   a sealed CONDUCTED ancestor) resolves a different wrap than the one
   currently stamped — a harness id that survives `--resume` under a new
-  terminal keeps following its CURRENT wrap. Unlike `hookAncestry`
-  (write-once, a birth fact) this is change-only on difference; no daemon
-  reachable or no conducted ancestor found leaves it untouched, fail-closed.
+  terminal keeps following its CURRENT wrap, caught on its next per-turn
+  hook. Unlike `hookAncestry` (write-once, a birth fact) this is change-only
+  on difference; no daemon reachable or no conducted ancestor found leaves it
+  untouched, fail-closed.
   `session_store::lineage_of`
   (ancestors + descendants) is the matching widened carve-out for the
   same-window registration-time eviction, reused by `reap.rs`'s dedup pass
