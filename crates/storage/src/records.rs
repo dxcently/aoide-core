@@ -95,6 +95,9 @@ pub struct RestoreSnapshot {
 pub struct SessionRecord {
     #[serde(rename = "sessionId", default)]
     pub session_id: String,
+    /// Explicit continuity binding; not a harness name or an authorization grant.
+    #[serde(rename = "enduringAgentId", default, skip_serializing_if = "Option::is_none")]
+    pub enduring_agent_id: Option<String>,
     #[serde(default)]
     pub agent: String,
     #[serde(rename = "windowAddress", default)]

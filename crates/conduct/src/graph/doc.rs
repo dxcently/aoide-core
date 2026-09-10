@@ -108,6 +108,9 @@ pub fn build_graph(
         // onto the node only when present, so a legacy/petname-less record
         // stays byte-for-byte as before. Display-only: `session_id` above
         // stays the canonical key.
+        if let Some(key) = &s.enduring_agent_id {
+            node["enduringAgentId"] = json!(key);
+        }
         if let Some(pn) = &s.petname {
             node["petname"] = json!(pn);
         }
@@ -570,6 +573,7 @@ pub(crate) fn ledger_session_exit(rec: &SessionRecord, ended_at: &str) {
     let entry = aoide_storage::ledger::LedgerEntry {
         v: 0,
         session_id: rec.session_id.clone(),
+        enduring_agent_id: rec.enduring_agent_id.clone(),
         agent: rec.agent.clone(),
         harness_session_id: rec.harness_session_id.clone(),
         cwd: rec.cwd.clone(),

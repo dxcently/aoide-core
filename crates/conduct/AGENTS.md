@@ -2,6 +2,12 @@
 
 ## Invariants
 
+- **`session bind` assigns continuity, never authority.** Keep the operation
+  daemon-owned and local-only; no missing-daemon fallback. It does not load
+  optional Mneme config, change grants, or replace executor-specific mail
+  reader keys. A binding is immutable within a session; same-key calls are
+  no-ops. Project the explicit binding into the graph and exit ledger.
+
 - **This crate is core, never lyra.** Nothing here may gain a
   wayland/image/quickshell dependency — that's exactly what P-A1 moved OUT
   (to `screen`) to keep this crate headless-safe. `cargo tree -p

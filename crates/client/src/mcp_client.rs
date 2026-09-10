@@ -702,3 +702,280 @@ mod tests {
         clear_melete_env();
     }
 }
+
+/// Streamable HTTP session for canonical Mneme reads. Melete's existing
+/// stateless commands retain their behavior; both use the shared curl runner.
+pub(crate) struct McpSession<T> {
+    post: T,
+    session_id: Option<String>,
+    protocol_version: Option<String>,
+    next_id: u64,
+}
+
+impl<T> McpSession<T>
+where T: FnMut(&str, &str, &[(String, String)]) -> Result<crate::commands::HttpResponse, String> {
+    pub(crate) fn connect(post: T) -> Result<Self, String> {
+        let mut client = Self { post, session_id: None, protocol_version: None, next_id: 1 };
+        if let Err(reason) = client.initialize() {
+            let _ = client.close();
+            return Err(reason);
+        }
+        Ok(client)
+    }
+
+    fn initialize(&mut self) -> Result<(), String> {
+        let result = self.request("initialize", json!({
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": {"name": "aoide-context", "version": env!("CARGO_PKG_VERSION")},
+        }))?;
+        let version = result.get("protocolVersion").and_then(Value::as_str)
+            .filter(|v| matches!(*v, "2025-03-26" | "2025-06-18" | "2025-11-25"))
+            .ok_or("unsupported-mcp-protocol-version")?;
+        self.protocol_version = Some(version.into());
+        let notification = json!({"jsonrpc":"2.0", "method":"notifications/initialized"});
+        let response = self.exchange(&notification.to_string())?;
+        if response.status != 202 || !response.body.trim().is_empty() {
+            return Err("invalid-initialized-notification-response".into());
+        }
+        Ok(())
+    }
+
+    fn headers(&self) -> Vec<(String, String)> {
+        let mut headers = vec![("Accept".into(), "application/json, text/event-stream".into())];
+        if let Some(id) = &self.session_id {
+            headers.push(("Mcp-Session-Id".into(), id.clone()));
+        }
+        if let Some(version) = &self.protocol_version {
+            headers.push(("MCP-Protocol-Version".into(), version.clone()));
+        }
+        headers
+    }
+
+    pub(crate) fn close(&mut self) -> &'static str {
+        if self.session_id.is_none() { return "not-applicable"; }
+        let headers = self.headers();
+        let result = (self.post)("DELETE", "", &headers);
+        self.session_id = None;
+        match result {
+            Ok(response) if (200..300).contains(&response.status) || response.status == 404 => "closed",
+            Ok(response) if response.status == 405 => "unsupported",
+            _ => "failed",
+        }
+    }
+
+    fn exchange(&mut self, body: &str) -> Result<crate::commands::HttpResponse, String> {
+        let headers = self.headers();
+        let response = (self.post)("POST", body, &headers).map_err(|_| "mcp-transport-failed")?;
+        if response.status == 401 || response.status == 403 {
+            return Err("mneme-access-denied".into());
+        }
+        if !(200..300).contains(&response.status) {
+            return Err(format!("mcp-http-{}", response.status));
+        }
+        let ids: Vec<&str> = response.headers.iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case("mcp-session-id"))
+            .map(|(_, value)| value.as_str()).collect();
+        if ids.len() > 1 {
+            return Err("duplicate-mcp-session-id".into());
+        }
+        if let Some(id) = ids.first() {
+            if id.is_empty() || !id.bytes().all(|b| (0x21..=0x7e).contains(&b)) {
+                return Err("invalid-mcp-session-id".into());
+            }
+            if let Some(current) = &self.session_id {
+                if current != id { return Err("mcp-session-id-changed".into()); }
+            } else if self.protocol_version.is_some() {
+                return Err("mcp-session-id-outside-initialize".into());
+            } else {
+                self.session_id = Some((*id).into());
+            }
+        }
+        Ok(response)
+    }
+
+    fn request(&mut self, method: &str, params: Value) -> Result<Value, String> {
+        let id = self.next_id;
+        self.next_id += 1;
+        let response = self.exchange(&json!({"jsonrpc":"2.0", "id":id, "method":method, "params":params}).to_string())?;
+        if response.status != 200 { return Err("missing-mcp-rpc-response".into()); }
+        matching_rpc_result(&response.body, id)
+    }
+
+    pub(crate) fn mneme_rpc(&mut self, function: &str, args: Value) -> Result<String, String> {
+        let result = self.request("tools/call", json!({
+            "name": "RPC", "arguments": {"call": {"function": function, "args": args}},
+        }))?;
+        tool_text(&result)
+    }
+}
+
+fn matching_rpc_result(body: &str, id: u64) -> Result<Value, String> {
+    let mut events = Vec::new();
+    if let Ok(value) = serde_json::from_str::<Value>(body) {
+        events.push(value);
+    } else {
+        let normalized = body.replace("\r\n", "\n");
+        for event in normalized.split("\n\n") {
+            let data = event.lines().filter_map(|line| line.strip_prefix("data:")
+                .map(|v| v.strip_prefix(' ').unwrap_or(v))).collect::<Vec<_>>().join("\n");
+            if !data.is_empty() {
+                events.push(serde_json::from_str::<Value>(&data).map_err(|_| "malformed-mcp-event")?);
+            }
+        }
+    }
+    let replies: Vec<&Value> = events.iter().filter(|v| v.get("id") == Some(&json!(id))).collect();
+    if replies.len() != 1 { return Err("missing-or-duplicate-mcp-response-id".into()); }
+    let reply = replies[0];
+    if reply.get("jsonrpc").and_then(Value::as_str) != Some("2.0") {
+        return Err("invalid-jsonrpc-version".into());
+    }
+    if reply.get("error").is_some() { return Err("mcp-rpc-error".into()); }
+    reply.get("result").cloned().ok_or_else(|| "missing-mcp-result".into())
+}
+
+fn tool_text(result: &Value) -> Result<String, String> {
+    if result.get("isError") == Some(&Value::Bool(true)) {
+        return Err("mneme-tool-error".into());
+    }
+    if result.get("isError").is_some_and(|v| !v.is_boolean()) {
+        return Err("malformed-mcp-tool-result".into());
+    }
+    let blocks = result.get("content").and_then(Value::as_array)
+        .ok_or("missing-mcp-text-content")?;
+    // read_note/list_notes currently return one raw-text block. Joining blocks
+    // would fabricate note bytes and make the reported content hash misleading.
+    if blocks.len() != 1 || blocks[0].get("type").and_then(Value::as_str) != Some("text") {
+        return Err("ambiguous-mcp-text-content".into());
+    }
+    blocks[0].get("text").and_then(Value::as_str).map(String::from)
+        .ok_or_else(|| "missing-mcp-text-content".into())
+}
+
+#[cfg(test)]
+mod streamable_tests {
+    use super::*;
+    use crate::commands::HttpResponse;
+
+    fn response(status: u16, body: Value) -> HttpResponse {
+        HttpResponse { status, headers:vec![], body:body.to_string() }
+    }
+
+    #[test]
+    fn handshake_preserves_session_header_and_rpc_ids_across_reads() {
+        let mut step = 0;
+        let mut client = McpSession::connect(|method: &str, body: &str, headers: &[(String, String)]| {
+            assert_eq!(method, "POST");
+            let request: Value = serde_json::from_str(body).unwrap();
+            step += 1;
+            assert!(headers.iter().any(|(k,v)| k == "Accept" && v.contains("text/event-stream")));
+            if step == 1 {
+                assert_eq!(request["method"], "initialize");
+                assert_eq!(request["id"], 1);
+                assert!(!headers.iter().any(|(k,_)| k == "Mcp-Session-Id"));
+                let mut reply = response(200, json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26","capabilities":{}}}));
+                reply.headers.push(("mcp-session-id".into(), "session-abc".into()));
+                return Ok(reply);
+            }
+            assert!(headers.iter().any(|(k,v)| k == "Mcp-Session-Id" && v == "session-abc"));
+            assert!(headers.iter().any(|(k,v)| k == "MCP-Protocol-Version" && v == "2025-03-26"));
+            if step == 2 {
+                assert_eq!(request["method"], "notifications/initialized");
+                assert!(request.get("id").is_none());
+                return Ok(HttpResponse {status:202, headers:vec![], body:String::new()});
+            }
+            assert_eq!(request["method"], "tools/call");
+            assert_eq!(request["id"], step - 1);
+            assert_eq!(request["params"]["name"], "RPC");
+            assert_eq!(request["params"]["arguments"]["call"]["function"], "read_note");
+            assert_eq!(request["params"]["arguments"]["call"]["args"]["vault"], "Personal");
+            let reply = json!({"jsonrpc":"2.0", "id":request["id"], "result":{"content":[{"type":"text","text":"note"}],"isError":false}});
+            Ok(HttpResponse {status:200, headers:vec![], body:format!(
+                "data: {{\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}}\n\ndata: {reply}\n\n",
+            )})
+        }).unwrap();
+        for title in ["personas/rook.md", "memory/rook.md"] {
+            assert_eq!(client.mneme_rpc("read_note", json!({"title":title,"vault":"Personal"})).unwrap(), "note");
+        }
+        drop(client);
+        assert_eq!(step, 4);
+    }
+
+    #[test]
+    fn response_selection_is_by_id_not_last_sse_event() {
+        let body = "data: {\"jsonrpc\":\"2.0\",\"id\":2,\n\
+                    data: \"result\":{\"wanted\":true}}\n\n\
+                    data: {\"jsonrpc\":\"2.0\",\"method\":\"notifications/progress\"}\n\n";
+        assert_eq!(matching_rpc_result(body, 2).unwrap()["wanted"], true);
+        assert!(matching_rpc_result(body, 3).is_err());
+        assert!(matching_rpc_result(&format!("{body}{body}"), 2).is_err());
+        assert!(matching_rpc_result(r#"{"jsonrpc":"2.0","id":"2","result":{}}"#, 2).is_err());
+    }
+
+    #[test]
+    fn errors_do_not_echo_server_payloads_and_tool_errors_are_failures() {
+        let err = matching_rpc_result(r#"{"jsonrpc":"2.0","id":1,"error":{"message":"reflected bearer secret"}}"#, 1).unwrap_err();
+        assert_eq!(err, "mcp-rpc-error");
+        assert_eq!(tool_text(&json!({"isError":true,"content":[{"type":"text","text":"not found"}]})).unwrap_err(), "mneme-tool-error");
+        assert!(tool_text(&json!({"content":[{"type":"text","text":"first"},{"type":"text","text":"second"}]})).is_err());
+        assert_eq!(tool_text(&json!({"content":[{"type":"text","text":""}]})).unwrap(), "");
+        let denied = McpSession::connect(|_method: &str, _: &str, _: &[(String,String)]| {
+            Ok(HttpResponse {status:403, headers:vec![], body:"reflected secret".into()})
+        });
+        assert!(matches!(denied, Err(ref reason) if reason == "mneme-access-denied"));
+    }
+
+    #[test]
+    fn duplicate_or_rotating_session_ids_fail_without_silent_reinitialization() {
+        let duplicate = McpSession::connect(|_method: &str, _: &str, _: &[(String,String)]| {
+            Ok(HttpResponse { status:200,
+                headers:vec![("mcp-session-id".into(),"a".into()),("Mcp-Session-Id".into(),"b".into())],
+                body:String::new() })
+        });
+        assert!(matches!(duplicate, Err(ref reason) if reason == "duplicate-mcp-session-id"));
+        let mut n = 0;
+        let rotating = McpSession::connect(|method: &str, _: &str, _: &[(String,String)]| {
+            if method == "DELETE" { return Ok(HttpResponse {status:204, headers:vec![], body:String::new()}); }
+            n += 1;
+            Ok(HttpResponse {status:if n == 1 {200} else {202},
+                headers:vec![("mcp-session-id".into(),n.to_string())],
+                body:if n == 1 {json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26"}}).to_string()} else {String::new()},
+            })
+        });
+        assert!(matches!(rotating, Err(ref reason) if reason == "mcp-session-id-changed"));
+        assert_eq!(n, 2);
+    }
+}
+
+#[cfg(test)]
+mod mcp_cleanup_tests {
+    use super::*;
+    use crate::commands::HttpResponse;
+
+    #[test]
+    fn cleanup_uses_assigned_session_and_preserves_a_failed_fetch() {
+        for (status, expected) in [(204,"closed"),(405,"unsupported"),(500,"failed")] {
+            let mut deleted = false;
+            let mut client = McpSession::connect(|method: &str, body: &str, headers: &[(String,String)]| {
+                if method == "DELETE" {
+                    assert!(headers.iter().any(|(k,v)| k == "Mcp-Session-Id" && v == "assigned"));
+                    deleted = true;
+                    return Ok(HttpResponse {status, headers:vec![], body:String::new()});
+                }
+                let body: Value = serde_json::from_str(body).unwrap();
+                match body["method"].as_str().unwrap() {
+                    "initialize" => Ok(HttpResponse { status:200, headers:vec![("Mcp-Session-Id".into(),"assigned".into())],
+                        body:json!({"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-03-26"}}).to_string() }),
+                    "notifications/initialized" => Ok(HttpResponse {status:202, headers:vec![], body:String::new()}),
+                    "tools/call" => Ok(HttpResponse {status:200, headers:vec![],
+                        body:json!({"jsonrpc":"2.0","id":body["id"],"result":{"isError":true,"content":[{"type":"text","text":"missing note"}]}}).to_string()}),
+                    _ => panic!("unexpected request"),
+                }
+            }).unwrap();
+            let primary = client.mneme_rpc("read_note", json!({})).unwrap_err();
+            assert_eq!(client.close(), expected);
+            assert_eq!(primary, "mneme-tool-error");
+            drop(client);
+            assert!(deleted);
+        }
+    }
+}

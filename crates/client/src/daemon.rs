@@ -106,13 +106,19 @@ fn connect_bounded(socket_path: &std::path::Path, timeout: Duration) -> Option<U
 /// just landed) always sees `Door::Daemon` and takes its direct path
 /// unconditionally, rather than trying to connect to itself and recursing.
 pub fn daemon_dispatch(inv: &Invocation) -> Option<Outcome> {
+    daemon_dispatch_with_timeout(inv, ROUND_TRIP_TIMEOUT)
+}
+
+/// Explicit reply bound for operations that perform bounded upstream work.
+/// The default dispatch callers retain their two-second bound; no retry occurs.
+pub fn daemon_dispatch_with_timeout(inv: &Invocation, reply_timeout: Duration) -> Option<Outcome> {
     if inv.door == Door::Daemon {
         return None;
     }
 
     let socket_path = socket_path();
     let mut stream = connect_bounded(&socket_path, CONNECT_TIMEOUT)?;
-    if stream.set_read_timeout(Some(ROUND_TRIP_TIMEOUT)).is_err() {
+    if stream.set_read_timeout(Some(reply_timeout)).is_err() {
         return Some(Outcome::error(inv.dotted(), "setting a read timeout on the daemon connection"));
     }
 
@@ -330,6 +336,30 @@ mod tests {
         assert_eq!(out.status, Status::Error);
 
         std::fs::remove_file(&socket_path).ok();
+    }
+
+    #[test]
+    fn explicit_dispatch_timeout_reports_failure_without_retrying() {
+        let _lock = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = aoide_test_support::EnvSaver::capture(&["AOIDE_DAEMON_SOCKET"]);
+        let path = short_tmp("deadline").with_extension("sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let (release, wait) = std::sync::mpsc::channel::<()>();
+        let server = std::thread::spawn(move || {
+            let (conn, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            BufReader::new(&conn).read_line(&mut request).unwrap();
+            wait.recv_timeout(Duration::from_secs(5)).unwrap();
+            listener.set_nonblocking(true).unwrap();
+            assert!(matches!(listener.accept(), Err(e) if e.kind() == std::io::ErrorKind::WouldBlock));
+        });
+        std::env::set_var("AOIDE_DAEMON_SOCKET", &path);
+        let out = daemon_dispatch_with_timeout(&inv(&["context"], Door::Cli), Duration::from_millis(20)).unwrap();
+        release.send(()).unwrap();
+        server.join().unwrap();
+        assert_eq!(out.status, Status::Error);
+        assert!(out.message.contains("reading the daemon"));
+        std::fs::remove_file(path).unwrap();
     }
 
     // ── daemon_seal_pubkey_hex ───────────────────────────────────────────

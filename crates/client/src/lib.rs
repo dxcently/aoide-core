@@ -49,6 +49,7 @@
 
 pub mod adapter;
 pub mod commands;
+pub mod context;
 pub mod daemon;
 pub mod discover;
 pub mod mail_wire;

@@ -1132,6 +1132,7 @@ mod tests {
         aoide_storage::ledger::LedgerEntry {
             v: 0,
             session_id: session_id.to_string(),
+            enduring_agent_id: None,
             agent: agent.to_string(),
             harness_session_id: Some(session_id.to_string()),
             cwd: cwd.to_string(),

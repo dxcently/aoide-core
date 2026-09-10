@@ -7,6 +7,14 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 
 ## Named seams (what it exposes)
 
+- `graph::session_bind` implements `session bind --id <session> --agent-id
+  <key>` through aoided. Only local CLI/Daemon doors may bind; the CLI does
+  not fall back when aoided is absent. The key uses `valid_node_name` grammar
+  and need not have a Mneme mapping. An unknown session, invalid key, or
+  conflicting binding refuses without mutation; the same key is idempotent.
+  The enduring key appears in the graph and exit ledger, independently of
+  executor-specific mail readers. Resurrection does not implicitly bind it.
+
 - **Graph residency (P-D6, `docs/architecture/AOIDED.md`'s "L4")**: the
   session-write family — `session start/phase/end`, `session
   hook`, and `session reap` (below) — each try `aoide_client::daemon::

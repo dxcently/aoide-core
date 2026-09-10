@@ -78,6 +78,7 @@ pub fn upsert_session(
         let petname = petname::mint_for(sessions);
         sessions.push(SessionRecord {
             session_id: id.to_string(),
+            enduring_agent_id: None,
             agent: agent.unwrap_or(CLAUDE_PROFILE.name).to_string(),
             window_address: window.unwrap_or_default().to_string(),
             cwd: cwd.unwrap_or_default().to_string(),
@@ -257,5 +258,60 @@ mod tests {
             "2026-02-02T00:00:00Z"
         ));
         assert_eq!(sessions[0].petname, None, "a legacy None petname must never be backfilled");
+    }
+}
+
+/// Bind an explicitly supplied enduring key, independent of knowledge services.
+/// Restart UPSERT never changes it.
+/// Returns false for the same binding; all refusals leave the records untouched.
+pub fn bind_enduring_agent(
+    sessions: &mut [SessionRecord],
+    id: &str,
+    key: &str,
+) -> Result<bool, String> {
+    if !crate::node_store::valid_node_name(key) {
+        return Err("invalid-enduring-agent-id".into());
+    }
+    let session = sessions.iter_mut().find(|s| s.session_id == id)
+        .ok_or_else(|| "unknown-session".to_string())?;
+    match session.enduring_agent_id.as_deref() {
+        Some(current) if current == key => Ok(false),
+        Some(_) => Err("conflicting-binding".into()),
+        None => {
+            session.enduring_agent_id = Some(key.into());
+            Ok(true)
+        }
+    }
+}
+
+#[cfg(test)]
+mod context_binding_tests {
+    use super::*;
+
+    #[test]
+    fn invalid_keys_are_rejected_before_binding_a_fresh_executor() {
+        let mut sessions = vec![SessionRecord { session_id: "fresh".into(), ..Default::default() }];
+        for key in ["", "UPPER", "two words", "../other", "-leading", "id_with_underscore"] {
+            assert_eq!(bind_enduring_agent(&mut sessions, "fresh", key).unwrap_err(), "invalid-enduring-agent-id");
+            assert!(sessions[0].enduring_agent_id.is_none());
+        }
+    }
+
+    #[test]
+    fn binding_survives_harness_restart_and_refusals_do_not_mutate() {
+        let mut sessions = vec![SessionRecord { session_id: "executor-1".into(), ..Default::default() }];
+        assert!(bind_enduring_agent(&mut sessions, "executor-1", "7e3f5976-98b2-44a4-827c-c687a0d9526e").unwrap());
+        assert!(!bind_enduring_agent(&mut sessions, "executor-1", "7e3f5976-98b2-44a4-827c-c687a0d9526e").unwrap());
+        let before = serde_json::to_value(&sessions).unwrap();
+        for (id, key) in [("missing", "7e3f5976-98b2-44a4-827c-c687a0d9526e"), ("executor-1", "Bad Key"), ("executor-1", "opaque-2")] {
+            assert!(bind_enduring_agent(&mut sessions, id, key).is_err());
+            assert_eq!(serde_json::to_value(&sessions).unwrap(), before);
+        }
+        upsert_session(&mut sessions, "executor-1", Some("codex"), None, None, None, None, None, None, None, "later");
+        assert_eq!(sessions[0].enduring_agent_id.as_deref(), Some("7e3f5976-98b2-44a4-827c-c687a0d9526e"));
+        assert_eq!(sessions[0].agent, "codex");
+        let legacy: SessionRecord = serde_json::from_str(r#"{"sessionId":"old"}"#).unwrap();
+        assert!(legacy.enduring_agent_id.is_none());
+        assert!(serde_json::to_value(legacy).unwrap().get("enduringAgentId").is_none());
     }
 }

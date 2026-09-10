@@ -12,6 +12,7 @@ path = "src/lib.rs"
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 aoide-protocol = { workspace = true }
 aoide-storage = { workspace = true }
 # task #84: `node` commands resolve a per-node outbound Authorization: Bearer

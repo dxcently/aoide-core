@@ -9,6 +9,16 @@ by decision — no embedded database yet
 
 ## Named seams (what it exposes)
 
+- `config::Context` holds optional `context.agents` and `context.vaults` maps:
+  an enduring key names persona/memory note paths and a logical vault; that
+  vault resolves to an MCP endpoint, server-local vault name, and `tokenEnv`
+  variable name. Values are validated, like dynamic `mesh` declarations,
+  outside the static `config set` table. Credentials are never config values.
+- `session::bind_enduring_agent` binds an existing executor to an explicit
+  opaque key without consulting Mneme configuration. The optional
+  `SessionRecord.enduring_agent_id` survives UPSERT and projects into
+  `LedgerEntry.enduring_agent_id` at exit. It conveys continuity, not access.
+
 - `records`/`fs`/`stage` — the stage-file record shapes and atomic
   read/write I/O every stage consumer (this crate's own `commands`, `conduct`,
   `song`, `conductor`) goes through instead of touching JSON on disk directly.

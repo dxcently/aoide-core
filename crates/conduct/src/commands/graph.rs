@@ -351,4 +351,18 @@ pub fn register(r: &mut Registry) {
             "session grant exempt off --id <session-id>",
         ],
     ));
+    r.insert(cmd!(
+        path: ["session", "bind"],
+        summary: "Bind a local executor to an explicit enduring agent key; idempotent, refuses a conflicting binding, requires aoided. Does not grant access or require Mneme.",
+        args: [],
+        flags: [
+            flag!("id", "string", "Existing session id (required)."),
+            flag!("agent-id", "string", "Opaque enduring key (required): lowercase letters, digits, and hyphens; starts with a letter or digit. Independent of display names and harness sessions."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::session_bind,
+        examples: ["session bind --id executor-1 --agent-id 7e3f5976-98b2-44a4-827c-c687a0d9526e"],
+    ));
+
 }

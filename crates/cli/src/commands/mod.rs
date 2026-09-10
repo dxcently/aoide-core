@@ -90,5 +90,7 @@ pub fn all() -> Registry {
     aoide_client::mesh::register(&mut r); // mesh + mesh pair — the declared-mesh-vs-live-registry drift report and the converge that closes it (task #135 P4/P5, appended newest)
     aoide_client::commands::register_mail(&mut r); // mail send/read/show/mark/rm/outbox/outbox.rm — the addressed, signed, append-only mailbase plus its outbox spool for a directly paired node (messaging plan P-M1/P-M2, docs/architecture/MAIL.md, appended newest)
 
+    aoide_client::context::register(&mut r); // explicit shared persona/memory retrieval
+
     r
 }

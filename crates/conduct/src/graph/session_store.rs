@@ -2402,3 +2402,99 @@ mod tests {
         let _ = std::fs::remove_dir_all(&stage);
     }
 }
+
+/// Binding is explicit local orchestration state, never a remote access grant.
+pub fn session_bind(inv: &Invocation) -> Outcome {
+    let cmd = "session.bind";
+    match inv.door {
+        aoide_protocol::Door::Cli => {
+            return aoide_client::daemon::daemon_dispatch(inv).unwrap_or_else(||
+                Outcome::error(cmd, "aoided must be running to bind an enduring agent"));
+        }
+        aoide_protocol::Door::Daemon => {}
+        _ => return Outcome::error(cmd, "session bind is local-only; remote doors cannot assign an enduring identity"),
+    }
+    let id = match require_flag(inv, "id") {
+        Ok(id) => id,
+        Err(out) => return out,
+    };
+    let key = match require_flag(inv, "agent-id") {
+        Ok(key) => key,
+        Err(out) => return out,
+    };
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(file) => file,
+            Err(e) => return stage_error(cmd, e),
+        };
+        let changed = match aoide_storage::session::bind_enduring_agent(&mut file.sessions, &id, &key) {
+            Ok(changed) => changed,
+            Err(reason) => return Outcome::error(cmd, format!("cannot bind session `{id}`: {reason}"))
+                .with_data(json!({"reason": reason, "sessionId": id, "enduringAgentId": key})),
+        };
+        let mut changed_paths = Vec::new();
+        if changed {
+            if let Err(e) = write_stage(&sessions_path(), &file) {
+                return stage_error(cmd, e);
+            }
+            changed_paths.push(sessions_path().to_string_lossy().into_owned());
+            match restage_graph() {
+                Ok(path) => changed_paths.push(path.to_string_lossy().into_owned()),
+                Err(e) => return stage_error(cmd, e),
+            }
+        }
+        Outcome::ok(cmd, if changed { "enduring agent bound" } else { "enduring agent already bound" })
+            .changed(changed_paths)
+            .with_data(json!({"sessionId": id, "enduringAgentId": key, "bindingChanged": changed}))
+    })
+}
+
+#[cfg(test)]
+mod enduring_binding_tests {
+    use super::*;
+
+    #[test]
+    fn daemon_binding_ignores_optional_knowledge_config_and_preserves_refusals_on_disk() {
+        let _lock = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("enduring-binding");
+        let _config_env = aoide_test_support::EnvSaver::capture(&["AOIDE_CONFIG"]);
+        let broken_config = root.join("deliberately-invalid.toml");
+        std::fs::write(&broken_config, "not valid toml !").unwrap();
+        std::env::set_var("AOIDE_CONFIG", broken_config);
+        let file = SessionsFile { sessions:vec![SessionRecord {
+            session_id:"executor".into(), agent:"claude".into(), state:"idle".into(),
+            ..Default::default()
+        }], ..Default::default() };
+        write_stage(&sessions_path(), &file).unwrap();
+        let invocation = |id: &str, key: &str| Invocation {
+            path:vec!["session".into(), "bind".into()], args:vec![],
+            flags:[("id".into(),id.into()),("agent-id".into(),key.into())].into_iter().collect(),
+            door:aoide_protocol::Door::Daemon,
+        };
+        let key = "7e3f5976-98b2-44a4-827c-c687a0d9526e";
+        let first = session_bind(&invocation("executor", key));
+        assert_eq!(first.status, aoide_protocol::output::Status::Ok, "{first:?}");
+        let before = std::fs::read(sessions_path()).unwrap();
+        assert_eq!(session_bind(&invocation("executor", key)).data.unwrap()["bindingChanged"], false);
+        for (id,key) in [("missing",key),("executor","different-key"),("executor","Bad Key")] {
+            assert_eq!(session_bind(&invocation(id,key)).status, aoide_protocol::output::Status::Error);
+            assert_eq!(std::fs::read(sessions_path()).unwrap(), before);
+        }
+        let graph: Value = load_stage(&aoide_storage::stage::graph_path()).unwrap();
+        assert_eq!(graph["nodes"][0]["enduringAgentId"], key);
+        let bound: SessionsFile = load_stage(&sessions_path()).unwrap();
+        ledger_session_exit(&bound.sessions[0], "2026-09-09T12:00:00Z");
+        assert_eq!(aoide_storage::ledger::read_ledger().unwrap()[0].enduring_agent_id.as_deref(), Some(key));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn remote_binding_is_refused_before_session_lookup() {
+        for door in [aoide_protocol::Door::Mcp, aoide_protocol::Door::A2a] {
+            let inv = Invocation {path:vec!["session".into(),"bind".into()], args:vec![], flags:Default::default(), door};
+            let out = session_bind(&inv);
+            assert_eq!(out.status, aoide_protocol::output::Status::Error);
+            assert!(out.message.contains("local-only"));
+        }
+    }
+}

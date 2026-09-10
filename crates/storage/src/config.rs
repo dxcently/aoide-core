@@ -99,6 +99,37 @@ pub struct Config {
     /// simply declares no mesh, loads byte-identically to before it existed.
     #[serde(default)]
     pub mesh: BTreeMap<String, Mesh>,
+    /// Explicit enduring identities and their canonical Mneme references.
+    #[serde(default)]
+    pub context: Context,
+}
+
+/// Dynamic operator-declared maps, like `mesh`: validated but not `config set` targets.
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Context {
+    #[serde(default)]
+    pub agents: BTreeMap<String, AgentContext>,
+    #[serde(default)]
+    pub vaults: BTreeMap<String, ContextVault>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct AgentContext {
+    pub vault: String,
+    pub persona_note: String,
+    pub memory_note: String,
+}
+
+/// A logical vault reference resolves on this host to one authenticated service.
+/// Only the environment variable NAME is configuration; credentials never are.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ContextVault {
+    pub endpoint: String,
+    pub vault: String,
+    pub token_env: String,
 }
 
 /// `[pairing]` — the pairing ceremony's own intent.
@@ -390,7 +421,49 @@ pub fn validate(config: &Config, path: &Path) -> Result<(), LoadError> {
             }
         }
     }
-    validate_mesh(&config.mesh, path)
+    validate_mesh(&config.mesh, path)?;
+    validate_context(&config.context, path)
+}
+
+fn validate_context(context: &Context, path: &Path) -> Result<(), LoadError> {
+    let invalid = |key: String, detail: &str| LoadError::InvalidValue {
+        path: path.to_path_buf(), key, detail: detail.into(),
+    };
+    let clean = |s: &str| !s.is_empty() && s.trim() == s && !s.chars().any(char::is_control);
+    for (key, vault) in &context.vaults {
+        if !clean(key) || !clean(&vault.vault) {
+            return Err(invalid(format!("context.vaults.{key}"), "vault keys and server vault names must be nonempty, without control characters or surrounding whitespace"));
+        }
+        let url = vault.endpoint.strip_prefix("https://")
+            .or_else(|| vault.endpoint.strip_prefix("http://"));
+        let authority = url.unwrap_or("").split('/').next().unwrap_or("");
+        if authority.is_empty() || vault.endpoint.chars().any(char::is_whitespace)
+            || vault.endpoint.chars().any(char::is_control)
+            || vault.endpoint.contains(['?', '#']) || authority.contains('@') {
+            return Err(invalid(format!("context.vaults.{key}.endpoint"), "expected an HTTP(S) MCP endpoint without user info, query credentials, fragment, or whitespace"));
+        }
+        let mut chars = vault.token_env.chars();
+        if !matches!(chars.next(), Some(c) if c == '_' || c.is_ascii_alphabetic())
+            || !chars.all(|c| c == '_' || c.is_ascii_alphanumeric()) {
+            return Err(invalid(format!("context.vaults.{key}.tokenEnv"), "expected an environment variable name, never a token value"));
+        }
+    }
+    for (key, agent) in &context.agents {
+        if !crate::node_store::valid_node_name(key) {
+            return Err(invalid("context.agents".into(), "enduring keys use lowercase letters, digits, and hyphens, starting with a letter or digit"));
+        }
+        if !context.vaults.contains_key(&agent.vault) {
+            return Err(invalid(format!("context.agents.{key}.vault"), "logical vault is not declared in context.vaults"));
+        }
+        for (field, note) in [("personaNote", &agent.persona_note), ("memoryNote", &agent.memory_note)] {
+            if !clean(note) || note.starts_with('/') || note.contains('\\')
+                || note.split('/').any(|p| p.is_empty() || p == "." || p == "..")
+                || !note.ends_with(".md") {
+                return Err(invalid(format!("context.agents.{key}.{field}"), "expected an explicit vault-relative .md path without traversal"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// [`Config::mesh`]'s own pass: a mesh name and every node name inside it
@@ -1232,5 +1305,42 @@ mod tests {
             assert!(out.changed);
             assert_eq!(load().unwrap().config.upkeep.verify_command, "");
         });
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+    const CONFIG: &str = r#"
+[context.vaults.knowledge]
+endpoint = "https://mneme.example/mcp"
+vault = "Personal"
+tokenEnv = "MNEME_TOKEN"
+[context.agents."4cf1-opaque"]
+vault = "knowledge"
+personaNote = "personas/rook.md"
+memoryNote = "memory/rook.md"
+"#;
+
+    #[test]
+    fn context_is_optional_and_opaque_keys_are_not_session_names() {
+        assert_eq!(parse("", Path::new("config.toml")).unwrap().context, Context::default());
+        let parsed = parse(CONFIG, Path::new("config.toml")).unwrap();
+        assert_eq!(parsed.context.agents["4cf1-opaque"].vault, "knowledge");
+    }
+
+    #[test]
+    fn broken_references_and_inline_credentials_are_refused() {
+        for (before, after) in [
+            ("vault = \"knowledge\"", "vault = \"missing\""),
+            ("MNEME_TOKEN", "Bearer secret value"),
+            ("https://mneme.example/mcp", "https://token@mneme.example/mcp"),
+            ("https://mneme.example/mcp", "https://mneme.example/mcp?token=secret"),
+            ("personas/rook.md", "../rook.md"),
+            ("personas/rook.md", "Rook"),
+        ] {
+            assert!(parse(&CONFIG.replace(before, after), Path::new("config.toml")).is_err(), "accepted {after}");
+        }
+        assert!(parse(&format!("{CONFIG}\nunknown = true\n"), Path::new("config.toml")).is_err());
     }
 }

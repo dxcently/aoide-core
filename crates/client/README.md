@@ -6,6 +6,32 @@ never the inbound/serve half (that's `aoide-server`).
 
 ## Named seams (what it exposes)
 
+- `context` implements `aoide context --id <session>`: local CLI requests
+  daemon-owned, read-only persona/memory retrieval through the optional
+  portable `context` config. The CLI requires aoided; MCP/A2A are refused.
+  Its CLI reply wait is bounded at 120 seconds for the sequential 15-second
+  HTTP requests and cleanup; timeout is incomplete, never retried. Other
+  daemon dispatch callers retain their two-second bound.
+  Configure the named `tokenEnv` in **aoided's environment**: caller secrets
+  are not forwarded in an invocation. Missing bindings, mappings, credentials,
+  or note references fail explicitly. No cache, prompt insertion, or write.
+  `mcp_client::McpSession` performs initialize/initialized and carries the
+  negotiated protocol version and optional MCP session ID through every
+  request. `commands::request_json_with_headers` keeps bounded response headers
+  alongside the body through the existing curl runner; credentials and MCP
+  session headers use stdin, never argv. Melete's existing commands retain
+  their stateless behavior. Assigned MCP sessions receive a bounded DELETE
+  after retrieval (and after a failed initialization); cleanup failure does
+  not replace the primary result. `sessionCleanup` reports closed, unsupported
+  (HTTP 405), failed, or not-applicable for a stateless server.
+  Each requested `.md` path must appear exactly in `list_notes` before
+  `read_note`. Returned notes include content, SHA-256, requested reference,
+  and retrieval time. These are sequential reads with no server revision:
+  Mneme may alias-resolve a path changed between listing and reading, so
+  coordinated writers must keep references stable during retrieval. A later
+  failure returns a nonzero outcome with `complete=false` and any earlier
+  fetched notes explicitly separated from errors.
+
 - `daemon` — the fourth door's outbound half (P-D6, `docs/architecture/
   AOIDED.md`'s "L4 — graph residency"): `daemon_dispatch(&Invocation) ->
   Option<Outcome>` tries the resident `aoided`'s `{"op":"dispatch"}` wire

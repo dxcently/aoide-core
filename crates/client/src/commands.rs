@@ -299,6 +299,76 @@ pub(crate) fn post_json(url: &str, body: &str, bearer: Option<&str>, extra_heade
     }
 }
 
+/// MCP needs response headers as well as the bounded body. Session headers and
+/// credentials use stdin; the shared curl runner remains the only spawn point.
+pub(crate) struct HttpResponse {
+    pub status: u16,
+    pub headers: Vec<(String, String)>,
+    pub body: String,
+}
+
+pub(crate) fn request_json_with_headers(
+    method: &str,
+    url: &str,
+    body: &str,
+    bearer: &str,
+    headers: &[(String, String)],
+    timeout_secs: u64,
+) -> Result<HttpResponse, String> {
+    if method != HTTP_METHOD && method != "DELETE" {
+        return Err("unsupported MCP HTTP method".into());
+    }
+    if bearer.is_empty() || bearer.chars().any(char::is_control) {
+        return Err("invalid bearer credential".into());
+    }
+    let mut header_lines = format!("Authorization: Bearer {bearer}\n");
+    for (name, value) in headers {
+        if name.is_empty() || !name.bytes().all(|c| c.is_ascii_alphanumeric() || c == b'-')
+            || value.chars().any(char::is_control) {
+            return Err("invalid HTTP header".into());
+        }
+        header_lines.push_str(&format!("{name}: {value}\n"));
+    }
+    let scratch = ScratchBodyFile::write(body)?;
+    let data_arg = scratch.arg();
+    let (status, raw) = run_curl_with_timeout(timeout_secs, &[
+        "--include", "--suppress-connect-headers", "-X", method,
+        "-H", "Content-Type: application/json", "-H", "@-",
+        "--data-binary", &data_arg, "--", url,
+    ], Some(&header_lines))?;
+    parse_http_response(status, &raw)
+}
+
+fn parse_http_response(status: u16, raw: &str) -> Result<HttpResponse, String> {
+    let mut rest = raw;
+    loop {
+        let (block, body) = rest.split_once("\r\n\r\n")
+            .or_else(|| rest.split_once("\n\n"))
+            .ok_or("HTTP response has no header boundary")?;
+        let mut lines = block.lines();
+        let status_line = lines.next().ok_or("HTTP response has no status line")?;
+        let mut parts = status_line.split_whitespace();
+        if !parts.next().is_some_and(|v| v.starts_with("HTTP/")) {
+            return Err("invalid HTTP status line".into());
+        }
+        let header_status = parts.next().and_then(|s| s.parse::<u16>().ok())
+            .ok_or("invalid HTTP status code")?;
+        if (100..200).contains(&header_status) {
+            rest = body;
+            continue;
+        }
+        if header_status != status {
+            return Err("HTTP status does not match transport status".into());
+        }
+        let mut headers = Vec::new();
+        for line in lines {
+            let (name, value) = line.split_once(':').ok_or("invalid HTTP response header")?;
+            headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+        }
+        return Ok(HttpResponse { status, headers, body: body.to_string() });
+    }
+}
+
 // ── Dial resolution (ssh-transport lane, P-S4): the tunnel seam every
 // ── outbound POST resolves through BEFORE it ever reaches `post_json` ───────
 //
@@ -6737,5 +6807,62 @@ mod tests {
         assert_eq!(out.data.unwrap()["pruned"], 0, "the letter just sent is nowhere near 30 days old");
 
         let _ = std::fs::remove_dir_all(&root);
+    }
+}
+
+#[cfg(test)]
+mod mcp_http_tests {
+    use super::*;
+
+    #[test]
+    fn headers_survive_interim_responses_without_consuming_body_lines() {
+        let response = parse_http_response(200, "HTTP/1.1 100 Continue\r\n\r\nHTTP/2 200 OK\r\nMcp-Session-Id: mcp-123\r\nContent-Type: application/json\r\n\r\n{\"result\":\"body: value\"}").unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.headers[0], ("mcp-session-id".into(), "mcp-123".into()));
+        assert_eq!(response.body, "{\"result\":\"body: value\"}");
+        assert!(parse_http_response(200, "HTTP/1.1 403 Forbidden\r\n\r\ndenied").is_err());
+        assert!(parse_http_response(200, "{\"missing\":\"headers\"}").is_err());
+    }
+
+    #[test]
+    fn mcp_credentials_and_session_headers_use_stdin_never_argv_or_body_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let _lock = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = aoide_test_support::EnvSaver::capture(&["PATH"]);
+        let dir = std::env::temp_dir().join(format!("aoide-mcp-http-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let shim = dir.join("curl");
+        let script = format!(r#"#!/bin/sh
+cat > '{0}/headers'
+printf '%s\n' "$@" > '{0}/argv'
+previous=''
+for arg in "$@"; do
+  if [ "$previous" = '--data-binary' ]; then
+    cat "${{arg#@}}" > '{0}/body'
+    printf '%s' "${{arg#@}}" > '{0}/scratch-path'
+  fi
+  previous="$arg"
+done
+printf 'HTTP/1.1 200 OK\r\nMcp-Session-Id: reply-id\r\n\r\n{{"jsonrpc":"2.0","id":1,"result":{{}}}}\n200'
+"#, dir.display());
+        std::fs::write(&shim, script).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::env::set_var("PATH", format!("{}:{}", dir.display(), std::env::var("PATH").unwrap_or_default()));
+        let response = request_json_with_headers("POST", "https://mneme.invalid/mcp", "{}", "test-bearer-value",
+            &[("Mcp-Session-Id".into(), "test-session-value".into())], 1).unwrap();
+        let argv = std::fs::read_to_string(dir.join("argv")).unwrap();
+        let headers = std::fs::read_to_string(dir.join("headers")).unwrap();
+        let body = std::fs::read_to_string(dir.join("body")).unwrap();
+        for value in ["test-bearer-value", "test-session-value"] {
+            assert!(headers.contains(value));
+            assert!(!argv.contains(value));
+            assert!(!body.contains(value));
+        }
+        let scratch = std::fs::read_to_string(dir.join("scratch-path")).unwrap();
+        assert!(!std::path::Path::new(&scratch).exists());
+        assert_eq!(response.headers[0].1, "reply-id");
+        assert!(request_json_with_headers("POST", "https://mneme.invalid/mcp", "{}", "token\nInjected: value", &[], 1).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

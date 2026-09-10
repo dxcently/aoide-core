@@ -237,6 +237,7 @@ mod tests {
     fn headless_session(path: &std::path::Path) -> SessionRecord {
         SessionRecord {
             session_id: "s1".into(),
+            enduring_agent_id: None,
             agent: "claude".into(),
             window_address: String::new(),
             cwd: "/tmp".into(),

@@ -36,6 +36,8 @@ pub struct LedgerEntry {
     pub v: u32,
     #[serde(rename = "sessionId", default)]
     pub session_id: String,
+    #[serde(rename = "enduringAgentId", default)]
+    pub enduring_agent_id: Option<String>,
     #[serde(default)]
     pub agent: String,
     #[serde(rename = "harnessSessionId", default)]
@@ -143,6 +145,7 @@ mod tests {
         let entry = LedgerEntry {
             v: 0,
             session_id: "s1".to_string(),
+            enduring_agent_id: Some("7e3f5976-98b2-44a4-827c-c687a0d9526e".into()),
             agent: "claude".to_string(),
             harness_session_id: Some("h1".to_string()),
             cwd: "/home/khoa/Aoide".to_string(),

@@ -2,6 +2,23 @@
 
 ## Invariants
 
+- **`context` is daemon-owned and local-only.** The CLI must route to aoided
+  and refuse if it is absent. Resolve `tokenEnv` only in that daemon's
+  environment; never forward caller credential values in Invocation, argv,
+  files, or diagnostics. MCP/A2A cannot use this credential-bearing surface.
+- **Mneme context reads require a real MCP session.** Use the shared bounded
+  curl transport with response headers, initialize then initialized, retain
+  the optional session ID, and match JSON/SSE responses by request ID.
+  A JSON-RPC error or `isError` tool result fails retrieval. Do not apply
+  Melete's existing stateless assumption to this path.
+- **Context provenance names requested references, not verified paths.**
+  Exact `list_notes` membership precedes each `read_note`, but the sequence
+  is not atomic and Mneme can alias-resolve after a concurrent path change.
+  Never claim a resolved path or source revision that the server did not
+  supply. Hash actual returned text bytes; partial reads stay explicit
+  errors with `complete=false`. No cache, automatic prompt insertion, or
+  shared-memory writes belong to this read operation.
+
 - **Outbound only.** This crate is the CLIENT half of A2A — node
   registration/messaging, the pairing ceremony's CLI half, the melete
   adapter. The serve/listen half lives in `aoide-server` and must never
@@ -118,8 +135,8 @@
   strictly would turn an unexpected-but-valid Melete reply shape into a
   hard parse failure instead of the taught error the untyped path
   produces today.
-- **`mcp_client` makes exactly ONE POST per command — no `initialize`-then-
-  session-id handshake is threaded into `graph`/`call` (M2, task #14).**
+- **Each existing `melete` command makes exactly ONE POST — no `initialize`-then-
+  session-id handshake is threaded into `melete graph`/`melete call` (M2, task #14).**
   Documented as an ASSUMPTION (this crate's module doc), not a proven
   wire fact — Melete's connector is treated as a stateless-per-request
   bearer-token API, the minimal shape the three commands need. If a live

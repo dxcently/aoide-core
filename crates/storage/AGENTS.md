@@ -2,6 +2,12 @@
 
 ## Invariants
 
+- **Enduring identity is independent of knowledge configuration.** Bind an
+  explicit `valid_node_name`-shaped key in `session::bind_enduring_agent`;
+  do not infer it from a persona title, session name, or optional Mneme map.
+  Refusals never mutate. UPSERT preserves the field. Session records omit an
+  absent `enduringAgentId`; exit ledger records serialize it as null.
+
 - **Stage files are read/written through `fs`/`stage`, never ad hoc.** A new
   consumer that wants a JSON file under the stage tree adds a typed
   accessor here rather than `serde_json::from_str`-ing a raw path elsewhere.
