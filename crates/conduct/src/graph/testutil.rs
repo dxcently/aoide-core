@@ -35,6 +35,7 @@ pub(crate) fn session(
     SessionRecord {
         session_id: id.into(),
         enduring_agent_id: None,
+            project: None,
         agent: "claude".into(),
         window_address: format!("0x{id}"),
         cwd: cwd.into(),

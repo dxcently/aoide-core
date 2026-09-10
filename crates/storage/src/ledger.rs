@@ -39,6 +39,8 @@ pub struct LedgerEntry {
     #[serde(rename = "enduringAgentId", default)]
     pub enduring_agent_id: Option<String>,
     #[serde(default)]
+    pub project: Option<String>,
+    #[serde(default)]
     pub agent: String,
     #[serde(rename = "harnessSessionId", default)]
     pub harness_session_id: Option<String>,
@@ -146,6 +148,7 @@ mod tests {
             v: 0,
             session_id: "s1".to_string(),
             enduring_agent_id: Some("7e3f5976-98b2-44a4-827c-c687a0d9526e".into()),
+            project: None,
             agent: "claude".to_string(),
             harness_session_id: Some("h1".to_string()),
             cwd: "/home/khoa/Aoide".to_string(),

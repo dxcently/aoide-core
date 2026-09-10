@@ -647,6 +647,7 @@ mod tests {
             state: state.to_string(),
             presence: "online",
             cwd: cwd.to_string(),
+            project: None,
             exempt: false,
         }
     }

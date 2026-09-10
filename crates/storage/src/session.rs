@@ -79,6 +79,7 @@ pub fn upsert_session(
         sessions.push(SessionRecord {
             session_id: id.to_string(),
             enduring_agent_id: None,
+            project: None,
             agent: agent.unwrap_or(CLAUDE_PROFILE.name).to_string(),
             window_address: window.unwrap_or_default().to_string(),
             cwd: cwd.unwrap_or_default().to_string(),

@@ -398,6 +398,7 @@ fn resurrect_one(
     // false` on a slow terminal open) — never a second wait loop here;
     // `session_spawn` already spent its own registration budget.
     stamp_resumed_from(&new_id, &c.entry.session_id);
+    if let Some(project) = &c.entry.project { super::actions::assign_project(&new_id, Some(project)); }
 
     // Carry the ledger entry's own `origin` forward onto the revived record
     // (LANE IDENTITY P-ID0, G6) — LOCAL-CLASS ONLY. `ledger_session_exit`
@@ -624,7 +625,7 @@ pub fn session_resurrect(inv: &Invocation) -> Outcome {
     };
     let anchored: Vec<aoide_storage::ledger::LedgerEntry> = ledger
         .into_iter()
-        .filter(|e| super::model::anchor_for(&e.cwd, &projects.projects) == Some(target_idx))
+        .filter(|e| e.project.as_ref().map_or_else(|| super::model::anchor_for(&e.cwd, &projects.projects) == Some(target_idx), |p| p == &projects.projects[target_idx].name))
         .collect();
 
     let selected: Vec<aoide_storage::ledger::LedgerEntry> = if let Some(id) = inv.flags.get("id") {
@@ -1133,6 +1134,7 @@ mod tests {
             v: 0,
             session_id: session_id.to_string(),
             enduring_agent_id: None,
+            project: None,
             agent: agent.to_string(),
             harness_session_id: Some(session_id.to_string()),
             cwd: cwd.to_string(),

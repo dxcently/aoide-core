@@ -238,6 +238,7 @@ mod tests {
         SessionRecord {
             session_id: "s1".into(),
             enduring_agent_id: None,
+            project: None,
             agent: "claude".into(),
             window_address: String::new(),
             cwd: "/tmp".into(),

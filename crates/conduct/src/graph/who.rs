@@ -115,6 +115,7 @@ pub(super) struct SessionView {
     pub(super) state: String,
     pub(super) presence: &'static str,
     pub(super) cwd: String,
+    pub(super) project: Option<String>,
     /// `SessionRecord::exempt` (task #20), carried through for the roster's
     /// one-word tag. Local rows read the real record; a node row has no
     /// cross-host exempt story yet (`grant.rs`'s module doc — out of scope,
@@ -169,6 +170,7 @@ pub(super) fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord],
                 state: s.state.clone(),
                 presence: session_presence(&s.state),
                 cwd: s.cwd.clone(),
+                project: s.project.clone(),
                 exempt: s.exempt,
             }
         })
@@ -212,6 +214,7 @@ pub(super) fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView>
                 presence: session_presence(&state),
                 state,
                 cwd: n["cwd"].as_str().unwrap_or("").to_string(),
+                project: n["project"].as_str().map(str::to_owned),
                 session_id,
                 petname,
                 // No cross-host exempt story yet (module doc's widening
@@ -410,6 +413,7 @@ fn node_json(n: &NodeView) -> Value {
             "state": s.state,
             "presence": s.presence,
             "cwd": s.cwd,
+            "project": s.project,
             "exempt": s.exempt,
         })).collect::<Vec<_>>(),
     })
@@ -460,7 +464,7 @@ fn group_by_project(nodes: Vec<NodeView>, projects: &[Project]) -> Vec<ProjectGr
     let mut buckets: std::collections::HashMap<String, Vec<SessionView>> = std::collections::HashMap::new();
     for node in nodes {
         for sv in node.sessions {
-            let name = project_bucket(&sv.cwd, projects).unwrap_or_else(|| NO_PROJECT.to_string());
+            let name = sv.project.clone().or_else(|| project_bucket(&sv.cwd, projects)).unwrap_or_else(|| NO_PROJECT.to_string());
             if !buckets.contains_key(&name) {
                 order.push(name.clone());
             }
@@ -511,6 +515,7 @@ fn group_json(g: &ProjectGroup) -> Value {
             "state": s.state,
             "presence": s.presence,
             "cwd": s.cwd,
+            "project": s.project,
             "exempt": s.exempt,
         })).collect::<Vec<_>>(),
     })
@@ -788,8 +793,8 @@ mod tests {
             fetched_at: None,
             error: None,
             sessions: vec![
-                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), exempt: true },
-                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), exempt: false },
+                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, exempt: true },
+                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, exempt: false },
             ],
         }];
         let rendered = render_nodes(&nodes);
@@ -809,7 +814,7 @@ mod tests {
                 agent: "claude".into(),
                 state: "idle".into(),
                 presence: "online",
-                cwd: "/x".into(),
+                cwd: "/x".into(), project: None,
                 exempt: true,
             }],
         }];
@@ -842,7 +847,7 @@ mod tests {
                 agent: "claude".to_string(),
                 state: "working".to_string(),
                 presence: "online",
-                cwd: "/y".to_string(),
+                cwd: "/y".to_string(), project: None,
                 exempt: false,
             }],
         };
@@ -934,9 +939,9 @@ mod tests {
             fetched_at: None,
             error: None,
             sessions: vec![
-                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/z/nowhere".into(), exempt: false },
-                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/zeta/x".into(), exempt: false },
-                SessionView { session_id: "s3".into(), label: "l3".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/alpha/x".into(), exempt: false },
+                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/z/nowhere".into(), project: None, exempt: false },
+                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/zeta/x".into(), project: None, exempt: false },
+                SessionView { session_id: "s3".into(), label: "l3".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/alpha/x".into(), project: None, exempt: false },
             ],
         }];
         let projects = vec![project("zeta", "/proj/zeta"), project("alpha", "/proj/alpha")];
@@ -966,7 +971,7 @@ mod tests {
                 agent: "claude".into(),
                 state: "working".into(),
                 presence: "online",
-                cwd: "/home/k/Aoide/pkgs/aoide".into(),
+                cwd: "/home/k/Aoide/pkgs/aoide".into(), project: None,
                 exempt: false,
             }],
         }];
