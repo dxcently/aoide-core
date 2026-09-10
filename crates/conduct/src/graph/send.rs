@@ -600,6 +600,18 @@ fn real_attested_wrap(hook_pid: i32) -> Option<String> {
     })
 }
 
+/// `HookAction::Start`'s own parent resolution (P-QOL-C §3): attested kernel
+/// evidence outranks the ordinary same-user `AOIDE_SESSION_ID` env var, the
+/// SAME order [`hook_ensure_session_with`]'s fresh branch already resolves
+/// in. Pure — `attested` and `env_parent` are already-resolved values, not a
+/// pid to walk — so the preference order is directly testable without a
+/// live daemon: [`real_attested_wrap`] itself always resolves `None` under
+/// this crate's fixtures (a dead `AOIDE_DAEMON_SOCKET` by design,
+/// `aoide_test_support::isolated_mail_root`'s own doc).
+fn start_parent(attested: Option<String>, env_parent: Option<String>) -> Option<String> {
+    attested.or(env_parent)
+}
+
 /// The exact body `--id` has always run, factored out so [`session_send_to`]'s
 /// LOCAL resolution branch re-drives it unmodified rather than reimplementing
 /// any piece of the gate/pending/provenance/audit path — the phase's SACRED
@@ -1641,10 +1653,12 @@ fn my_hook_ancestry() -> Vec<i32> {
 /// `attest` decides whether the walk runs AT ALL — `None` skips it outright,
 /// `resolve_wrap` never called. The walk is a daemon ping for the seal
 /// pubkey, a full sessions.json load, and up to a 64-hop /proc walk; a
-/// terminal's wrap only ever changes across a process restart (which fires
-/// `SessionStart`, registering fresh) or a `--resume` onto a new wrap (caught
-/// by the very next per-turn hook re-checking) — never mid-turn, never
-/// mid-tool-call. So `HookAction::Phase`'s registration self-heal and
+/// terminal's wrap only ever changes across a process restart or a
+/// `--resume` onto a new wrap, both of which fire `SessionStart` —
+/// `HookAction::Start` in `hook_for_profile_gated` runs this SAME attested
+/// walk directly (`start_parent`), so a resumed record re-parents right
+/// there, not only on the next per-turn hook re-checking — never mid-turn,
+/// never mid-tool-call. So `HookAction::Phase`'s registration self-heal and
 /// `PhaseIfRunning` (each fires once per turn) pass `Some(hook_pid)`;
 /// `ToolStart`/`ToolEnd`/`SubRekey`/`SubEnsure` — PreToolUse/PostToolUse and
 /// their subagent siblings, fired on EVERY tool call, the hottest hooks in
@@ -1840,6 +1854,14 @@ fn hook_for_profile_gated(
             let env_parent = std::env::var("AOIDE_SESSION_ID")
                 .ok()
                 .filter(|p| !p.is_empty() && *p != id);
+            // Attested kernel evidence outranks `env_parent` (`start_parent`'s
+            // own doc): `do_session_start` below re-stamps `parentSessionId`
+            // on any EXISTING id whenever `parent` is `Some` (`upsert_session`
+            // in `aoide-storage`), so resolving the attested wrap HERE — not
+            // only on the next per-turn hook via `hook_ensure_session` — is
+            // what closes the window where a `--resume` under a new wrap
+            // leaves a `session kill` resolving through the STALE one.
+            let parent = start_parent(real_attested_wrap(hook_pid), env_parent);
             // Windowless by construction (task #89): this (about-to-be-set)
             // parent's own lineage running through an unwindowed conducted
             // wrap means THIS session has no window either — skip discovery
@@ -1848,7 +1870,7 @@ fn hook_for_profile_gated(
             // the eviction pass treat two unrelated agents as stale twins).
             let windowless = load_stage::<SessionsFile>(&sessions_path())
                 .ok()
-                .map(|f| windowless_by_lineage_from_parent(env_parent.as_deref(), &f.sessions))
+                .map(|f| windowless_by_lineage_from_parent(parent.as_deref(), &f.sessions))
                 .unwrap_or(false);
             // Best-effort: the hook is a subprocess of the agent's terminal, so
             // discover that window (+ its owning pid) now and register it — this
@@ -1884,7 +1906,7 @@ fn hook_for_profile_gated(
                 Some(profile.name),
                 cwd.as_deref(),
                 window.as_deref(),
-                env_parent.as_deref(),
+                parent.as_deref(),
                 None,
                 None,
                 None,
@@ -6196,6 +6218,61 @@ mod tests {
             rec.parent_session_id.as_deref(),
             Some("wrap-x"),
             "the fresh branch still prefers an attested wrap over AOIDE_SESSION_ID"
+        );
+    }
+
+    /// P-QOL-C §3's own resolution order, isolated from any daemon or hook
+    /// plumbing — [`start_parent`] takes already-resolved values, so this is
+    /// a plain unit test needing no env/stage fixture (kept anyway for the
+    /// suite's own convention — see the guard on the next test's doc).
+    #[test]
+    fn start_parent_prefers_attested_over_env_and_falls_back() {
+        assert_eq!(
+            start_parent(Some("wrap-x".to_string()), Some("env-parent".to_string())),
+            Some("wrap-x".to_string()),
+            "an attested wrap outranks the env parent"
+        );
+        assert_eq!(
+            start_parent(None, Some("env-parent".to_string())),
+            Some("env-parent".to_string()),
+            "no attested wrap falls back to the env parent"
+        );
+        assert_eq!(start_parent(None, None), None, "neither present resolves to no parent");
+    }
+
+    /// The exact upsert path the `HookAction::Start` arm now relies on
+    /// (`do_session_start` → `aoide_storage::session::upsert_session`): a
+    /// re-`session_start` on an EXISTING id, given a DIFFERENT parent,
+    /// re-stamps `parentSessionId` — the shape a `--resume` under a newly
+    /// attested wrap now produces, since the arm passes `start_parent`'s
+    /// resolved value straight through. No separate cycle-guard test needed
+    /// here — `session_start_refuses_a_cyclic_parent` (`session_store.rs`)
+    /// already pins that half of this same call.
+    #[test]
+    fn do_session_start_reparents_an_existing_record_with_a_stale_parent() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env_sid = EnvVars::save(&["AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (_env, _root) = aoide_test_support::isolated_mail_root("do-session-start-reparent");
+
+        do_session_start(
+            "resumed", Some("claude"), Some("/p"), None, Some("old-wrap"), None, None, None, None,
+        );
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            s.sessions.iter().find(|s| s.session_id == "resumed").unwrap().parent_session_id.as_deref(),
+            Some("old-wrap"),
+            "setup: the stale-parented shape a --resume leaves behind"
+        );
+
+        do_session_start(
+            "resumed", Some("claude"), Some("/p"), None, Some("new-wrap"), None, None, None, None,
+        );
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            s.sessions.iter().find(|s| s.session_id == "resumed").unwrap().parent_session_id.as_deref(),
+            Some("new-wrap"),
+            "an existing record re-parents onto the newly attested wrap"
         );
     }
 }
