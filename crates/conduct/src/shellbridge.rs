@@ -584,11 +584,23 @@ fn dispatch_recheck_sessions() {
 
 // ── session actions (the acknowledged session-menu bridge) ─────────────────
 
-/// A wire value that becomes a bare argv token: a session id, a project name.
-fn safe_action_value(s: &str) -> bool {
+/// A wire value that becomes a bare argv token: a SESSION ID. Stricter than
+/// [`safe_action_value`] below — a session id is a bookkeeping key with no
+/// legitimate use for whitespace, so any is refused outright.
+fn safe_session_id(s: &str) -> bool {
     !s.is_empty()
         && !s.starts_with('-')
         && s.chars().all(|c| !c.is_whitespace() && !c.is_control())
+}
+
+/// A wire value that becomes a bare argv token: a PROJECT NAME (`project`'s
+/// `project` field, `createproject`/`editproject`'s `name`). Ordinary spaces
+/// ARE legal here — "My Project" is a real name, and an argv element is
+/// passed to `Command::arg` whole, never through a shell — so only
+/// emptiness, a leading `-` (flag-shaped), and control characters are
+/// refused. Session ids keep the stricter [`safe_session_id`] above.
+fn safe_action_value(s: &str) -> bool {
+    !s.is_empty() && !s.starts_with('-') && !s.chars().any(char::is_control)
 }
 
 /// A wire value that becomes a filesystem path argument. Whitespace IS legal
@@ -600,12 +612,6 @@ fn safe_action_value(s: &str) -> bool {
 fn safe_action_path(s: &str) -> bool {
     s.starts_with('/') && !s.chars().any(char::is_control)
 }
-
-/// The path-list length cap for `createproject`/`editproject`. The list is
-/// built from a wire value, so its length is bounded on principle: 16 is far
-/// above any real project's root count and stops one hostile line from
-/// building a ten-thousand-element argv.
-const MAX_ACTION_PATHS: usize = 16;
 
 /// The closed, five-action session-menu whitelist — a PLAN, not one argv.
 /// One action is one or two invocations, run in order, stopping at the first
@@ -626,7 +632,7 @@ const MAX_ACTION_PATHS: usize = 16;
 /// matching the UI is the whole point of this slice. Do not "normalize"
 /// them.
 fn session_action_args(session_id: &str, action: &str, fields: &Value) -> Option<Vec<Vec<String>>> {
-    if !safe_action_value(session_id) {
+    if !safe_session_id(session_id) {
         return None;
     }
     let id = session_id.to_string();
@@ -646,16 +652,13 @@ fn session_action_args(session_id: &str, action: &str, fields: &Value) -> Option
             ]])
         }
         "project" => {
-            // No `clear` field: an empty name IS the clear request, which is
-            // what the menu's "Automatic from directory" row sends. A
-            // non-string `project` reads as absent and therefore clears —
-            // lax, deliberate, and harmless: the worst a malformed value can
-            // do is restore the default anchoring.
-            let name = fields
-                .get("project")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .unwrap_or("");
+            // No `clear` field: an empty STRING is the clear request, which
+            // is what the menu's "Automatic from directory" row sends. But
+            // `project` must actually BE a JSON string — a missing key or a
+            // non-string value (`null`, a number, …) is refused outright,
+            // never read as an implicit clear: a malformed wire line must
+            // never mutate anything.
+            let name = fields.get("project").and_then(Value::as_str)?.trim();
             if name.is_empty() {
                 Some(vec![vec![
                     "session".to_string(),
@@ -694,7 +697,9 @@ fn session_action_args(session_id: &str, action: &str, fields: &Value) -> Option
             let raw_paths = fields.get("paths").and_then(Value::as_array)?;
             // An empty list is `None`, not an instruction to erase: an
             // "exact replacement" with nothing to replace with is a mistake.
-            if raw_paths.is_empty() || raw_paths.len() > MAX_ACTION_PATHS {
+            // No length cap: the list is bounded by the wire's own line
+            // length, not by a count guessed in advance.
+            if raw_paths.is_empty() {
                 return None;
             }
             let mut paths = Vec::with_capacity(raw_paths.len());
@@ -737,13 +742,17 @@ fn session_action_args(session_id: &str, action: &str, fields: &Value) -> Option
     }
 }
 
-/// The `status`-is-ok flag and `message` of one `--json` envelope, from
-/// whichever stream carried it.
-fn outcome_envelope(stream: &str) -> Option<(bool, String)> {
+/// The `status`-is-ok flag, `message`, and optional `data` payload of one
+/// `--json` envelope, from whichever stream carried it. `data` is `None`
+/// when the key is absent — carried through verbatim by
+/// [`session_action_reply`] when a step's CLI outcome has one (a `kill`
+/// reply's resolved target/pid, say).
+fn outcome_envelope(stream: &str) -> Option<(bool, String, Option<Value>)> {
     let v: Value = serde_json::from_str(stream.trim()).ok()?;
     let ok = v.get("status").and_then(Value::as_str)? == "ok";
     let message = v.get("message").and_then(Value::as_str).unwrap_or("").trim().to_string();
-    Some((ok, message))
+    let data = v.get("data").cloned();
+    Some((ok, message, data))
 }
 
 /// Shape the ONE JSON reply line for an acknowledged session action — pure
@@ -762,8 +771,8 @@ fn session_action_reply(
     stdout: &str,
     stderr: &str,
 ) -> Value {
-    let (ok, message) = match outcome_envelope(stdout).or_else(|| outcome_envelope(stderr)) {
-        Some((status_ok, msg)) => {
+    let (ok, message, data) = match outcome_envelope(stdout).or_else(|| outcome_envelope(stderr)) {
+        Some((status_ok, msg, data)) => {
             let ok = exited_ok && status_ok;
             let message = if !msg.is_empty() {
                 msg
@@ -772,7 +781,7 @@ fn session_action_reply(
             } else {
                 format!("session {action} failed")
             };
-            (ok, message)
+            (ok, message, data)
         }
         None => {
             let stderr = stderr.trim();
@@ -784,15 +793,19 @@ fn session_action_reply(
             } else {
                 format!("`aoide {action}` printed no parseable envelope")
             };
-            (false, message)
+            (false, message, None)
         }
     };
-    json!({
+    let mut reply = json!({
         "ok": ok,
         "message": message,
         "action": action,
         "sessionId": session_id,
-    })
+    });
+    if let Some(data) = data {
+        reply["data"] = data;
+    }
+    reply
 }
 
 /// One step, spawned: exec the core `aoide` binary
@@ -1784,16 +1797,11 @@ mod tests {
 
     #[test]
     fn parse_command_accepts_a_session_project_clear() {
-        // An empty name IS the clear request, not a rejection.
+        // An explicit empty STRING is the clear request, not a rejection.
         assert!(matches!(
             parse_command(
                 r#"{"cmd":"sessionaction","sessionId":"s1","action":"project","fields":{"project":""}}"#
             ),
-            Some(BridgeCommand::SessionAction { .. })
-        ));
-        // So is an absent `fields` key.
-        assert!(matches!(
-            parse_command(r#"{"cmd":"sessionaction","sessionId":"s1","action":"project"}"#),
             Some(BridgeCommand::SessionAction { .. })
         ));
     }
@@ -1900,6 +1908,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_command_rejects_a_project_action_with_a_missing_or_non_string_project_field() {
+        // A missing key, `null`, or a non-string value never mutates
+        // anything — the whitelist drops the request as unknown rather than
+        // guessing at "clear".
+        for fields in [r#"{}"#, r#"{"project":null}"#, r#"{"project":5}"#] {
+            assert_eq!(
+                parse_command(&format!(
+                    r#"{{"cmd":"sessionaction","sessionId":"s1","action":"project","fields":{fields}}}"#
+                )),
+                None,
+                "{fields} must be refused"
+            );
+        }
+        // An absent `fields` key entirely is the same as `{}` above.
+        assert_eq!(
+            parse_command(r#"{"cmd":"sessionaction","sessionId":"s1","action":"project"}"#),
+            None
+        );
+    }
+
+    #[test]
     fn parse_command_rejects_a_project_edit_with_no_paths() {
         // An "exact replacement" with nothing to replace with is a mistake,
         // never an instruction to erase.
@@ -1948,25 +1977,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_command_rejects_more_paths_than_the_cap() {
-        let paths17: Vec<String> = (0..17).map(|i| format!("\"/p{i}\"")).collect();
-        let paths16: Vec<String> = (0..16).map(|i| format!("\"/p{i}\"")).collect();
-        let line17 = format!(
-            r#"{{"cmd":"sessionaction","sessionId":"s1","action":"createproject","fields":{{"name":"aoide","paths":[{}]}}}}"#,
-            paths17.join(",")
-        );
-        let line16 = format!(
-            r#"{{"cmd":"sessionaction","sessionId":"s1","action":"createproject","fields":{{"name":"aoide","paths":[{}]}}}}"#,
-            paths16.join(",")
-        );
-        assert_eq!(parse_command(&line17), None, "17 paths must exceed the cap");
-        assert!(
-            matches!(parse_command(&line16), Some(BridgeCommand::SessionAction { .. })),
-            "16 paths must be accepted"
-        );
-    }
-
     // -- argv exactness --
 
     #[test]
@@ -1991,9 +2001,20 @@ mod tests {
 
     #[test]
     fn session_action_args_builds_the_exact_project_clear_argv() {
-        let want = Some(vec![sv(&["session", "project", "--id", "s1", "--clear"])]);
-        assert_eq!(session_action_args("s1", "project", &json!({"project":""})), want);
-        assert_eq!(session_action_args("s1", "project", &json!({})), want);
+        assert_eq!(
+            session_action_args("s1", "project", &json!({"project":""})),
+            Some(vec![sv(&["session", "project", "--id", "s1", "--clear"])])
+        );
+    }
+
+    #[test]
+    fn session_action_args_rejects_a_missing_or_non_string_project_field() {
+        // `project` must BE a JSON string: a missing key, `null`, or a
+        // number all read as unknown and refuse the whole action — never as
+        // an implicit clear.
+        assert_eq!(session_action_args("s1", "project", &json!({})), None);
+        assert_eq!(session_action_args("s1", "project", &json!({"project": null})), None);
+        assert_eq!(session_action_args("s1", "project", &json!({"project": 5})), None);
     }
 
     #[test]
@@ -2031,19 +2052,54 @@ mod tests {
     }
 
     #[test]
-    fn session_action_args_never_admits_whitespace_or_control_characters_in_a_name() {
+    fn session_action_args_never_admits_whitespace_in_a_session_id() {
         assert_eq!(session_action_args("a b", "kill", &json!({})), None);
         assert_eq!(session_action_args("a\nb", "kill", &json!({})), None);
         assert_eq!(session_action_args("a\tb", "kill", &json!({})), None);
+    }
+
+    #[test]
+    fn session_action_args_admits_ordinary_spaces_but_rejects_control_characters_in_a_name() {
+        // "My Project" is a real, legal name across all three shapes that
+        // carry one — argv elements are passed to `Command::arg` whole,
+        // never through a shell, so a space is no more dangerous here than
+        // in a path.
         assert_eq!(
-            session_action_args("s1", "project", &json!({"project":"my project"})),
-            None
+            session_action_args("s1", "project", &json!({"project":"My Project"})),
+            Some(vec![sv(&["session", "project", "--id", "s1", "--project", "My Project"])])
         );
+        assert_eq!(
+            session_action_args(
+                "s1",
+                "createproject",
+                &json!({"name":"My Project","paths":["/a"]})
+            ),
+            Some(vec![
+                sv(&["project", "add", "My Project", "/a", "--new"]),
+                sv(&["session", "project", "--id", "s1", "--project", "My Project"]),
+            ])
+        );
+        assert_eq!(
+            session_action_args(
+                "s1",
+                "editproject",
+                &json!({"name":"My Project","paths":["/a"]})
+            ),
+            Some(vec![sv(&["project", "edit", "My Project", "/a"])])
+        );
+        // A space is not a blanket whitespace exemption: control characters
+        // are still refused.
         assert_eq!(
             session_action_args("s1", "project", &json!({"project":"a\u{1b}b"})),
             None
         );
-        // A PATH containing a space is a DIFFERENT rule and IS accepted.
+        assert_eq!(session_action_args("s1", "project", &json!({"project":"a\nb"})), None);
+    }
+
+    #[test]
+    fn session_action_args_admits_a_space_in_a_path_too() {
+        // A PATH containing a space was always accepted — a different rule
+        // ([`safe_action_path`]), same underlying reasoning.
         assert_eq!(
             session_action_args(
                 "s1",
@@ -2069,6 +2125,21 @@ mod tests {
         assert_eq!(reply["message"], "session project updated");
         assert_eq!(reply["action"], "project");
         assert_eq!(reply["sessionId"], "s1");
+        assert!(reply.get("data").is_none());
+    }
+
+    #[test]
+    fn a_session_action_reply_carries_the_cli_outcomes_data_verbatim() {
+        // A `kill` reply can show the resolved target/pid this way.
+        let reply = session_action_reply(
+            "s1",
+            "kill",
+            true,
+            r#"{"status":"ok","command":"session.kill","message":"session killed","data":{"pid":1234,"target":"s1"}}"#,
+            "",
+        );
+        assert_eq!(reply["ok"], true);
+        assert_eq!(reply["data"], json!({"pid": 1234, "target": "s1"}));
     }
 
     #[test]
