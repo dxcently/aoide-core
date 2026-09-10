@@ -6092,8 +6092,10 @@ mod tests {
     /// daemon reachable means [`real_attested_wrap`] resolves `None`, so
     /// `hook_ensure_session` touches neither `parentSessionId` nor the
     /// existing pid-refresh behavior — the fail-closed half of the seam,
-    /// exercised through two real hooks (a fresh SessionStart, then a
-    /// PreToolUse that hits the now-existing record's self-heal branch).
+    /// exercised through two real hooks: a fresh SessionStart, whose Start
+    /// arm walks and resolves `None` with no daemon, then a PreToolUse that
+    /// passes `attest: None` and hits the now-existing record's self-heal
+    /// branch without ever calling the resolver.
     #[test]
     fn hook_leaves_the_parent_untouched_when_no_wrap_is_attested() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
