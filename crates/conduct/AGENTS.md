@@ -844,8 +844,12 @@
   project management`), never a silent local write; a `Door::Daemon`
   caller (already inside `aoided`) takes the local path directly —
   `daemon_dispatch` short-circuits to `None` on `Door::Daemon` for exactly
-  this reentrancy reason; every other door is refused as local-only. The
-  local mutation lives in three inner helpers (`add_roots`/`remove_roots`/
+  this reentrancy reason; every other door is refused as local-only.
+  `register_bootstrap_project` (also in `manage.rs`) is the one exception:
+  `aoide onboard`'s `register_clone` is its sole caller, calling straight
+  into `add_roots` before any daemon exists to dispatch to, never through
+  `local_daemon`. The local
+  mutation lives in three inner helpers (`add_roots`/`remove_roots`/
   `edit_roots`), each wrapped ONCE, end to end, in
   `aoide_storage::fs::with_stage_lock` — the `--new` existence check (or
   the membership check, or the replacement) and the write happen under the
