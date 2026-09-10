@@ -52,7 +52,7 @@ use super::session_store::{
 };
 use super::window::{discover_window, ensure_session_window, pid_ancestry, windowless_by_lineage_from_parent};
 use aoide_protocol::agents::{agent_profile, known_agents, AgentProfile, HookClass, CLAUDE_PROFILE};
-use aoide_protocol::Invocation;
+use aoide_protocol::{Door, Invocation};
 use aoide_protocol::output::Outcome;
 use aoide_storage::addr::{self, LocalCandidate, Resolution};
 use aoide_storage::fs::{conducting_stage_dir, with_stage_lock};
@@ -1689,7 +1689,25 @@ fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str) {
     stamp_hook_ancestry(id, &my_hook_ancestry());
 }
 
+/// Test-only convenience wrapper: every existing test in this module drives
+/// `HookAction` handling through here rather than [`session_hook`]'s own
+/// door gate, so it always allows the replay — the shape this function held
+/// before P-M5a-2c split the gate out. `#[cfg(test)]` because production now
+/// has no caller of this arity: [`session_hook`] calls
+/// [`hook_for_profile_gated`] directly with the real `may_ring` value.
+#[cfg(test)]
 fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
+    hook_for_profile_gated(profile, buf, true)
+}
+
+/// `may_ring` gates ONLY the Stop-hook ring replay inside `HookAction::
+/// Phase`'s `phase == "stopped"` arm (P-M5a-2c: a ring executes only under
+/// `Door::Daemon` — the daemon is the policy and audit boundary for every
+/// ring). Every other action, and every other line of this function, is
+/// unaffected by it. [`session_hook`] is the one production caller, passing
+/// `inv.door == Door::Daemon` straight through — never a global, a
+/// thread-local, or an env var.
+fn hook_for_profile_gated(profile: &'static AgentProfile, buf: &str, may_ring: bool) -> Outcome {
     let cmd = "session.hook";
     let noop = |reason: &str| {
         Outcome::ok(cmd, format!("no-op ({reason})"))
@@ -1888,16 +1906,22 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
                 // exactly like the check lane above: a ring failure here must
                 // never change this hook's own outcome, and a session-store
                 // read that comes back empty is silently a no-op.
-                if let Ok(file) = load_stage::<SessionsFile>(&sessions_path()) {
-                    if let Some(parent) = file
-                        .sessions
-                        .iter()
-                        .find(|s| s.session_id == id)
-                        .and_then(|s| s.parent_session_id.clone())
-                    {
-                        if let Ok(armed) = aoide_storage::mail::armed_names_for_reader(&parent) {
-                            for (name, _) in armed {
-                                let _ = super::ring(&name, None);
+                // Gated on `may_ring` (P-M5a-2c): a ring executes only under
+                // `Door::Daemon`, so this hook's local no-daemon fallback
+                // must never replay — the latch stays armed for the next
+                // daemon-handled trigger instead.
+                if may_ring {
+                    if let Ok(file) = load_stage::<SessionsFile>(&sessions_path()) {
+                        if let Some(parent) = file
+                            .sessions
+                            .iter()
+                            .find(|s| s.session_id == id)
+                            .and_then(|s| s.parent_session_id.clone())
+                        {
+                            if let Ok(armed) = aoide_storage::mail::armed_names_for_reader(&parent) {
+                                for (name, _) in armed {
+                                    let _ = super::ring(&name, None);
+                                }
                             }
                         }
                     }
@@ -2104,7 +2128,7 @@ const STDIN_PAYLOAD_FLAG: &str = "__daemon-stdin-payload";
 /// `session hook [--agent <name>]` — the hook door for agent harnesses.
 /// Reads ONE JSON object from stdin and maps it (through the selected agent
 /// profile) to the session commands. Never exits non-zero for a payload problem
-/// (see [`hook_for_profile`]); a bogus `--agent` is a plain CLI error.
+/// (see [`hook_for_profile_gated`]); a bogus `--agent` is a plain CLI error.
 ///
 /// P-D6 routing (`docs/architecture/AOIDED.md`'s "L4"): stdin is read FIRST,
 /// always, from THIS process's own pipe — a routed call cannot read it a
@@ -2118,8 +2142,17 @@ pub fn session_hook(inv: &Invocation) -> Outcome {
         Ok(p) => p,
         Err(o) => return o,
     };
+    // P-M5a-2c: the Stop-hook ring replay executes only under `Door::
+    // Daemon` — the daemon is the policy and audit boundary for every ring,
+    // the same ruling `doorbell.rs`'s own module doc states. `invocation_
+    // from_dispatch_request` (`aoide-server`'s `daemon.rs`) builds a
+    // `Door::Daemon` invocation LITERALLY, never off the wire, so this is
+    // trustworthy on both branches below: the STDIN_PAYLOAD_FLAG branch is
+    // exactly that routed invocation, and the local-fallback branch's `inv`
+    // is whatever door the ORIGINAL caller actually used.
+    let may_ring = inv.door == Door::Daemon;
     if let Some(payload) = inv.flags.get(STDIN_PAYLOAD_FLAG) {
-        return hook_for_profile(profile, payload);
+        return hook_for_profile_gated(profile, payload, may_ring);
     }
     let mut buf = String::new();
     let _ = std::io::stdin().lock().read_to_string(&mut buf);
@@ -2136,7 +2169,7 @@ pub fn session_hook(inv: &Invocation) -> Outcome {
     if let Some(outcome) = aoide_client::daemon::daemon_dispatch(&routed) {
         return outcome;
     }
-    hook_for_profile(profile, &buf)
+    hook_for_profile_gated(profile, &buf, may_ring)
 }
 
 #[cfg(test)]

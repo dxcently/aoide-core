@@ -779,7 +779,18 @@
   only ever does a brief in-memory read-modify-write, and a ring's own
   socket connect, write, and submit-keystroke delay must never make one
   of those wait. Don't fold them into one lock, and don't add a second
-  socket-holding critical section under `.stage.lock`.
+  socket-holding critical section under `.stage.lock`. It is the
+  daemon's own serializer for concurrent rings, not a second policy
+  boundary — see the next bullet for the actual boundary.
+- **A ring executes only under `Door::Daemon`** (P-M5a-2c, the
+  architecture owner's ruling on b8af466): the resident daemon is the
+  policy and audit boundary for every ring, not `.ring.lock`. `ring`
+  itself has exactly two callers — `mail_ring`'s own `Door::Daemon` arm,
+  and the Stop-hook replay when that hook is likewise being handled
+  under `Door::Daemon` — and every other door forwards through
+  `aoide_client::daemon::daemon_dispatch` instead of calling it. Do not
+  add a third caller of `ring` outside those two; a door that needs to
+  ring forwards, it never links around the daemon.
 - **A ring only ever stamps its latch (`stamp_rung`) AFTER a socket write
   that returned `Ok`, never before and never on a write failure.** The
   reader stays armed on any failure — unreachable socket, dead process,
@@ -806,6 +817,15 @@
   already decided, discards its `Result`, and never turns a successful
   Stop hook into a reported failure just because a deferred ring's socket
   write failed.
+- **The Stop-hook ring replay never rings on the no-daemon local path**
+  (P-M5a-2c): `session_hook` gates the replay on `inv.door ==
+  Door::Daemon`, threaded down as a single `may_ring` boolean, never a
+  global, thread-local, or env var. When the hook cannot reach a daemon
+  and falls back to handling itself locally, the replay is skipped
+  outright — not attempted and swallowed — and every name still armed
+  for that reader stays armed for the next daemon-handled trigger. The
+  hook's own `Outcome` is identical either way; only the replay is
+  gated.
 - **`doorbell.rs` changes update `docs/architecture/MAIL.md`'s "Delivery
   and the doorbell" section in the same commit** (house rule 8) — that
   section is the design's canonical prose statement; this file states

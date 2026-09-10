@@ -1718,15 +1718,6 @@ fn mail_deposit(params: &Value, ctx: &RequestCtx) -> Result<Value, (i64, String)
     match &outcome {
         aoide_storage::mail::DepositOutcome::Filed { msgid, kind } if kind == aoide_storage::mail::ENTRY_TYPE_LETTER => {
             spool_and_drain_ack(&envelope, msgid);
-            // The doorbell (P-M5a-2, MAIL.md "Delivery and the doorbell"):
-            // a remotely-deposited LETTER arms exactly like a locally-filed
-            // one, so it rings exactly like one too — in-process, under
-            // `ring`'s own `.ring.lock` file (never this process's copy of
-            // the stage lock). Best-effort: a ring failure must never turn
-            // an already-accepted deposit into a reported failure, and
-            // nothing here logs the mailbox name. A RECEIPT never rings —
-            // it is not arming mail (see the sibling arm below).
-            let _ = aoide_conduct::graph::ring(&envelope.header.to.name, None);
             Ok(json!({ "status": "accepted", "msgid": msgid }))
         }
         aoide_storage::mail::DepositOutcome::Filed { msgid, kind } if kind == aoide_storage::mail::ENTRY_TYPE_RECEIPT => {
@@ -9290,24 +9281,23 @@ mod tests {
     }
 
     #[test]
-    fn a_filed_remote_letter_rings_an_armed_headless_reader_and_a_receipt_does_not() {
-        // P-M5a-2: `mail_deposit`'s Filed-Letter arm rings in-process
-        // (`aoide_conduct::graph::ring`), the same lock file any other
-        // ringer takes. This crate already depends on `aoide-conduct`
-        // (never `aoide-client`), so — unlike `aoide-client`'s own `mail
-        // send`, which must forward through `daemon_dispatch` — the fixture
-        // here is a REAL headless wrap + hook-fed child pair, built the
-        // identical way `aoide-conduct`'s own `graph::doorbell` tests build
-        // it (`SessionRecord` literals written straight onto `sessions.json`
-        // via the SAME `write_stage`/`sessions_path` this crate already
-        // imports for its OTHER conductable-session tests above), proving
-        // the call site actually fires for a REMOTELY deposited letter, not
-        // only a locally filed one.
+    fn a_filed_remote_letter_does_not_ring_in_the_door_process() {
+        // P-M5a-2c: the architecture owner's ruling on b8af466 withdrew
+        // `mail_deposit`'s in-process `aoide_conduct::graph::ring` call — a
+        // ring now executes only inside the resident daemon. The fixture is
+        // unchanged from the slice this corrects (a REAL headless wrap +
+        // hook-fed child pair, armed for `conductor`, built the identical
+        // way `aoide-conduct`'s own `graph::doorbell` tests build it) so the
+        // ONLY thing that changed is the assertion: the deposit still files
+        // and acks, but the armed reader's socket must never see a
+        // connection, and the letter's own latch must stay armed for the
+        // next daemon-side trigger (P-M5b-2 gives this door a forward path
+        // of its own).
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
         let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
         let saved_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
-        let root = mail_deposit_root("ring");
+        let root = mail_deposit_root("no-ring");
         act_as(&root, "here");
         std::fs::create_dir_all(root.join("runtime")).unwrap();
         std::env::set_var("XDG_RUNTIME_DIR", root.join("runtime"));
@@ -9342,45 +9332,33 @@ mod tests {
         let ctx = mail_deposit_ctx(&audit_log, Some(&origin_name));
         let req = json!({ "jsonrpc": "2.0", "id": 1, "method": "aoide/mailDeposit", "params": { "envelope": envelope } });
 
-        let acc = std::thread::spawn(move || {
-            let (mut conn, _) = listener.accept().unwrap();
-            use std::io::Read as _;
-            let mut buf = Vec::new();
-            let _ = conn.read_to_end(&mut buf);
-            buf
-        });
         let resp = handle_jsonrpc(&req, &ctx);
         assert_eq!(resp["result"]["status"], "accepted", "{resp}");
-        let bytes = acc.join().unwrap();
-        assert!(
-            String::from_utf8_lossy(&bytes).starts_with("[aoide mail] new mail for conductor"),
-            "the deposit's own Filed-Letter arm must ring the armed headless reader in-process: {bytes:?}"
-        );
-        let entries = aoide_storage::mail::read_base().unwrap();
-        assert!(
-            entries.iter().any(|e| e.kind == aoide_storage::mail::ENTRY_TYPE_RECEIPT),
-            "the ring's own file_receipt landed a receipt too"
-        );
 
-        // "and a receipt does not": the entry-kind gate that keeps a
-        // RECEIPT from ever arming is already `aoide_storage::mail::arms`'s
-        // own tested invariant (slice 1) — what is specific to THIS call
-        // site is which match arm wires the call at all, which a real
-        // second fixture would only re-prove at ten times the cost. Assert
-        // it structurally instead: the Filed-Letter arm's own source calls
-        // `graph::ring(`, the Filed-Receipt arm's does not.
+        // No bytes ever arrive — a short bounded poll, not a blocking
+        // `accept`: there is no ring left in this process to connect, so
+        // nothing here is ever supposed to become readable.
+        listener.set_nonblocking(true).unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        loop {
+            match listener.accept() {
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                other => panic!("the door process must never ring the target itself: {other:?}"),
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+
+        let targets = aoide_storage::mail::ring_targets("conductor").unwrap();
+        assert_eq!(targets.armed.len(), 1, "still armed for the next daemon-side trigger — a deposit files and acks, it does not ring");
+
+        // Structural, same discipline the slice this corrects held: no arm
+        // of `mail_deposit` may call `graph::ring(` anymore (flipped from
+        // that slice's own "the letter arm must call it" assertion).
         let src = production_source();
-        let letter_arm_start = src.find("ENTRY_TYPE_LETTER =>").expect("the Filed-Letter arm exists");
-        let receipt_arm_start = src.find("ENTRY_TYPE_RECEIPT =>").expect("the Filed-Receipt arm exists");
-        assert!(letter_arm_start < receipt_arm_start, "arms appear in file order, letter then receipt");
-        let letter_arm_src = &src[letter_arm_start..receipt_arm_start];
-        assert!(!call_sites(letter_arm_src, "graph::ring").is_empty(), "the letter arm must call graph::ring(");
-        let receipt_arm_end = src[receipt_arm_start..]
-            .find("DepositOutcome::Filed { msgid, .. } =>")
-            .map(|i| receipt_arm_start + i)
-            .expect("the fallthrough Filed arm follows the receipt arm");
-        let receipt_arm_src = &src[receipt_arm_start..receipt_arm_end];
-        assert!(call_sites(receipt_arm_src, "graph::ring").is_empty(), "the receipt arm must never call graph::ring(");
+        assert!(call_sites(src, "graph::ring").is_empty(), "aoide-server must never call graph::ring( directly anymore");
 
         mail_deposit_cleanup(&root, saved_state, saved_stage);
         match saved_runtime {

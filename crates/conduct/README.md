@@ -122,11 +122,16 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   headless, hook-fed-and-at-the-prompt reader, raw-injected through the
   SAME `send.rs::write_delivery` this crate's ordinary deliveries use, under
   a dedicated `.ring.lock` file (`aoide_storage::mail::with_ring_lock`) —
-  never `.stage.lock`. `ring` is callable by any process linking this
-  crate (the CLI's `mail ring`, `aoide-server`'s A2A deposit arm, this
-  crate's own Stop-hook replay); `aoide-client` sits below this crate and
-  forwards `mail ring` through `daemon_dispatch` instead of calling `ring`
-  directly.
+  never `.stage.lock`, and only the daemon's own serializer, not a second
+  policy boundary. `ring` executes only under `Door::Daemon`: its two
+  callers are `mail_ring`'s own `Door::Daemon` arm and this crate's
+  Stop-hook replay when that hook is likewise being handled by the
+  daemon. Every other door forwards instead of ringing — `mail_ring`
+  itself, reached from the CLI or MCP, and the Stop-hook replay's
+  no-daemon local fallback, both go through `aoide_client::daemon::
+  daemon_dispatch` (or replay nothing) rather than calling `ring`
+  directly; `aoide-server`'s A2A deposit arm does not ring at all
+  (P-M5b-2 gives it its own forward path).
 - **The undying mark (P-C2/P-C3, durable-sessions plan; renamed from "carry"
   at command-defrag lane U1, 2026-08-27; relocated under `session grant` at
   the session-surface redesign, command-defrag lane X, 2026-08-28):**

@@ -585,10 +585,17 @@
   generalized the one flock-a-path routine both share, rather than
   duplicating it), so the two lock files behave identically (block for
   `LOCK_EX`, `Err` only when the lock file itself cannot be opened or
-  created) while never being the same file. Any process on the box may
-  ring concurrently; two overlapping rings for the same name simply
-  serialize on this file, the second always selecting after the first
-  has already stamped.
+  created) while never being the same file. The lock is purely a
+  serializer, not a policy boundary — that boundary is the resident
+  daemon itself: `ring` executes only under `Door::Daemon` (P-M5a-2c),
+  so in practice only the daemon process ever takes this lock, plus the
+  brief window a daemon restart can overlap old and new processes both
+  holding a live copy of `ring`'s call path. Two overlapping rings for
+  the same name simply serialize on this file, the second always
+  selecting after the first has already stamped; this file does not, by
+  itself, stop some other process from opening it and taking the same
+  lock — the daemon-only invariant lives in `graph::doorbell`'s own
+  callers, not here.
 - **The pseudo-reader (a cursor key equal to the mailbox name itself) is
   never a ring target and never counts as enrolled (ruling R1).**
   `ring_targets`/`armed_names_for_reader` both exclude the key `name ==

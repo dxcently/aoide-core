@@ -374,11 +374,13 @@ the inbound half of the two-door contract (the outbound half is
   drains that node once through the SAME `aoide_conduct::mail_bridge::
   drain_node` the daemon's own periodic tick uses — one drain
   implementation; `aoide-server` never dials out on its own account. It
-  ALSO rings the doorbell in-process, in that same arm, best-effort
-  (P-M5a-2: `aoide_conduct::graph::ring(&envelope.header.to.name, None)`
-  — this crate already depends on `aoide-conduct`, so a remotely-deposited
-  letter arms and rings exactly like a locally-filed one, under `ring`'s
-  own `.ring.lock`, never this process's copy of the stage lock). A filed
+  never rings the doorbell itself (P-M5a-2c: the resident daemon is the
+  policy and audit boundary for every ring, so this door files and acks
+  and stops there) — a remotely-deposited letter arms its readers
+  exactly like a locally-filed one, but is rung only by the next
+  daemon-side trigger for that name (a reader's Stop hook, a local
+  filing, `mail ring` by hand), until a later slice (P-M5b-2) gives this
+  door its own forward path to the daemon. A filed
   **receipt** never rings — it is not arming mail (`aoide_storage::mail`'s
   own `arms` predicate) — and instead retires the local outbox entry it
   confirms via `aoide_storage::outbox::retire_by_ack` (spec item 7 — a pure
