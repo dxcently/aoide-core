@@ -948,6 +948,17 @@
   for that reader stays armed for the next daemon-handled trigger. The
   hook's own `Outcome` is identical either way; only the replay is
   gated.
+- **The petname fallback is gated on LIVENESS, not a raw enrolment
+  count.** `ring_locked` loads the session roster once and runs the
+  petname fallback only when no key in `ring_targets`'s `enrolled` roster
+  resolves to a session record that `is_conductable_now` — a latched but
+  still-live reader blocks it, but a stale enrolment (no session record,
+  or one whose control socket is gone) never wedges a mailbox shut. The
+  target walk is unaffected: a dead armed reader still walks and still
+  reports `unknown`/`not-conductable`; liveness decides only whether the
+  fallback runs. `storage::mail::RingTargets.enrolled` is the reader keys
+  (`Vec<String>`, count = `.len()`) so this crate can judge liveness;
+  storage stays a pure read with no liveness argument.
 - **`doorbell.rs` changes update `docs/architecture/MAIL.md`'s "Delivery
   and the doorbell" section in the same commit** (house rule 8) — that
   section is the design's canonical prose statement; this file states
