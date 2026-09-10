@@ -31,6 +31,11 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
+/// The note prefix `register_clone` writes on a failed project registration
+/// and `handle_onboard` reads back to refuse an unconditional ok — one
+/// literal, so neither side can drift from the other.
+const PROJECT_FAILED_PREFIX: &str = "project registration failed: ";
+
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["onboard"],
@@ -75,7 +80,7 @@ fn handle_onboard(inv: &Invocation) -> Outcome {
 
     say(&format!("onboard: registering the clone ({})...", root.display()));
     let (clone_changed, clone_notes) = register_clone(&root);
-    let project_registered = !clone_notes.iter().any(|n| n.starts_with("project registration failed:"));
+    let project_registered = !clone_notes.iter().any(|n| n.starts_with(PROJECT_FAILED_PREFIX));
     for n in &clone_notes {
         say(&format!("  {n}"));
     }
@@ -175,7 +180,7 @@ fn register_clone(root: &Path) -> (Vec<String>, Vec<String>) {
     notes.push(if out.status == Status::Ok {
         out.message.clone()
     } else {
-        format!("project registration failed: {}", out.message)
+        format!("{PROJECT_FAILED_PREFIX}{}", out.message)
     });
     changed.extend(out.changed);
 
@@ -497,7 +502,7 @@ mod tests {
 
         let (_changed, notes) = register_clone(&root);
         assert!(
-            !notes.iter().any(|n| n.starts_with("project registration failed:")),
+            !notes.iter().any(|n| n.starts_with(PROJECT_FAILED_PREFIX)),
             "notes: {notes:?}"
         );
 
