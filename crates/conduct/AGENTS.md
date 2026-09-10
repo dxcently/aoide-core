@@ -782,14 +782,36 @@
   not — and never replaces what is already there; `--new` is the guard
   against a typo'd name silently joining an existing project instead of
   registering its own. `project edit NAME PATH…` is the ONLY command that
-  REPLACES a project's whole root list outright (first path → `path`, rest
-  → `roots`); it never touches the name or `autoResume` — `add`/`remove`
-  stay the only ways a project appears or disappears. `project remove NAME
-  [PATH]` drops one root, promoting the next remaining one into `path` so
-  `path` always equals the first root, or with no `PATH` drops the whole
-  project (unchanged behaviour). `project add` and `project edit` both
-  validate EVERY given path (absolute, an existing directory) BEFORE
-  mutating anything — one bad path in a multi-path call writes nothing.
+  REPLACES a project's whole root list outright — the FULL given list,
+  deduplicated, becomes `roots`, and `path` mirrors `roots[0]`; `roots` is
+  never "just the extras" (see `aoide-storage`'s own docs). It never
+  touches the name or `autoResume` — `add`/`remove` stay the only ways a
+  project appears or disappears. `project remove NAME [PATH]` drops one
+  root, promoting the next remaining one into `path` so `path` always
+  equals the first root, or with no `PATH` drops the whole project.
+  `project add` and `project edit` both validate EVERY given path
+  (absolute, an existing directory) BEFORE mutating anything — one bad
+  path in a multi-path call writes nothing.
+- **`project add`/`project edit`/`project remove` are daemon-owned atomic
+  mutations (`manage.rs`'s `local_daemon`)** — the same door-gated shape
+  as `actions.rs`'s `assign_project`/`session_kill`: a `Door::Cli` caller
+  forwards the WHOLE invocation through
+  `aoide_client::daemon::daemon_dispatch` to the live `aoided` and turns
+  "no daemon answered" into a real error (`aoided must be running for
+  project management`), never a silent local write; a `Door::Daemon`
+  caller (already inside `aoided`) takes the local path directly —
+  `daemon_dispatch` short-circuits to `None` on `Door::Daemon` for exactly
+  this reentrancy reason; every other door is refused as local-only. The
+  local mutation lives in three inner helpers (`add_roots`/`remove_roots`/
+  `edit_roots`), each wrapped ONCE, end to end, in
+  `aoide_storage::fs::with_stage_lock` — the `--new` existence check (or
+  the membership check, or the replacement) and the write happen under the
+  SAME lock hold, so two threads racing one project name can never both
+  observe a stale registry and both win. Nothing execs under the lock. A
+  handler test that exercises the LOCAL path (no daemon, like every other
+  test in this crate) stamps its `Invocation` with `Door::Daemon`, not
+  `testutil::invocation()`'s default `Door::Cli` — see the handler tests
+  in `graph/manage.rs`.
 - **`node list` (`graph/node_list.rs`, task #120 P2) is the roster core's
   probe under a wider fold — never a fork of it.** Its presence/session data
   comes ONLY from `who.rs`'s `pub(super)` seam (`probe_nodes`/
