@@ -1629,21 +1629,51 @@ fn my_hook_ancestry() -> Vec<i32> {
 /// seam (pid = terminal) converges to the harness's real pid on its very next
 /// hook, so a later agent death becomes reapable without a re-registration.
 ///
-/// Attested re-parenting (P-QOL-C §1): BEFORE the exists/fresh split, walk
-/// `hook_pid`'s real `/proc` ancestry for a verified conducted wrap
+/// Attested re-parenting (P-QOL-C §1 built it; this doc states §1's own
+/// follow-up restriction): BEFORE the exists/fresh split, walk `attest`'s
+/// pid's real `/proc` ancestry for a verified conducted wrap
 /// ([`real_attested_wrap`]) and, when found, re-stamp `parentSessionId` onto
 /// it (`stamp_attested_parent`, change-only). This is what fixes an EXISTING
 /// record: the exists branch below only ever refreshed `pid` and returned,
 /// so a record born under an earlier wrap (a harness id that survives
-/// `--resume`) never re-parented onto its CURRENT one — kernel process
-/// evidence now runs on every hook, not just at birth. No daemon or no
-/// resolvable ancestor → `None` → nothing touched, no error (fail-closed,
-/// never a guess from cwd/title/workspace).
-fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str, hook_pid: i32) {
+/// `--resume`) never re-parented onto its CURRENT one.
+///
+/// `attest` decides whether the walk runs AT ALL — `None` skips it outright,
+/// `resolve_wrap` never called. The walk is a daemon ping for the seal
+/// pubkey, a full sessions.json load, and up to a 64-hop /proc walk; a
+/// terminal's wrap only ever changes across a process restart (which fires
+/// `SessionStart`, registering fresh) or a `--resume` onto a new wrap (caught
+/// by the very next per-turn hook re-checking) — never mid-turn, never
+/// mid-tool-call. So `HookAction::Phase`'s registration self-heal and
+/// `PhaseIfRunning` (each fires once per turn) pass `Some(hook_pid)`;
+/// `ToolStart`/`ToolEnd`/`SubRekey`/`SubEnsure` — PreToolUse/PostToolUse and
+/// their subagent siblings, fired on EVERY tool call, the hottest hooks in
+/// this file — pass `None` and skip straight to the pid refresh / fresh
+/// registration below, unmodified. No daemon or no resolvable ancestor →
+/// `None` → nothing touched, no error (fail-closed, never a guess from
+/// cwd/title/workspace).
+fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str, attest: Option<i32>) {
+    hook_ensure_session_with(profile, payload, id, attest, real_attested_wrap)
+}
+
+/// [`hook_ensure_session`]'s actual body, parameterized over the
+/// attested-wrap resolver — the exact seam [`deliver_local`]/
+/// [`deliver_local_with`] already established for [`real_attested_sender`]
+/// (LANE IDENTITY P-ID2), restated here rather than reinvented, so the
+/// re-parenting behavior is table-testable without a live daemon: production
+/// wires [`real_attested_wrap`] via [`hook_ensure_session`]; tests inject a
+/// fixed resolver directly.
+fn hook_ensure_session_with(
+    profile: &AgentProfile,
+    payload: &Value,
+    id: &str,
+    attest: Option<i32>,
+    resolve_wrap: impl Fn(i32) -> Option<String>,
+) {
     if id.starts_with("sub:") {
         return;
     }
-    let attested = real_attested_wrap(hook_pid);
+    let attested = attest.and_then(resolve_wrap);
     if let Some(w) = attested.as_deref() {
         stamp_attested_parent(id, w);
     }
@@ -1745,10 +1775,14 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
 /// ring). Every other action, and every other line of this function, is
 /// unaffected by it. [`session_hook`] is the one production caller, passing
 /// `inv.door == Door::Daemon` straight through — never a global, a
-/// thread-local, or an env var. `hook_pid` (P-QOL-C §1) is threaded straight
-/// through to every [`hook_ensure_session`] call site below, unexamined
-/// here — see [`HOOK_PID_FLAG`]'s doc for why it cannot be re-derived from
-/// `std::process::id()` on the daemon-routed path.
+/// thread-local, or an env var. `hook_pid` (P-QOL-C §1) is the raw pid every
+/// [`hook_ensure_session`] call site below could attest from — see
+/// [`HOOK_PID_FLAG`]'s doc for why it cannot be re-derived from
+/// `std::process::id()` on the daemon-routed path — but only the `Phase`
+/// self-heal and `PhaseIfRunning` arms actually pass it on
+/// (`Some(hook_pid)`); `ToolStart`/`ToolEnd`/`SubRekey`/`SubEnsure` pass
+/// `None` and skip the walk ([`hook_ensure_session`]'s own doc has the rate
+/// argument for the split).
 fn hook_for_profile_gated(
     profile: &'static AgentProfile,
     buf: &str,
@@ -1885,8 +1919,10 @@ fn hook_for_profile_gated(
             // back on its NEXT event — harnesses fire SessionStart only at
             // launch, so without this the session is permanently invisible until
             // the harness restarts. Same registration path as Start (window +
-            // env-parent threading), fresh idle.
-            hook_ensure_session(profile, &payload, &id, hook_pid);
+            // env-parent threading), fresh idle. Attested (`Some(hook_pid)`):
+            // this arm fires once per turn (Stop/UserPromptSubmit/Awaiting),
+            // the rate the re-parenting walk is actually worth paying.
+            hook_ensure_session(profile, &payload, &id, Some(hook_pid));
             // Backfill a still-empty windowAddress on any later hook — covers a
             // session that registered before the window mapped (or before this
             // discovery shipped), so it becomes jumpable without a restart.
@@ -1977,7 +2013,9 @@ fn hook_for_profile_gated(
             out
         }
         HookAction::PhaseIfRunning { id, phase } => {
-            hook_ensure_session(profile, &payload, &id, hook_pid);
+            // Attested — the other once-per-turn hook (an idle ping outside
+            // an active turn), same rate as the `Phase` self-heal above.
+            hook_ensure_session(profile, &payload, &id, Some(hook_pid));
             ensure_session_window(&id);
             do_session_phase_if(&id, &phase, "working")
         }
@@ -1987,7 +2025,10 @@ fn hook_for_profile_gated(
             activity,
             spawn,
         } => {
-            hook_ensure_session(profile, &payload, &session, hook_pid);
+            // Unattested (`None`) — PreToolUse fires on EVERY tool call; the
+            // walk buys nothing here (a wrap cannot change mid-tool-call),
+            // so only the pid refresh / fresh registration below runs.
+            hook_ensure_session(profile, &payload, &session, None);
             ensure_session_window(&session);
             // Spawn the child FIRST so it exists before its parent's activity
             // points at it, then mark the owner working + its current activity.
@@ -2002,7 +2043,9 @@ fn hook_for_profile_gated(
             owner,
             end_sub,
         } => {
-            hook_ensure_session(profile, &payload, &session, hook_pid);
+            // Unattested — PostToolUse, the same every-tool-call rate as
+            // ToolStart above.
+            hook_ensure_session(profile, &payload, &session, None);
             ensure_session_window(&session);
             if let Some(sub) = end_sub {
                 do_subagent_end(&sub);
@@ -2018,7 +2061,8 @@ fn hook_for_profile_gated(
             from_sub_id,
             to_sub_id,
         } => {
-            hook_ensure_session(profile, &payload, &session, hook_pid);
+            // Unattested — a subagent handoff, not a wrap change.
+            hook_ensure_session(profile, &payload, &session, None);
             ensure_session_window(&session);
             do_subagent_rekey(&from_sub_id, &to_sub_id);
             // The launch returned; the parent is no longer running that tool in
@@ -2036,7 +2080,8 @@ fn hook_for_profile_gated(
             agent_type,
             create,
         } => {
-            hook_ensure_session(profile, &payload, &session, hook_pid);
+            // Unattested — same reasoning as SubRekey above.
+            hook_ensure_session(profile, &payload, &session, None);
             do_subagent_spawn(&sub_id, &session, &agent_type, &agent_type, create);
             Outcome::ok("session.hook", format!("subagent {sub_id}"))
         }
@@ -2181,6 +2226,20 @@ const STDIN_PAYLOAD_FLAG: &str = "__daemon-stdin-payload";
 /// `systemd --user`, not the agent's terminal tree). The hook process is
 /// blocked on the daemon's reply while this rides along, so its `/proc`
 /// entry is still live when the daemon walks it.
+///
+/// **This pid is trusted verbatim, not attested.** It rides the SAME
+/// dispatch socket `cross_uid_gate`'s doc (`server/src/daemon.rs`) and
+/// `daemon_seal_pubkey_hex`'s doc (`client/src/daemon.rs`) already give the
+/// honest accounting for: a same-uid process can already dispatch over that
+/// socket and could name any pid here it likes, real or fabricated — "NOT a
+/// channel a same-uid attacker is locked out of". Not a privilege
+/// escalation: `terminate_verified` re-verifies the resolved kill target's
+/// OWN seal before ever signaling it (`actions.rs`), and a same-uid attacker
+/// could already signal any process of its own directly, flag or no flag —
+/// but a lied-about pid can still walk to, and re-parent onto, a real
+/// conducted wrap that pid's true ancestry has no business near, so treat
+/// this flag as ordinary same-uid input, never as kernel evidence in its own
+/// right.
 const HOOK_PID_FLAG: &str = "__daemon-hook-pid";
 
 /// `session hook [--agent <name>]` — the hook door for agent harnesses.
@@ -6052,5 +6111,91 @@ mod tests {
             "an existing record's parent stays untouched with no daemon to attest against"
         );
         assert_eq!(rec.pid, pid_before, "the existing-record pid refresh is unaffected");
+    }
+
+    /// The gate itself (`hook_ensure_session`'s own doc has the rate
+    /// argument): `attest: Some(pid)` on the Start-shaped self-heal and
+    /// PhaseIfRunning arms runs the walk, `None` on a tool/sub arm never
+    /// even calls the resolver. Driven straight at [`hook_ensure_session_with`]
+    /// with each arm's actual `attest` argument shape — the SAME injection
+    /// seam [`deliver_local_with`]'s own tests use for
+    /// [`real_attested_sender`] — rather than a live daemon (out of scope
+    /// for this crate's fixtures, `isolated_mail_root`'s own doc).
+    #[test]
+    fn attested_walk_fires_only_when_attest_carries_a_pid() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env_sid = EnvVars::save(&["AOIDE_SESSION_ID"]);
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (_env, _root) = aoide_test_support::isolated_mail_root("hook-attest-gate");
+        let profile = agent_profile(CLAUDE_PROFILE.name).unwrap();
+
+        let calls = std::cell::Cell::new(0u32);
+        let resolve_wrap_x = |_pid: i32| {
+            calls.set(calls.get() + 1);
+            Some("wrap-x".to_string())
+        };
+        let restage_stale = |id: &str| {
+            aoide_storage::fs::with_stage_lock(|| {
+                let mut f: SessionsFile = load_stage(&sessions_path()).unwrap();
+                f.sessions.iter_mut().find(|s| s.session_id == id).unwrap().parent_session_id =
+                    Some("old-wrap".to_string());
+                write_stage(&sessions_path(), &f).unwrap();
+            });
+        };
+        let parent_of = |id: &str| -> Option<String> {
+            let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+            s.sessions.iter().find(|s| s.session_id == id).unwrap().parent_session_id.clone()
+        };
+
+        // An EXISTING record, stale-parented onto an earlier wrap — the
+        // exact shape a resumed harness id leaves behind.
+        do_session_start(
+            "c1", Some(profile.name), Some("/p"), None, Some("old-wrap"), None, None, None, None,
+        );
+        let payload = json!({ "session_id": "c1", "hook_event_name": "Stop" });
+
+        // (i) Start-shaped: the `Phase` arm's registration self-heal passes
+        // `Some(hook_pid)` — re-stamps the stale parent onto the attested wrap.
+        hook_ensure_session_with(profile, &payload, "c1", Some(4242), resolve_wrap_x);
+        assert_eq!(parent_of("c1"), Some("wrap-x".to_string()), "Start-shaped re-stamps");
+        assert_eq!(calls.get(), 1);
+
+        // (ii) PhaseIfRunning-shaped: same `Some(hook_pid)`, same treatment.
+        restage_stale("c1");
+        hook_ensure_session_with(profile, &payload, "c1", Some(4242), resolve_wrap_x);
+        assert_eq!(parent_of("c1"), Some("wrap-x".to_string()), "PhaseIfRunning-shaped re-stamps");
+        assert_eq!(calls.get(), 2);
+
+        // (iii) ToolStart-shaped: `None` — the resolver is never even
+        // invoked (the call count does not move), so the stale parent from
+        // ToolStart/ToolEnd/SubRekey/SubEnsure's shared shape survives untouched.
+        restage_stale("c1");
+        hook_ensure_session_with(profile, &payload, "c1", None, resolve_wrap_x);
+        assert_eq!(parent_of("c1"), Some("old-wrap".to_string()), "ToolStart-shaped never re-stamps");
+        assert_eq!(calls.get(), 2, "attest: None must never call the resolver");
+    }
+
+    /// (iv) The FRESH branch's own resolution order — `attested.or(env_parent)`
+    /// — survives the `attest: Option<i32>` gate: an attested wrap still
+    /// outranks `AOIDE_SESSION_ID` when both are present, exactly as it did
+    /// when the walk ran unconditionally.
+    #[test]
+    fn attested_wins_over_env_parent_on_the_fresh_branch() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env_sid = EnvVars::save(&["AOIDE_SESSION_ID"]);
+        let (_env, _root) = aoide_test_support::isolated_mail_root("hook-attest-fresh");
+        let profile = agent_profile(CLAUDE_PROFILE.name).unwrap();
+        std::env::set_var("AOIDE_SESSION_ID", "env-parent");
+
+        let payload = json!({ "session_id": "c2", "hook_event_name": "Stop" });
+        hook_ensure_session_with(profile, &payload, "c2", Some(4242), |_| Some("wrap-x".to_string()));
+
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|s| s.session_id == "c2").unwrap();
+        assert_eq!(
+            rec.parent_session_id.as_deref(),
+            Some("wrap-x"),
+            "the fresh branch still prefers an attested wrap over AOIDE_SESSION_ID"
+        );
     }
 }
