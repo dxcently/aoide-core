@@ -47,8 +47,8 @@ use super::model::{
 use super::session_store::{
     do_session_end, do_session_phase, do_session_phase_if, do_session_start, do_subagent_end,
     do_subagent_rekey, do_subagent_spawn, ensure_session_ceiling, now_iso_utc,
-    refresh_subagent_says, refresh_transcript_fields, set_owner_activity, stamp_harness_session_id,
-    stamp_hook_ancestry, stored_phase,
+    refresh_subagent_says, refresh_transcript_fields, set_owner_activity, stamp_attested_parent,
+    stamp_harness_session_id, stamp_hook_ancestry, stored_phase,
 };
 use super::window::{discover_window, ensure_session_window, pid_ancestry, windowless_by_lineage_from_parent};
 use aoide_protocol::agents::{agent_profile, known_agents, AgentProfile, HookClass, CLAUDE_PROFILE};
@@ -578,6 +578,24 @@ pub fn session_send(inv: &Invocation) -> Outcome {
 fn real_attested_sender(sessions: &[SessionRecord]) -> Option<String> {
     let pubkey = aoide_client::daemon::daemon_seal_pubkey_hex()?;
     crate::graph::identity::attested_sender(std::process::id() as i32, sessions, |rec| {
+        crate::graph::identity::verify_seal_over(rec, &pubkey)
+    })
+}
+
+/// The REAL attested-wrap resolution [`hook_ensure_session`] uses in
+/// production (P-QOL-C §1): the same live daemon-key fetch
+/// [`real_attested_sender`] makes, delegated to
+/// [`crate::graph::identity::attested_wrap`] (the conducted-ancestor-only
+/// walk) instead of `attested_sender`'s any-sealed-ancestor one, walked from
+/// `hook_pid` — the HOOK process's own real pid (carried across the daemon
+/// hop by [`HOOK_PID_FLAG`]), never this process's own `std::process::id()`
+/// when running daemon-side. An unreachable daemon or an unreadable roster
+/// makes every hook unattested (`None`), never a benign fallback — same
+/// fail-closed posture as `real_attested_sender`.
+fn real_attested_wrap(hook_pid: i32) -> Option<String> {
+    let pubkey = aoide_client::daemon::daemon_seal_pubkey_hex()?;
+    let sessions: SessionsFile = load_stage(&sessions_path()).ok()?;
+    crate::graph::identity::attested_wrap(hook_pid, &sessions.sessions, |rec| {
         crate::graph::identity::verify_seal_over(rec, &pubkey)
     })
 }
@@ -1610,9 +1628,24 @@ fn my_hook_ancestry() -> Vec<i32> {
 /// self-heal for the liveness anchor — a record born before the payload-pid
 /// seam (pid = terminal) converges to the harness's real pid on its very next
 /// hook, so a later agent death becomes reapable without a re-registration.
-fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str) {
+///
+/// Attested re-parenting (P-QOL-C §1): BEFORE the exists/fresh split, walk
+/// `hook_pid`'s real `/proc` ancestry for a verified conducted wrap
+/// ([`real_attested_wrap`]) and, when found, re-stamp `parentSessionId` onto
+/// it (`stamp_attested_parent`, change-only). This is what fixes an EXISTING
+/// record: the exists branch below only ever refreshed `pid` and returned,
+/// so a record born under an earlier wrap (a harness id that survives
+/// `--resume`) never re-parented onto its CURRENT one — kernel process
+/// evidence now runs on every hook, not just at birth. No daemon or no
+/// resolvable ancestor → `None` → nothing touched, no error (fail-closed,
+/// never a guess from cwd/title/workspace).
+fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str, hook_pid: i32) {
     if id.starts_with("sub:") {
         return;
+    }
+    let attested = real_attested_wrap(hook_pid);
+    if let Some(w) = attested.as_deref() {
+        stamp_attested_parent(id, w);
     }
     let reported = payload_pid(payload);
     let existing = load_stage::<SessionsFile>(&sessions_path()).ok();
@@ -1654,6 +1687,12 @@ fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str) {
     let env_parent = std::env::var("AOIDE_SESSION_ID")
         .ok()
         .filter(|p| !p.is_empty() && *p != id);
+    // Attested beats env — kernel truth over an ordinary same-user variable
+    // a subprocess could set on itself. Same value feeds windowless
+    // discovery below AND `do_session_start`: one resolution, no double
+    // write (the fresh record doesn't exist yet, so `stamp_attested_parent`
+    // above was a no-op; `do_session_start` is what actually stamps it).
+    let parent = attested.as_deref().or(env_parent.as_deref());
     // Windowless by construction (task #89): a hook session whose
     // (about-to-be-set) parent's own lineage runs through an unwindowed
     // conducted wrap must never discover a window at all — that walk would
@@ -1662,7 +1701,7 @@ fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str) {
     // unrelated agents as stale twins.
     let windowless = existing
         .as_ref()
-        .map(|f| windowless_by_lineage_from_parent(env_parent.as_deref(), &f.sessions))
+        .map(|f| windowless_by_lineage_from_parent(parent, &f.sessions))
         .unwrap_or(false);
     let (window, discovered) = if windowless {
         (None, None)
@@ -1680,7 +1719,7 @@ fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str) {
         Some(profile.name),
         cwd.as_deref(),
         window.as_deref(),
-        env_parent.as_deref(),
+        parent,
         None,
         None,
         None,
@@ -1697,7 +1736,7 @@ fn hook_ensure_session(profile: &AgentProfile, payload: &Value, id: &str) {
 /// [`hook_for_profile_gated`] directly with the real `may_ring` value.
 #[cfg(test)]
 fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
-    hook_for_profile_gated(profile, buf, true)
+    hook_for_profile_gated(profile, buf, true, std::process::id() as i32)
 }
 
 /// `may_ring` gates ONLY the Stop-hook ring replay inside `HookAction::
@@ -1706,8 +1745,16 @@ fn hook_for_profile(profile: &'static AgentProfile, buf: &str) -> Outcome {
 /// ring). Every other action, and every other line of this function, is
 /// unaffected by it. [`session_hook`] is the one production caller, passing
 /// `inv.door == Door::Daemon` straight through — never a global, a
-/// thread-local, or an env var.
-fn hook_for_profile_gated(profile: &'static AgentProfile, buf: &str, may_ring: bool) -> Outcome {
+/// thread-local, or an env var. `hook_pid` (P-QOL-C §1) is threaded straight
+/// through to every [`hook_ensure_session`] call site below, unexamined
+/// here — see [`HOOK_PID_FLAG`]'s doc for why it cannot be re-derived from
+/// `std::process::id()` on the daemon-routed path.
+fn hook_for_profile_gated(
+    profile: &'static AgentProfile,
+    buf: &str,
+    may_ring: bool,
+    hook_pid: i32,
+) -> Outcome {
     let cmd = "session.hook";
     let noop = |reason: &str| {
         Outcome::ok(cmd, format!("no-op ({reason})"))
@@ -1839,7 +1886,7 @@ fn hook_for_profile_gated(profile: &'static AgentProfile, buf: &str, may_ring: b
             // launch, so without this the session is permanently invisible until
             // the harness restarts. Same registration path as Start (window +
             // env-parent threading), fresh idle.
-            hook_ensure_session(profile, &payload, &id);
+            hook_ensure_session(profile, &payload, &id, hook_pid);
             // Backfill a still-empty windowAddress on any later hook — covers a
             // session that registered before the window mapped (or before this
             // discovery shipped), so it becomes jumpable without a restart.
@@ -1930,7 +1977,7 @@ fn hook_for_profile_gated(profile: &'static AgentProfile, buf: &str, may_ring: b
             out
         }
         HookAction::PhaseIfRunning { id, phase } => {
-            hook_ensure_session(profile, &payload, &id);
+            hook_ensure_session(profile, &payload, &id, hook_pid);
             ensure_session_window(&id);
             do_session_phase_if(&id, &phase, "working")
         }
@@ -1940,7 +1987,7 @@ fn hook_for_profile_gated(profile: &'static AgentProfile, buf: &str, may_ring: b
             activity,
             spawn,
         } => {
-            hook_ensure_session(profile, &payload, &session);
+            hook_ensure_session(profile, &payload, &session, hook_pid);
             ensure_session_window(&session);
             // Spawn the child FIRST so it exists before its parent's activity
             // points at it, then mark the owner working + its current activity.
@@ -1955,7 +2002,7 @@ fn hook_for_profile_gated(profile: &'static AgentProfile, buf: &str, may_ring: b
             owner,
             end_sub,
         } => {
-            hook_ensure_session(profile, &payload, &session);
+            hook_ensure_session(profile, &payload, &session, hook_pid);
             ensure_session_window(&session);
             if let Some(sub) = end_sub {
                 do_subagent_end(&sub);
@@ -1971,7 +2018,7 @@ fn hook_for_profile_gated(profile: &'static AgentProfile, buf: &str, may_ring: b
             from_sub_id,
             to_sub_id,
         } => {
-            hook_ensure_session(profile, &payload, &session);
+            hook_ensure_session(profile, &payload, &session, hook_pid);
             ensure_session_window(&session);
             do_subagent_rekey(&from_sub_id, &to_sub_id);
             // The launch returned; the parent is no longer running that tool in
@@ -1989,7 +2036,7 @@ fn hook_for_profile_gated(profile: &'static AgentProfile, buf: &str, may_ring: b
             agent_type,
             create,
         } => {
-            hook_ensure_session(profile, &payload, &session);
+            hook_ensure_session(profile, &payload, &session, hook_pid);
             do_subagent_spawn(&sub_id, &session, &agent_type, &agent_type, create);
             Outcome::ok("session.hook", format!("subagent {sub_id}"))
         }
@@ -2125,6 +2172,17 @@ fn hook_profile_for(inv: &Invocation) -> Result<&'static AgentProfile, Outcome> 
 /// which is never the calling hook's own pipe.
 const STDIN_PAYLOAD_FLAG: &str = "__daemon-stdin-payload";
 
+/// Internal-only flag key carrying the HOOK process's own real pid across the
+/// same daemon hop `STDIN_PAYLOAD_FLAG` rides (P-QOL-C §1) — never set by a
+/// real CLI/MCP/A2A caller, never registered in `commands/graph.rs`'s
+/// `flags:` list, no schema surface. `std::process::id()` read daemon-side
+/// (inside `hook_ensure_session`'s attested-wrap walk) is `aoided`'s OWN
+/// pid, not the hook's — useless as ancestry evidence (its parent is
+/// `systemd --user`, not the agent's terminal tree). The hook process is
+/// blocked on the daemon's reply while this rides along, so its `/proc`
+/// entry is still live when the daemon walks it.
+const HOOK_PID_FLAG: &str = "__daemon-hook-pid";
+
 /// `session hook [--agent <name>]` — the hook door for agent harnesses.
 /// Reads ONE JSON object from stdin and maps it (through the selected agent
 /// profile) to the session commands. Never exits non-zero for a payload problem
@@ -2152,7 +2210,16 @@ pub fn session_hook(inv: &Invocation) -> Outcome {
     // is whatever door the ORIGINAL caller actually used.
     let may_ring = inv.door == Door::Daemon;
     if let Some(payload) = inv.flags.get(STDIN_PAYLOAD_FLAG) {
-        return hook_for_profile_gated(profile, payload, may_ring);
+        // Daemon side: `std::process::id()` here is `aoided`'s own pid, not
+        // the hook's — use the pid the hook stamped onto the routed
+        // invocation before the hop, falling back to this process's pid on
+        // an absent or unparsable flag (never a hard failure of the hook).
+        let hook_pid = inv
+            .flags
+            .get(HOOK_PID_FLAG)
+            .and_then(|s| s.parse::<i32>().ok())
+            .unwrap_or_else(|| std::process::id() as i32);
+        return hook_for_profile_gated(profile, payload, may_ring, hook_pid);
     }
     let mut buf = String::new();
     let _ = std::io::stdin().lock().read_to_string(&mut buf);
@@ -2162,6 +2229,7 @@ pub fn session_hook(inv: &Invocation) -> Outcome {
         flags: {
             let mut f = inv.flags.clone();
             f.insert(STDIN_PAYLOAD_FLAG.to_string(), buf.clone());
+            f.insert(HOOK_PID_FLAG.to_string(), std::process::id().to_string());
             f
         },
         door: inv.door,
@@ -2169,7 +2237,8 @@ pub fn session_hook(inv: &Invocation) -> Outcome {
     if let Some(outcome) = aoide_client::daemon::daemon_dispatch(&routed) {
         return outcome;
     }
-    hook_for_profile_gated(profile, &buf, may_ring)
+    // Local, no-daemon fallback: THIS process is the hook itself.
+    hook_for_profile_gated(profile, &buf, may_ring, std::process::id() as i32)
 }
 
 #[cfg(test)]
@@ -5933,5 +6002,55 @@ mod tests {
         assert_eq!(data["reason"], "unknown-agent");
         assert_eq!(data["agent"], "bogus");
         assert_eq!(data["known"], json!(["claude", "kimi", "pi"]));
+    }
+
+    /// P-QOL-C §1's composed positive path (hook → attested wrap →
+    /// re-stamp) needs a live daemon to prove end to end — out of scope for
+    /// this crate's fixtures, which guarantee a DEAD daemon socket
+    /// (`isolated_mail_root`'s own doc). What IS provable here, in-crate: no
+    /// daemon reachable means [`real_attested_wrap`] resolves `None`, so
+    /// `hook_ensure_session` touches neither `parentSessionId` nor the
+    /// existing pid-refresh behavior — the fail-closed half of the seam,
+    /// exercised through two real hooks (a fresh SessionStart, then a
+    /// PreToolUse that hits the now-existing record's self-heal branch).
+    #[test]
+    fn hook_leaves_the_parent_untouched_when_no_wrap_is_attested() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env_sid = EnvVars::save(&["AOIDE_SESSION_ID"]);
+        // No sender attribution in scope here — a real ambient
+        // `AOIDE_SESSION_ID` (this test may itself be running inside a
+        // conducted session) is exactly the ENV fallback `parent` falls
+        // back to, and would otherwise leak that real session id into the
+        // "no attested parent" assertions below (`send_yes_delivers_and_
+        // autorenames_the_title`'s own doc comment states the same hazard).
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let (_env, _root) = aoide_test_support::isolated_mail_root("hook-no-attested-wrap");
+        let profile = agent_profile(CLAUDE_PROFILE.name).unwrap();
+
+        let out = hook_for_profile(
+            profile,
+            r#"{ "session_id": "c1", "hook_event_name": "SessionStart", "cwd": "/p" }"#,
+        );
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|s| s.session_id == "c1").unwrap();
+        assert_eq!(rec.parent_session_id, None, "no daemon means no attested parent");
+        let pid_before = rec.pid;
+
+        // PreToolUse on the now-EXISTING record hits `hook_ensure_session`'s
+        // self-heal branch — the exact path §0 identified as never
+        // re-parenting. With no daemon reachable it must still be a no-op.
+        let out = hook_for_profile(
+            profile,
+            r#"{ "session_id": "c1", "hook_event_name": "PreToolUse" }"#,
+        );
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let s: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = s.sessions.iter().find(|s| s.session_id == "c1").unwrap();
+        assert_eq!(
+            rec.parent_session_id, None,
+            "an existing record's parent stays untouched with no daemon to attest against"
+        );
+        assert_eq!(rec.pid, pid_before, "the existing-record pid refresh is unaffected");
     }
 }

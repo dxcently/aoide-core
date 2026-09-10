@@ -122,6 +122,28 @@ pub(in crate::graph) fn attested_sender(
     aoide_storage::attest::attested_session(start_pid, sessions, verify)
 }
 
+/// The conducted-ancestor-only sibling of [`attested_sender`] (P-QOL-C §1):
+/// same nearest-first `/proc` ancestry walk and the same injected, fail-closed
+/// `verify`, but narrowed to a record that is itself a conducted wrap
+/// (`conductable == Some(true)`) — the process a `session kill` can actually
+/// stop. `attested_sender` accepts ANY verified sealed ancestor (its callers
+/// gate on sender identity, not on process ownership); this one exists
+/// because the hook-time re-parenting seam (`hook_ensure_session`) and the
+/// kill door both need the NEAREST conducted wrap specifically, never a bare
+/// hook-fed ancestor. `verify` stays injected for the same reason
+/// `attested_sender`'s doc gives: a pure, table-testable function, with the
+/// real call site (`send.rs`'s `real_attested_wrap`) supplying the live
+/// daemon-key check.
+pub(in crate::graph) fn attested_wrap(
+    start_pid: i32,
+    sessions: &[SessionRecord],
+    verify: impl Fn(&SessionRecord) -> bool,
+) -> Option<String> {
+    aoide_storage::attest::attested_session(start_pid, sessions, |rec| {
+        rec.conductable == Some(true) && verify(rec)
+    })
+}
+
 /// The per-session control socket's self-injection refusal (LANE IDENTITY
 /// P-ID2, review round 1 MUST-FIX): resolves the CONNECTING pid's OWN
 /// nearest live registered session — the SAME nearest-first walk
@@ -339,6 +361,48 @@ mod tests {
             ..Default::default()
         }];
         assert_eq!(attested_sender(me, &sessions, |_| true), None);
+    }
+
+    // ── attested_wrap ─────────────────────────────────────────────────────
+
+    #[test]
+    fn attested_wrap_finds_the_conducted_ancestor_of_a_real_child_process() {
+        let mut child = std::process::Command::new("sleep").arg("30").spawn().unwrap();
+        let kp = identity::mint_ephemeral().unwrap();
+        let me = std::process::id() as i32;
+        let mut wrap = sealed_record("wrap", me, Some("local"), &kp);
+        wrap.conductable = Some(true);
+        let sessions = vec![wrap];
+        let pubkey = kp.info().pubkey_hex;
+        let found = attested_wrap(child.id() as i32, &sessions, |rec| {
+            verify_seal_over(rec, &pubkey)
+        });
+        assert_eq!(
+            found,
+            Some("wrap".to_string()),
+            "a real spawned child must resolve to its conducted parent"
+        );
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[test]
+    fn attested_wrap_refuses_a_non_conductable_ancestor_and_the_init_chain() {
+        let kp = identity::mint_ephemeral().unwrap();
+        let me = std::process::id() as i32;
+        // conductable defaults to None — a bare sealed session, not a wrap.
+        let sessions = vec![sealed_record("hook-fed", me, Some("local"), &kp)];
+        let pubkey = kp.info().pubkey_hex;
+        assert_eq!(
+            attested_wrap(me, &sessions, |rec| verify_seal_over(rec, &pubkey)),
+            None,
+            "a non-conductable ancestor is never a kill target"
+        );
+        assert_eq!(
+            attested_wrap(1, &sessions, |_| true),
+            None,
+            "walking from init resolves nothing"
+        );
     }
 
     // ── is_self_originated (review round 1 MUST-FIX) ────────────────────────

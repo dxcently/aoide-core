@@ -437,6 +437,50 @@ pub(in crate::graph) fn stamp_hook_ancestry(id: &str, ancestry: &[i32]) {
     });
 }
 
+/// Stamp `parentSessionId` on a hook record from ATTESTED kernel process
+/// evidence (P-QOL-C §1, `send.rs`'s `hook_ensure_session`) — the fix for a
+/// record born under an EARLIER wrap (a harness id survives `--resume`)
+/// never re-parenting onto the wrap that hosts it NOW. Three differences
+/// from [`stamp_hook_ancestry`] just above, despite the identical
+/// silent-no-op-on-error/unknown-id posture: (a) CHANGE-ONLY on difference,
+/// not write-once — a resumed record must keep following its current wrap,
+/// the whole transfer-window case this exists for; (b) refuses a self-parent
+/// or any parent that would close a cycle ([`would_cycle`], the same guard
+/// `do_session_start` applies to an explicit `--parent`) — attested evidence
+/// is still just an ordinary edge once it reaches the DAG, never license to
+/// corrupt it; (c) calls [`restage_graph`] — unlike `hookAncestry`
+/// (consumed internally only), `parentSessionId` IS a rendered edge, so a
+/// change here must reach `graph.json` immediately, not wait for some other
+/// writer to re-stage it.
+pub(in crate::graph) fn stamp_attested_parent(id: &str, parent: &str) {
+    if parent.is_empty() || parent == id {
+        return;
+    }
+    with_stage_lock(|| {
+        let mut file: SessionsFile = match load_stage(&sessions_path()) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        if would_cycle(&file.sessions, id, parent) {
+            return;
+        }
+        let Some(s) = file
+            .sessions
+            .iter_mut()
+            .find(|s| s.session_id == id && s.parent_session_id.as_deref() != Some(parent))
+        else {
+            return;
+        };
+        s.parent_session_id = Some(parent.to_string());
+        if file.schema_version.is_empty() {
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        }
+        if write_stage(&sessions_path(), &file).is_ok() {
+            let _ = restage_graph();
+        }
+    });
+}
+
 /// Stamp `headless = true` on a headless `aoide conduct` wrap's OWN record —
 /// a PERMANENT registration fact (task #89, review round 2), called
 /// unconditionally right after `do_session_start` whenever `--headless` was
@@ -1707,6 +1751,73 @@ mod tests {
             !ids2.contains(&"kimi"),
             "kimi too — same window, no lineage relation to the freshly-registered twin"
         );
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn stamp_attested_parent_rewrites_a_changed_parent_and_refuses_a_cycle() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("stamp-attested-parent");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        write_stage(
+            &sessions_path(),
+            &SessionsFile {
+                sessions: vec![
+                    session("child", "/w", "idle", "t", Some("old")),
+                    session("old", "/w", "idle", "t", None),
+                    session("new", "/w", "idle", "t", None),
+                ],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        stamp_attested_parent("child", "new");
+        let file: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            file.sessions
+                .iter()
+                .find(|s| s.session_id == "child")
+                .unwrap()
+                .parent_session_id
+                .as_deref(),
+            Some("new"),
+            "a changed attested parent rewrites the record"
+        );
+
+        let before = std::fs::read(sessions_path()).unwrap();
+        stamp_attested_parent("child", "new");
+        assert_eq!(
+            std::fs::read(sessions_path()).unwrap(),
+            before,
+            "an identical re-stamp writes nothing — the file stays byte-identical"
+        );
+
+        // "new" is now downstream of "child" (child → new); parenting "new"
+        // under "child" would close the cycle — refused, "new" keeps its
+        // own (absent) parent untouched.
+        stamp_attested_parent("new", "child");
+        let file: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            file.sessions
+                .iter()
+                .find(|s| s.session_id == "new")
+                .unwrap()
+                .parent_session_id,
+            None,
+            "a cycling parent is refused"
+        );
+
+        // An unknown id is a silent no-op — never a panic, never a write.
+        let before = std::fs::read(sessions_path()).unwrap();
+        stamp_attested_parent("missing", "new");
+        assert_eq!(std::fs::read(sessions_path()).unwrap(), before);
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),

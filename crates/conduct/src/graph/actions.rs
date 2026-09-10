@@ -8,6 +8,7 @@ use super::model::{
 use aoide_protocol::{output::Outcome, Door, Invocation};
 use aoide_storage::fs::with_stage_lock;
 use serde_json::json;
+use std::collections::HashSet;
 
 fn local_daemon(inv: &Invocation) -> Option<Outcome> {
     match inv.door {
@@ -73,10 +74,40 @@ pub(super) fn assign_project(id: &str, project: Option<&str>) -> Outcome {
     })
 }
 
+/// The refusal message a stalled or unresolvable walk returns — VERBATIM
+/// what this function always returned before the walk existed, so a caller
+/// (and every existing test) that only ever saw the direct-record shape sees
+/// the identical string for the identical class of refusal.
+const NO_DEDICATED_PROCESS: &str =
+    "no dedicated conducted process; refusing to terminate a shared app or unverified harness";
+
+/// Resolve `id` to the record whose process a kill actually stops (P-QOL-C
+/// §2): `id` itself when it's already a conducted wrap with a dedicated pid
+/// (today's shape, unchanged), else the nearest `parentSessionId` ancestor
+/// that is. The desktop menu and the CLI both pass whatever card the user
+/// clicked — a native hook-fed record, never necessarily a wrap — so this is
+/// what makes "Kill process" resolve at all (`§0`'s whole problem statement).
+///
+/// Returns the target record plus the walked CHAIN (`id` first, the target
+/// last) so the shared-pid check below can exclude every hop the walk
+/// legitimately passed through — a wrap and its own hook-fed descendants
+/// sharing one process's pid is the EXPECTED shape, never a collision.
+///
+/// The walk is ≤32 hops and cycle-guarded with a `seen` set — the same
+/// guard [`super::session_store::lineage_of`] applies to its own ancestor
+/// half (`session_store.rs`). `lineage_of` itself doesn't fit here: it
+/// returns an unordered `HashSet` mixing ancestors with descendants, and
+/// this needs an ORDERED, ancestors-only chain — hence the small local loop
+/// rather than reusing it.
+///
+/// The seal is deliberately NOT checked here — [`terminate_verified`]
+/// re-verifies it fresh against the resolved target, and a stale seal must
+/// surface ITS OWN "session process identity is stale or unsealed" message,
+/// never get pre-empted by a misleading ancestry refusal from this walk.
 fn kill_target<'a>(
     id: &str,
     sessions: &'a [SessionRecord],
-) -> Result<&'a SessionRecord, &'static str> {
+) -> Result<(&'a SessionRecord, Vec<String>), &'static str> {
     let rec = sessions
         .iter()
         .find(|s| s.session_id == id)
@@ -84,20 +115,33 @@ fn kill_target<'a>(
     if canonical_state(&rec.state) == "done" {
         return Err("session has already ended");
     }
-    if rec.conductable != Some(true) {
-        return Err("no dedicated conducted process; refusing to terminate a shared app or unverified harness");
+    let is_wrap = |s: &SessionRecord| {
+        s.conductable == Some(true)
+            && s.pid.is_some_and(|pid| pid > 1 && pid != std::process::id())
+    };
+    let mut chain = vec![rec.session_id.clone()];
+    let mut seen: HashSet<String> = [rec.session_id.clone()].into_iter().collect();
+    let mut current = rec;
+    while !is_wrap(current) {
+        let parent_id = current.parent_session_id.as_deref().ok_or(NO_DEDICATED_PROCESS)?;
+        if chain.len() >= 32 || !seen.insert(parent_id.to_string()) {
+            return Err(NO_DEDICATED_PROCESS);
+        }
+        current = sessions
+            .iter()
+            .find(|s| s.session_id == parent_id)
+            .ok_or(NO_DEDICATED_PROCESS)?;
+        chain.push(parent_id.to_string());
     }
-    let pid = rec
-        .pid
-        .filter(|pid| *pid > 1 && *pid != std::process::id())
-        .ok_or("no eligible session process")?;
-    if sessions
-        .iter()
-        .any(|s| s.session_id != id && s.pid == Some(pid) && canonical_state(&s.state) != "done")
-    {
+    let target = current;
+    if sessions.iter().any(|s| {
+        !chain.contains(&s.session_id)
+            && s.pid == target.pid
+            && canonical_state(&s.state) != "done"
+    }) {
         return Err("process is shared by multiple sessions");
     }
-    Ok(rec)
+    Ok((target, chain))
 }
 
 pub fn session_kill(inv: &Invocation) -> Outcome {
@@ -113,16 +157,27 @@ pub fn session_kill(inv: &Invocation) -> Outcome {
             Ok(v) => v,
             Err(e) => return stage_error("session.kill", e),
         };
-        let rec = match kill_target(&id, &sessions.sessions) {
+        let (target, _chain) = match kill_target(&id, &sessions.sessions) {
             Ok(v) => v,
             Err(e) => return Outcome::error("session.kill", e),
         };
-        match terminate_verified(rec) {
-            Ok(()) => Outcome::ok(
-                "session.kill",
-                "termination requested; exit is not yet confirmed",
-            )
-            .with_data(json!({"sessionId":id,"pid":rec.pid,"signal":"SIGTERM"})),
+        match terminate_verified(target) {
+            Ok(()) => {
+                let message = if target.session_id == id {
+                    "termination requested; exit is not yet confirmed".to_string()
+                } else {
+                    format!(
+                        "terminating {} (the terminal that hosts {id}); exit is not yet confirmed",
+                        target.session_id
+                    )
+                };
+                Outcome::ok("session.kill", message).with_data(json!({
+                    "sessionId": id,
+                    "target": target.session_id,
+                    "pid": target.pid,
+                    "signal": "SIGTERM",
+                }))
+            }
             Err(e) => Outcome::error("session.kill", e),
         }
     })
@@ -194,6 +249,89 @@ mod tests {
         a.conductable = Some(true);
         a.state = "done".into();
         assert!(kill_target("a", &[a]).is_err());
+    }
+    #[test]
+    fn kill_target_resolves_a_hook_child_to_its_conducted_wrap() {
+        let w = rec("w"); // conducted wrap: conductable, dedicated pid.
+        let mut c = rec("c");
+        c.conductable = None;
+        c.pid = None;
+        c.parent_session_id = Some("w".into());
+        let sessions = [c, w];
+        let (target, chain) = kill_target("c", &sessions)
+            .expect("a hook child must resolve to its conducted wrap");
+        assert_eq!(target.session_id, "w");
+        assert_eq!(chain, vec!["c".to_string(), "w".to_string()]);
+    }
+    #[test]
+    fn kill_target_refuses_a_shared_record_with_no_conductable_ancestor() {
+        // A desktop record: a pid, no parent, never conducted — refused
+        // outright, no walk to attempt.
+        let mut desktop = rec("d");
+        desktop.conductable = None;
+        assert_eq!(kill_target("d", &[desktop]).unwrap_err(), NO_DEDICATED_PROCESS);
+
+        // A two-hop chain, neither hop conductable — the walk runs out of
+        // ancestors without ever finding a wrap.
+        let mut c1 = rec("c1");
+        c1.conductable = None;
+        c1.pid = None;
+        c1.parent_session_id = Some("c2".into());
+        let mut c2 = rec("c2");
+        c2.conductable = None;
+        c2.pid = None;
+        assert_eq!(
+            kill_target("c1", &[c1, c2]).unwrap_err(),
+            NO_DEDICATED_PROCESS
+        );
+    }
+    #[test]
+    fn kill_target_excludes_the_walked_chain_from_the_shared_process_check() {
+        let w = rec("w"); // wrap, pid 99999.
+        let mut c = rec("c");
+        c.conductable = None;
+        c.parent_session_id = Some("w".into());
+        // `c` carries the SAME pid as the wrap it walks to — a chain member
+        // sharing the target's pid is the EXPECTED shape, not a collision.
+        let two = [c.clone(), w.clone()];
+        let (target, _chain) = kill_target("c", &two)
+            .expect("a chain member sharing the target's pid must not trip the shared check");
+        assert_eq!(target.session_id, "w");
+
+        // An UNRELATED live record on that same pid is the real collision.
+        let mut d = rec("d");
+        d.conductable = None;
+        let three = [c, w, d];
+        assert_eq!(
+            kill_target("c", &three).unwrap_err(),
+            "process is shared by multiple sessions"
+        );
+    }
+    #[test]
+    fn kill_target_stops_at_a_parent_cycle() {
+        let mut a = rec("a");
+        a.conductable = None;
+        a.pid = None;
+        a.parent_session_id = Some("b".into());
+        let mut b = rec("b");
+        b.conductable = None;
+        b.pid = None;
+        b.parent_session_id = Some("a".into());
+        assert_eq!(kill_target("a", &[a, b]).unwrap_err(), NO_DEDICATED_PROCESS);
+    }
+    #[test]
+    fn kill_target_selects_a_wrap_with_a_stale_seal() {
+        // The walk must not pre-filter on seal validity — that refusal is
+        // `terminate_verified`'s job alone (already pinned by
+        // `verified_termination_rejects_stale_seal_and_stops_only_child`).
+        let mut w = rec("w");
+        w.seal = Some("stale-or-forged".into());
+        w.sealed_issued_at = Some(1);
+        let sessions = vec![w];
+        let (target, chain) = kill_target("w", &sessions)
+            .expect("kill_target never checks the seal — only terminate_verified does");
+        assert_eq!(target.session_id, "w");
+        assert_eq!(chain, vec!["w".to_string()]);
     }
     #[test]
     fn explicit_project_beats_cwd_and_clear_restores_it() {
