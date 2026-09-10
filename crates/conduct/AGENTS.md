@@ -34,12 +34,17 @@
 - **`sessionaction`'s five-action whitelist never becomes a translator.**
   `session_action_args` is the ONE authority for the whitelist and the ONE
   call site for the gate; nothing else builds argv from wire values it did
-  not validate. `safe_action_value` (session ids, project/create/edit
-  names) rejects empty, `-`-prefixed, whitespaced, or control-charactered
-  strings before they reach an argv; `safe_action_path` is a deliberately
-  separate, looser rule for path arguments — a path is absolute and
-  control-free, whitespace included, with the list length bounded
-  (`MAX_ACTION_PATHS`). The reply is one JSON line on its own dedicated
+  not validate. `safe_session_id` (session ids: no whitespace) and `safe_action_value`
+  (project/create/edit names: ordinary spaces allowed) are two different
+  checks — an id is a bookkeeping key, a name is user-facing text — and
+  both reject empty, `-`-prefixed, or control-charactered strings before
+  they reach an argv; `safe_action_path` is the rule for path arguments —
+  absolute and control-free, whitespace included — with no count cap: the
+  wire line's own length is the only bound. The `project` field must be a
+  JSON string: `""` is the clear request, and a missing key, `null`, or a
+  non-string value is refused outright, never read as a clear. The reply
+  forwards the CLI outcome's `data` verbatim under `"data"` when the
+  envelope has one and omits the key otherwise — never reshape it. The reply is one JSON line on its own dedicated
   connection and the QML callback contract is exactly-once. A multi-step
   action (`createproject`'s add-then-assign) stops at its first failure and
   reports the partial state honestly rather than rolling back. The bridge

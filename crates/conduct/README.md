@@ -357,8 +357,11 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   closes. `createproject` is two invocations in order — `project add
   <name> <paths…> --new`, then `session project --id <id> --project
   <name>` to assign it — that stop at the first failure and report a
-  partial honestly rather than rolling back. Every other socket command
-  stays fire-and-forget.
+  partial honestly rather than rolling back. The `project` field is a
+  JSON string (`""` clears; a missing or non-string value is refused);
+  names may carry ordinary spaces; `paths` has no count cap; the reply
+  carries the CLI outcome's `data` verbatim when there is one. Every other
+  socket command stays fire-and-forget.
 - `commands` — this crate's CLI commands: 19 paths registered in one
   `register()` call (`conduct/src/commands/graph.rs`, still that file's name
   post-cutover) — the `graph` family narrowed at task #101 R1 to the bare
