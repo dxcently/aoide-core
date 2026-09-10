@@ -110,13 +110,16 @@ fn conducted_ancestor(id: &str, sessions: &[SessionRecord]) -> Option<String> {
 }
 
 /// The petname fallback (MAIL.md "Delivery and the doorbell"): called ONLY
-/// when [`aoide_storage::mail::ring_targets`] reports `enrolled == 0` for
-/// `name` — a real reader already enrolled (armed or latched) must never be
-/// second-guessed by a display-name coincidence. Every session record whose
-/// `petname` equals `name` is resolved to its [`conducted_ancestor`] and
-/// that ancestor is `enrol_reader`-ed, deduplicated (a fan of hook-fed
-/// children sharing one wrap enrols the wrap once, not once per child).
-/// Best-effort: an enrol failure for one match never stops the others.
+/// when no key in [`aoide_storage::mail::ring_targets`]'s `enrolled` roster
+/// resolves to a session record that [`is_conductable_now`] — a real reader
+/// that is still ALIVE, armed or merely latched, must never be
+/// second-guessed by a display-name coincidence, but a stale enrolment with
+/// no record at all, or one whose socket is gone, must never wall off a
+/// mailbox from ever being rung again. Every session record whose `petname`
+/// equals `name` is resolved to its [`conducted_ancestor`] and that ancestor
+/// is `enrol_reader`-ed, deduplicated (a fan of hook-fed children sharing
+/// one wrap enrols the wrap once, not once per child). Best-effort: an
+/// enrol failure for one match never stops the others.
 fn petname_fallback(name: &str, sessions: &[SessionRecord]) {
     let mut enrolled = HashSet::new();
     for rec in sessions {
@@ -143,19 +146,26 @@ fn ring_locked(name: &str, exclude: Option<&str>) -> RingReport {
         Err(_) => return report,
     };
 
-    if targets.enrolled == 0 {
-        if let Ok(file) = load_stage::<SessionsFile>(&sessions_path()) {
-            petname_fallback(name, &file.sessions);
-        }
+    // Loaded once: `petname_fallback` reads session records but never
+    // writes them, so the same snapshot serves both the liveness check
+    // below and the target walk further down — no second load after a
+    // fallback pass.
+    let sessions: Vec<SessionRecord> = load_stage::<SessionsFile>(&sessions_path())
+        .map(|f| f.sessions)
+        .unwrap_or_default();
+
+    let any_live_enrolled = targets
+        .enrolled
+        .iter()
+        .any(|reader| sessions.iter().any(|s| &s.session_id == reader && is_conductable_now(s)));
+
+    if !any_live_enrolled {
+        petname_fallback(name, &sessions);
         targets = match aoide_storage::mail::ring_targets(name) {
             Ok(t) => t,
             Err(_) => return report,
         };
     }
-
-    let sessions: Vec<SessionRecord> = load_stage::<SessionsFile>(&sessions_path())
-        .map(|f| f.sessions)
-        .unwrap_or_default();
 
     for (wrap_id, seq) in &targets.armed {
         // The filer's own wrap is never rung for its own letter — not even
@@ -585,7 +595,7 @@ mod tests {
     }
 
     #[test]
-    fn a_latched_reader_blocks_the_petname_fallback() {
+    fn a_live_latched_reader_still_blocks_the_petname_fallback() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -597,14 +607,18 @@ mod tests {
         ]);
         let root = setup("ring-latched");
         let name = "claude-mail";
+        let wrap_id = "wrap-1";
 
-        aoide_storage::mail::enrol_reader(name, "wrap-1").unwrap();
+        // Genuinely live: a bound socket, conducted, headless — not merely
+        // a cursor key with nothing behind it.
+        let _listener = headless_wrap(wrap_id);
+        aoide_storage::mail::enrol_reader(name, wrap_id).unwrap();
         let entry = aoide_storage::mail::file_letter("someone", name, "hello").unwrap();
-        aoide_storage::mail::stamp_rung(name, "wrap-1", entry.seq).unwrap();
+        aoide_storage::mail::stamp_rung(name, wrap_id, entry.seq).unwrap();
 
         // A session record whose petname matches `name` exists on disk — if
-        // the fallback ran despite an already-enrolled reader, this is who
-        // it would (wrongly) enrol and ring.
+        // the fallback ran despite an already-enrolled, still-live reader,
+        // this is who it would (wrongly) enrol and ring.
         let mut file: SessionsFile = load_stage(&sessions_path()).unwrap_or_default();
         let mut rec = session("petname-match", "/w", "idle", "t0", None);
         rec.petname = Some(name.to_string());
@@ -618,7 +632,125 @@ mod tests {
         assert!(report.skipped.is_empty());
 
         let targets = aoide_storage::mail::ring_targets(name).unwrap();
-        assert_eq!(targets.enrolled, 1, "the fallback must never enrol on top of an already-enrolled reader");
+        assert_eq!(
+            targets.enrolled.len(),
+            1,
+            "the fallback must never enrol on top of an already-enrolled, still-live reader"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stale_enrolment_with_no_session_record_does_not_block_the_petname_fallback() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("ring-stale-no-record");
+        let name = "claude-mail";
+        let wrap_id = "wrap-1";
+        let child_id = "wrap-1-child";
+
+        // A dead enrolment: a cursor key with no session record behind it
+        // at all — a wrap that read this mailbox once and later vanished
+        // without ever being un-enrolled.
+        aoide_storage::mail::enrol_reader(name, "ghost").unwrap();
+
+        let listener = headless_wrap(wrap_id);
+        hook_child(child_id, wrap_id, "claude");
+        do_session_phase(child_id, "stopped");
+        set_petname(child_id, name);
+
+        aoide_storage::mail::file_letter("someone", name, "hello").unwrap();
+
+        let acc = std::thread::spawn(move || read_all(listener));
+        let report = ring(name, None).unwrap();
+        let bytes = acc.join().unwrap();
+
+        // The target walk is unchanged: the dead enrolment still walks and
+        // still reports `unknown` — liveness governs only whether the
+        // fallback runs, never the walk itself.
+        assert_eq!(report.skipped, vec![("ghost".to_string(), "unknown".to_string())], "{report:?}");
+        assert_eq!(report.rung, vec![wrap_id.to_string()], "the live petname match still gets rung: {report:?}");
+        assert!(String::from_utf8_lossy(&bytes).starts_with(&nudge_line(name)));
+
+        let targets = aoide_storage::mail::ring_targets(name).unwrap();
+        assert!(targets.enrolled.iter().any(|r| r == "ghost"), "the stale enrolment is left in place: {targets:?}");
+        assert!(targets.enrolled.iter().any(|r| r == wrap_id), "the live match is now enrolled too: {targets:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stale_enrolment_whose_socket_is_gone_does_not_block_the_petname_fallback() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("ring-stale-gone-socket");
+        let name = "claude-mail";
+        let dead_wrap_id = "dead-wrap";
+        let live_wrap_id = "wrap-1";
+        let child_id = "wrap-1-child";
+
+        // Recorded, conductable, headless — but nothing ever bound the
+        // path (the same shape as `a_recorded_reader_whose_socket_file_
+        // is_gone_is_skipped_and_stays_armed`, here as the only prior
+        // enrolment a mailbox has).
+        let dead_socket = conduct_socket_path(dead_wrap_id);
+        do_session_start(
+            dead_wrap_id,
+            Some("claude"),
+            Some("/w"),
+            None,
+            None,
+            Some(true),
+            Some(dead_socket.to_str().unwrap()),
+            None,
+            None,
+        );
+        stamp_headless(dead_wrap_id);
+        aoide_storage::mail::enrol_reader(name, dead_wrap_id).unwrap();
+
+        let listener = headless_wrap(live_wrap_id);
+        hook_child(child_id, live_wrap_id, "claude");
+        do_session_phase(child_id, "stopped");
+        set_petname(child_id, name);
+
+        aoide_storage::mail::file_letter("someone", name, "hello").unwrap();
+
+        let acc = std::thread::spawn(move || read_all(listener));
+        let report = ring(name, None).unwrap();
+        let bytes = acc.join().unwrap();
+
+        // The target walk is unchanged: the dead enrolment still walks and
+        // still reports `not-conductable` — liveness governs only whether
+        // the fallback runs, never the walk itself.
+        assert_eq!(
+            report.skipped,
+            vec![(dead_wrap_id.to_string(), "not-conductable".to_string())],
+            "{report:?}"
+        );
+        assert_eq!(report.rung, vec![live_wrap_id.to_string()], "the live petname match still gets rung: {report:?}");
+        assert!(String::from_utf8_lossy(&bytes).starts_with(&nudge_line(name)));
+
+        let targets = aoide_storage::mail::ring_targets(name).unwrap();
+        assert!(
+            targets.enrolled.iter().any(|r| r == dead_wrap_id),
+            "the stale enrolment is left in place: {targets:?}"
+        );
+        assert!(targets.enrolled.iter().any(|r| r == live_wrap_id), "the live match is now enrolled too: {targets:?}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -654,7 +786,7 @@ mod tests {
         assert!(String::from_utf8_lossy(&bytes).starts_with(&nudge_line(name)));
 
         let targets = aoide_storage::mail::ring_targets(name).unwrap();
-        assert_eq!(targets.enrolled, 1, "the ANCESTOR is enrolled, not the child");
+        assert_eq!(targets.enrolled.len(), 1, "the ANCESTOR is enrolled, not the child");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -689,7 +821,7 @@ mod tests {
         // A second letter arrives before the reader has read anything.
         aoide_storage::mail::file_letter("someone", name, "second").unwrap();
         let targets = aoide_storage::mail::ring_targets(name).unwrap();
-        assert_eq!(targets.enrolled, 1, "no duplicate enrolment from a second fallback pass");
+        assert_eq!(targets.enrolled.len(), 1, "no duplicate enrolment from a second fallback pass");
         assert!(targets.armed.is_empty(), "still latched: the reader has not read yet");
 
         let _ = std::fs::remove_dir_all(&root);

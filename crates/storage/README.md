@@ -499,13 +499,20 @@ by decision — no embedded database yet
   P-M5a-1 adds the doorbell's own state and its safety floor: `arms(kind)`
   is the one place that decides which entry kinds ring (`letter` only,
   until P-M5b's `fetched`); `ring_targets(name)` reads who is armed under
-  a name and how many real readers are enrolled at all (`RingTargets {
-  armed, enrolled }`, MAIL.md "Delivery and the doorbell") — the
-  pseudo-reader (cursor key == `name`) is excluded from both counts;
-  `stamp_rung`/`enrol_reader` are its paired mutations, latching an
-  already-enrolled reader and enrolling a fresh one respectively, never
-  the other's job; `armed_names_for_reader` is the same armed rule run
-  for one reader across every name, the shape the Stop-hook replay reads.
+  a name and which real readers are enrolled at all (`RingTargets {
+  armed, enrolled }`, MAIL.md "Delivery and the doorbell") — `enrolled`
+  is the full roster of reader keys, not a count (the count is
+  `.len()`), so a caller can ask not just how many but which, and the
+  pseudo-reader (cursor key == `name`) is excluded from both `armed` and
+  `enrolled`; `stamp_rung`/`enrol_reader` are its paired mutations,
+  latching an already-enrolled reader and enrolling a fresh one
+  respectively, never the other's job; `armed_names_for_reader` is the
+  same armed rule run for one reader across every name, the shape the
+  Stop-hook replay reads. Storage stays read-only about liveness: whether
+  an enrolled reader is still alive is a session-store question
+  `ring_targets` cannot answer, so `RingTargets` hands back keys, not a
+  verdict — `aoide-conduct`'s `graph::doorbell` is the one place with
+  both the roster and the session records to judge it.
   `file_letter`/`mint_outbound_letter` refuse a `to_name` outside
   `^[a-z0-9][a-z0-9-]*$` (`node_store::valid_node_name`) before taking
   the lock — validated, never clamped; a letter already on disk under an

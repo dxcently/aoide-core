@@ -1024,20 +1024,24 @@ pub fn names_with_unread(reader_session: Option<&str>) -> Result<Vec<String>, St
 pub struct RingTargets {
     /// (reader key, highest arming seq) for every reader that is armed.
     pub armed: Vec<(String, u64)>,
-    /// Reader keys under this name other than the pseudo-reader.
-    pub enrolled: usize,
+    /// Reader keys under this name other than the pseudo-reader — the full
+    /// enrolment roster, armed or merely latched. There is no separate count
+    /// field: the count is `.len()`.
+    pub enrolled: Vec<String>,
 }
 
-/// Who is armed under `name`, and how many real (non-pseudo) readers are
+/// Who is armed under `name`, and which real (non-pseudo) readers are
 /// enrolled at all (MAIL.md "Delivery and the doorbell"). The pseudo-reader
 /// (cursor key == `name` itself, the identity an unconducted caller reads
-/// under) is never armed and never counts toward `enrolled` — it is
-/// nobody's terminal to ring, and its presence must never suppress the
-/// ringer's petname fallback. A reader is armed once unread arming mail
-/// ([`arms`], currently `letter` only) exists beyond both what it has read
-/// (`mark.seq`) and what it was last rung for (`mark.rung`): rung once, a
-/// reader stays latched until its own read catches up to that point, and
-/// re-arms only on the next arming entry after that. Read-only.
+/// under) is never armed and never counted in `enrolled` — it is nobody's
+/// terminal to ring, and its presence must never suppress the ringer's
+/// petname fallback. A reader is armed once unread arming mail ([`arms`],
+/// currently `letter` only) exists beyond both what it has read (`mark.seq`)
+/// and what it was last rung for (`mark.rung`): rung once, a reader stays
+/// latched until its own read catches up to that point, and re-arms only on
+/// the next arming entry after that. Read-only — whether an enrolled reader
+/// is still alive is a session-store question this module cannot answer;
+/// that liveness filtering belongs to the caller.
 pub fn ring_targets(name: &str) -> Result<RingTargets, String> {
     let name = name.to_string();
     with_lock(move || {
@@ -1050,13 +1054,13 @@ pub fn ring_targets(name: &str) -> Result<RingTargets, String> {
             .unwrap_or(0);
         let cursors = load_cursors()?;
         let mut armed = Vec::new();
-        let mut enrolled = 0usize;
+        let mut enrolled = Vec::new();
         if let Some(cursor) = cursors.get(&name) {
             for (reader, mark) in cursor {
                 if *reader == name {
                     continue;
                 }
-                enrolled += 1;
+                enrolled.push(reader.clone());
                 if max_arm > mark.seq && mark.rung <= mark.seq {
                     armed.push((reader.clone(), max_arm));
                 }
@@ -1983,7 +1987,7 @@ mod tests {
         enrol_reader("bob", "sess-1").unwrap();
         let before = ring_targets("bob").unwrap();
         assert!(before.armed.is_empty(), "no arming mail at all: nothing armed");
-        assert_eq!(before.enrolled, 1);
+        assert_eq!(before.enrolled.len(), 1);
 
         file_letter("alice", "bob", "one").unwrap();
         let after = ring_targets("bob").unwrap();
@@ -2054,14 +2058,14 @@ mod tests {
         read_for("bob", false, None).unwrap(); // enrols only the pseudo-reader, key "bob"
 
         let t = ring_targets("bob").unwrap();
-        assert_eq!(t.enrolled, 0, "the pseudo-reader is never counted as enrolled");
+        assert_eq!(t.enrolled.len(), 0, "the pseudo-reader is never counted as enrolled");
         assert!(t.armed.is_empty(), "the pseudo-reader is never a ring target");
 
         // Unread arming mail piles up for it too — still never a target.
         file_letter("alice", "bob", "two").unwrap();
         let t2 = ring_targets("bob").unwrap();
         assert!(t2.armed.is_empty(), "still never a target, even with unread arming mail outstanding");
-        assert_eq!(t2.enrolled, 0);
+        assert_eq!(t2.enrolled.len(), 0);
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2077,7 +2081,38 @@ mod tests {
 
         let t = ring_targets("bob").unwrap();
         assert!(t.armed.is_empty(), "latched immediately after stamping, before any read: not armed");
-        assert_eq!(t.enrolled, 1, "a latched reader is still enrolled");
+        assert_eq!(t.enrolled.len(), 1, "a latched reader is still enrolled");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ring_targets_names_every_enrolled_reader_not_just_a_count() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("ring-enrolled-names");
+
+        enrol_reader("bob", "sess-1").unwrap();
+        enrol_reader("bob", "sess-2").unwrap();
+
+        let t = ring_targets("bob").unwrap();
+        let mut names = t.enrolled.clone();
+        names.sort();
+        assert_eq!(names, vec!["sess-1".to_string(), "sess-2".to_string()], "every enrolled reader key, not merely how many");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_pseudo_reader_is_absent_from_the_enrolled_names() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("ring-enrolled-names-pseudo");
+
+        file_letter("alice", "bob", "one").unwrap();
+        read_for("bob", false, None).unwrap(); // enrols only the pseudo-reader, key "bob"
+        enrol_reader("bob", "sess-1").unwrap();
+
+        let t = ring_targets("bob").unwrap();
+        assert_eq!(t.enrolled, vec!["sess-1".to_string()], "the pseudo-reader's own key must never appear among the names");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
