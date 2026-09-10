@@ -1726,10 +1726,12 @@ mod tests {
         // the per-test stage dir instead of the fictional /home/k/Aoide.
         let proj = stage.join("proj");
         std::fs::create_dir_all(proj.join("sub")).unwrap();
-        project_add(&invocation(
-            &["project", "add"],
-            &["aoide", proj.to_str().unwrap()],
-        ));
+        // `project add` is DAEMON-OWNED now (`manage.rs`'s `local_daemon`):
+        // stamp `Door::Daemon` to exercise the local path with no daemon
+        // running, same as `manage.rs`'s own handler tests.
+        let mut proj_inv = invocation(&["project", "add"], &["aoide", proj.to_str().unwrap()]);
+        proj_inv.door = aoide_protocol::Door::Daemon;
+        project_add(&proj_inv);
         let out = session_start(&flag_invocation(
             &["session", "start"],
             &[("id", "s1"), ("cwd", proj.join("sub").to_str().unwrap())],

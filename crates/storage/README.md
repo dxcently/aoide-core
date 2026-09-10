@@ -73,11 +73,14 @@ by decision — no embedded database yet
   `None` (never a default that might not exist) when neither resolves; the
   caller turns that into a taught error naming both locations.
 - `records::Project` — a project is a set of anchor roots, not one
-  directory: `path` is always the first, `roots` the second and later
-  (optional, additive, off the wire when empty). `Project::roots()` is the
-  one enumeration path every reader uses (path first, then `roots`,
-  deduplicated) — a hand-edited record whose `path` disagrees with
-  `roots[0]` is read as given, never silently rewritten.
+  directory: `path` is always the first root, mirrored at `roots[0]`;
+  `roots` is the FULL ordered root list, always written by
+  `project add`/`project edit`/`project remove` (ROOTS SERIALIZED
+  COMPLETE — never omitted, never "just the extras"). `Project::roots()` is
+  the one enumeration path every reader uses (path first, then `roots`,
+  deduplicated) — a legacy record predating `roots`, or a hand-edited one
+  whose `path` disagrees with `roots[0]`, is read as given, never silently
+  rewritten.
 - `config` — the portable runtime config (task #135 P-C, CONTRACTS.md §4's
   `config.toml` subsection): `$AOIDE_ROOT/config.toml`, the one file here
   that records INTENT rather than state. It exists because core is portable

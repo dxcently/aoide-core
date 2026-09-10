@@ -133,11 +133,70 @@ fn app_loads_recomputes_selects_and_dispatches_against_the_tempdir() {
     // ── project add via dispatch lands on disk + in state ──
     // (The path must be a real absolute dir — `project add` rejects
     // relative/nonexistent paths now — so a subdir of the tempdir stands in.)
+    //
+    // `project add/edit/remove` are DAEMON-OWNED atomic mutations
+    // (`manage.rs`'s `local_daemon`): the conductor's `App::dispatch` always
+    // stamps `Door::Cli` (`app.rs`'s own doc), so this now forwards through
+    // `aoide_client::daemon::daemon_dispatch` instead of writing locally —
+    // exactly like `session.project`/`session.kill` already required a live
+    // daemon before this fix. A fake daemon thread stands in for `aoided`:
+    // it accepts the ONE connection this dispatch makes, runs the SAME
+    // `aoide::dispatch::dispatch` the real daemon's `serve_daemon` loop
+    // calls (with `Door::Daemon`, so it takes the local path unconditionally
+    // — `local_daemon`'s reentrancy guard), and replies with the real
+    // Outcome — proving the intended live-daemon path actually works,
+    // rather than papering over the new requirement.
+    let daemon_socket = stage.join("fake-aoided.sock");
+    let listener = std::os::unix::net::UnixListener::bind(&daemon_socket).unwrap();
+    let daemon_thread = std::thread::spawn(move || {
+        use std::io::{BufRead, BufReader, Write};
+        let (conn, _) = listener.accept().unwrap();
+        let mut reader = BufReader::new(conn);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        let req: serde_json::Value = serde_json::from_str(line.trim()).unwrap();
+        let inv = aoide_protocol::Invocation {
+            path: req["path"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect(),
+            args: req["args"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_str().unwrap().to_string())
+                .collect(),
+            flags: Default::default(),
+            door: aoide_protocol::Door::Daemon,
+        };
+        let outcome = aoide::dispatch::dispatch(&inv);
+        let reply = serde_json::json!({ "outcome": outcome });
+        let mut out = reply.to_string();
+        out.push('\n');
+        reader.into_inner().write_all(out.as_bytes()).unwrap();
+    });
+    std::env::set_var("AOIDE_DAEMON_SOCKET", &daemon_socket);
+
     let newproj_dir = stage.join("newproj");
     std::fs::create_dir_all(&newproj_dir).unwrap();
     app.dispatch(
         &["project", "add"],
         &["newproj".to_string(), newproj_dir.to_string_lossy().into_owned()],
+    );
+    daemon_thread.join().unwrap();
+    std::env::remove_var("AOIDE_DAEMON_SOCKET");
+
+    let outcome = app
+        .last_outcome
+        .as_ref()
+        .expect("project add produced an outcome");
+    assert_eq!(
+        outcome.status,
+        aoide_protocol::output::Status::Ok,
+        "project add forwarded through the fake daemon: {}",
+        outcome.message
     );
     assert!(
         app.projects.iter().any(|p| p.name == "newproj"),

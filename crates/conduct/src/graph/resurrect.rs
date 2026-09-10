@@ -1175,10 +1175,13 @@ mod tests {
         std::env::set_var("XDG_RUNTIME_DIR", &root);
         std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
         let proj_path = root.to_str().unwrap().to_string();
-        let out = crate::graph::project_add(&invocation(
-            &["project", "add"],
-            &["proj", &proj_path],
-        ));
+        // `project add` is DAEMON-OWNED now (`manage.rs`'s `local_daemon`):
+        // a `Door::Cli` invocation would try to forward to `aoided`, which
+        // nothing here is running — stamp `Door::Daemon` to exercise the
+        // local path directly, same as `manage.rs`'s own handler tests.
+        let mut inv = invocation(&["project", "add"], &["proj", &proj_path]);
+        inv.door = aoide_protocol::Door::Daemon;
+        let out = crate::graph::project_add(&inv);
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         (root, proj_path)
     }

@@ -27,12 +27,17 @@ pub struct Project {
     pub name: String,
     #[serde(default)]
     pub path: String,
-    /// The project's SECOND and later anchor roots. `path` is the first and
-    /// is never repeated here, so a one-root project stays byte-identical on
-    /// the wire to a pre-`roots` record — the same additive discipline
-    /// `autoResume` above and `SessionRecord.headless` set the precedent for.
-    /// Read through [`Project::roots`], never directly.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Every anchor root of this project, in order, `path` mirrored at
+    /// `roots[0]` — the FULL list, not "second root onward." Always written
+    /// by `project add`/`project edit`/`project remove` (no
+    /// `skip_serializing_if`: a project touched by the new code always has
+    /// a non-empty `roots`, ROOTS SERIALIZED COMPLETE). A legacy record
+    /// predating this field, or one hand-edited so `roots[0]` disagrees
+    /// with `path` or repeats it, still reads correctly — [`Project::roots`]
+    /// is path-first-then-`roots`-deduped, never a raw field read, and is
+    /// never rewritten just by reading it. Read through [`Project::roots`],
+    /// never directly.
+    #[serde(default)]
     pub roots: Vec<String>,
     /// Additive/v0-safe (P-D8, `docs/architecture/AOIDED.md`'s "L5"): when
     /// true, the daemon's `run_loop` entry (once per BOOT, boot-epoch
@@ -613,24 +618,34 @@ mod tests {
         assert_eq!(p.roots(), vec!["/b"]);
     }
     #[test]
-    fn a_project_with_extra_roots_round_trips_and_stays_off_the_wire_when_empty() {
-        let bare = Project { name: "aoide".into(), path: "/a".into(), ..Default::default() };
-        let bare_json = serde_json::to_string(&bare).unwrap();
-        assert!(!bare_json.contains("\"roots\""), "serialised: {bare_json}");
+    fn a_project_with_extra_roots_round_trips_the_full_list_always_on_the_wire() {
+        // ROOTS SERIALIZED COMPLETE: `roots` has no `skip_serializing_if`
+        // any more, and the new-code shape is the FULL ordered root list
+        // with `path` mirrored at `roots[0]` — never "extras only."
+        let one_root = Project {
+            name: "aoide".into(),
+            path: "/a".into(),
+            roots: vec!["/a".into()],
+            ..Default::default()
+        };
+        let one_root_json = serde_json::to_string(&one_root).unwrap();
+        assert!(one_root_json.contains("\"roots\":[\"/a\"]"), "serialised: {one_root_json}");
 
         let populated = Project {
             name: "aoide".into(),
             path: "/a".into(),
-            roots: vec!["/b".into()],
+            roots: vec!["/a".into(), "/b".into()],
             ..Default::default()
         };
         let json = serde_json::to_string(&populated).unwrap();
-        assert!(json.contains("\"roots\":[\"/b\"]"), "serialised: {json}");
+        assert!(json.contains("\"roots\":[\"/a\",\"/b\"]"), "serialised: {json}");
 
-        let back_bare: Project = serde_json::from_str(&bare_json).unwrap();
+        let back_one_root: Project = serde_json::from_str(&one_root_json).unwrap();
         let back_populated: Project = serde_json::from_str(&json).unwrap();
-        assert_eq!(back_bare.roots(), bare.roots());
-        assert_eq!(back_populated.roots(), populated.roots());
+        assert_eq!(back_one_root.roots(), vec!["/a"]);
+        assert_eq!(back_one_root.path, back_one_root.roots()[0]);
+        assert_eq!(back_populated.roots(), vec!["/a", "/b"]);
+        assert_eq!(back_populated.path, back_populated.roots()[0]);
     }
     #[test]
     fn a_legacy_project_without_roots_reads_as_one_root() {

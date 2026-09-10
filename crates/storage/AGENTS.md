@@ -4,10 +4,14 @@
   names a registered project independently of cwd. The exit ledger retains
   it; an unset field means automatic cwd anchoring.
 - **A project is a set of anchor roots.** `Project.path` is always the
-  first root; `Project.roots` holds the second and later, additive and off
-  the wire when empty. Read roots through `Project::roots()`, never the raw
-  fields directly — that is the one place the path-first, deduped ordering
-  is guaranteed.
+  first root, mirrored at `roots[0]`; `Project.roots` is the FULL ordered
+  root list (ROOTS SERIALIZED COMPLETE) — always written by
+  `project add`/`project edit`/`project remove`, never omitted or
+  extras-only. A legacy record predating this field, or one hand-edited so
+  `roots[0]` disagrees with `path`, still reads correctly: read roots
+  through `Project::roots()`, never the raw fields directly — that is the
+  one place the path-first, deduped ordering is guaranteed, and reading it
+  never rewrites the record.
 
 ## Invariants
 

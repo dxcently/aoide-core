@@ -8,11 +8,32 @@ use super::model::{
     hooks_path, load_stage, projects_path, sessions_path, sorted_projects,
     write_stage, HooksFile, Project, ProjectsFile, SessionsFile, STAGE_GRAPH_VERSION,
 };
-use aoide_protocol::Invocation;
+use aoide_protocol::{Door, Invocation};
 use aoide_protocol::output::Outcome;
+use aoide_storage::fs::with_stage_lock;
 use serde_json::json;
 #[cfg(test)]
 use serde_json::Value;
+
+/// `project add/edit/remove` are DAEMON-OWNED atomic mutations, the same
+/// shape `actions.rs`'s `assign_project`/`session_kill` set the precedent
+/// for: a `Door::Cli` caller forwards through `aoided`'s dispatch socket and
+/// errors if none answers; a `Door::Daemon` caller (already running INSIDE
+/// `aoided`, because a remote request just landed there) takes the local
+/// path directly — `daemon_dispatch` itself short-circuits to `None` on
+/// `Door::Daemon` for exactly this reentrancy reason; every other door is
+/// refused as local-only.
+fn local_daemon(inv: &Invocation) -> Option<Outcome> {
+    match inv.door {
+        Door::Daemon => None,
+        Door::Cli => Some(
+            aoide_client::daemon::daemon_dispatch(inv).unwrap_or_else(|| {
+                Outcome::error(inv.dotted(), "aoided must be running for project management")
+            }),
+        ),
+        _ => Some(Outcome::error(inv.dotted(), "project management is local-only")),
+    }
+}
 
 /// Bare `graph` — render the DAG (tree in text, graph document in `--json`).
 pub fn view(inv: &Invocation) -> Outcome {
@@ -65,8 +86,13 @@ fn validate_root(cmd: &str, name: &str, path: &str) -> Result<(), Outcome> {
 /// directory supplies exactly one root, so a bare `aoide project add <name>`
 /// registers the dir you're in — and a session started there anchors to it
 /// by cwd prefix. `--new` refuses a name that already exists instead of
-/// adding to it.
+/// adding to it. DAEMON-OWNED (`local_daemon`, above): a CLI caller forwards
+/// to `aoided`; only the door check and arg parsing happen out here, the
+/// actual mutation is [`add_roots`].
 pub fn project_add(inv: &Invocation) -> Outcome {
+    if let Some(out) = local_daemon(inv) {
+        return out;
+    }
     let args = match require_args(inv, &["name"]) {
         Ok(a) => a,
         Err(e) => return e,
@@ -85,136 +111,153 @@ pub fn project_add(inv: &Invocation) -> Outcome {
             }
         }
     };
-    let mut file: ProjectsFile = match load_stage(&projects_path()) {
-        Ok(f) => f,
-        Err(e) => return stage_error("project.add", e),
-    };
-
-    // `--new` refuses a name that already exists BEFORE any path validation
-    // or write — the invocation was well-formed, the world disagreed.
-    if inv.flag_present("new") && file.projects.iter().any(|p| p.name == name) {
-        return Outcome::error(
-            "project.add",
-            format!(
-                "project `{name}` already exists — omit --new to add a root to it, or use `project edit` to replace its roots"
-            ),
-        )
-        .with_data(json!({ "reason": "exists", "name": name }));
-    }
-
-    // Validate EVERY root before mutating anything — one bad path in the
-    // list refuses the whole invocation and writes nothing.
-    for path in &paths {
-        if let Err(e) = validate_root("project.add", &name, path) {
-            return e;
-        }
-    }
-
     // `--auto-resume` (P-D8, `docs/architecture/AOIDED.md`'s "L5"): opts this
     // project into the daemon's boot-time auto-resume sweep. Only ever sets
     // it true here — `project edit` never touches it (see this crate's own
     // `AGENTS.md`).
-    let auto_resume = inv.flag_present("auto-resume");
+    add_roots(&name, &paths, inv.flag_present("new"), inv.flag_present("auto-resume"))
+}
 
-    let mut changed: Vec<String> = Vec::new();
-    let mut added_roots: Vec<String> = Vec::new();
-    let message;
-    match file.projects.iter_mut().find(|p| p.name == name) {
-        Some(existing) => {
-            let mut this_changed = false;
-            for path in &paths {
-                if existing.path.is_empty() {
-                    changed.push(format!("project {name}: path → {path}"));
-                    existing.path = path.clone();
-                    added_roots.push(path.clone());
-                    this_changed = true;
-                } else if !existing.roots().contains(&path.as_str()) {
-                    existing.roots.push(path.clone());
-                    changed.push(format!("project {name}: added root {path}"));
-                    added_roots.push(path.clone());
-                    this_changed = true;
-                }
-            }
-            if auto_resume && !existing.auto_resume {
-                changed.push(format!("project {name}: autoResume → true"));
-                existing.auto_resume = true;
-                this_changed = true;
-            }
-            message = if !added_roots.is_empty() {
-                if added_roots.len() == 1 {
-                    format!("added root {} to project `{name}`", added_roots[0])
-                } else {
-                    format!("added roots {} to project `{name}`", added_roots.join(", "))
-                }
-            } else if this_changed {
+/// The local mutation behind `project add`, run inside ONE [`with_stage_lock`]
+/// hold end to end — the `--new` existence check, every path's validation,
+/// and the write all happen under the SAME lock, so two threads racing
+/// `--new` for the same name can never both see "unregistered" and both win
+/// (only one lock holder observes the empty registry; the other sees the
+/// first's write). `roots` is written as the FULL ordered root list, `path`
+/// mirrored at `roots[0]` (ROOTS SERIALIZED COMPLETE) — never "just the new
+/// ones appended to whatever was on disk."
+fn add_roots(name: &str, paths: &[String], new: bool, auto_resume: bool) -> Outcome {
+    with_stage_lock(|| {
+        let mut file: ProjectsFile = match load_stage(&projects_path()) {
+            Ok(f) => f,
+            Err(e) => return stage_error("project.add", e),
+        };
+
+        // `--new` refuses a name that already exists BEFORE any path
+        // validation or write — the invocation was well-formed, the world
+        // disagreed.
+        if new && file.projects.iter().any(|p| p.name == name) {
+            return Outcome::error(
+                "project.add",
                 format!(
-                    "project `{name}`: autoResume → true (root {} already registered)",
-                    paths.join(", ")
-                )
-            } else {
-                format!("project `{name}` already has root {} (no change)", paths.join(", "))
-            };
+                    "project `{name}` already exists — omit --new to add a root to it, or use `project edit` to replace its roots"
+                ),
+            )
+            .with_data(json!({ "reason": "exists", "name": name }));
         }
-        None => {
-            let mut iter = paths.iter();
-            let first = iter.next().cloned().unwrap_or_default();
-            let mut rest: Vec<String> = Vec::new();
-            for path in iter {
-                if path != &first && !rest.contains(path) {
-                    rest.push(path.clone());
-                }
-            }
-            let rest_len = rest.len();
-            file.projects.push(Project {
-                name: name.clone(),
-                path: first.clone(),
-                roots: rest,
-                auto_resume,
-            });
-            changed.push(format!("registered project {name} → {first}"));
-            if auto_resume {
-                changed.push(format!("project {name}: autoResume → true"));
-            }
-            message = if rest_len > 0 {
-                format!("registered project `{name}` → {first} (+{rest_len} more root(s))")
-            } else {
-                format!("registered project `{name}` → {first}")
-            };
-        }
-    }
 
-    let final_auto_resume = auto_resume
-        || file
+        // Validate EVERY root before mutating anything — one bad path in the
+        // list refuses the whole invocation and writes nothing.
+        for path in paths {
+            if let Err(e) = validate_root("project.add", name, path) {
+                return e;
+            }
+        }
+
+        let mut changed: Vec<String> = Vec::new();
+        let mut added_roots: Vec<String> = Vec::new();
+        let message;
+        match file.projects.iter_mut().find(|p| p.name == name) {
+            Some(existing) => {
+                let mut current: Vec<String> =
+                    existing.roots().into_iter().map(str::to_string).collect();
+                let mut this_changed = false;
+                for path in paths {
+                    if !current.contains(path) {
+                        if current.is_empty() {
+                            changed.push(format!("project {name}: path → {path}"));
+                        } else {
+                            changed.push(format!("project {name}: added root {path}"));
+                        }
+                        current.push(path.clone());
+                        added_roots.push(path.clone());
+                        this_changed = true;
+                    }
+                }
+                if auto_resume && !existing.auto_resume {
+                    changed.push(format!("project {name}: autoResume → true"));
+                    existing.auto_resume = true;
+                    this_changed = true;
+                }
+                if this_changed {
+                    existing.path = current[0].clone();
+                    existing.roots = current;
+                }
+                message = if !added_roots.is_empty() {
+                    if added_roots.len() == 1 {
+                        format!("added root {} to project `{name}`", added_roots[0])
+                    } else {
+                        format!("added roots {} to project `{name}`", added_roots.join(", "))
+                    }
+                } else if this_changed {
+                    format!(
+                        "project `{name}`: autoResume → true (root {} already registered)",
+                        paths.join(", ")
+                    )
+                } else {
+                    format!("project `{name}` already has root {} (no change)", paths.join(", "))
+                };
+            }
+            None => {
+                let mut full: Vec<String> = Vec::new();
+                for path in paths {
+                    if !full.contains(path) {
+                        full.push(path.clone());
+                    }
+                }
+                let first = full.first().cloned().unwrap_or_default();
+                let rest_len = full.len().saturating_sub(1);
+                file.projects.push(Project {
+                    name: name.to_string(),
+                    path: first.clone(),
+                    roots: full,
+                    auto_resume,
+                });
+                changed.push(format!("registered project {name} → {first}"));
+                if auto_resume {
+                    changed.push(format!("project {name}: autoResume → true"));
+                }
+                message = if rest_len > 0 {
+                    format!("registered project `{name}` → {first} (+{rest_len} more root(s))")
+                } else {
+                    format!("registered project `{name}` → {first}")
+                };
+            }
+        }
+
+        let final_auto_resume = auto_resume
+            || file
+                .projects
+                .iter()
+                .any(|p| p.name == name && p.auto_resume);
+        if !changed.is_empty() {
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            file.projects.sort_by(|a, b| a.name.cmp(&b.name));
+            if let Err(e) = write_stage(&projects_path(), &file) {
+                return stage_error("project.add", e);
+            }
+            // Keep the staged graph.json in lock-step with the registry.
+            match restage_graph() {
+                Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+                Err(e) => return stage_error("project.add", e),
+            }
+        }
+        // Read the record back out post-write so `path`/`roots` describe the
+        // FINAL state, never the just-appended locals.
+        let (final_path, final_roots): (String, Vec<String>) = file
             .projects
             .iter()
-            .any(|p| p.name == name && p.auto_resume);
-    if !changed.is_empty() {
-        file.schema_version = STAGE_GRAPH_VERSION.to_string();
-        file.projects.sort_by(|a, b| a.name.cmp(&b.name));
-        if let Err(e) = write_stage(&projects_path(), &file) {
-            return stage_error("project.add", e);
-        }
-        // Keep the staged graph.json in lock-step with the registry.
-        match restage_graph() {
-            Ok(g) => changed.push(g.to_string_lossy().into_owned()),
-            Err(e) => return stage_error("project.add", e),
-        }
-    }
-    // Read the record back out post-write so `path`/`roots` describe the
-    // FINAL state, never the just-appended locals.
-    let (final_path, final_roots): (String, Vec<String>) = file
-        .projects
-        .iter()
-        .find(|p| p.name == name)
-        .map(|p| (p.path.clone(), p.roots().into_iter().map(str::to_string).collect()))
-        .unwrap_or_default();
-    Outcome::ok("project.add", message).changed(changed).with_data(json!({
-        "name": name,
-        "path": final_path,
-        "roots": final_roots,
-        "autoResume": final_auto_resume,
-        "file": projects_path().to_string_lossy(),
-    }))
+            .find(|p| p.name == name)
+            .map(|p| (p.path.clone(), p.roots().into_iter().map(str::to_string).collect()))
+            .unwrap_or_default();
+        Outcome::ok("project.add", message).changed(changed).with_data(json!({
+            "name": name,
+            "path": final_path,
+            "roots": final_roots,
+            "autoResume": final_auto_resume,
+            "file": projects_path().to_string_lossy(),
+        }))
+    })
 }
 
 /// `project remove <name> [<path>]` — unregister a whole project, or one of
@@ -222,205 +265,233 @@ pub fn project_add(inv: &Invocation) -> Outcome {
 /// today's behaviour byte-for-byte. Matching is exact string equality
 /// against the stored root — no trailing-slash normalization, no
 /// canonicalization, and no `is_dir` check: a root whose directory has
-/// since been deleted must still be removable.
+/// since been deleted must still be removable. DAEMON-OWNED (`local_daemon`,
+/// above): a CLI caller forwards to `aoided`; the actual mutation is
+/// [`remove_roots`].
 pub fn project_remove(inv: &Invocation) -> Outcome {
+    if let Some(out) = local_daemon(inv) {
+        return out;
+    }
     let args = match require_args(inv, &["name"]) {
         Ok(a) => a,
         Err(e) => return e,
     };
     let name = args[0].clone();
     let path = inv.args.get(1).cloned();
-    let mut file: ProjectsFile = match load_stage(&projects_path()) {
-        Ok(f) => f,
-        Err(e) => return stage_error("project.remove", e),
-    };
+    remove_roots(&name, path.as_deref())
+}
 
-    let Some(existing) = file.projects.iter().find(|p| p.name == name) else {
-        return Outcome::ok(
-            "project.remove",
-            format!("project `{name}` was not registered (no change)"),
-        )
-        .with_data(json!({ "name": name }));
-    };
-    let roots: Vec<String> = existing.roots().into_iter().map(str::to_string).collect();
-
-    let Some(path) = path else {
-        // No PATH: today's behaviour, byte-for-byte — drop the whole project.
-        file.projects.retain(|p| p.name != name);
-        file.schema_version = STAGE_GRAPH_VERSION.to_string();
-        if let Err(e) = write_stage(&projects_path(), &file) {
-            return stage_error("project.remove", e);
-        }
-        let mut changed = vec![format!("removed project {name}")];
-        match restage_graph() {
-            Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+/// The local mutation behind `project remove`, run inside ONE
+/// [`with_stage_lock`] hold — the load, the root-membership check, and the
+/// write all happen under the same lock. `roots` is rewritten as the FULL
+/// remaining root list, `path` mirrored at `roots[0]` (ROOTS SERIALIZED
+/// COMPLETE), same as [`add_roots`]/[`edit_roots`].
+fn remove_roots(name: &str, path: Option<&str>) -> Outcome {
+    with_stage_lock(|| {
+        let mut file: ProjectsFile = match load_stage(&projects_path()) {
+            Ok(f) => f,
             Err(e) => return stage_error("project.remove", e),
+        };
+
+        let Some(existing) = file.projects.iter().find(|p| p.name == name) else {
+            return Outcome::ok(
+                "project.remove",
+                format!("project `{name}` was not registered (no change)"),
+            )
+            .with_data(json!({ "name": name }));
+        };
+        let roots: Vec<String> = existing.roots().into_iter().map(str::to_string).collect();
+
+        let Some(path) = path else {
+            // No PATH: today's behaviour, byte-for-byte — drop the whole project.
+            file.projects.retain(|p| p.name != name);
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            if let Err(e) = write_stage(&projects_path(), &file) {
+                return stage_error("project.remove", e);
+            }
+            let mut changed = vec![format!("removed project {name}")];
+            match restage_graph() {
+                Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+                Err(e) => return stage_error("project.remove", e),
+            }
+            return Outcome::ok("project.remove", format!("removed project `{name}`"))
+                .changed(changed)
+                .with_data(json!({ "name": name, "file": projects_path().to_string_lossy() }));
+        };
+
+        if !roots.iter().any(|r| r == path) {
+            return Outcome::ok(
+                "project.remove",
+                format!("project `{name}` has no root {path} (no change)"),
+            )
+            .with_data(json!({ "name": name, "path": path }));
         }
-        return Outcome::ok("project.remove", format!("removed project `{name}`"))
+
+        if roots.len() == 1 {
+            // PATH is the only root — drop the whole project.
+            file.projects.retain(|p| p.name != name);
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            if let Err(e) = write_stage(&projects_path(), &file) {
+                return stage_error("project.remove", e);
+            }
+            let mut changed = vec![format!("removed project {name}")];
+            match restage_graph() {
+                Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+                Err(e) => return stage_error("project.remove", e),
+            }
+            return Outcome::ok(
+                "project.remove",
+                format!("removed project `{name}` (last root {path})"),
+            )
             .changed(changed)
-            .with_data(json!({ "name": name, "file": projects_path().to_string_lossy() }));
-    };
+            .with_data(json!({
+                "name": name,
+                "path": path,
+                "roots": Vec::<String>::new(),
+                "file": projects_path().to_string_lossy(),
+            }));
+        }
 
-    if !roots.contains(&path) {
-        return Outcome::ok(
-            "project.remove",
-            format!("project `{name}` has no root {path} (no change)"),
-        )
-        .with_data(json!({ "name": name, "path": path }));
-    }
+        // PATH is one of several — rebuild from `roots()`, promoting the next
+        // root into `path` when `path` itself was removed, leaving `path`
+        // untouched otherwise. `roots` stays the FULL remaining list, `path`
+        // included at index 0.
+        let existing = file.projects.iter_mut().find(|p| p.name == name).unwrap();
+        let all: Vec<String> = existing.roots().iter().map(|s| s.to_string()).collect();
+        let remaining: Vec<String> = all.into_iter().filter(|r| r != path).collect();
+        existing.path = remaining[0].clone();
+        existing.roots = remaining;
 
-    if roots.len() == 1 {
-        // PATH is the only root — drop the whole project.
-        file.projects.retain(|p| p.name != name);
         file.schema_version = STAGE_GRAPH_VERSION.to_string();
         if let Err(e) = write_stage(&projects_path(), &file) {
             return stage_error("project.remove", e);
         }
-        let mut changed = vec![format!("removed project {name}")];
+        let mut changed = vec![format!("project {name}: removed root {path}")];
         match restage_graph() {
             Ok(g) => changed.push(g.to_string_lossy().into_owned()),
             Err(e) => return stage_error("project.remove", e),
         }
-        return Outcome::ok(
-            "project.remove",
-            format!("removed project `{name}` (last root {path})"),
-        )
-        .changed(changed)
-        .with_data(json!({
-            "name": name,
-            "path": path,
-            "roots": Vec::<String>::new(),
-            "file": projects_path().to_string_lossy(),
-        }));
-    }
-
-    // PATH is one of several — rebuild from `roots()`, promoting the next
-    // root into `path` when `path` itself was removed, leaving `path`
-    // untouched otherwise.
-    let existing = file.projects.iter_mut().find(|p| p.name == name).unwrap();
-    let all: Vec<String> = existing.roots().iter().map(|s| s.to_string()).collect();
-    let mut remaining: Vec<String> = all.into_iter().filter(|r| r != &path).collect();
-    existing.path = remaining.remove(0);
-    existing.roots = remaining;
-
-    file.schema_version = STAGE_GRAPH_VERSION.to_string();
-    if let Err(e) = write_stage(&projects_path(), &file) {
-        return stage_error("project.remove", e);
-    }
-    let mut changed = vec![format!("project {name}: removed root {path}")];
-    match restage_graph() {
-        Ok(g) => changed.push(g.to_string_lossy().into_owned()),
-        Err(e) => return stage_error("project.remove", e),
-    }
-    let (new_path, roots_after): (String, Vec<String>) = file
-        .projects
-        .iter()
-        .find(|p| p.name == name)
-        .map(|p| (p.path.clone(), p.roots().into_iter().map(str::to_string).collect()))
-        .unwrap_or_default();
-    Outcome::ok("project.remove", format!("removed root {path} from project `{name}`"))
-        .changed(changed)
-        .with_data(json!({
-            "name": name,
-            "path": new_path,
-            "roots": roots_after,
-            "file": projects_path().to_string_lossy(),
-        }))
+        let (new_path, roots_after): (String, Vec<String>) = file
+            .projects
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| (p.path.clone(), p.roots().into_iter().map(str::to_string).collect()))
+            .unwrap_or_default();
+        Outcome::ok("project.remove", format!("removed root {path} from project `{name}`"))
+            .changed(changed)
+            .with_data(json!({
+                "name": name,
+                "path": new_path,
+                "roots": roots_after,
+                "file": projects_path().to_string_lossy(),
+            }))
+    })
 }
 
 /// `project edit <name> <path> [<path>…]` — replace a project's roots
-/// outright. The first path becomes `path`, the rest become `roots`;
-/// duplicates collapse, order is the order given. The name is immutable
-/// (`add`/`remove` are the only ways a project appears or disappears) and
-/// `autoResume` is never touched.
+/// outright. The first path becomes `path`, the rest follow it into
+/// `roots`; duplicates collapse, order is the order given. The name is
+/// immutable (`add`/`remove` are the only ways a project appears or
+/// disappears) and `autoResume` is never touched. DAEMON-OWNED
+/// (`local_daemon`, above): a CLI caller forwards to `aoided`; the actual
+/// mutation is [`edit_roots`].
 pub fn project_edit(inv: &Invocation) -> Outcome {
+    if let Some(out) = local_daemon(inv) {
+        return out;
+    }
     let args = match require_args(inv, &["name", "path"]) {
         Ok(a) => a,
         Err(e) => return e,
     };
     let name = args[0].clone();
     let paths: Vec<String> = inv.args[1..].to_vec();
+    edit_roots(&name, &paths)
+}
 
-    let mut file: ProjectsFile = match load_stage(&projects_path()) {
-        Ok(f) => f,
-        Err(e) => return stage_error("project.edit", e),
-    };
-    if !file.projects.iter().any(|p| p.name == name) {
-        return Outcome::error(
-            "project.edit",
-            format!("no project named `{name}` — register it first with `project add`"),
-        )
-        .with_data(json!({ "reason": "unknown", "name": name }));
-    }
-
-    // Validate EVERY path before any mutation — one bad path refuses the
-    // whole edit.
-    for path in &paths {
-        if let Err(e) = validate_root("project.edit", &name, path) {
-            return e;
+/// The local mutation behind `project edit`, run inside ONE
+/// [`with_stage_lock`] hold — the unknown-name check, every path's
+/// validation, and the write all happen under the same lock. `roots` is
+/// written as the FULL deduped list given, `path` mirrored at `roots[0]`
+/// (ROOTS SERIALIZED COMPLETE), same as [`add_roots`]/[`remove_roots`].
+fn edit_roots(name: &str, paths: &[String]) -> Outcome {
+    with_stage_lock(|| {
+        let mut file: ProjectsFile = match load_stage(&projects_path()) {
+            Ok(f) => f,
+            Err(e) => return stage_error("project.edit", e),
+        };
+        if !file.projects.iter().any(|p| p.name == name) {
+            return Outcome::error(
+                "project.edit",
+                format!("no project named `{name}` — register it first with `project add`"),
+            )
+            .with_data(json!({ "reason": "unknown", "name": name }));
         }
-    }
 
-    // Dedupe preserving first-seen order.
-    let mut deduped: Vec<String> = Vec::new();
-    for path in &paths {
-        if !deduped.contains(path) {
-            deduped.push(path.clone());
+        // Validate EVERY path before any mutation — one bad path refuses the
+        // whole edit.
+        for path in paths {
+            if let Err(e) = validate_root("project.edit", name, path) {
+                return e;
+            }
         }
-    }
-    let new_path = deduped[0].clone();
-    let new_roots = deduped[1..].to_vec();
-    let desired: Vec<&str> = std::iter::once(new_path.as_str())
-        .chain(new_roots.iter().map(String::as_str))
-        .collect();
 
-    let existing = file.projects.iter().find(|p| p.name == name).unwrap();
-    if existing.roots() == desired {
-        return Outcome::ok(
+        // Dedupe preserving first-seen order.
+        let mut deduped: Vec<String> = Vec::new();
+        for path in paths {
+            if !deduped.contains(path) {
+                deduped.push(path.clone());
+            }
+        }
+        let desired: Vec<&str> = deduped.iter().map(String::as_str).collect();
+
+        let existing = file.projects.iter().find(|p| p.name == name).unwrap();
+        if existing.roots() == desired {
+            return Outcome::ok(
+                "project.edit",
+                format!("project `{name}` already has exactly those roots (no change)"),
+            )
+            .with_data(json!({
+                "name": name,
+                "path": deduped[0],
+                "roots": desired,
+            }));
+        }
+
+        let existing = file.projects.iter_mut().find(|p| p.name == name).unwrap();
+        existing.path = deduped[0].clone();
+        existing.roots = deduped;
+
+        file.schema_version = STAGE_GRAPH_VERSION.to_string();
+        if let Err(e) = write_stage(&projects_path(), &file) {
+            return stage_error("project.edit", e);
+        }
+        let (final_path, final_roots, final_auto_resume): (String, Vec<String>, bool) = file
+            .projects
+            .iter()
+            .find(|p| p.name == name)
+            .map(|p| (p.path.clone(), p.roots().into_iter().map(str::to_string).collect(), p.auto_resume))
+            .unwrap_or_default();
+        let mut changed: Vec<String> = final_roots
+            .iter()
+            .map(|r| format!("project {name}: root {r}"))
+            .collect();
+        match restage_graph() {
+            Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+            Err(e) => return stage_error("project.edit", e),
+        }
+        Outcome::ok(
             "project.edit",
-            format!("project `{name}` already has exactly those roots (no change)"),
+            format!("replaced the roots of project `{name}` → {}", final_roots.join(", ")),
         )
+        .changed(changed)
         .with_data(json!({
             "name": name,
-            "path": new_path,
-            "roots": desired,
-        }));
-    }
-
-    let existing = file.projects.iter_mut().find(|p| p.name == name).unwrap();
-    existing.path = new_path;
-    existing.roots = new_roots;
-
-    file.schema_version = STAGE_GRAPH_VERSION.to_string();
-    if let Err(e) = write_stage(&projects_path(), &file) {
-        return stage_error("project.edit", e);
-    }
-    let (final_path, final_roots, final_auto_resume): (String, Vec<String>, bool) = file
-        .projects
-        .iter()
-        .find(|p| p.name == name)
-        .map(|p| (p.path.clone(), p.roots().into_iter().map(str::to_string).collect(), p.auto_resume))
-        .unwrap_or_default();
-    let mut changed: Vec<String> = final_roots
-        .iter()
-        .map(|r| format!("project {name}: root {r}"))
-        .collect();
-    match restage_graph() {
-        Ok(g) => changed.push(g.to_string_lossy().into_owned()),
-        Err(e) => return stage_error("project.edit", e),
-    }
-    Outcome::ok(
-        "project.edit",
-        format!("replaced the roots of project `{name}` → {}", final_roots.join(", ")),
-    )
-    .changed(changed)
-    .with_data(json!({
-        "name": name,
-        "path": final_path,
-        "roots": final_roots,
-        "autoResume": final_auto_resume,
-        "file": projects_path().to_string_lossy(),
-    }))
+            "path": final_path,
+            "roots": final_roots,
+            "autoResume": final_auto_resume,
+            "file": projects_path().to_string_lossy(),
+        }))
+    })
 }
 
 /// `project list` — the registered anchor roots.
@@ -662,7 +733,7 @@ mod tests {
         // Register a project. graph.json must now exist and carry the node.
         // (The path must be a real absolute dir — `project_add` rejects
         // anything else now — so the per-test stage dir stands in.)
-        let out = project_add(&invocation(
+        let out = project_add(&daemon_invocation(
             &["project", "add"],
             &["aoide", stage.to_str().unwrap()],
         ));
@@ -702,7 +773,7 @@ mod tests {
         let stage = unique_stage("reject-relative");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
-        let out = project_add(&invocation(&["project", "add"], &["aoide", "intergration"]));
+        let out = project_add(&daemon_invocation(&["project", "add"], &["aoide", "intergration"]));
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
         assert!(out.message.contains("intergration"), "the offending value is shown: {}", out.message);
@@ -726,7 +797,7 @@ mod tests {
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
 
         let bogus = stage.join("does-not-exist").to_string_lossy().into_owned();
-        let out = project_add(&invocation(&["project", "add"], &["aoide", &bogus]));
+        let out = project_add(&daemon_invocation(&["project", "add"], &["aoide", &bogus]));
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
         assert_eq!(out.render(false).1, aoide_protocol::output::exit::USAGE);
         assert!(out.message.contains(&bogus), "the offending value is shown: {}", out.message);
@@ -751,7 +822,7 @@ mod tests {
 
         // Bare `project add <name>` registers the cwd as the anchor root.
         std::env::set_current_dir(&stage).unwrap();
-        let out = project_add(&invocation(&["project", "add"], &["aoide"]));
+        let out = project_add(&daemon_invocation(&["project", "add"], &["aoide"]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
 
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
@@ -776,6 +847,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&stage);
     }
 
+    // `project add/edit/remove` are DAEMON-OWNED atomic mutations now
+    // (`local_daemon`, above): a `Door::Cli` invocation forwards to `aoided`
+    // instead of running locally, which a bare handler test has no daemon
+    // to answer. Every direct in-process handler call below stamps
+    // `Door::Daemon` instead — the exact door
+    // `aoide_server::daemon::invocation_from_dispatch_request` stamps for a
+    // request that already reached `aoided`, so this exercises the SAME
+    // local path a live daemon runs, `local_daemon`'s `Door::Daemon => None`
+    // arm taking it unconditionally with no connect attempt. The
+    // `Door::Cli` forwarding path itself is covered separately (see
+    // `project_add_forwards_through_a_live_daemon_and_refuses_without_one`,
+    // below).
     fn project_invocation(cmd: &[&str], args: &[&str], flags: &[(&str, &str)]) -> Invocation {
         Invocation {
             path: cmd.iter().map(|s| s.to_string()).collect(),
@@ -784,8 +867,11 @@ mod tests {
                 .iter()
                 .map(|(k, v)| (k.to_string(), v.to_string()))
                 .collect(),
-            door: aoide_protocol::Door::Cli,
+            door: aoide_protocol::Door::Daemon,
         }
+    }
+    fn daemon_invocation(path: &[&str], args: &[&str]) -> Invocation {
+        project_invocation(path, args, &[])
     }
 
     #[test]
@@ -804,13 +890,15 @@ mod tests {
             c.to_string_lossy().into_owned(),
         );
 
-        let out = project_add(&invocation(&["project", "add"], &["aoide", &a, &b, &c]));
+        let out = project_add(&daemon_invocation(&["project", "add"], &["aoide", &a, &b, &c]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
 
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
         let p = file.projects.iter().find(|p| p.name == "aoide").unwrap();
         assert_eq!(p.path, a);
-        assert_eq!(p.roots, vec![b.clone(), c.clone()]);
+        // ROOTS SERIALIZED COMPLETE: the raw field is the FULL list, `path`
+        // mirrored at `roots[0]` — not "just the extras."
+        assert_eq!(p.roots, vec![a.clone(), b.clone(), c.clone()]);
         assert_eq!(p.roots(), vec![a.as_str(), b.as_str(), c.as_str()]);
 
         match saved {
@@ -832,10 +920,10 @@ mod tests {
         let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
 
         assert_eq!(
-            project_add(&invocation(&["project", "add"], &["aoide", &a])).status,
+            project_add(&daemon_invocation(&["project", "add"], &["aoide", &a])).status,
             aoide_protocol::output::Status::Ok
         );
-        let out = project_add(&invocation(&["project", "add"], &["aoide", &b]));
+        let out = project_add(&daemon_invocation(&["project", "add"], &["aoide", &b]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
 
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
@@ -866,8 +954,8 @@ mod tests {
             c.to_string_lossy().into_owned(),
         );
 
-        project_add(&invocation(&["project", "add"], &["aoide", &a, &b]));
-        let out = project_add(&invocation(&["project", "add"], &["aoide", &b, &c]));
+        project_add(&daemon_invocation(&["project", "add"], &["aoide", &a, &b]));
+        let out = project_add(&daemon_invocation(&["project", "add"], &["aoide", &b, &c]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
 
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
@@ -891,9 +979,9 @@ mod tests {
         std::fs::create_dir_all(&a).unwrap();
         let a = a.to_string_lossy().into_owned();
 
-        project_add(&invocation(&["project", "add"], &["aoide", &a]));
+        project_add(&daemon_invocation(&["project", "add"], &["aoide", &a]));
         let before = std::fs::read(projects_path()).unwrap();
-        let out = project_add(&invocation(&["project", "add"], &["aoide", &a]));
+        let out = project_add(&daemon_invocation(&["project", "add"], &["aoide", &a]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         assert!(out.changed.is_empty(), "{:?}", out.changed);
         assert_eq!(std::fs::read(projects_path()).unwrap(), before);
@@ -916,7 +1004,7 @@ mod tests {
         std::fs::create_dir_all(&b).unwrap();
         let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
 
-        project_add(&invocation(&["project", "add"], &["aoide", &a]));
+        project_add(&daemon_invocation(&["project", "add"], &["aoide", &a]));
         let before = std::fs::read(projects_path()).unwrap();
         let out = project_add(&project_invocation(
             &["project", "add"],
@@ -970,7 +1058,7 @@ mod tests {
         std::fs::create_dir_all(&a).unwrap();
         let a = a.to_string_lossy().into_owned();
 
-        let out = project_add(&invocation(
+        let out = project_add(&daemon_invocation(
             &["project", "add"],
             &["aoide", &a, "not-absolute"],
         ));
@@ -1004,7 +1092,7 @@ mod tests {
             c.to_string_lossy().into_owned(),
         );
 
-        let out = project_add(&invocation(&["project", "add"], &["aoide", &a, &b, &c]));
+        let out = project_add(&daemon_invocation(&["project", "add"], &["aoide", &a, &b, &c]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let data = out.data.as_ref().unwrap();
         assert_eq!(data["path"], a);
@@ -1032,9 +1120,9 @@ mod tests {
             b.to_string_lossy().into_owned(),
             c.to_string_lossy().into_owned(),
         );
-        project_add(&invocation(&["project", "add"], &["aoide", &a, &b, &c]));
+        project_add(&daemon_invocation(&["project", "add"], &["aoide", &a, &b, &c]));
 
-        let out = project_remove(&invocation(&["project", "remove"], &["aoide", &b]));
+        let out = project_remove(&daemon_invocation(&["project", "remove"], &["aoide", &b]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
         let p = file.projects.iter().find(|p| p.name == "aoide").unwrap();
@@ -1063,9 +1151,9 @@ mod tests {
             b.to_string_lossy().into_owned(),
             c.to_string_lossy().into_owned(),
         );
-        project_add(&invocation(&["project", "add"], &["aoide", &a, &b, &c]));
+        project_add(&daemon_invocation(&["project", "add"], &["aoide", &a, &b, &c]));
 
-        let out = project_remove(&invocation(&["project", "remove"], &["aoide", &a]));
+        let out = project_remove(&daemon_invocation(&["project", "remove"], &["aoide", &a]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
         let p = file.projects.iter().find(|p| p.name == "aoide").unwrap();
@@ -1088,9 +1176,9 @@ mod tests {
         let a = stage.join("a");
         std::fs::create_dir_all(&a).unwrap();
         let a = a.to_string_lossy().into_owned();
-        project_add(&invocation(&["project", "add"], &["aoide", &a]));
+        project_add(&daemon_invocation(&["project", "add"], &["aoide", &a]));
 
-        let out = project_remove(&invocation(&["project", "remove"], &["aoide", &a]));
+        let out = project_remove(&daemon_invocation(&["project", "remove"], &["aoide", &a]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
         assert!(!file.projects.iter().any(|p| p.name == "aoide"));
@@ -1112,9 +1200,9 @@ mod tests {
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
         let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
-        project_add(&invocation(&["project", "add"], &["aoide", &a, &b]));
+        project_add(&daemon_invocation(&["project", "add"], &["aoide", &a, &b]));
 
-        let out = project_remove(&invocation(&["project", "remove"], &["aoide"]));
+        let out = project_remove(&daemon_invocation(&["project", "remove"], &["aoide"]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
         assert!(
@@ -1139,10 +1227,10 @@ mod tests {
         std::fs::create_dir_all(&a).unwrap();
         std::fs::create_dir_all(&b).unwrap();
         let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
-        project_add(&invocation(&["project", "add"], &["aoide", &a]));
+        project_add(&daemon_invocation(&["project", "add"], &["aoide", &a]));
         let before = std::fs::read(projects_path()).unwrap();
 
-        let out = project_remove(&invocation(&["project", "remove"], &["aoide", &b]));
+        let out = project_remove(&daemon_invocation(&["project", "remove"], &["aoide", &b]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         assert_eq!(std::fs::read(projects_path()).unwrap(), before);
 
@@ -1174,14 +1262,16 @@ mod tests {
             x.to_string_lossy().into_owned(),
             y.to_string_lossy().into_owned(),
         );
-        project_add(&invocation(&["project", "add"], &["aoide", &a, &b]));
+        project_add(&daemon_invocation(&["project", "add"], &["aoide", &a, &b]));
 
-        let out = project_edit(&invocation(&["project", "edit"], &["aoide", &x, &y]));
+        let out = project_edit(&daemon_invocation(&["project", "edit"], &["aoide", &x, &y]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
         let p = file.projects.iter().find(|p| p.name == "aoide").unwrap();
         assert_eq!(p.path, x);
-        assert_eq!(p.roots, vec![y.clone()]);
+        // ROOTS SERIALIZED COMPLETE: the raw field is the FULL replacement
+        // list, `path` mirrored at `roots[0]`.
+        assert_eq!(p.roots, vec![x.clone(), y.clone()]);
         assert_eq!(p.roots(), vec![x.as_str(), y.as_str()]);
         assert!(!p.roots().contains(&a.as_str()) && !p.roots().contains(&b.as_str()));
 
@@ -1207,9 +1297,9 @@ mod tests {
             x.to_string_lossy().into_owned(),
             y.to_string_lossy().into_owned(),
         );
-        project_add(&invocation(&["project", "add"], &["aoide", &a]));
+        project_add(&daemon_invocation(&["project", "add"], &["aoide", &a]));
 
-        let out = project_edit(&invocation(&["project", "edit"], &["aoide", &x, &x, &y, &y]));
+        let out = project_edit(&daemon_invocation(&["project", "edit"], &["aoide", &x, &x, &y, &y]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
         let p = file.projects.iter().find(|p| p.name == "aoide").unwrap();
@@ -1233,7 +1323,7 @@ mod tests {
         std::fs::create_dir_all(&a).unwrap();
         let a = a.to_string_lossy().into_owned();
 
-        let out = project_edit(&invocation(&["project", "edit"], &["ghost", &a]));
+        let out = project_edit(&daemon_invocation(&["project", "edit"], &["ghost", &a]));
         assert_eq!(out.status, aoide_protocol::output::Status::Error);
         assert_eq!(out.data.as_ref().unwrap()["reason"], "unknown");
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
@@ -1255,9 +1345,9 @@ mod tests {
         let a = stage.join("a");
         std::fs::create_dir_all(&a).unwrap();
         let a = a.to_string_lossy().into_owned();
-        project_add(&invocation(&["project", "add"], &["aoide", &a]));
+        project_add(&daemon_invocation(&["project", "add"], &["aoide", &a]));
 
-        let out = project_edit(&invocation(&["project", "edit"], &["aoide"]));
+        let out = project_edit(&daemon_invocation(&["project", "edit"], &["aoide"]));
         assert_eq!(out.status, aoide_protocol::output::Status::Usage);
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
         let p = file.projects.iter().find(|p| p.name == "aoide").unwrap();
@@ -1286,12 +1376,202 @@ mod tests {
             &[("auto-resume", "true")],
         ));
 
-        let out = project_edit(&invocation(&["project", "edit"], &["aoide", &b]));
+        let out = project_edit(&daemon_invocation(&["project", "edit"], &["aoide", &b]));
         assert_eq!(out.status, aoide_protocol::output::Status::Ok);
         assert_eq!(out.data.as_ref().unwrap()["autoResume"], true);
         let file: ProjectsFile = load_stage(&projects_path()).unwrap();
         let p = file.projects.iter().find(|p| p.name == "aoide").unwrap();
         assert!(p.auto_resume, "`project edit` never touches autoResume");
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    // ── DAEMON-OWNED ATOMIC MUTATIONS: the `with_stage_lock` hold really
+    // serializes concurrent local mutators, and a `Door::Cli` caller with
+    // no daemon listening really errors instead of silently going local ──
+
+    #[test]
+    fn add_roots_new_races_two_threads_for_one_name_exactly_one_wins() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("add-roots-new-race");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let (a, b) = (stage.join("a"), stage.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+
+        // Two threads race `add_roots(..., new: true)` for the SAME name
+        // with DIFFERENT candidate paths. `add_roots` runs its whole
+        // "unregistered?" check and its write inside ONE `with_stage_lock`
+        // hold, so only one thread can ever observe the registry as still
+        // missing the name — the other's `--new` refusal is a genuine "the
+        // world disagreed", never a lost-update race where both threads
+        // read empty and both win.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (b1, b2) = (barrier.clone(), barrier.clone());
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            add_roots("racer", &[a], true, false)
+        });
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            add_roots("racer", &[b], true, false)
+        });
+        let (r1, r2) = (t1.join().unwrap(), t2.join().unwrap());
+
+        let oks = [&r1, &r2]
+            .iter()
+            .filter(|o| o.status == aoide_protocol::output::Status::Ok)
+            .count();
+        assert_eq!(oks, 1, "exactly one racer wins `--new` for the same name");
+        let errs = [&r1, &r2]
+            .iter()
+            .filter(|o| o.status == aoide_protocol::output::Status::Error)
+            .count();
+        assert_eq!(errs, 1, "the other sees a real `exists` refusal, not a silent clobber");
+
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        assert_eq!(
+            file.projects.iter().filter(|p| p.name == "racer").count(),
+            1,
+            "exactly one `racer` project ever lands in the registry"
+        );
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn add_roots_two_concurrent_calls_add_distinct_roots_both_land() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("add-roots-concurrent-distinct");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let (base, x, y) = (stage.join("base"), stage.join("x"), stage.join("y"));
+        for d in [&base, &x, &y] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (base, x, y) = (
+            base.to_string_lossy().into_owned(),
+            x.to_string_lossy().into_owned(),
+            y.to_string_lossy().into_owned(),
+        );
+        // Register the project up front so both racers hit the existing-
+        // project append arm (not the create arm, exercised above).
+        assert_eq!(
+            add_roots("shared", &[base.clone()], false, false).status,
+            aoide_protocol::output::Status::Ok
+        );
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let (b1, b2) = (barrier.clone(), barrier.clone());
+        let (xc, yc) = (x.clone(), y.clone());
+        let t1 = std::thread::spawn(move || {
+            b1.wait();
+            add_roots("shared", &[xc], false, false)
+        });
+        let t2 = std::thread::spawn(move || {
+            b2.wait();
+            add_roots("shared", &[yc], false, false)
+        });
+        let (r1, r2) = (t1.join().unwrap(), t2.join().unwrap());
+        assert_eq!(r1.status, aoide_protocol::output::Status::Ok);
+        assert_eq!(r2.status, aoide_protocol::output::Status::Ok);
+
+        // `with_stage_lock` serializes the two read-modify-write cycles —
+        // without it, whichever thread wrote second would clobber the
+        // other's addition (a lost update). Both distinct roots survive.
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        let p = file.projects.iter().find(|p| p.name == "shared").unwrap();
+        assert!(p.roots().contains(&base.as_str()));
+        assert!(p.roots().contains(&x.as_str()), "roots: {:?}", p.roots());
+        assert!(p.roots().contains(&y.as_str()), "roots: {:?}", p.roots());
+
+        match saved {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn project_add_via_door_cli_with_no_daemon_errors_and_leaves_the_registry_untouched() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let saved_socket = std::env::var("AOIDE_DAEMON_SOCKET").ok();
+        let stage = unique_stage("add-door-cli-no-daemon");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        // A socket path with plainly nothing listening: `connect_bounded`
+        // fails fast (100ms bound), `daemon_dispatch` returns `None`, and
+        // `local_daemon` turns that into a real error — never a silent
+        // fall-through to the local mutation.
+        std::env::set_var("AOIDE_DAEMON_SOCKET", stage.join("no-such-daemon.sock"));
+        let a = stage.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let a = a.to_string_lossy().into_owned();
+
+        // `invocation` (shared testutil helper) hardcodes `Door::Cli` — the
+        // real shape a CLI process's own invocation carries.
+        let out = project_add(&invocation(&["project", "add"], &["aoide", &a]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert!(
+            out.message.contains("aoided must be running"),
+            "message: {}",
+            out.message
+        );
+        assert!(
+            !projects_path().exists(),
+            "no daemon reachable: the registry file is never even created"
+        );
+
+        match saved_stage {
+            Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
+            None => std::env::remove_var("AOIDE_STAGE_DIR"),
+        }
+        match saved_socket {
+            Some(v) => std::env::set_var("AOIDE_DAEMON_SOCKET", v),
+            None => std::env::remove_var("AOIDE_DAEMON_SOCKET"),
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+
+    #[test]
+    fn a_project_name_with_spaces_survives_add_edit_and_remove() {
+        // No name validator beyond what `require_args` already enforces
+        // (non-empty); a name with spaces is legal end to end.
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("AOIDE_STAGE_DIR").ok();
+        let stage = unique_stage("name-with-spaces");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let (a, b) = (stage.join("a"), stage.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+        let name = "My Project";
+
+        let out = project_add(&daemon_invocation(&["project", "add"], &[name, &a]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        assert!(file.projects.iter().any(|p| p.name == name && p.path == a));
+
+        let out = project_edit(&daemon_invocation(&["project", "edit"], &[name, &b]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        let p = file.projects.iter().find(|p| p.name == name).unwrap();
+        assert_eq!(p.path, b);
+
+        let out = project_remove(&daemon_invocation(&["project", "remove"], &[name]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        assert!(!file.projects.iter().any(|p| p.name == name));
 
         match saved {
             Some(v) => std::env::set_var("AOIDE_STAGE_DIR", v),
