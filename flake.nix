@@ -55,6 +55,10 @@
         {
           default = aoide;
           inherit aoide aoide-static;
+          # The paint binary under its own name. Same derivation, the `rice`
+          # output default.nix:138 moves it into — a consumer names `lyra`
+          # instead of writing the `aoide^out,rice` output selector.
+          lyra = aoide.rice;
         }
       );
 
