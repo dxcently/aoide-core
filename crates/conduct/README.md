@@ -702,6 +702,17 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   refuse (a raw, unrelated same-uid connection bypassing `aoide send`
   still injects ungated — the socket carries no envelope, so `--yes`
   cannot be told apart from an ordinary send at the receiving end).
+- **`channel_socket_path` (P-M5c-2, `docs/architecture/
+  CLAUDE-CHANNEL-PROOF.md`) sits beside `conduct_socket_path` in
+  `graph/conduct.rs`, same `$XDG_RUNTIME_DIR/aoide/` convention and
+  fallback, differing only by the `channel-` prefix** (`channel-<id>.sock`
+  vs. `session-<id>.sock`). One authority for the path, re-exported at
+  `graph::channel_socket_path` the same way `conduct_socket_path` already
+  crosses the `aoide-conduct` → `aoide-server` boundary. Unlike the
+  control socket, this crate never binds or accepts on it — `aoide-server`'s
+  stdio MCP server owns the bind/accept/unlink lifecycle entirely, scoped
+  to that one MCP subprocess, never `aoided`'s. This crate only computes
+  where it lives.
 - **The remaining two sockets get a peercred floor (LANE IDENTITY P-ID3).**
   `identity::peer_cred`/`PeerCred` widened `pub(crate)` (was `pub(in
   crate::graph)`) so `shellbridge.rs` — a sibling module of `graph`, not a

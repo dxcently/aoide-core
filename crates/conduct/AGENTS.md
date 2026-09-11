@@ -1198,6 +1198,15 @@
 - **A new `graph`/`conduct`/`hooks` command** adds a `cmd!`/`register` entry in
   `commands/`, wired into `cli`'s `commands::all()` (this crate's commands are
   core, never `lyra`'s).
+- **A new per-session socket convention** (the channel socket,
+  `channel_socket_path`, P-M5c-2, is the first one beside
+  `conduct_socket_path`) stays a pure path function in `graph/conduct.rs`
+  sharing `conduct_socket_path`'s runtime-dir resolution — never a second
+  `XDG_RUNTIME_DIR`/fallback lookup hand-rolled elsewhere. Whether this
+  crate itself binds the socket or only computes the path for another
+  crate to bind (the channel socket's case: `aoide-server` owns bind/
+  accept/unlink) is a per-socket decision, stated in that function's own
+  doc comment.
 - **A new `session grant` kind** (`exempt`, task #20, is the second one
   landed after `undying`; #127's secret grants are the next one named, not
   yet built) adds one `match` arm in `grant.rs::session_grant` — no new
