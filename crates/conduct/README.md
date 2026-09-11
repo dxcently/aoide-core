@@ -148,8 +148,12 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 - **`graph::doorbell`** (`ring`, `mail_ring`, `RingReport`; P-M5a-2,
   `docs/architecture/MAIL.md` "Delivery and the doorbell") is the mailbase
   latch's actual ringer: filing an arming letter nudges every armed,
-  headless, hook-fed-and-at-the-prompt reader, raw-injected through the
-  SAME `send.rs::write_delivery` this crate's ordinary deliveries use, under
+  hook-fed-and-at-the-prompt reader over whichever transport it has — a
+  live Claude Code channel socket (`channel_socket_path`) if one connects,
+  else the PTY control socket, raw-injected through the SAME
+  `send.rs::write_delivery` this crate's ordinary deliveries use, and only
+  for a headless wrap (headless decides whether the PTY fallback exists,
+  never whether a wrap is reachable) — under
   a dedicated `.ring.lock` file (`aoide_storage::mail::with_ring_lock`) —
   never `.stage.lock`, and only the daemon's own serializer, not a second
   policy boundary. `ring` executes only under `Door::Daemon`: its two
@@ -711,8 +715,9 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   crosses the `aoide-conduct` → `aoide-server` boundary. Unlike the
   control socket, this crate never binds or accepts on it — `aoide-server`'s
   stdio MCP server owns the bind/accept/unlink lifecycle entirely, scoped
-  to that one MCP subprocess, never `aoided`'s. This crate only computes
-  where it lives.
+  to that one MCP subprocess, never `aoided`'s. This crate computes where
+  it lives and is its first client: `doorbell.rs::ring_locked` connects to
+  it (never binds or accepts — that lifecycle stays `aoide-server`'s).
 - **The remaining two sockets get a peercred floor (LANE IDENTITY P-ID3).**
   `identity::peer_cred`/`PeerCred` widened `pub(crate)` (was `pub(in
   crate::graph)`) so `shellbridge.rs` — a sibling module of `graph`, not a

@@ -990,13 +990,17 @@
   caught by the next trigger. Do not reorder the stamp ahead of the
   write, and do not stamp inside a `Result`-discarding path that can't
   tell success from failure.
-- **A ring never writes to a non-headless (interactive) wrap, full stop
-  — there is no override flag, no `--force`.** An interactive composer is
-  someone's own terminal; auto-submitting into it needs a control-layer
-  guard that does not exist yet (P-M5a-3, the labeled residual
-  `docs/architecture/MAIL.md` "Delivery and the doorbell" leaves open).
-  Don't lift this check without landing that guard first, and update
-  MAIL.md's doorbell section in the same commit that does.
+- **A ring never PTY-injects into a non-headless (interactive) wrap, full
+  stop — there is no override flag, no `--force`.** Transport selection
+  runs first: a live Claude Code channel socket (`channel_socket_path`) is
+  a one-way MCP push, never a keystroke, so it carries no half-typed-
+  composer risk and is offered to interactive and headless wraps alike.
+  Only the PTY path — raw keystroke injection — keeps the interactive ban:
+  an interactive wrap with no channel is skipped `interactive-composer`,
+  with no flag to force it. Don't lift the PTY-side ban without a
+  control-layer guard for that raw-keystroke case (P-M5a-3 in
+  `docs/architecture/MAIL.md`'s roadmap), and update MAIL.md's doorbell
+  section in the same commit that does.
 - **A ring's readiness signal is the CHILD's hook state, checked with
   `aoide_protocol::agents::agent_profile` (returns `None` for an
   unrecognized harness) — never `profile_for_agent` (its `CLAUDE_PROFILE`

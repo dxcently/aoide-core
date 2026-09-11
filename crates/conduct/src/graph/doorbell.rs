@@ -97,17 +97,10 @@ fn nudge_line(name: &str) -> String {
 /// The channel write itself (P-M5c-3): `payload` once, then a flush — no
 /// submit key, ever, and no [`super::send::write_delivery`] (that one
 /// exists to add a keystroke this transport must never send). Generic over
-/// `Write` rather than pinned to `UnixStream`: racing a real socket's
-/// peer-close against this single ~90-byte write is not reliably
-/// reproducible on Linux — a write immediately following a successful
-/// `connect()` wins against even a pre-warmed, busy-spinning acceptor on
-/// every trial measured (0/300 induced failures, including under
-/// synthetic load) — so `tests::a_channel_write_that_fails_leaves_the_
-/// latch_armed` proves this function's own error path against a fake
-/// writer instead of an unreproducible kernel race; [`ring_locked`]'s
-/// shared `match` on the result is the SAME block `tests::
-/// a_failed_socket_write_leaves_the_latch_armed` already proves for the
-/// PTY transport.
+/// `Write` because a post-connect write failure is not reproducibly
+/// inducible on a real unix socket; the error path is proven against a
+/// fake writer, and [`ring_locked`]'s shared `match` on the result is the
+/// block the PTY transport's failure test already covers.
 fn write_channel(mut stream: impl std::io::Write, payload: &[u8]) -> std::io::Result<()> {
     stream.write_all(payload)?;
     stream.flush()
@@ -1236,20 +1229,10 @@ mod tests {
 
     #[test]
     fn a_channel_write_that_fails_leaves_the_latch_armed() {
-        // Racing a real socket's peer-close against this ~90-byte write is
-        // not reliably reproducible: a write immediately following a
-        // successful `connect()` beat even a pre-warmed, busy-spinning
-        // acceptor on every trial measured (0 induced failures out of 300
-        // attempts, including under synthetic 32-way CPU load) — the kernel
-        // has already handed the bytes to the send buffer before any peer,
-        // however eager, can react. `write_channel` is generic over `Write`
-        // precisely so this failure path is provable against a fake writer
-        // instead of an unreproducible kernel race. `ring_locked`'s own
-        // handling of the resulting `Err` — report `write-failed`, never
-        // stamp the latch — is the SAME shared block
-        // `a_failed_socket_write_leaves_the_latch_armed` (below) already
-        // proves for the PTY transport; both transports feed the identical
-        // `match wrote { Ok(()) => .., Err(_) => "write-failed" }`.
+        // A post-connect write failure is not reproducibly inducible on a
+        // real socket, so the error path is proven against a fake writer;
+        // `ring_locked`'s handling of the `Err` is the shared block
+        // `a_failed_socket_write_leaves_the_latch_armed` proves for the PTY.
         struct AlwaysFails;
         impl std::io::Write for AlwaysFails {
             fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
