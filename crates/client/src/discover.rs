@@ -164,7 +164,7 @@ pub fn run_sweep(secs: u64) -> std::io::Result<SweepResult> {
                     Err(()) => dropped += 1,
                 }
             }
-            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
+            Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted) => continue,
             Err(e) => return Err(e),
         }
     }
