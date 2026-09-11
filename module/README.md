@@ -40,3 +40,21 @@ overlay together — no separate `nixpkgs.overlays` entry, no second
 `aoide.*` declaration to keep in sync. `modules/nucleus/options.nix`
 is this repo's own consumer: it imports the same line rather than
 declaring the seven options itself.
+
+A stranger outside this repo pins the same five lines — no `modules/`
+import, no `inputs.quickshell`/`hyprland`/`nvf`:
+
+```nix
+inputs.aoide.url = "path:/path/to/pkgs/aoide";
+inputs.aoide.inputs.nixpkgs.follows = "nixpkgs";
+modules = [ aoide.nixosModules.default ];
+aoide.enable = true;
+aoide.user = "stranger";
+```
+
+## This directory is outside the package `src`
+
+`pkgs/aoide/default.nix`'s `src` filter drops the top-level `module/`
+directory, so a file added or edited here never moves the `aoide`
+derivation's store path or reruns its cargo test phase — the package
+is the crate tree; this module ships beside it.

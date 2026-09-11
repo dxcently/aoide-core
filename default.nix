@@ -39,7 +39,14 @@ rustPlatform.buildRustPackage {
   # drift on the first one that forgot it.
   version = (builtins.fromTOML (builtins.readFile ./Cargo.toml)).workspace.package.version;
 
-  src = lib.cleanSource ./.;
+  # The package is the crate tree; `module/` (the NixOS deployment module,
+  # pkgs/aoide/flake.nix's nixosModules.default) ships beside it, not inside
+  # it — dropped from `src` so a doc edit there never moves this store path.
+  src = lib.cleanSourceWith {
+    src = lib.cleanSource ./.;
+    filter =
+      path: type: !(type == "directory" && baseNameOf path == "module" && dirOf path == toString ./.);
+  };
 
   # P-A8 of the binary-split workstream: `lyra` moves off $out into its own
   # `rice` output, so a config that never enables the paint half (headless

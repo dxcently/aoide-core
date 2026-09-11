@@ -24,6 +24,9 @@
   `default.nix`'s existing shape — never fold a new unit's options into
   `options.nix` itself, and never grow `default.nix` into anything but
   a flat import list plus the overlay.
+- **`module/` is outside the package `src`.** `pkgs/aoide/default.nix`
+  filters this directory out of the crate build's source tree; a file
+  added here must never be needed by the crate build.
 
 ## Docs update required in the same commit
 
