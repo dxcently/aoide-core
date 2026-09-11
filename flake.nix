@@ -71,6 +71,14 @@
         };
       });
 
+      # ── Overlay ────────────────────────────────────────────────────────────
+      # One attribute, pinned to this flake's own build: a consumer that
+      # applies this overlay and one that reads packages.<sys>.aoide get the
+      # SAME derivation, never two builds of it.
+      overlays.default = final: _prev: {
+        aoide = self.packages.${final.stdenv.hostPlatform.system}.default;
+      };
+
       # ── Checks ─────────────────────────────────────────────────────────────
       # The check IS the package build: default.nix runs `cargo test` in the
       # sandbox (doCheck), so a green `checks.default` is the full Rust suite.
