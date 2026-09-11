@@ -73,6 +73,23 @@ pub mod shellbridge;
 /// its own `AOIDE_STATE_DIR` override afterward (`ledger.rs`'s and
 /// `resurrect.rs`'s own tests do exactly that) — this only keeps every
 /// OTHER test's incidental ledger append off production disk.
+///
+/// **P-CX-3 safety net, same shape again, one more env var over:** the first
+/// call ALSO floors `CODEX_HOME`, unless a test already set one. Wiring
+/// `sync_codex_app_threads` into bare `reap()` (P-CX-3) means every test in
+/// this crate that calls `reap()` now try-flocks whatever
+/// `<CODEX_HOME or $HOME>/.codex/thread-writer-locks/*.lock` exists — on a
+/// dev box (this one included) with a real desktop Codex/ChatGPT app open,
+/// that is a REAL live thread, and `reap()`'s existing test suite (predating
+/// P-CX-3, none of it expecting a codex thread to exist) never had reason to
+/// float either var. Caught live: `reap_drops_superseded_done_siblings_on_
+/// an_otherwise_quiet_pass` gained a real, unexpected `01a07d89-…` record the
+/// moment the call site landed. The floor points at a directory that can
+/// never exist, which `codex_home()`/`live_thread_locks` already read as "no
+/// threads" (never an error) — so this is a safe default, not a new special
+/// case. A test that wants to prove real `~/.codex` reads (`codex_app.rs`'s
+/// own suite) still installs its own `CODEX_HOME`/`HOME` override afterward,
+/// same as any other env var here.
 #[cfg(test)]
 pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
     static ISOLATE_DAEMON_SOCKET: std::sync::Once = std::sync::Once::new();
@@ -87,6 +104,12 @@ pub(crate) fn env_lock() -> &'static std::sync::Mutex<()> {
             std::env::set_var(
                 "AOIDE_STATE_DIR",
                 std::env::temp_dir().join(format!("aoide-conduct-tests-state-{}", std::process::id())),
+            );
+        }
+        if std::env::var("CODEX_HOME").is_err() {
+            std::env::set_var(
+                "CODEX_HOME",
+                "/nonexistent/aoide-conduct-tests-never-a-real-codex-home",
             );
         }
     });

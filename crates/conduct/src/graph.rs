@@ -17,9 +17,11 @@ mod actions;
 pub use actions::{session_kill, session_project};
 // The P-CX desktop Codex/ChatGPT association design
 // (`docs/architecture/CODEX-INTEGRATION.md`): the pure reconciler plus its
-// discovery seam. Neither has a caller outside its own tests until P-CX-3
-// wires the call site; only `codex_home` is re-exported below, for
-// `reap.rs`'s title refresh.
+// discovery seam. `sync_codex_app_threads` (re-exported below) is called
+// from the reaper tick (`reap.rs`) and, for promptness, the Hyprland window
+// listener (`window.rs`); `codex_home` is re-exported separately for
+// `reap.rs`'s own title refresh. Only `reconcile_codex_app_threads` itself
+// stays reachable from its own tests alone.
 mod codex_app;
 mod common;
 mod conduct;
@@ -148,6 +150,7 @@ pub(crate) use self::session_store::{
 };
 pub(crate) use self::window::hyprctl_clients;
 pub(crate) use self::codex_app::codex_home;
+pub(crate) use self::codex_app::sync_codex_app_threads;
 /// Widened from `pub(crate)` to `pub` at P-A1 of the binary-split
 /// workstream: `aoide-screen` (moved out of this crate) needs the same
 /// `0x`/case-tolerant window-address comparison its own session-targeted

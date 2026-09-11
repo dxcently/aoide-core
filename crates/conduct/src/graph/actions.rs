@@ -88,6 +88,13 @@ pub(super) const NO_DEDICATED_PROCESS: &str =
 const SUBAGENT_SHARES_EXECUTOR: &str =
     "a subagent has no process of its own; kill its executor session instead";
 
+/// A `kind:"app"` record's pid names a desktop app-server process aoide
+/// never launched and holds no authority to signal (P-CX,
+/// `docs/architecture/CODEX-INTEGRATION.md`) — closing its task belongs to
+/// the app, never to a kill routed through here.
+const APP_OWNS_PROCESS: &str =
+    "the desktop app owns this thread's process; close the thread in the app instead";
+
 /// An ANCESTOR hop (never the requested record itself, which keeps its own
 /// "session has already ended") whose `canonical_state` is `"done"`: the
 /// terminal a kill would have resolved through no longer exists to signal.
@@ -140,6 +147,9 @@ pub(super) fn kill_target<'a>(
     loop {
         if current.session_id.starts_with("sub:") {
             return Err(SUBAGENT_SHARES_EXECUTOR);
+        }
+        if current.kind.as_deref() == Some("app") {
+            return Err(APP_OWNS_PROCESS);
         }
         if canonical_state(&current.state) == "done" {
             return Err(if chain.len() == 1 {
@@ -357,6 +367,20 @@ mod tests {
         assert_eq!(
             kill_target("sub:t1", &[sub, w]).unwrap_err(),
             SUBAGENT_SHARES_EXECUTOR
+        );
+    }
+    #[test]
+    fn killing_a_codex_app_record_refuses_without_touching_the_app() {
+        // A `kind:"app"` record with a live pid (the app-server holding the
+        // thread's writer lock) — `kill_target` must refuse outright, never
+        // resolve a target to signal. Only the Err is asserted; nothing
+        // sends a signal here (`kill_target` itself never does — signaling
+        // is `terminate_verified`'s job, never reached).
+        let mut app = rec("01a07d89-app");
+        app.kind = Some("app".to_string());
+        assert_eq!(
+            kill_target("01a07d89-app", &[app]).unwrap_err(),
+            APP_OWNS_PROCESS
         );
     }
     #[test]

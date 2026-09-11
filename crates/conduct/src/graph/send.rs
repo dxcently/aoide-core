@@ -687,6 +687,23 @@ fn deliver_local_with(
         audit_send(inv, "error", &out.message, &text);
         return out;
     };
+    // A `kind:"app"` record (P-CX, `docs/architecture/CODEX-INTEGRATION.md`)
+    // is a task inside a desktop app aoide does not conduct — no socket ever
+    // exists to fill in, so this must never fall through to the ordinary
+    // `not-conductable` refusal below (which implies a retry might work) or
+    // to any other executor. Checked before `is_conductable_now` so an
+    // app record's absent socket is never misread as the ordinary case.
+    if rec.kind.as_deref() == Some("app") {
+        let out = Outcome::error(
+            cmd,
+            format!(
+                "session `{id}` lives inside the desktop app that owns its server; aoide has no channel to it"
+            ),
+        )
+        .with_data(json!({ "reason": "codex-app-unsupported", "id": id }));
+        audit_send(inv, "error", &out.message, &text);
+        return out;
+    }
     let is_conductable = super::doc::is_conductable_now(rec);
     let socket = rec.socket.clone().filter(|s| !s.is_empty());
     let target_parent = rec.parent_session_id.clone();
@@ -4208,6 +4225,58 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Error);
         assert_eq!(out.data.as_ref().unwrap()["reason"], "not-conductable");
         assert!(out.message.contains("is gone"), "msg: {}", out.message);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    // ── P-CX: a desktop Codex/ChatGPT `kind:"app"` record refuses `send` ──
+    #[test]
+    fn a_codex_app_record_refuses_a_send_as_unsupported_not_not_conductable() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("send-codex-app");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        let mut app = session("01a07d89-app", "/home/khoa/Aoide", "idle", "1", None);
+        app.agent = "codex".to_string();
+        app.kind = Some("app".to_string());
+        let sf = SessionsFile { schema_version: "0".to_string(), sessions: vec![app] };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let out = session_send(&send_invocation(&["hi"], &[("id", "01a07d89-app"), ("yes", "true")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "codex-app-unsupported");
+        assert_ne!(
+            out.data.as_ref().unwrap()["reason"], "not-conductable",
+            "an app record's refusal must never read as the ordinary retryable case"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
+    fn the_unsupported_refusal_names_the_app_as_the_server_owner() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("send-codex-app-msg");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        let mut app = session("01a08a23-app", "/home/khoa/Documents", "idle", "1", None);
+        app.agent = "codex".to_string();
+        app.kind = Some("app".to_string());
+        let sf = SessionsFile { schema_version: "0".to_string(), sessions: vec![app] };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let out = session_send(&send_invocation(&["hi"], &[("id", "01a08a23-app"), ("yes", "true")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert!(out.message.contains("desktop app"), "msg: {}", out.message);
+        assert!(out.message.contains("no channel"), "msg: {}", out.message);
 
         let _ = std::fs::remove_dir_all(&root);
     }

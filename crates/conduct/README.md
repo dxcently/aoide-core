@@ -411,6 +411,14 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   the one authority for the root path; `reap.rs::refresh_codex_titles` calls
   the same function rather than a second copy. See AGENTS.md's invariants
   for why `kind:"app"` exists and what it must never gain.
+
+  `sync_codex_app_threads` (P-CX-3) has two call sites. The reaper's own
+  tick (`reap.rs`, run immediately before its title refresh so a thread
+  enrolled this pass gets its title in the same pass) is PRIMARY — it runs
+  wherever `aoided` runs, Hyprland or not. `run_hypr_window_listener`
+  (`window.rs`) calls it too, beside every `sync_untracked_terminal_windows`
+  tick (startup, reconnect, the ~5s timeout, `Appeared`, `Closed`), but only
+  for PROMPTNESS on a host where that listener happens to be running.
 - `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below). The socket answers exactly one command with a reply,

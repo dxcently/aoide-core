@@ -69,8 +69,9 @@ use aoide_protocol::agents::{agent_profile, AgentProfile, CLAUDE_PROFILE};
 use crate::graph::{
     canonical_state, codex_home, drop_sessions, hooks_path, hyprctl_clients, ledger_session_exit,
     lineage_of, load_stage, normalize_addr, now_iso_utc, prune_done, refresh_subagent_says,
-    refresh_transcript_fields, restage_graph, sessions_path, stage_error, upsert_hook,
-    write_stage, HookRecord, HooksFile, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
+    refresh_transcript_fields, restage_graph, sessions_path, stage_error, sync_codex_app_threads,
+    upsert_hook, write_stage, HookRecord, HooksFile, SessionRecord, SessionsFile,
+    STAGE_GRAPH_VERSION,
 };
 use aoide_protocol::output::Outcome;
 use serde_json::{json, Value};
@@ -1077,6 +1078,14 @@ pub fn reap(inv: &Invocation) -> Outcome {
         if let Some(data) = outcome.data.as_mut() {
             data["orphanTunnels"] = json!(swept_tunnels);
         }
+    }
+    // Reconcile desktop Codex/ChatGPT threads BEFORE the title refresh below:
+    // a thread enrolled (or dropped) this pass then gets its title filled in
+    // the SAME pass, rather than waiting a full tick. Unlike the title
+    // refresh, an enrolment or a dropped thread IS a roster change, so it
+    // joins `changed` and can toast.
+    if sync_codex_app_threads() {
+        outcome.changed.push("reconciled desktop codex threads".to_string());
     }
     // The refresh is reported but deliberately NOT folded into `changed`: that
     // vec is the sweep's ledger (what entered or left the roster), and it is

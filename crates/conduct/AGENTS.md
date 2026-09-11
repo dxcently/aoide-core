@@ -49,6 +49,18 @@
   `conductable`/`socket` — there is no transport and no lifecycle event to
   back any of them.
 
+- **An `"app"` record refuses `send` and `kill` by NAME and never falls
+  back to another executor (P-CX-3).** `graph/send.rs::deliver_local_with`
+  checks `rec.kind.as_deref() == Some("app")` BEFORE `is_conductable_now`
+  and errors `codex-app-unsupported` — never today's `not-conductable`,
+  which implies a retry might work. `graph/actions.rs::kill_target` checks
+  the same field at the top of its walk, beside the `sub:` check, and
+  refuses with `APP_OWNS_PROCESS` — the app owns the process, never a
+  signal this crate sends. Both `--to` and A2A inject (`aoide-server`'s
+  `a2a::do_inject`) fold into `deliver_local_with` before ever reaching a
+  socket, so this is the ONE gate for every send path; don't add a second
+  `kind:"app"` check anywhere else.
+
 - **No path may synthesize a per-thread window address.** A Codex-app
   record's `windowAddress` is the window owning the process that holds that
   thread's writer lock, stamped ONLY by the existing

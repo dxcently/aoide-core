@@ -4,6 +4,7 @@
 //! `socket2` event listener, and the untracked-terminal (`win:*`)
 //! synthetic-record reconciler.
 
+use super::codex_app::sync_codex_app_threads;
 use super::conduct::proc_cwd;
 use super::doc::restage_graph;
 use super::model::{
@@ -1061,6 +1062,14 @@ pub(crate) fn is_read_timeout(e: &std::io::Error) -> bool {
 /// short backoff. NEVER panics. A ~5s read timeout on the connection also
 /// re-ticks the untracked-terminal sync (see [`is_read_timeout`]) so a bare tty's
 /// cwd/title doesn't go stale between window events.
+///
+/// Every one of those same ticks also calls [`sync_codex_app_threads`] — for
+/// PROMPTNESS only. The reaper's own tick (`reap.rs`) is the primary,
+/// portable call site (it runs wherever `aoided` runs, Hyprland or not);
+/// this listener merely reconciles sooner on a host where it happens to be
+/// running. Wherever [`resolve_pending_session_windows`] also runs (reconnect,
+/// `Appeared`), it comes AFTER the codex sync so a thread enrolled just now
+/// is stamped with its window in the same pass.
 pub fn run_hypr_window_listener() {
     use std::io::{BufRead, BufReader};
     let Some(sock) = hypr_event_socket_path() else {
@@ -1072,12 +1081,14 @@ pub fn run_hypr_window_listener() {
     // Populate the untracked-terminal roster once at startup, so the Terminals
     // widget has a complete tty roster the instant shellbridge comes up — not
     // only after the next window event fires.
+    sync_codex_app_threads();
     sync_untracked_terminal_windows();
     loop {
         match UnixStream::connect(&sock) {
             Ok(stream) => {
                 // On every (re)connect, sweep any windows that opened while we
                 // were not listening (service start mid-session, or a reconnect).
+                sync_codex_app_threads();
                 resolve_pending_session_windows();
                 sync_untracked_terminal_windows();
                 // Coarse read timeout so a blocking read wakes every ~5s even
@@ -1093,6 +1104,7 @@ pub fn run_hypr_window_listener() {
                         // The read itself blocked for the full 5s, so this paces
                         // itself — no busy-loop.
                         Err(e) if is_read_timeout(&e) => {
+                            sync_codex_app_threads();
                             sync_untracked_terminal_windows();
                             continue;
                         }
@@ -1101,11 +1113,13 @@ pub fn run_hypr_window_listener() {
                     };
                     match parse_hypr_window_event(&line) {
                         Some(HyprWindowEvent::Appeared { .. }) => {
+                            sync_codex_app_threads();
                             resolve_pending_session_windows();
                             sync_untracked_terminal_windows();
                         }
                         Some(HyprWindowEvent::Closed { address }) => {
                             clear_closed_window(&address);
+                            sync_codex_app_threads();
                             sync_untracked_terminal_windows();
                         }
                         None => {}
