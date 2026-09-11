@@ -1,10 +1,13 @@
-//! The doorbell's RING (P-M5a-2, corrected at P-M5a-2c — `docs/architecture/
-//! MAIL.md` "Delivery and the doorbell"). Slice 1 (971cad8) stored the
-//! latch — `aoide_storage::mail`'s `arms`/`ring_targets`/`stamp_rung`/
-//! `armed_names_for_reader`/`enrol_reader`. This module is what actually
-//! rings: when an arming entry (a `letter`) is filed to a mailbox name,
-//! every armed reader of that name whose wrap is headless and whose agent
-//! child is at the prompt gets one line written to the wrap's control
+//! The doorbell's RING (P-M5a-2, corrected at P-M5a-2c, transport choice
+//! added at P-M5c-3 — `docs/architecture/MAIL.md` "Delivery and the
+//! doorbell"). Slice 1 (971cad8) stored the latch — `aoide_storage::mail`'s
+//! `arms`/`ring_targets`/`stamp_rung`/`armed_names_for_reader`/
+//! `enrol_reader`. This module is what actually rings: when an arming entry
+//! (a `letter`) is filed to a mailbox name, every armed reader of that name
+//! whose agent child is at the prompt gets nudged — over its live Claude
+//! Code channel socket ([`channel_socket_path`]) when one is bound, which
+//! needs no submit keystroke and so works for an interactive composer too;
+//! otherwise, for a headless wrap, one line written to the wrap's control
 //! socket and submitted — latched (never repeated) until the reader reads.
 //!
 //! **A ring executes only inside the resident daemon — the policy and audit
@@ -31,11 +34,12 @@
 //! all; two overlapping rings simply serialize on it, the second selecting
 //! after the first stamped and finding the latch already closed.
 //!
-//! **Raw injection, never [`super::send::session_send`].** A ring writes
-//! directly with [`super::send::write_delivery`] — no gate, no pending
-//! queue, no provenance prefix, no title rename. The nudge line is the only
-//! thing that ever reaches the socket, followed by the target's own submit
-//! keystroke.
+//! **Raw injection, never [`super::send::session_send`].** A channel ring
+//! writes the nudge line to the channel socket, once, then closes — no
+//! submit keystroke, nothing else on the wire. A PTY ring (headless, no
+//! live channel) writes directly with [`super::send::write_delivery`] — no
+//! gate, no pending queue, no provenance prefix, no title rename — and that
+//! one is followed by the target's own submit keystroke.
 //!
 //! **Every other door forwards, never rings.** `aoide-client`'s `mail send`
 //! (self branch) already forwarded `mail ring` through
@@ -47,6 +51,7 @@
 //! daemon-side trigger; the remote door's own forward path is P-M5b-2's,
 //! deliberately deferred out of this slice.
 
+use super::conduct::channel_socket_path;
 use super::doc::is_conductable_now;
 use super::model::{load_stage, sessions_path, SessionRecord, SessionsFile};
 use super::permit::profile_for_agent;
@@ -73,10 +78,11 @@ pub struct RingReport {
     pub deferred: Vec<(String, String)>,
     /// (wrap id, reason) — `unknown` (armed but no session record),
     /// `not-conductable` (`is_conductable_now` false, including a socket
-    /// file that no longer exists), `interactive-composer` (not headless),
-    /// `no-readiness-signal` (no hook-fed agent child), or `write-failed`
-    /// (the socket connect/write itself failed). The latch is untouched in
-    /// every case.
+    /// file that no longer exists), `interactive-composer` (interactive
+    /// AND no live channel socket), `no-readiness-signal` (no hook-fed
+    /// agent child), or `write-failed` (the chosen transport's connect/
+    /// write itself failed — channel or PTY alike). The latch is untouched
+    /// in every case.
     pub skipped: Vec<(String, String)>,
 }
 
@@ -86,6 +92,25 @@ pub struct RingReport {
 /// there is no parameter through which a letter's bytes could ride along.
 fn nudge_line(name: &str) -> String {
     format!("[aoide mail] new mail for {name} — aoide mail read --for {name}")
+}
+
+/// The channel write itself (P-M5c-3): `payload` once, then a flush — no
+/// submit key, ever, and no [`super::send::write_delivery`] (that one
+/// exists to add a keystroke this transport must never send). Generic over
+/// `Write` rather than pinned to `UnixStream`: racing a real socket's
+/// peer-close against this single ~90-byte write is not reliably
+/// reproducible on Linux — a write immediately following a successful
+/// `connect()` wins against even a pre-warmed, busy-spinning acceptor on
+/// every trial measured (0/300 induced failures, including under
+/// synthetic load) — so `tests::a_channel_write_that_fails_leaves_the_
+/// latch_armed` proves this function's own error path against a fake
+/// writer instead of an unreproducible kernel race; [`ring_locked`]'s
+/// shared `match` on the result is the SAME block `tests::
+/// a_failed_socket_write_leaves_the_latch_armed` already proves for the
+/// PTY transport.
+fn write_channel(mut stream: impl std::io::Write, payload: &[u8]) -> std::io::Result<()> {
+    stream.write_all(payload)?;
+    stream.flush()
 }
 
 /// Self-check-then-walk-up (the shape `window.rs`'s `windowless_by_lineage`/
@@ -184,16 +209,13 @@ fn ring_locked(name: &str, exclude: Option<&str>) -> RingReport {
             continue;
         }
 
-        if !wrap.headless {
-            report.skipped.push((wrap_id.clone(), "interactive-composer".to_string()));
-            continue;
-        }
-
         // Readiness is the CHILD's hook state — the hook-fed agent session
         // whose parent is this wrap and whose `agent` names a registered
         // harness profile (`agent_profile` returning `None` is the
         // "unknown/never hooked" signal; `profile_for_agent`'s own
-        // CLAUDE_PROFILE fallback would hide that signal instead).
+        // CLAUDE_PROFILE fallback would hide that signal instead). This
+        // gate runs before transport selection and binds every wrap alike,
+        // channel or PTY.
         let child = sessions.iter().find(|s| {
             s.parent_session_id.as_deref() == Some(wrap_id.as_str())
                 && aoide_protocol::agents::agent_profile(&s.agent).is_some()
@@ -209,17 +231,37 @@ fn ring_locked(name: &str, exclude: Option<&str>) -> RingReport {
             continue;
         }
 
-        // `is_conductable_now` already proved `wrap.socket` is `Some`,
-        // non-empty, and exists on disk.
-        let socket = wrap.socket.as_deref().unwrap_or_default();
         let line = nudge_line(name);
         let payload = format!("{line}\n");
-        let profile = profile_for_agent(&child.agent);
 
-        let wrote = (|| -> std::io::Result<()> {
-            let mut stream = UnixStream::connect(socket)?;
-            write_delivery(&mut stream, payload.as_bytes(), true, profile.submit_key, SUBMIT_KEYSTROKE_DELAY)
-        })();
+        // Transport selection (P-M5c-3): a live Claude Code channel socket
+        // outranks the control-socket PTY for ANY wrap, interactive or
+        // headless — it is a one-way push into the wrap's own MCP
+        // subprocess, never a keystroke, so there is no half-typed
+        // composer line to clobber. A stale socket FILE with nothing
+        // listening (the owning MCP subprocess died without unlinking it)
+        // refuses the connect and falls through to the PTY/skip below —
+        // never a stat-only check.
+        let channel_write =
+            UnixStream::connect(channel_socket_path(wrap_id)).ok().map(|stream| write_channel(stream, payload.as_bytes()));
+
+        let wrote = match channel_write {
+            Some(result) => result,
+            None if wrap.headless => {
+                // `is_conductable_now` already proved `wrap.socket` is
+                // `Some`, non-empty, and exists on disk.
+                let socket = wrap.socket.as_deref().unwrap_or_default();
+                let profile = profile_for_agent(&child.agent);
+                (|| -> std::io::Result<()> {
+                    let mut stream = UnixStream::connect(socket)?;
+                    write_delivery(&mut stream, payload.as_bytes(), true, profile.submit_key, SUBMIT_KEYSTROKE_DELAY)
+                })()
+            }
+            None => {
+                report.skipped.push((wrap_id.clone(), "interactive-composer".to_string()));
+                continue;
+            }
+        };
 
         match wrote {
             Ok(()) => {
@@ -349,6 +391,29 @@ mod tests {
         do_session_start(id, Some("claude"), Some("/w"), None, None, Some(true), Some(socket.to_str().unwrap()), None, None);
         stamp_headless(id);
         listener
+    }
+
+    /// Bind `id`'s control socket and register it as an ordinary
+    /// INTERACTIVE conducted wrap — conductable, a real socket, but never
+    /// `stamp_headless`, the same shape `an_interactive_wrap_is_skipped_
+    /// untouched_and_stays_armed` builds by hand. Returns the bound
+    /// listener so a test can prove the PTY is never written to.
+    fn interactive_wrap(id: &str) -> UnixListener {
+        let socket = conduct_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        let listener = UnixListener::bind(&socket).unwrap();
+        do_session_start(id, Some("claude"), Some("/w"), None, None, Some(true), Some(socket.to_str().unwrap()), None, None);
+        listener
+    }
+
+    /// Bind `id`'s Claude Code channel socket ([`channel_socket_path`],
+    /// P-M5c-2) — the shape `aoide-server`'s stdio MCP server binds for the
+    /// lifetime of its own subprocess. Returns the listener so a test can
+    /// accept the ring's connection.
+    fn channel_listener(id: &str) -> UnixListener {
+        let socket = channel_socket_path(id);
+        std::fs::create_dir_all(socket.parent().unwrap()).unwrap();
+        UnixListener::bind(&socket).unwrap()
     }
 
     /// Register `id` as an ordinary hook-fed session, child of `parent`,
@@ -985,6 +1050,289 @@ mod tests {
 
         let targets = aoide_storage::mail::ring_targets(name).unwrap();
         assert_eq!(targets.armed.len(), 1, "the latch stays armed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // ── P-M5c-3: transport selection ─────────────────────────────────────
+
+    #[test]
+    fn an_interactive_wrap_with_a_live_channel_socket_is_rung_over_the_channel() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("ring-channel-interactive");
+        let name = "claude-mail";
+        let wrap_id = "wrap-1";
+        let child_id = "wrap-1-child";
+        let pty_listener = interactive_wrap(wrap_id);
+        hook_child(child_id, wrap_id, "claude");
+        do_session_phase(child_id, "stopped");
+        let channel = channel_listener(wrap_id);
+
+        aoide_storage::mail::enrol_reader(name, wrap_id).unwrap();
+        aoide_storage::mail::file_letter("someone", name, "hello").unwrap();
+
+        let acc = std::thread::spawn(move || read_all(channel));
+        let report = ring(name, None).unwrap();
+        let bytes = acc.join().unwrap();
+
+        assert_eq!(report.rung, vec![wrap_id.to_string()], "{report:?}");
+        assert_eq!(bytes, format!("{}\n", nudge_line(name)).into_bytes(), "the channel gets the line and nothing else");
+        // The PTY is never touched: the channel wins, never a keystroke,
+        // even though this wrap is exactly the kind (interactive, no
+        // headless stamp) `an_interactive_wrap_is_skipped_untouched_and_
+        // stays_armed` proves is refused when no channel exists.
+        assert_nothing_arrives(&pty_listener);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_channel_ring_writes_no_submit_key() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("ring-channel-no-submit");
+        let name = "claude-mail";
+        let wrap_id = "wrap-1";
+        let child_id = "wrap-1-child"; // agent "kimi" (a PTY ring would submit "\r")
+        let _pty_listener = headless_wrap(wrap_id);
+        hook_child(child_id, wrap_id, "kimi");
+        do_session_phase(child_id, "stopped");
+        let channel = channel_listener(wrap_id);
+
+        aoide_storage::mail::enrol_reader(name, wrap_id).unwrap();
+        aoide_storage::mail::file_letter("someone", name, "hello").unwrap();
+
+        let acc = std::thread::spawn(move || read_all(channel));
+        let report = ring(name, None).unwrap();
+        let bytes = acc.join().unwrap();
+
+        assert_eq!(report.rung, vec![wrap_id.to_string()]);
+        // Exactly the line plus its own `\n` — never kimi's own `\r`, never
+        // any submit key at all: a channel write is one write and closes.
+        assert_eq!(bytes, format!("{}\n", nudge_line(name)).into_bytes());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_channel_present_beats_the_pty_on_a_headless_wrap() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("ring-channel-beats-headless-pty");
+        let name = "claude-mail";
+        let wrap_id = "wrap-1";
+        let child_id = "wrap-1-child";
+        let pty_listener = headless_wrap(wrap_id);
+        hook_child(child_id, wrap_id, "claude");
+        do_session_phase(child_id, "stopped");
+        let channel = channel_listener(wrap_id);
+
+        aoide_storage::mail::enrol_reader(name, wrap_id).unwrap();
+        aoide_storage::mail::file_letter("someone", name, "hello").unwrap();
+
+        let acc = std::thread::spawn(move || read_all(channel));
+        let report = ring(name, None).unwrap();
+        let bytes = acc.join().unwrap();
+
+        assert_eq!(report.rung, vec![wrap_id.to_string()]);
+        assert_eq!(bytes, format!("{}\n", nudge_line(name)).into_bytes());
+        // Headless would ordinarily earn the PTY; a live channel outranks
+        // it regardless.
+        assert_nothing_arrives(&pty_listener);
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_headless_wrap_with_no_channel_socket_still_rings_over_the_pty() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("ring-no-channel-still-pty");
+        let name = "claude-mail";
+        let wrap_id = "wrap-1";
+        let child_id = "wrap-1-child";
+        let listener = headless_wrap(wrap_id);
+        hook_child(child_id, wrap_id, "claude");
+        do_session_phase(child_id, "stopped");
+        // No channel socket bound at all — the pre-P-M5c-3 shape.
+
+        aoide_storage::mail::enrol_reader(name, wrap_id).unwrap();
+        aoide_storage::mail::file_letter("someone", name, "hello").unwrap();
+
+        let acc = std::thread::spawn(move || read_all(listener));
+        let report = ring(name, None).unwrap();
+        let bytes = acc.join().unwrap();
+
+        assert_eq!(report.rung, vec![wrap_id.to_string()]);
+        assert!(String::from_utf8_lossy(&bytes).starts_with(&nudge_line(name)));
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_working_child_defers_even_with_a_live_channel() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("ring-channel-working-defers");
+        let name = "claude-mail";
+        let wrap_id = "wrap-1";
+        let child_id = "wrap-1-child";
+        let _pty_listener = headless_wrap(wrap_id);
+        hook_child(child_id, wrap_id, "claude");
+        do_session_phase(child_id, "working");
+        let channel = channel_listener(wrap_id);
+
+        aoide_storage::mail::enrol_reader(name, wrap_id).unwrap();
+        aoide_storage::mail::file_letter("someone", name, "hello").unwrap();
+
+        let report = ring(name, None).unwrap();
+        assert_eq!(report.deferred, vec![(wrap_id.to_string(), "working".to_string())]);
+        assert!(report.rung.is_empty());
+        // A mid-turn child defers on every transport alike — the channel is
+        // never written to either.
+        assert_nothing_arrives(&channel);
+
+        let targets = aoide_storage::mail::ring_targets(name).unwrap();
+        assert_eq!(targets.armed.len(), 1, "the latch stays armed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_channel_write_that_fails_leaves_the_latch_armed() {
+        // Racing a real socket's peer-close against this ~90-byte write is
+        // not reliably reproducible: a write immediately following a
+        // successful `connect()` beat even a pre-warmed, busy-spinning
+        // acceptor on every trial measured (0 induced failures out of 300
+        // attempts, including under synthetic 32-way CPU load) — the kernel
+        // has already handed the bytes to the send buffer before any peer,
+        // however eager, can react. `write_channel` is generic over `Write`
+        // precisely so this failure path is provable against a fake writer
+        // instead of an unreproducible kernel race. `ring_locked`'s own
+        // handling of the resulting `Err` — report `write-failed`, never
+        // stamp the latch — is the SAME shared block
+        // `a_failed_socket_write_leaves_the_latch_armed` (below) already
+        // proves for the PTY transport; both transports feed the identical
+        // `match wrote { Ok(()) => .., Err(_) => "write-failed" }`.
+        struct AlwaysFails;
+        impl std::io::Write for AlwaysFails {
+            fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::from(std::io::ErrorKind::BrokenPipe))
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let err = write_channel(AlwaysFails, nudge_line("claude-mail").as_bytes())
+            .expect_err("a broken pipe must surface as an error, never a silent success");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+    }
+
+    #[test]
+    fn an_interactive_wrap_with_no_channel_is_still_skipped_interactive_composer() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("ring-no-channel-interactive-skipped");
+        let name = "claude-mail";
+        let wrap_id = "wrap-1";
+        let child_id = "wrap-1-child";
+        let _pty_listener = interactive_wrap(wrap_id);
+        hook_child(child_id, wrap_id, "claude");
+        do_session_phase(child_id, "stopped");
+        // No channel socket bound at all.
+
+        aoide_storage::mail::enrol_reader(name, wrap_id).unwrap();
+        aoide_storage::mail::file_letter("someone", name, "hello").unwrap();
+
+        let report = ring(name, None).unwrap();
+        assert_eq!(report.skipped, vec![(wrap_id.to_string(), "interactive-composer".to_string())]);
+        assert!(report.rung.is_empty());
+
+        let targets = aoide_storage::mail::ring_targets(name).unwrap();
+        assert_eq!(targets.armed.len(), 1, "the latch stays armed");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_stale_channel_socket_file_falls_through_to_the_pty_or_skip() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_STATE_DIR",
+            "XDG_RUNTIME_DIR",
+            "AOIDE_AUDIT_LOG",
+            "AOIDE_CONDUCT_AUTOGATE",
+            "AOIDE_SESSION_ID",
+        ]);
+        let root = setup("ring-stale-channel-socket");
+        let name = "claude-mail";
+        let wrap_id = "wrap-1";
+        let child_id = "wrap-1-child";
+        let pty_listener = headless_wrap(wrap_id);
+        hook_child(child_id, wrap_id, "claude");
+        do_session_phase(child_id, "stopped");
+        // Bind the channel socket, then drop the listener WITHOUT
+        // unlinking — the special file is left behind on disk (the shape a
+        // SIGKILLed MCP subprocess leaves), so a connect must refuse,
+        // never merely stat the path.
+        let channel = channel_socket_path(wrap_id);
+        std::fs::create_dir_all(channel.parent().unwrap()).unwrap();
+        drop(UnixListener::bind(&channel).unwrap());
+
+        aoide_storage::mail::enrol_reader(name, wrap_id).unwrap();
+        aoide_storage::mail::file_letter("someone", name, "hello").unwrap();
+
+        let acc = std::thread::spawn(move || read_all(pty_listener));
+        let report = ring(name, None).unwrap();
+        let bytes = acc.join().unwrap();
+
+        assert_eq!(report.rung, vec![wrap_id.to_string()], "the stale channel file falls through to the PTY: {report:?}");
+        assert!(String::from_utf8_lossy(&bytes).starts_with(&nudge_line(name)));
 
         let _ = std::fs::remove_dir_all(&root);
     }
