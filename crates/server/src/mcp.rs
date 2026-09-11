@@ -18,6 +18,7 @@
 //! `mcp serve --stdio` launch site passes `dispatch::registry()` and
 //! `dispatch::dispatch` in.
 
+use crate::daemon::{read_capped_line, LineReadError, MAX_REQUEST_LINE_BYTES};
 use aoide_conduct::graph::channel_socket_path;
 use aoide_protocol::output::{Outcome, Status};
 use aoide_protocol::registry::Registry;
@@ -30,6 +31,7 @@ use aoide_protocol::{Door, Invocation};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixListener;
 use std::sync::{Arc, Mutex};
 
@@ -243,11 +245,32 @@ fn channel_notification(content: &str) -> Value {
 /// The channel's one listener thread (P-M5c-2): serially accepts
 /// connections and, for each, relays every newline-delimited line it reads
 /// as one `notifications/claude/channel` line on `out` — one connection is
-/// read start-to-finish before the next is even accepted, so no second
-/// thread ever touches the socket.
+/// read start-to-finish (to EOF or a dropped line) before the next is even
+/// accepted, so no second thread ever touches the socket. A caller is
+/// expected to connect, write one line, and close (the doorbell's own
+/// `nudge_line` write does exactly that); a connection held open past its
+/// one line stalls every later caller until it closes.
+///
+/// Lines are read via [`read_capped_line`] under the SAME
+/// [`MAX_REQUEST_LINE_BYTES`] cap the daemon socket already enforces
+/// (P-M5c-2 review) rather than the unbounded `BufRead::lines()` this
+/// started with: a client that never sends `\n` grew this thread's buffer
+/// without bound. A line over the cap, or one that isn't valid UTF-8, drops
+/// just that connection — no reply (this socket is one-way), no panic —
+/// and the listener moves on to the next `accept`.
 fn run_channel_listener<W: Write + Send + 'static>(listener: UnixListener, out: Arc<Mutex<W>>) {
     for conn in listener.incoming().flatten() {
-        for line in std::io::BufReader::new(conn).lines().flatten() {
+        let mut reader = std::io::BufReader::new(conn);
+        loop {
+            let line_bytes = match read_capped_line(&mut reader, MAX_REQUEST_LINE_BYTES) {
+                Ok(None) => break, // EOF: caller closed.
+                Ok(Some(bytes)) => bytes,
+                Err(LineReadError::TooLarge) => break, // over the cap: drop this connection.
+                Err(LineReadError::Io) => break,       // read error: drop this connection.
+            };
+            let Ok(line) = String::from_utf8(line_bytes) else {
+                break; // invalid UTF-8: drop this connection.
+            };
             if line.is_empty() {
                 continue;
             }
@@ -260,12 +283,15 @@ fn run_channel_listener<W: Write + Send + 'static>(listener: UnixListener, out: 
 /// Bind `id`'s channel socket and spawn the one listener thread above
 /// (P-M5c-2). Unlink-then-bind, the same convention
 /// `aoide_conduct::graph::conduct`'s own per-session socket already follows
-/// — clears a stale socket left by a prior crash. The socket IS the
+/// — clears a stale socket left by a prior crash — then chmod `0600`
+/// (P-M5c-2 review: structural, not umask luck, matching `daemon::
+/// bind_socket`'s own posture — this socket carries no envelope, so
+/// same-uid-only is the entire access control it has). The socket IS the
 /// registration (house rule 7): no record, no command, no flag; its
 /// lifetime is this MCP subprocess's own, never `aoided`'s. `None` on a
-/// bind failure (best-effort, matching that same per-session socket's own
-/// posture): a session that can't bind stays reachable over stdio, just not
-/// over the channel.
+/// bind or chmod failure (best-effort, matching that same per-session
+/// socket's own posture): a session that can't secure the channel socket
+/// stays reachable over stdio, just not over the channel.
 fn spawn_channel_socket<W: Write + Send + 'static>(
     id: &str,
     out: Arc<Mutex<W>>,
@@ -282,6 +308,12 @@ fn spawn_channel_socket<W: Write + Send + 'static>(
             return None;
         }
     };
+    // 0600, structural, not umask luck — the same posture
+    // `daemon::bind_socket` already holds for its own control socket.
+    if let Err(e) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        eprintln!("aoide mcp serve: channel socket chmod failed: {e}");
+        return None;
+    }
     std::thread::spawn(move || run_channel_listener(listener, out));
     Some(path)
 }
@@ -568,6 +600,120 @@ mod tests {
                 line == reply || line == notice,
                 "a torn/interleaved line: {line}"
             );
+        }
+    }
+
+    #[test]
+    fn a_channel_line_over_the_cap_is_dropped_and_the_listener_survives() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("XDG_RUNTIME_DIR").ok();
+        let root = short_runtime_dir("cap");
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let out: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let path = spawn_channel_socket("chan-cap", Arc::clone(&out))
+            .expect("bind must succeed under a fresh tempdir");
+
+        // First connection: stream past the cap with no trailing newline,
+        // then close — the listener must drop it silently, never emitting
+        // a notification for it.
+        {
+            let mut conn = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            let chunk = vec![b'x'; 64 * 1024];
+            let mut sent: usize = 0;
+            while sent <= MAX_REQUEST_LINE_BYTES {
+                match conn.write(&chunk) {
+                    Ok(0) => break,
+                    Ok(n) => sent += n,
+                    Err(e)
+                        if e.kind() == std::io::ErrorKind::BrokenPipe
+                            || e.kind() == std::io::ErrorKind::ConnectionReset =>
+                    {
+                        break
+                    }
+                    Err(e) => panic!("unexpected write error: {e}"),
+                }
+            }
+        }
+
+        // Second connection: one well-formed line — the listener must still
+        // be alive to accept it and emit exactly one notification for it.
+        {
+            let mut conn = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            writeln!(
+                conn,
+                "[aoide mail] new mail for bob — aoide mail read --for bob"
+            )
+            .unwrap();
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let line = loop {
+            {
+                let buf = out.lock().unwrap();
+                if let Ok(s) = std::str::from_utf8(&buf) {
+                    if let Some(l) = s.lines().next() {
+                        if !l.is_empty() {
+                            break l.to_string();
+                        }
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the listener never recovered to notify the second connection's line"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["method"], "notifications/claude/channel");
+        assert_eq!(
+            v["params"]["content"],
+            "[aoide mail] new mail for bob — aoide mail read --for bob"
+        );
+        assert_eq!(v["params"]["meta"]["mailbox"], "bob");
+
+        // The oversized connection produced no notification of its own —
+        // exactly one line total, from the second connection alone.
+        {
+            let buf = out.lock().unwrap();
+            let text = std::str::from_utf8(&buf).unwrap();
+            assert_eq!(
+                text.lines().count(),
+                1,
+                "the oversized connection must never have produced a notification"
+            );
+        }
+
+        std::fs::remove_file(&path).ok();
+        match saved {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    #[test]
+    fn the_channel_socket_is_owner_only() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("XDG_RUNTIME_DIR").ok();
+        let root = short_runtime_dir("mode");
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let out: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let path = spawn_channel_socket("chan-mode", Arc::clone(&out))
+            .expect("bind must succeed under a fresh tempdir");
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "expected the channel socket to be user-private, got {mode:o}"
+        );
+
+        std::fs::remove_file(&path).ok();
+        match saved {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
         }
     }
 }

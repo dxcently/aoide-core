@@ -262,8 +262,11 @@ pub(crate) const EVENTS_CAP_BYTES: u64 = 1024 * 1024;
 
 /// A single request line's byte cap (module doc's "Framing" — the
 /// KNOWN-LIMITATION note there explains why this check is only exact for a
-/// line that eventually terminates with `\n`).
-const MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
+/// line that eventually terminates with `\n`). `pub(crate)` (P-M5c-2
+/// review): `mcp.rs`'s channel-socket listener reuses this SAME cap via
+/// [`read_capped_line`] rather than inventing a second number for a second
+/// unbounded-line class.
+pub(crate) const MAX_REQUEST_LINE_BYTES: usize = 1024 * 1024;
 
 /// How often a `subscribe` connection polls its own [`Follower`] AND probes
 /// the client for a hang-up — short enough that a subscriber sees a new
@@ -703,7 +706,11 @@ fn write_json_line(writer: &mut impl Write, value: &Value) -> std::io::Result<()
 
 /// How [`read_capped_line`] failed — the two cases [`handle_conn`]'s caller
 /// tells apart, since only one of them still has a peer worth replying to.
-enum LineReadError {
+/// `pub(crate)` (P-M5c-2 review): `mcp.rs`'s channel-socket listener
+/// matches on this same enum via the widened `read_capped_line` below,
+/// rather than re-deriving a second capped-line reader for its own
+/// unbounded-`BufReader::lines()` class of bug.
+pub(crate) enum LineReadError {
     /// A real I/O read error (`fill_buf` itself failed) — no reply is
     /// attempted. Invalid UTF-8 is a SEPARATE case this variant does not
     /// cover: `read_capped_line` only ever hands back raw bytes, and
@@ -731,7 +738,10 @@ enum LineReadError {
 /// last message with no trailing newline is still processed exactly as
 /// before this fix. `Err(LineReadError::TooLarge)` fires the moment the
 /// accumulated length exceeds `cap` with no `\n` in sight yet.
-fn read_capped_line(reader: &mut BufReader<UnixStream>, cap: usize) -> Result<Option<Vec<u8>>, LineReadError> {
+pub(crate) fn read_capped_line(
+    reader: &mut BufReader<UnixStream>,
+    cap: usize,
+) -> Result<Option<Vec<u8>>, LineReadError> {
     let mut line: Vec<u8> = Vec::new();
     loop {
         let buf = match reader.fill_buf() {

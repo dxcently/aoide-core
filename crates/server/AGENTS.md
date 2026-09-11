@@ -24,7 +24,11 @@
   torn-JSON-RPC-line interleave this seam exists to close. A
   `notifications/claude/channel` `meta` object's keys stay bare
   identifiers (`mailbox`, never `mail-box`); a hyphenated key is silently
-  dropped by the harness on the other end.
+  dropped by the harness on the other end. The listener serves one
+  connection to EOF (or a dropped over-cap line) before accepting the
+  next, so a caller is expected to connect, write one line, and close —
+  the doorbell's own write is exactly connect + one line + close; a
+  connection held open past its one line stalls every later caller.
 - **The daemon door's own accept loop (`daemon::serve_daemon`/
   `accept_loop`) is thread-per-connection via the FALLIBLE
   `thread::Builder::spawn`, never the panicking `thread::spawn`** — a
