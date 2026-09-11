@@ -14,8 +14,11 @@
 //! ([`lock_is_held`], never `/proc`), and ownership resolution from ONE
 //! parsed `ps -axo pid=,ppid=,command=` table keyed on the app-server argv
 //! ([`codex_app_servers`], [`lock_holder`]) — the same primitives on every
-//! OS, with exactly one `cfg(target_os = "linux")` tie-break
-//! ([`holder_via_proc_fd`]) for when several app-servers run.
+//! OS, with exactly one `cfg(target_os = "linux")` extra
+//! ([`holder_via_proc_fd`]): an app-server owns a lock only when its own
+//! `/proc/<pid>/fd` table holds it — the sole evidence, for one server or
+//! many, never a shortcut and never a tie-break reserved for the
+//! multi-server case.
 //!
 //! [`codex_app_threads`] assembles the live set and [`sync_codex_app_threads`]
 //! is the I/O wrapper over [`reconcile_codex_app_threads`] — but NEITHER has
@@ -45,17 +48,18 @@ pub(crate) struct CodexThread {
     /// The thread's cwd, read once from its rollout header
     /// (`session_meta.payload.cwd`) at enrolment — never re-read per tick.
     pub cwd: String,
-    /// The pid of the `app-server` process holding this thread's writer
-    /// lock — `None` when two or more app-servers are running and the OS
-    /// cannot say which one holds it (P-CX-2's `lock_holder`: an "owner
-    /// ambiguous" refusal, never a guess). Feeds exactly two things
-    /// downstream when `Some`: the existing window sweep's pid-ancestry
-    /// walk, and the reaper's pid-DEATH signal — NEVER proof of life either
-    /// way. A shared app-server pid backs every thread it holds a lock for,
-    /// so the staleness arm must stay closed to it regardless of this pid's
-    /// liveness or presence (that's what `kind:"app"` buys, below); an
-    /// absent pid costs only the window (no ancestry walk to run).
-    pub pid: Option<u32>,
+    /// The pid of the `app-server` process PROVEN (`holder_via_proc_fd`'s
+    /// own fd table holds this exact lock) to own this thread's writer
+    /// lock. A `CodexThread` exists at all only for a lock with such a
+    /// proven owner — [`codex_app_threads`]'s `filter_map` never
+    /// constructs one otherwise, so this field is never optional. Feeds
+    /// exactly two things downstream: the existing window sweep's
+    /// pid-ancestry walk, and the reaper's pid-DEATH signal — NEVER proof
+    /// of life either way. A shared app-server pid backs every thread it
+    /// holds a lock for, so the staleness arm must stay closed to it
+    /// regardless of this pid's liveness (that's what `kind:"app"` buys,
+    /// below).
+    pub pid: u32,
 }
 
 /// Reconcile `kind:"app"` Codex-desktop records against the live thread set —
@@ -72,7 +76,9 @@ pub(crate) struct CodexThread {
 ///   * A native id already claimed by a NON-`"app"` record (a real tracked
 ///     session somehow already sitting on that id) is left entirely alone:
 ///     never inserted, never overwritten, never removed by this function —
-///     the tracked record carries the rich state and always wins.
+///     the tracked record carries the rich state and always wins (the
+///     ruling's "ambiguous records retain known CLI classification",
+///     P-CX-2b).
 ///
 /// Every record this function writes carries a fixed identity
 /// (`agent:"codex"`, `kind:"app"`, `state:"idle"`), re-applied on every
@@ -122,8 +128,8 @@ pub(crate) fn reconcile_codex_app_threads(
     // Upsert a record per desired thread.
     for (id, t) in &desired {
         if let Some(rec) = sessions.iter_mut().find(|s| s.session_id.as_str() == *id) {
-            if rec.pid != t.pid {
-                rec.pid = t.pid;
+            if rec.pid != Some(t.pid) {
+                rec.pid = Some(t.pid);
                 changed = true;
             }
             if rec.cwd != t.cwd {
@@ -152,7 +158,7 @@ pub(crate) fn reconcile_codex_app_threads(
                 cwd: t.cwd.clone(),
                 state: "idle".to_string(),
                 kind: Some("app".to_string()),
-                pid: t.pid,
+                pid: Some(t.pid),
                 petname: Some(petname),
                 ..Default::default()
             });
@@ -318,38 +324,34 @@ pub(crate) fn codex_app_servers(procs: &[Proc]) -> Vec<u32> {
 }
 
 /// Resolve which app-server owns a lock, given the servers the process
-/// table yielded. Zero servers: nothing enrols (`None`). Exactly one: it
-/// owns every live lock — the overwhelmingly common case. Two or more: only
-/// the Linux tie-break ([`holder_via_proc_fd`]) can disambiguate; wherever
-/// it can't (a non-Linux unix, or a Linux fd-scan miss) this taught-refuses
-/// to `None` with one audit line rather than guess.
+/// table yielded: an app-server owns a lock only when its own fd table
+/// holds that lock ([`holder_via_proc_fd`]) — anything less is not a
+/// desktop thread. Zero servers, or none whose fd table holds this lock
+/// (one server or a hundred — the count never shortcuts the check):
+/// `None`, the routine CLI case, not an anomaly.
 pub(crate) fn lock_holder(servers: &[u32], lock: &Path) -> Option<u32> {
     match servers {
         [] => None,
-        [only] => Some(*only),
-        many => holder_via_proc_fd(many, lock).or_else(|| {
-            eprintln!(
-                "[aoide/codex_app] codex app-server owner ambiguous ({} servers)",
-                many.len()
-            );
-            None
-        }),
+        many => holder_via_proc_fd(many, lock),
     }
 }
 
 /// The ONE permitted `cfg(target_os = "linux")` extra (§4 P-CX-2 of the
 /// P-CX design brief): scan each candidate's `/proc/<pid>/fd` for a
-/// descriptor whose target is this exact lock path. A tie-break only —
-/// never the primary discovery path, and never consulted for liveness
-/// (that is always [`lock_is_held`]'s flock).
+/// descriptor whose target is this exact lock path — the ONLY evidence
+/// [`lock_holder`] accepts, for one server or many, never a tie-break
+/// reserved for the multi-server case. `lock` is canonicalized once before
+/// the scan so a symlinked `~/.codex` cannot defeat the match; never
+/// consulted for liveness (that is always [`lock_is_held`]'s flock).
 #[cfg(target_os = "linux")]
 fn holder_via_proc_fd(candidates: &[u32], lock: &Path) -> Option<u32> {
+    let target = lock.canonicalize().unwrap_or_else(|_| lock.to_path_buf());
     for &pid in candidates {
         let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
             continue;
         };
         for entry in entries.flatten() {
-            if std::fs::read_link(entry.path()).map(|t| t == lock).unwrap_or(false) {
+            if std::fs::read_link(entry.path()).map(|t| t == target).unwrap_or(false) {
                 return Some(pid);
             }
         }
@@ -357,8 +359,8 @@ fn holder_via_proc_fd(candidates: &[u32], lock: &Path) -> Option<u32> {
     None
 }
 
-/// No `/proc` on this platform — see [`lock_holder`]'s doc for what an
-/// unresolved tie leads to (a taught "owner ambiguous", never a guess).
+/// No positive ownership evidence is available on this platform, so no
+/// desktop thread is ever enrolled here — see [`UNSUPPORTED_PLATFORM`].
 #[cfg(not(target_os = "linux"))]
 fn holder_via_proc_fd(_candidates: &[u32], _lock: &Path) -> Option<u32> {
     None
@@ -441,14 +443,24 @@ pub(crate) fn codex_app_threads(known: &BTreeMap<String, String>) -> Vec<CodexTh
     held.into_iter()
         .filter_map(|lock| {
             let id = lock.file_stem()?.to_str()?.to_string();
-            let pid = lock_holder(&servers, &lock);
-            let cwd = match known.get(&id) {
-                Some(cwd) if !cwd.is_empty() => cwd.clone(),
-                _ => thread_cwd(&home, &id).unwrap_or_default(),
-            };
+            let pid = lock_holder(&servers, &lock)?;
+            let cwd = resolved_cwd(known, &home, &id);
             Some(CodexThread { id, cwd, pid })
         })
         .collect()
+}
+
+/// A thread's cwd for [`codex_app_threads`]'s assembly step: the cached
+/// value from `known` when non-empty, else a fresh [`thread_cwd`] walk.
+/// Pulled out on its own so the caching rule stays testable without a
+/// process that can genuinely hold a `/proc/<pid>/fd` on the fixture lock
+/// (see the P-CX-2b tests below) — [`codex_app_servers`] keys ownership on
+/// the real system process table, which a unit test cannot spoof.
+fn resolved_cwd(known: &BTreeMap<String, String>, home: &Path, id: &str) -> String {
+    match known.get(id) {
+        Some(cwd) if !cwd.is_empty() => cwd.clone(),
+        _ => thread_cwd(home, id).unwrap_or_default(),
+    }
 }
 
 /// The I/O wrapper over [`reconcile_codex_app_threads`] — gathers the live
@@ -504,7 +516,7 @@ mod tests {
     use super::*;
     use crate::graph::testutil::{session, unique_stage, EnvVars};
 
-    fn thread(id: &str, cwd: &str, pid: Option<u32>) -> CodexThread {
+    fn thread(id: &str, cwd: &str, pid: u32) -> CodexThread {
         CodexThread {
             id: id.to_string(),
             cwd: cwd.to_string(),
@@ -519,7 +531,7 @@ mod tests {
             &[thread(
                 "01a07d89-5f9b-7900-b909-d5eb9457c195",
                 "/home/khoa/Aoide",
-                Some(2598256),
+                2598256,
             )],
         );
         assert!(changed);
@@ -551,11 +563,11 @@ mod tests {
         let (out, changed) = reconcile_codex_app_threads(
             vec![],
             &[
-                thread("01a07d89-thread-one", "/home/khoa/Aoide", Some(2598256)),
+                thread("01a07d89-thread-one", "/home/khoa/Aoide", 2598256),
                 thread(
                     "01a08a23-thread-two",
                     "/home/khoa/Documents/Codex/2026-09-10/wha",
-                    Some(2598256),
+                    2598256,
                 ),
             ],
         );
@@ -575,7 +587,7 @@ mod tests {
     fn a_thread_whose_lock_is_gone_loses_its_record() {
         let (first, _) = reconcile_codex_app_threads(
             vec![],
-            &[thread("01a07d89-gone", "/home/khoa/Aoide", Some(2598256))],
+            &[thread("01a07d89-gone", "/home/khoa/Aoide", 2598256)],
         );
         assert_eq!(first.len(), 1);
         let (second, changed) = reconcile_codex_app_threads(first, &[]);
@@ -593,7 +605,7 @@ mod tests {
         let tracked = session("01a07d89-claimed", "/home/khoa/Aoide", "working", "t", None);
         let (out, changed) = reconcile_codex_app_threads(
             vec![tracked.clone()],
-            &[thread("01a07d89-claimed", "/home/khoa/Aoide", Some(2598256))],
+            &[thread("01a07d89-claimed", "/home/khoa/Aoide", 2598256)],
         );
         assert!(
             !changed,
@@ -610,7 +622,7 @@ mod tests {
     fn an_app_record_is_never_agent_kind_so_dedup_and_staleness_skip_it() {
         let (out, _) = reconcile_codex_app_threads(
             vec![],
-            &[thread("01a07d89-live", "/home/khoa/Aoide", Some(2598256))],
+            &[thread("01a07d89-live", "/home/khoa/Aoide", 2598256)],
         );
         let rec = &out[0];
         assert!(
@@ -633,7 +645,7 @@ mod tests {
         drifted.pid = Some(2598256);
         let (out, changed) = reconcile_codex_app_threads(
             vec![drifted],
-            &[thread("01a07d89-drift", "/home/khoa/Aoide", Some(2598256))],
+            &[thread("01a07d89-drift", "/home/khoa/Aoide", 2598256)],
         );
         assert!(
             changed,
@@ -642,24 +654,6 @@ mod tests {
         assert_eq!(
             out[0].state, "idle",
             "an app record must never publish a state other than idle"
-        );
-    }
-
-    #[test]
-    fn an_ambiguous_owner_enrols_the_thread_with_no_pid_and_no_window() {
-        let (out, changed) = reconcile_codex_app_threads(
-            vec![],
-            &[thread("01a07d89-ambiguous", "/home/khoa/Aoide", None)],
-        );
-        assert!(changed);
-        assert_eq!(out.len(), 1);
-        assert_eq!(
-            out[0].pid, None,
-            "an ambiguous owner enrols the thread with no pid"
-        );
-        assert!(
-            out[0].window_address.is_empty(),
-            "and no window — nothing may guess one"
         );
     }
 
@@ -686,8 +680,8 @@ mod tests {
 ";
 
     /// Two independent desktop installs, each with its own Electron main
-    /// and its own codex app-server child — the genuine multi-server case
-    /// `lock_holder` cannot resolve without the Linux tie-break.
+    /// and its own codex app-server child — the multi-server case where
+    /// neither's fd table holds a given lock, so `lock_holder` owns nothing.
     const PS_TWO_APP_SERVERS: &str = "\
 2597865       1 /opt/chatgpt-linux/chatgpt --no-sandbox
 2598256 2597865 /opt/chatgpt-linux/resources/codex -c features.code_mode_host=true app-server
@@ -756,16 +750,116 @@ mod tests {
     }
 
     #[test]
-    fn two_app_servers_leave_the_holder_unresolved_without_the_linux_tiebreak() {
+    fn two_app_servers_own_nothing_when_neither_fds_the_lock() {
         let procs = parse_process_table(PS_TWO_APP_SERVERS);
         let servers = codex_app_servers(&procs);
         assert_eq!(servers, vec![2598256, 3000002]);
         // Neither pid actually holds any real `/proc/<pid>/fd` entry for
-        // this path, so even the REAL Linux tie-break compiled into this
-        // test binary cannot resolve it — the ambiguity is genuine, not a
-        // stubbed-out cfg swapped in for the test.
+        // this path, so even the REAL fd scan compiled into this test
+        // binary finds no owner — the fd scan is the ONLY evidence
+        // `lock_holder` accepts, for one server or a hundred, never a
+        // tie-break reserved for the multi-server case.
         let lock = Path::new("/nonexistent/thread-writer-locks/some-thread.lock");
         assert_eq!(lock_holder(&servers, lock), None);
+    }
+
+    #[test]
+    fn one_app_server_with_no_fd_on_the_lock_owns_nothing() {
+        let dir = unique_stage("codex-lock-owner-no-fd");
+        let lock = dir.join("never-opened.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let servers = [std::process::id()];
+        assert_eq!(
+            lock_holder(&servers, &lock),
+            None,
+            "one server with no fd on the lock still owns nothing"
+        );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn the_process_whose_fd_holds_the_lock_is_its_owner() {
+        // Linux-only: the evidence path reads `/proc/<pid>/fd`.
+        let dir = unique_stage("codex-lock-owner-fd");
+        let lock = dir.join("held.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).open(&lock).unwrap();
+        let servers = [std::process::id()];
+        assert_eq!(lock_holder(&servers, &lock), Some(std::process::id()));
+
+        // Canonicalization: a symlinked parent directory must not defeat
+        // the match.
+        let link = dir
+            .parent()
+            .unwrap()
+            .join(format!("{}-link", dir.file_name().unwrap().to_string_lossy()));
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let lock_via_link = link.join("held.lock");
+        assert_eq!(
+            lock_holder(&servers, &lock_via_link),
+            Some(std::process::id()),
+            "a symlinked parent directory must not defeat the fd match"
+        );
+
+        drop(held);
+        std::fs::remove_file(&link).ok();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn a_cli_thread_and_a_desktop_thread_side_by_side_enrol_only_the_desktop_one() {
+        // Linux-only: the evidence path reads `/proc/<pid>/fd`.
+        let dir = unique_stage("codex-mixed-cli-desktop");
+        let lock_a = dir.join("desktop-thread.lock");
+        let lock_b = dir.join("cli-thread.lock");
+        std::fs::write(&lock_a, b"").unwrap();
+        std::fs::write(&lock_b, b"").unwrap();
+        // Only A is held open by this process's own fd — B is never
+        // opened, so it carries no positive ownership evidence.
+        let held_a = std::fs::OpenOptions::new().read(true).open(&lock_a).unwrap();
+
+        let servers = [std::process::id()];
+        assert_eq!(lock_holder(&servers, &lock_a), Some(std::process::id()));
+        assert_eq!(lock_holder(&servers, &lock_b), None);
+
+        let id_a = lock_a.file_stem().unwrap().to_str().unwrap().to_string();
+        let id_b = lock_b.file_stem().unwrap().to_str().unwrap().to_string();
+
+        // B is already a TRACKED (non-app) record — a real CLI session's
+        // own bookkeeping — untouched by this reconciler either way.
+        let mut cli_record = session(&id_b, "/home/khoa/Aoide", "working", "t", None);
+        cli_record.agent = "codex".to_string();
+        cli_record.pid = Some(424242);
+
+        let desktop_thread = thread(&id_a, "/home/khoa/Aoide", std::process::id());
+
+        let (out, _changed) =
+            reconcile_codex_app_threads(vec![cli_record.clone()], &[desktop_thread]);
+
+        let b_after = out
+            .iter()
+            .find(|r| r.session_id == id_b)
+            .expect("B's tracked record must survive untouched");
+        assert_eq!(b_after.kind, cli_record.kind);
+        assert_eq!(b_after.pid, cli_record.pid);
+        assert_eq!(b_after.session_id, cli_record.session_id);
+
+        let app_records: Vec<_> = out
+            .iter()
+            .filter(|r| r.kind.as_deref() == Some("app"))
+            .collect();
+        assert_eq!(
+            app_records.len(),
+            1,
+            "exactly one app record — the desktop thread, never the CLI one"
+        );
+        assert_eq!(app_records[0].session_id, id_a);
+        assert_eq!(app_records[0].pid, Some(std::process::id()));
+
+        drop(held_a);
+        std::fs::remove_dir_all(dir).ok();
     }
 
     #[test]
@@ -858,33 +952,14 @@ mod tests {
 
     #[test]
     fn a_known_thread_keeps_its_cwd_without_a_walk_while_a_new_one_still_walks() {
-        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let _env = EnvVars::save(&["CODEX_HOME", "HOME"]);
+        // Exercises `resolved_cwd` directly rather than `codex_app_threads`:
+        // ownership resolution now needs a REAL fd on a REAL process
+        // (`codex_app_servers` keys off the live system `ps` table), which a
+        // unit test cannot fake, so this test's own concern — the caching
+        // rule, not enrolment — is isolated at the level that carries it.
         let home = unique_stage("codex-known-vs-new");
-        std::env::set_var("CODEX_HOME", &home);
-        std::env::set_var("HOME", home.join("unused-home"));
-
-        let lock_dir = home.join("thread-writer-locks");
-        std::fs::create_dir_all(&lock_dir).unwrap();
         let known_id = "01a07d89-already-known";
         let new_id = "01a08a23-brand-new";
-        let known_lock = lock_dir.join(format!("{known_id}.lock"));
-        let new_lock = lock_dir.join(format!("{new_id}.lock"));
-        std::fs::write(&known_lock, b"").unwrap();
-        std::fs::write(&new_lock, b"").unwrap();
-
-        // Hold both locks (a separate fd each) so both read as live threads.
-        use std::os::unix::io::AsRawFd;
-        let held_known = std::fs::OpenOptions::new().read(true).open(&known_lock).unwrap();
-        let held_new = std::fs::OpenOptions::new().read(true).open(&new_lock).unwrap();
-        assert_eq!(
-            unsafe { libc::flock(held_known.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        assert_eq!(
-            unsafe { libc::flock(held_new.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
 
         // Only the NEW id has a rollout on disk — the known id deliberately
         // has NONE, so if the walk ran for it anyway, `thread_cwd` would
@@ -904,26 +979,17 @@ mod tests {
         let mut known = BTreeMap::new();
         known.insert(known_id.to_string(), "/home/khoa/AlreadyKnown".to_string());
 
-        let threads = codex_app_threads(&known);
-
-        unsafe {
-            libc::flock(held_known.as_raw_fd(), libc::LOCK_UN);
-            libc::flock(held_new.as_raw_fd(), libc::LOCK_UN);
-        }
-        drop(held_known);
-        drop(held_new);
-        std::fs::remove_dir_all(&home).ok();
-
-        let known_thread = threads.iter().find(|t| t.id == known_id).expect("known thread enrolled");
         assert_eq!(
-            known_thread.cwd, "/home/khoa/AlreadyKnown",
+            resolved_cwd(&known, &home, known_id),
+            "/home/khoa/AlreadyKnown",
             "a known id must carry its known cwd through, never re-walk for it"
         );
-        let new_thread = threads.iter().find(|t| t.id == new_id).expect("new thread enrolled");
         assert_eq!(
-            new_thread.cwd, "/home/khoa/NewProject",
+            resolved_cwd(&known, &home, new_id),
+            "/home/khoa/NewProject",
             "a genuinely new id must still get its header cwd off the rollout walk"
         );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

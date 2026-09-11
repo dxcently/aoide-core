@@ -403,11 +403,12 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   thread's cwd runs once per NEW thread id only — an id an existing
   `kind:"app"` record already carries a non-empty cwd for is passed through
   unchanged, never re-walked on a later tick. `lock_holder` resolves the
-  owner: one server owns every held lock; two or more fall to
-  `holder_via_proc_fd`, the ONE `cfg(target_os = "linux")` tie-break in this
-  design, and anywhere it can't disambiguate (a non-Linux unix, or a Linux
-  fd-scan miss) the thread enrols with `pid: None` and no window — one audit
-  line, never a guess. `codex_home` (`$CODEX_HOME` else `$HOME/.codex`) is
+  owner: an app-server owns a lock only when its own fd table holds
+  it (`holder_via_proc_fd`, the ONE `cfg(target_os = "linux")` extra
+  in this design) — the sole evidence, for one server or many; a
+  held lock with no such owner enrols nothing (a CLI thread or
+  unknown, never an app record). `codex_home` (`$CODEX_HOME` else
+  `$HOME/.codex`) is
   the one authority for the root path; `reap.rs::refresh_codex_titles` calls
   the same function rather than a second copy. See AGENTS.md's invariants
   for why `kind:"app"` exists and what it must never gain.

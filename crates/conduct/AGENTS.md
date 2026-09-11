@@ -82,17 +82,17 @@
   `codex` plus a bare `app-server` token) against a single
   `ps -axo pid=,ppid=,command=` table shared by every OS. The only
   `cfg(target_os = "linux")` branch this design permits is
-  `holder_via_proc_fd`, a tie-break for when the table yields two or more
-  servers — never a second discovery implementation, and never consulted for
-  liveness.
+  `holder_via_proc_fd`: an app-server owns a lock only when its own
+  `/proc/<pid>/fd` table holds it — the sole evidence, for one server
+  or many, never a second discovery implementation, and never
+  consulted for liveness.
 
-- **An ambiguous owner enrols with no pid and no window, never a guess.**
-  When two or more app-servers exist and the platform cannot disambiguate
-  (no Linux tie-break, or the tie-break itself misses), the thread still
-  enrols — `CodexThread.pid: None` — with one audit line
-  ("codex app-server owner ambiguous (<n> servers)") and no window address.
-  Losing the window is the only cost; staleness and dedup stay closed to the
-  record regardless (see the `kind:"app"` invariant above).
+- **A desktop thread enrols only on positive ownership evidence.**
+  An app-server owns a lock only when its own fd table holds it
+  (`holder_via_proc_fd`, Linux); a held lock with no such owner is a
+  CLI thread or unknown and gets NO app record. A tracked non-app
+  record already sitting on that id is never touched either way
+  (root ruling, P-CX-2b).
 
 - **`session bind` assigns continuity, never authority.** Keep the operation
   daemon-owned and local-only; no missing-daemon fallback. It does not load
