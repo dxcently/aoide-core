@@ -14,6 +14,17 @@
 - **Untrusted input stops here.** Every door-facing parse/validate boundary
   in this crate is the last line before dispatch; don't push validation
   downstream into `conduct`/`storage` handlers that assume a trusted caller.
+- **`mcp::serve_stdio`'s channel socket is the MCP subprocess's own,
+  never `aoided`'s** (P-M5c-2, `docs/architecture/CLAUDE-CHANNEL-PROOF.md`):
+  bound only when `AOIDE_SESSION_ID` is set and non-empty, for the lifetime
+  of that one stdio session — no record, no command, no flag (house rule
+  7). Any code that writes to stdout in this module MUST go through the
+  shared `Arc<Mutex<_>>` (`write_line`) the request loop and the listener
+  thread already both lock — a second unlocked writer reopens the
+  torn-JSON-RPC-line interleave this seam exists to close. A
+  `notifications/claude/channel` `meta` object's keys stay bare
+  identifiers (`mailbox`, never `mail-box`); a hyphenated key is silently
+  dropped by the harness on the other end.
 - **The daemon door's own accept loop (`daemon::serve_daemon`/
   `accept_loop`) is thread-per-connection via the FALLIBLE
   `thread::Builder::spawn`, never the panicking `thread::spawn`** — a
@@ -587,7 +598,9 @@
 ## Docs update required in the same commit
 
 - This `README.md` when a new module or serve-side command is added.
-- `CONTRACTS.md §6` when an A2A/MCP wire shape changes.
+- `CONTRACTS.md §6` when an A2A wire shape changes.
+- `CONTRACTS.md §3`'s "MCP door" subsection when the `initialize` shape or
+  the channel notification shape changes.
 - `CONTRACTS.md §3`'s "Daemon wire" subsection when the daemon socket's own
   wire shape changes (`ping`/`subscribe`/`dispatch`).
 - `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants — not restated

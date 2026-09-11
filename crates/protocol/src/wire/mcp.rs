@@ -11,7 +11,10 @@
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// `initialize`'s result (the MCP handshake).
+/// `initialize`'s result (the MCP handshake). `instructions` (P-M5c-2,
+/// `docs/architecture/CLAUDE-CHANNEL-PROOF.md`) serializes unconditionally,
+/// same as every other field here — a client that has never heard of it
+/// simply ignores it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct InitializeResult {
     #[serde(rename = "protocolVersion")]
@@ -19,18 +22,38 @@ pub struct InitializeResult {
     pub capabilities: InitializeCapabilities,
     #[serde(rename = "serverInfo")]
     pub server_info: ServerInfo,
+    pub instructions: String,
 }
 
-/// `InitializeResult.capabilities` — aoide advertises tool support only, with
-/// no sub-capabilities (`listChanged` etc.) yet.
+/// `InitializeResult.capabilities` — aoide advertises tool support and the
+/// Claude Code channel capability (`experimental`), with no other
+/// sub-capabilities (`listChanged` etc.) yet.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct InitializeCapabilities {
     pub tools: ToolsCapability,
+    pub experimental: ExperimentalCapabilities,
 }
 
 /// Deliberately empty — serializes as `{}`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ToolsCapability {}
+
+/// `InitializeCapabilities.experimental` (P-M5c-2): the one recognized key is
+/// the Claude Code channel capability, `experimental["claude/channel"]` — an
+/// empty object that tells a Claude Code client this stdio MCP server can
+/// push one-way `notifications/claude/channel` events onto a per-session
+/// socket, woken even while the client session sits idle
+/// (`docs/architecture/CLAUDE-CHANNEL-PROOF.md`). Serializes unconditionally,
+/// same reasoning as `instructions` above.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ExperimentalCapabilities {
+    #[serde(rename = "claude/channel")]
+    pub claude_channel: ClaudeChannelCapability,
+}
+
+/// Deliberately empty — serializes as `{}`.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct ClaudeChannelCapability {}
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ServerInfo {
@@ -105,14 +128,41 @@ mod tests {
     fn initialize_result_matches_the_captured_handshake_shape() {
         let result = InitializeResult {
             protocol_version: "2024-11-05".to_string(),
-            capabilities: InitializeCapabilities { tools: ToolsCapability {} },
+            capabilities: InitializeCapabilities {
+                tools: ToolsCapability {},
+                experimental: ExperimentalCapabilities::default(),
+            },
             server_info: ServerInfo { name: "aoide".to_string(), version: "0.0.0".to_string() },
+            instructions: String::new(),
         };
         let v = serde_json::to_value(&result).unwrap();
         assert_eq!(v["protocolVersion"], "2024-11-05");
         assert_eq!(v["capabilities"]["tools"], json!({}));
         assert_eq!(v["serverInfo"]["name"], "aoide");
         assert_eq!(v["serverInfo"]["version"], "0.0.0");
+    }
+
+    #[test]
+    fn initialize_declares_the_channel_capability_and_carries_instructions() {
+        let result = InitializeResult {
+            protocol_version: "2024-11-05".to_string(),
+            capabilities: InitializeCapabilities {
+                tools: ToolsCapability {},
+                experimental: ExperimentalCapabilities::default(),
+            },
+            server_info: ServerInfo { name: "aoide".to_string(), version: "0.0.0".to_string() },
+            instructions: "read and act".to_string(),
+        };
+        let v = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            v["capabilities"]["experimental"]["claude/channel"],
+            json!({})
+        );
+        assert_eq!(v["instructions"], "read and act");
+
+        // Round-trips back through the rename, not just serializes.
+        let back: InitializeResult = serde_json::from_value(v).unwrap();
+        assert_eq!(back, result);
     }
 
     #[test]

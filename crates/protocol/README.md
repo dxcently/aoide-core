@@ -95,7 +95,12 @@ other crate in this workspace sits above.
   visibility each item already had there.
 - `state` — `canonical_state`, the session-state vocabulary every producer
   folds onto and every reader trusts verbatim.
-- `wire` — typed A2A-JSON-RPC and MCP payload shapes.
+- `wire` — typed A2A-JSON-RPC and MCP payload shapes. MCP's
+  `InitializeResult` (`wire::mcp`) carries `capabilities.experimental
+  ["claude/channel"]` (an empty object, serde-renamed since `/` isn't a
+  Rust identifier) and `instructions`, both unconditional (CONTRACTS.md §3,
+  P-M5c-2) — the Claude Code channel capability announcement and the prose
+  telling the model events arrive one-way as `<channel source="aoide">`.
 - `agents` — `agent_profile`, the per-harness knowledge table (hook
   vocabulary, model ceilings, transcript layout, the hook-settings and
   skills-directory locations, and — P-D7 — the argv that launches a harness

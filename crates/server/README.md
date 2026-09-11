@@ -165,7 +165,21 @@ the inbound half of the two-door contract (the outbound half is
   verbatim or narrated otherwise. `poll_once` is the bounded, non-blocking
   core a test drives directly; `tail` is the thin `SIGINT`-handling wrapper
   around it, mirroring `aoide_secrets::watch`'s own tail-loop shape.
-- `mcp` — `serve_stdio`, the MCP stdio server.
+- `mcp` — `serve_stdio`, the MCP stdio server. `initialize` answers
+  unconditionally with `capabilities.experimental["claude/channel"]` and
+  `instructions` (P-M5c-2, `docs/architecture/CLAUDE-CHANNEL-PROOF.md`,
+  CONTRACTS.md §3's "MCP door" subsection). When `AOIDE_SESSION_ID` is set
+  and non-empty, `serve_stdio` unlink-then-binds
+  `aoide_conduct::graph::channel_socket_path(<that id>)`, spawns one
+  listener thread for the lifetime of the MCP subprocess, and unlinks the
+  socket on return — no record, no command, the socket's own presence is
+  the whole registration (house rule 7). Each line received on that socket
+  becomes one `notifications/claude/channel` push, `{"content": <the
+  line>, "meta": {"mailbox": <name>}}` when the line names a mailbox
+  (`{}` otherwise — meta keys stay bare identifiers, never hyphenated).
+  Stdout is one `Arc<Mutex<_>>` writer shared between the request loop and
+  the listener thread, so a pushed notification and a `tools/call` reply
+  can never interleave on the wire.
 - `a2a` — the serve half of A2A (JSON-RPC/HTTP/SSE); the client half stays
   in `aoide-client`. Two `message/send` arms, two different relationships to
   the mailbase (messaging plan P-M1, `state/mail/base.jsonl`): `do_inject`

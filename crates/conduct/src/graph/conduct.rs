@@ -86,6 +86,26 @@ pub fn conduct_socket_path(id: &str) -> PathBuf {
         .join(format!("session-{id}.sock"))
 }
 
+/// The per-session Claude Code channel socket (P-M5c-2,
+/// `docs/architecture/CLAUDE-CHANNEL-PROOF.md`): `$XDG_RUNTIME_DIR/aoide/
+/// channel-<id>.sock`, one authority for the path shared with
+/// [`conduct_socket_path`] above (same runtime-dir convention and fallback,
+/// differing only by the `channel-` prefix). `aoide-server`'s stdio MCP
+/// server binds it for the lifetime of that MCP subprocess — never
+/// `aoided`'s — so a doorbell ring can push a one-way `notifications/claude/
+/// channel` event into an idle interactive Claude Code session. `pub` for
+/// the identical reason `conduct_socket_path` is: this crosses the
+/// `aoide-conduct` → `aoide-server` boundary too.
+pub fn channel_socket_path(id: &str) -> PathBuf {
+    let runtime = std::env::var("XDG_RUNTIME_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/run/user/1000".into());
+    PathBuf::from(runtime)
+        .join("aoide")
+        .join(format!("channel-{id}.sock"))
+}
+
 // SIGWINCH latch: the handler only flips a flag (async-signal-safe); the poll
 // loop services it (re-reading the real tty size and pushing it to the master).
 static WINCH: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -1290,6 +1310,32 @@ mod tests {
     use super::*;
     use crate::graph::session_store::upsert_session;
     use crate::graph::testutil::*;
+
+    #[test]
+    fn channel_socket_path_shares_conduct_socket_paths_parent_and_differs_only_by_prefix() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["XDG_RUNTIME_DIR"]);
+        let root = unique_stage("channel-socket-path");
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let id = "sess-1";
+        let conduct = conduct_socket_path(id);
+        let channel = channel_socket_path(id);
+
+        assert_eq!(
+            conduct.parent(),
+            channel.parent(),
+            "both sockets live in the same aoide runtime dir"
+        );
+        assert_eq!(
+            conduct.file_name().unwrap().to_str().unwrap(),
+            format!("session-{id}.sock")
+        );
+        assert_eq!(
+            channel.file_name().unwrap().to_str().unwrap(),
+            format!("channel-{id}.sock")
+        );
+    }
 
     /// LANE IDENTITY P-ID2 test infra: write `payload` to `socket` from a
     /// process that is genuinely NOT a descendant of the calling (test)

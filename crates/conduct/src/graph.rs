@@ -65,6 +65,11 @@ pub use self::conduct::session_conduct;
 // first turn before `sessions.json` necessarily reflects the new record yet —
 // the same path `graph send`/`conduct` derive internally.
 pub use self::conduct::conduct_socket_path;
+// `aoide-server`'s stdio MCP server (P-M5c-2, `docs/architecture/
+// CLAUDE-CHANNEL-PROOF.md`) resolves the SAME session id's channel socket —
+// the socket the doorbell will eventually write a nudge line onto — the
+// same way `conduct_socket_path` already crosses this boundary above.
+pub use self::conduct::channel_socket_path;
 pub use self::doc::{build_graph, render, resolve_graph_document};
 // `mail ring` (P-M5a-2, MAIL.md "Delivery and the doorbell"): the ring
 // itself, callable in-process by any door that has this crate (the daemon

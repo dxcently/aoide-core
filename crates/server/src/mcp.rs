@@ -18,18 +18,29 @@
 //! `mcp serve --stdio` launch site passes `dispatch::registry()` and
 //! `dispatch::dispatch` in.
 
+use aoide_conduct::graph::channel_socket_path;
 use aoide_protocol::output::{Outcome, Status};
 use aoide_protocol::registry::Registry;
 use aoide_protocol::wire::{
-    InitializeCapabilities, InitializeResult, JsonRpcResponse, ServerInfo, Tool, ToolAnnotations,
-    ToolCallContent, ToolCallResult, ToolInputSchema, ToolList, ToolProperty, ToolsCapability,
+    ExperimentalCapabilities, InitializeCapabilities, InitializeResult, JsonRpcResponse,
+    ServerInfo, Tool, ToolAnnotations, ToolCallContent, ToolCallResult, ToolInputSchema, ToolList,
+    ToolProperty, ToolsCapability,
 };
 use aoide_protocol::{Door, Invocation};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::io::{BufRead, Write};
+use std::os::unix::net::UnixListener;
+use std::sync::{Arc, Mutex};
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
+
+/// `initialize`'s `instructions` (P-M5c-2, `docs/architecture/
+/// CLAUDE-CHANNEL-PROOF.md`): tells the model that a channel event is
+/// pushed, not typed — one-way, nothing to reply into.
+const CHANNEL_INSTRUCTIONS: &str = "Events pushed over the aoide channel arrive as \
+    <channel source=\"aoide\">...</channel> notifications. They are one-way: read and act on \
+    them — there is no reply path back through the notification itself.";
 
 /// A dispatch fn pointer: matches `aoide::dispatch::dispatch`'s exact
 /// signature (a plain `fn`, not a closure — the process-wide dispatcher
@@ -136,11 +147,15 @@ fn handle(req: &Value, registry: &Registry, dispatch: DispatchFn) -> Option<Valu
         "initialize" => {
             let init = InitializeResult {
                 protocol_version: PROTOCOL_VERSION.to_string(),
-                capabilities: InitializeCapabilities { tools: ToolsCapability {} },
+                capabilities: InitializeCapabilities {
+                    tools: ToolsCapability {},
+                    experimental: ExperimentalCapabilities::default(),
+                },
                 server_info: ServerInfo {
                     name: "aoide".to_string(),
                     version: aoide_protocol::registry::AOIDE_VERSION.to_string(),
                 },
+                instructions: CHANNEL_INSTRUCTIONS.to_string(),
             };
             Ok(serde_json::to_value(init).expect("InitializeResult always serializes"))
         }
@@ -178,14 +193,137 @@ fn handle(req: &Value, registry: &Registry, dispatch: DispatchFn) -> Option<Valu
     Some(serde_json::to_value(&resp).expect("JsonRpcResponse always serializes"))
 }
 
+/// Write one line to the shared writer, then flush — the whole thing under
+/// `out`'s lock, so a reply and a channel notification (below) never
+/// interleave on the underlying stream (P-M5c-2): a torn JSON-RPC line is a
+/// dead channel.
+fn write_line<W: Write>(out: &Mutex<W>, line: &str) -> std::io::Result<()> {
+    let mut w = out
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    writeln!(w, "{line}")?;
+    w.flush()
+}
+
+/// The mailbox name a channel-socket line names, if any — the mail
+/// doorbell's own `nudge_line` shape (`conduct/src/graph/doorbell.rs`,
+/// P-M5c-3: `... --for <name>`, the mailbox's own `mail read --for <name>`
+/// fix spelled out verbatim). A bare suffix parse, not a dependency on
+/// `doorbell.rs` — that module is private to `aoide-conduct` and this crate
+/// has no business knowing its internals, only the line SHAPE it writes to
+/// the socket. No recognizable `--for <name>` suffix means no mailbox to
+/// name.
+fn channel_line_mailbox(line: &str) -> Option<String> {
+    let (_, name) = line.rsplit_once("--for ")?;
+    let name = name.trim();
+    if name.is_empty() {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+/// Build the one `notifications/claude/channel` line for a line received on
+/// the channel socket (P-M5c-2): `content` is the line verbatim, `meta`
+/// names the mailbox it names (`{"mailbox": <name>}`) or stays empty when it
+/// names none. Meta keys are bare identifiers throughout — a hyphenated key
+/// is silently dropped by the harness.
+fn channel_notification(content: &str) -> Value {
+    let meta = match channel_line_mailbox(content) {
+        Some(name) => json!({ "mailbox": name }),
+        None => json!({}),
+    };
+    json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/claude/channel",
+        "params": { "content": content, "meta": meta },
+    })
+}
+
+/// The channel's one listener thread (P-M5c-2): serially accepts
+/// connections and, for each, relays every newline-delimited line it reads
+/// as one `notifications/claude/channel` line on `out` — one connection is
+/// read start-to-finish before the next is even accepted, so no second
+/// thread ever touches the socket.
+fn run_channel_listener<W: Write + Send + 'static>(listener: UnixListener, out: Arc<Mutex<W>>) {
+    for conn in listener.incoming().flatten() {
+        for line in std::io::BufReader::new(conn).lines().flatten() {
+            if line.is_empty() {
+                continue;
+            }
+            let note = channel_notification(&line);
+            let _ = write_line(&out, &note.to_string());
+        }
+    }
+}
+
+/// Bind `id`'s channel socket and spawn the one listener thread above
+/// (P-M5c-2). Unlink-then-bind, the same convention
+/// `aoide_conduct::graph::conduct`'s own per-session socket already follows
+/// — clears a stale socket left by a prior crash. The socket IS the
+/// registration (house rule 7): no record, no command, no flag; its
+/// lifetime is this MCP subprocess's own, never `aoided`'s. `None` on a
+/// bind failure (best-effort, matching that same per-session socket's own
+/// posture): a session that can't bind stays reachable over stdio, just not
+/// over the channel.
+fn spawn_channel_socket<W: Write + Send + 'static>(
+    id: &str,
+    out: Arc<Mutex<W>>,
+) -> Option<std::path::PathBuf> {
+    let path = channel_socket_path(id);
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let _ = std::fs::remove_file(&path); // clear a stale socket from a prior crash.
+    let listener = match UnixListener::bind(&path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("aoide mcp serve: channel socket bind failed: {e}");
+            return None;
+        }
+    };
+    std::thread::spawn(move || run_channel_listener(listener, out));
+    Some(path)
+}
+
+/// The one gate `serve_stdio` binds the channel on: `$AOIDE_SESSION_ID` set
+/// and non-empty. Factored out so a test can drive the exact same gate
+/// without blocking on real stdin.
+fn maybe_spawn_channel_socket<W: Write + Send + 'static>(
+    out: Arc<Mutex<W>>,
+) -> Option<std::path::PathBuf> {
+    let id = std::env::var("AOIDE_SESSION_ID")
+        .ok()
+        .filter(|s| !s.is_empty())?;
+    spawn_channel_socket(&id, out)
+}
+
+/// Unlinks the channel socket when serving ends, on ANY return path
+/// (P-M5c-2) — the socket's lifetime is exactly `serve_stdio`'s own.
+struct ChannelSocketGuard(std::path::PathBuf);
+
+impl Drop for ChannelSocketGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
 /// Serve the MCP protocol over stdio (newline-delimited JSON-RPC).
 ///
 /// `registry`/`dispatch` are injected (see the module doc comment) — root
 /// `lib.rs` passes `dispatch::registry()` and `dispatch::dispatch`.
+///
+/// When `$AOIDE_SESSION_ID` is set and non-empty (P-M5c-2), also binds this
+/// session's channel socket and spawns the listener that turns each line
+/// written to it into one `notifications/claude/channel` line — `out` moves
+/// behind an `Arc<Mutex<_>>` so the request loop below and that listener
+/// thread never write an interleaved line to stdout.
 pub fn serve_stdio(registry: &Registry, dispatch: DispatchFn) -> std::io::Result<()> {
     let stdin = std::io::stdin();
-    let stdout = std::io::stdout();
-    let mut out = stdout.lock();
+    let out: Arc<Mutex<std::io::Stdout>> = Arc::new(Mutex::new(std::io::stdout()));
+
+    let channel_path = maybe_spawn_channel_socket(Arc::clone(&out));
+    let _channel_guard = channel_path.map(ChannelSocketGuard);
 
     for line in stdin.lock().lines() {
         let line = line?;
@@ -202,14 +340,12 @@ pub fn serve_stdio(registry: &Registry, dispatch: DispatchFn) -> std::io::Result
                     format!("parse error: {e}"),
                 ))
                 .expect("JsonRpcResponse always serializes");
-                writeln!(out, "{err}")?;
-                out.flush()?;
+                write_line(&out, &err.to_string())?;
                 continue;
             }
         };
         if let Some(resp) = handle(&req, registry, dispatch) {
-            writeln!(out, "{resp}")?;
-            out.flush()?;
+            write_line(&out, &resp.to_string())?;
         }
     }
     Ok(())
@@ -298,5 +434,140 @@ mod tests {
         });
         let resp = handle(&req, &registry, fake_handler).unwrap();
         assert_eq!(resp["error"]["code"], -32602);
+    }
+
+    // ── P-M5c-2: the Claude channel bridge ──────────────────────────────
+
+    /// A short, private `$XDG_RUNTIME_DIR` under `/tmp` — a full channel
+    /// socket path (`<dir>/aoide/channel-<id>.sock`) must stay under the
+    /// 108-byte `AF_UNIX` path cap, and this must never collide with, or
+    /// touch, the live `$XDG_RUNTIME_DIR/aoide/`.
+    fn short_runtime_dir(tag: &str) -> std::path::PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos();
+        let dir =
+            std::path::PathBuf::from(format!("/tmp/av-mcp-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_line_on_the_channel_socket_becomes_one_channel_notification() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved = std::env::var("XDG_RUNTIME_DIR").ok();
+        let root = short_runtime_dir("line");
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let out: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let path = spawn_channel_socket("chan-1", Arc::clone(&out))
+            .expect("bind must succeed under a fresh tempdir");
+
+        {
+            let mut conn = std::os::unix::net::UnixStream::connect(&path).unwrap();
+            writeln!(
+                conn,
+                "[aoide mail] new mail for alice — aoide mail read --for alice"
+            )
+            .unwrap();
+        }
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let line = loop {
+            {
+                let buf = out.lock().unwrap();
+                if let Ok(s) = std::str::from_utf8(&buf) {
+                    if let Some(l) = s.lines().next() {
+                        if !l.is_empty() {
+                            break l.to_string();
+                        }
+                    }
+                }
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the channel listener never emitted a notification"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["method"], "notifications/claude/channel");
+        assert_eq!(
+            v["params"]["content"],
+            "[aoide mail] new mail for alice — aoide mail read --for alice"
+        );
+        assert_eq!(v["params"]["meta"]["mailbox"], "alice");
+
+        std::fs::remove_file(&path).ok();
+        match saved {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    #[test]
+    fn the_channel_socket_is_unbound_when_no_session_id_is_set() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_id = std::env::var("AOIDE_SESSION_ID").ok();
+        let saved_runtime = std::env::var("XDG_RUNTIME_DIR").ok();
+        std::env::remove_var("AOIDE_SESSION_ID");
+        let root = short_runtime_dir("noid");
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let out: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let bound = maybe_spawn_channel_socket(out);
+        assert!(bound.is_none(), "no session id must mean no channel socket");
+        assert!(
+            !root.join("aoide").exists(),
+            "no session id must mean the aoide runtime dir is never even created"
+        );
+
+        match saved_id {
+            Some(v) => std::env::set_var("AOIDE_SESSION_ID", v),
+            None => std::env::remove_var("AOIDE_SESSION_ID"),
+        }
+        match saved_runtime {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+    }
+
+    #[test]
+    fn a_notification_and_a_tool_reply_never_interleave_on_stdout() {
+        let out: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+        let reply = "{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"x\":\"REPLY-PAYLOAD-PADDING-0000000000000000\"}}";
+        let notice = "{\"jsonrpc\":\"2.0\",\"method\":\"notifications/claude/channel\",\"params\":{\"content\":\"NOTICE-PAYLOAD-PADDING-0000000000000000\",\"meta\":{}}}";
+
+        let mut handles = Vec::new();
+        for _ in 0..50 {
+            let out_a = Arc::clone(&out);
+            handles.push(std::thread::spawn(move || {
+                write_line(&out_a, reply).unwrap();
+            }));
+            let out_b = Arc::clone(&out);
+            handles.push(std::thread::spawn(move || {
+                write_line(&out_b, notice).unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let buf = out.lock().unwrap();
+        let text = std::str::from_utf8(&buf).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(
+            lines.len(),
+            100,
+            "every write must land as exactly one whole line"
+        );
+        for line in lines {
+            assert!(
+                line == reply || line == notice,
+                "a torn/interleaved line: {line}"
+            );
+        }
     }
 }
