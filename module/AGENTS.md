@@ -13,6 +13,13 @@
   defaults to inert (`enable` is `mkEnableOption`, off unless a host
   flips it); nothing in this bundle wires behavior a host didn't ask
   for.
+- **The core module never reads a facet option.** A paint-dependent
+  value enters as a core option the AoideOS side sets, never a direct
+  read of `config.aoide.facets.*` from here — `aoided.nix`'s unit
+  anchors to `aoide.sessionTarget` (declared in `options.nix`,
+  default `default.target`) rather than the quickshell facet flag
+  itself; `modules/nucleus/aoided.nix` is the one file allowed to set
+  that option from the facet.
 - **A new core unit is a new file plus one `imports` line.** Follow
   `default.nix`'s existing shape — never fold a new unit's options into
   `options.nix` itself, and never grow `default.nix` into anything but

@@ -12,9 +12,20 @@ package build from the same one-line input.
   names), so a consumer that imports this module needs no separate
   overlay line of their own.
 - `options.nix` — THE core `aoide.*` option contract: `enable`, `root`,
-  `checkout`, `auditLog`, `terminal`, `user`. Every AoideOS-side unit
-  (`modules/nucleus/aoided.nix`, `secrets.nix`, `shellbridge.nix`,
-  `config.nix`) reads these options; this file only declares them.
+  `checkout`, `auditLog`, `terminal`, `user`, `sessionTarget`. Every
+  AoideOS-side unit (`modules/nucleus/aoided.nix`, `secrets.nix`,
+  `shellbridge.nix`, `config.nix`) reads these options; this file only
+  declares them.
+- `aoided.nix` — the `aoided` systemd user service itself: the tmpfiles
+  rules for the runtime tree and the core session variables
+  (`AOIDE_TERMINAL`, `AOIDE_ROOT`, `AOIDE_FLAKE_ROOT`), portable and
+  nixpkgs-only. The unit's `wantedBy`/`after`/`partOf` anchor to
+  `aoide.sessionTarget` — the seam a paint-dependent value enters
+  through, since this file may not read a facet option directly.
+  `modules/nucleus/aoided.nix` sets that option and carries the
+  lyra-gated `AOIDE_SONG_TEMPLATES` variable plus every door
+  (mcp/a2a/pair-watch), the discovery firewall carve, and the usage
+  poller — all still AoideOS-side deployment.
 
 ## How a consumer imports it
 
@@ -24,8 +35,8 @@ package build from the same one-line input.
 }
 ```
 
-One line pulls in the option contract and the overlay together — no
-separate `nixpkgs.overlays` entry, no second `aoide.*` declaration to
-keep in sync. `modules/nucleus/options.nix` is this repo's own
-consumer: it imports the same line rather than declaring the six
-options itself.
+One line pulls in the option contract, the `aoided` unit, and the
+overlay together — no separate `nixpkgs.overlays` entry, no second
+`aoide.*` declaration to keep in sync. `modules/nucleus/options.nix`
+is this repo's own consumer: it imports the same line rather than
+declaring the seven options itself.

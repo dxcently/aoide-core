@@ -2,6 +2,9 @@
 # exported as `nixosModules.default` (pkgs/aoide/flake.nix).
 { self }:
 {
-  imports = [ ./options.nix ];
+  imports = [
+    ./options.nix
+    ./aoided.nix
+  ];
   nixpkgs.overlays = [ self.overlays.default ];
 }

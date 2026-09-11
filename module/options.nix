@@ -91,5 +91,16 @@ in
       default = "khoa";
       description = "The primary user whose home hosts the ~/Aoide clone.";
     };
+
+    sessionTarget = mkOption {
+      type = types.str;
+      default = "default.target";
+      description = ''
+        The systemd user target `aoided` anchors to. `default.target` on a
+        headless box, so the daemon and its doors come up at boot with
+        linger on; a painting host names its session target instead and the
+        unit follows the session's lifetime.
+      '';
+    };
   };
 }
