@@ -83,6 +83,12 @@
         aoide = self.packages.${final.stdenv.hostPlatform.system}.default;
       };
 
+      # ── NixOS module ───────────────────────────────────────────────────────
+      # The core deployment bundle: the aoide.* option contract plus the
+      # overlay above, so a consumer needs one import, not two. See
+      # pkgs/aoide/module/README.md for the seams.
+      nixosModules.default = import ./module { inherit self; };
+
       # ── Checks ─────────────────────────────────────────────────────────────
       # The check IS the package build: default.nix runs `cargo test` in the
       # sandbox (doCheck), so a green `checks.default` is the full Rust suite.
