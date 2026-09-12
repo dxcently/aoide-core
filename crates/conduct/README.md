@@ -414,7 +414,13 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   unknown, never an app record). `codex_home` (`$CODEX_HOME` else
   `$HOME/.codex`) is
   the one authority for the root path; `reap.rs::refresh_codex_titles` calls
-  the same function rather than a second copy. See AGENTS.md's invariants
+  the same function rather than a second copy. Every gather returns a
+  `ThreadScan`, not a raw list: a failed or incomplete read anywhere in this
+  chain — the lock directory, a lock file, the process table, or an
+  already-enrolled thread's fd table — comes back `Unknown`, and
+  `reconcile_codex_app_threads` changes no record on `Unknown`; only a
+  positively observed thread set, including a positively observed empty
+  one, ever removes a `kind:"app"` record. See AGENTS.md's invariants
   for why `kind:"app"` exists and what it must never gain.
 
   `sync_codex_app_threads` (P-CX-3) has two call sites. The reaper's own

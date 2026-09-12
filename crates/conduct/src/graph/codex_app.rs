@@ -20,6 +20,16 @@
 //! many, never a shortcut and never a tie-break reserved for the
 //! multi-server case.
 //!
+//! Every gather of the live thread set produces a [`ThreadScan`]:
+//! `Observed` carries positive evidence for EVERY lock in the directory —
+//! including an empty vec, which means every lock was proven released, not
+//! merely unexamined — while `Unknown` means the scan could not complete
+//! and says nothing about any thread. [`reconcile_codex_app_threads`] acts
+//! on `Observed` alone; an `Unknown` scan changes no record, because a
+//! failed or incomplete observation is not the same fact as a confirmed
+//! thread exit (Codex ruling seq 211). Only a positively observed, empty
+//! thread set ever removes an existing `kind:"app"` record.
+//!
 //! [`codex_app_threads`] assembles the live set and [`sync_codex_app_threads`]
 //! is the I/O wrapper over [`reconcile_codex_app_threads`] — but NEITHER has
 //! a call site yet. The listener/daemon-tick wiring and the taught
@@ -51,7 +61,7 @@ pub(crate) struct CodexThread {
     /// The pid of the `app-server` process PROVEN (`holder_via_proc_fd`'s
     /// own fd table holds this exact lock) to own this thread's writer
     /// lock. A `CodexThread` exists at all only for a lock with such a
-    /// proven owner — [`codex_app_threads`]'s `filter_map` never
+    /// proven owner — [`codex_app_threads_with`]'s assembly loop never
     /// constructs one otherwise, so this field is never optional. Feeds
     /// exactly two things downstream: the existing window sweep's
     /// pid-ancestry walk, and the reaper's pid-DEATH signal — NEVER proof
@@ -62,9 +72,54 @@ pub(crate) struct CodexThread {
     pub pid: u32,
 }
 
-/// Reconcile `kind:"app"` Codex-desktop records against the live thread set —
-/// the PURE CORE (fed fake [`CodexThread`]s in tests), mirroring
-/// [`super::window::reconcile_untracked_terminals`] rule for rule:
+/// One gather of the desktop-thread set — the seam that keeps a FAILED or
+/// INCOMPLETE observation from ever reading as a CONFIRMED thread exit
+/// (Codex ruling seq 211). `Observed` carries positive evidence for every
+/// lock in the directory — an empty vec means every lock was proven
+/// released, not merely unexamined. `Unknown` means the scan could not
+/// complete and says nothing about any thread; see [`ScanFailure`] for
+/// which step gave up. [`reconcile_codex_app_threads`] acts on `Observed`
+/// alone.
+#[derive(Debug)]
+pub(crate) enum ThreadScan {
+    Observed(Vec<CodexThread>),
+    Unknown(ScanFailure),
+}
+
+/// Why a [`ThreadScan`] came back `Unknown` — which step of
+/// [`codex_app_threads`]'s gather could not complete. Every variant is a
+/// genuine "don't know," never a stand-in for "no."
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScanFailure {
+    /// `thread-writer-locks` exists but [`live_thread_locks`] could not read
+    /// it (permissions, an I/O error). A MISSING directory is
+    /// `Observed(empty)` instead — see that function's own doc.
+    LockDirUnreadable,
+    /// A lock file [`live_thread_locks`] listed could not be opened by
+    /// [`lock_is_held`] for a reason other than having simply vanished since
+    /// the listing (a vanished file is positively released, not unknown).
+    LockProbeUnavailable,
+    /// At least one lock came back held and [`process_table`] returned
+    /// `None` — no `ps` on `PATH` is the live case this exists for.
+    ProcessTableUnavailable,
+    /// An already-enrolled thread's candidate app-server has an unreadable
+    /// `/proc/<pid>/fd` table — the fd scan is the SOLE ownership evidence
+    /// ([`holder_via_proc_fd`]), so this thread's continued existence can be
+    /// neither confirmed nor denied. A candidate id with no existing
+    /// `kind:"app"` record takes the ordinary "no proven owner → no record"
+    /// reading instead, unchanged — enrolment still needs positive fd
+    /// evidence; only a record this crate ALREADY carries is ever put at
+    /// risk by an unreadable fd table.
+    LockOwnerUnavailable,
+}
+
+/// Reconcile `kind:"app"` Codex-desktop records against a [`ThreadScan`] —
+/// the PURE CORE (fed fake scans in tests), mirroring
+/// [`super::window::reconcile_untracked_terminals`] rule for rule. A
+/// `ThreadScan::Unknown` changes nothing — `(sessions, false)`, sessions
+/// returned exactly as given — because a scan that could not complete
+/// carries no evidence any thread has closed; every rule below fires only
+/// for [`ThreadScan::Observed`]:
 ///
 ///   * A desired thread with no existing record is INSERTED, keyed by its
 ///     native id verbatim (no synthetic prefix — see the module doc).
@@ -93,8 +148,13 @@ pub(crate) struct CodexThread {
 /// not invent one.
 pub(crate) fn reconcile_codex_app_threads(
     mut sessions: Vec<SessionRecord>,
-    threads: &[CodexThread],
+    scan: &ThreadScan,
 ) -> (Vec<SessionRecord>, bool) {
+    let threads: &[CodexThread] = match scan {
+        ThreadScan::Unknown(_) => return (sessions, false),
+        ThreadScan::Observed(threads) => threads,
+    };
+
     // Native ids already claimed by a TRACKED (non-`"app"`) record — never
     // ours to insert, overwrite, or remove.
     let claimed: HashSet<String> = sessions
@@ -193,36 +253,45 @@ pub(crate) const UNSUPPORTED_PLATFORM: &str =
 /// `<codex_home>/thread-writer-locks`) — names only; whether one is
 /// currently HELD is [`lock_is_held`]'s question, not this one.
 /// `.coordination.lock` is a cross-thread coordination file, never a
-/// per-thread lock, and is always skipped. A missing/unreadable directory
-/// (no desktop app has ever run on this box) reads as "no threads", never
-/// an error.
-pub(crate) fn live_thread_locks(dir: &Path) -> Vec<PathBuf> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+/// per-thread lock, and is always skipped. A MISSING directory reads as
+/// `Ok(empty)` — no desktop app has ever run on this box, today's story,
+/// and that is a genuine fact, not a failed observation. Any OTHER read
+/// error (permissions, a directory that stopped being readable mid-scan)
+/// comes back `Err`: the caller cannot tell "no threads" from "couldn't
+/// look," so it must not either.
+pub(crate) fn live_thread_locks(dir: &Path) -> Result<Vec<PathBuf>, ScanFailure> {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(_) => return Err(ScanFailure::LockDirUnreadable),
     };
-    entries
+    Ok(entries
         .flatten()
         .map(|e| e.path())
         .filter(|p| p.extension().and_then(|e| e.to_str()) == Some("lock"))
         .filter(|p| p.file_name().and_then(|n| n.to_str()) != Some(".coordination.lock"))
-        .collect()
+        .collect())
 }
 
 /// Is the thread-writer lock at `path` currently HELD by some process? The
 /// try-flock itself IS the liveness signal — never `/proc`, never a pid read
-/// out of the file (the file is 0 bytes and carries no pid). `LOCK_EX |
-/// LOCK_NB`: failure (`EWOULDBLOCK` on a real lock file) means another open
-/// file description already holds it, so the thread is live; success means
-/// nothing does, so the lock just taken is released and the fd closes in
-/// the same breath (`file` drops at the end of this function) — the probe
-/// itself never leaves a lock held. Opens `O_RDONLY` only, never `O_CREAT`,
-/// so a missing lock file reads as "not live" and is never brought into
-/// existence by asking.
+/// out of the file (the file is 0 bytes and carries no pid). A three-way
+/// answer: `Some(true)` — `LOCK_EX | LOCK_NB` failed (`EWOULDBLOCK`), so
+/// another open file description already holds it; `Some(false)` — the file
+/// is simply gone (`NotFound` on open), positively released, not merely
+/// unobserved; `None` — the open failed for any OTHER reason, which is not
+/// evidence either way. Opens `O_RDONLY` only, never `O_CREAT`, so a
+/// missing lock file is never brought into existence by asking, and a lock
+/// this probe DID acquire is released and the fd closed in the same breath
+/// (`file` drops at the end of this function) — the probe itself never
+/// leaves a lock held.
 #[cfg(unix)]
-pub(crate) fn lock_is_held(path: &Path) -> bool {
+pub(crate) fn lock_is_held(path: &Path) -> Option<bool> {
     use std::os::unix::io::AsRawFd;
-    let Ok(file) = std::fs::OpenOptions::new().read(true).open(path) else {
-        return false;
+    let file = match std::fs::OpenOptions::new().read(true).open(path) {
+        Ok(file) => file,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Some(false),
+        Err(_) => return None,
     };
     let fd = file.as_raw_fd();
     let acquired = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) } == 0;
@@ -231,14 +300,14 @@ pub(crate) fn lock_is_held(path: &Path) -> bool {
             libc::flock(fd, libc::LOCK_UN);
         }
     }
-    !acquired
+    Some(!acquired)
 }
 
 /// No unix file locks on this platform — see [`UNSUPPORTED_PLATFORM`]. No
-/// probe, no enrolment, no code: this is the whole Windows story.
+/// probe, no enrolment, no code: this platform never has anything held.
 #[cfg(not(unix))]
-pub(crate) fn lock_is_held(_path: &Path) -> bool {
-    false
+pub(crate) fn lock_is_held(_path: &Path) -> Option<bool> {
+    Some(false)
 }
 
 /// The whole system's process table, `ps -axo pid=,ppid=,command=` — the
@@ -326,12 +395,12 @@ pub(crate) fn codex_app_servers(procs: &[Proc]) -> Vec<u32> {
 /// Resolve which app-server owns a lock, given the servers the process
 /// table yielded: an app-server owns a lock only when its own fd table
 /// holds that lock ([`holder_via_proc_fd`]) — anything less is not a
-/// desktop thread. Zero servers, or none whose fd table holds this lock
-/// (one server or a hundred — the count never shortcuts the check):
-/// `None`, the routine CLI case, not an anomaly.
-pub(crate) fn lock_holder(servers: &[u32], lock: &Path) -> Option<u32> {
+/// desktop thread. Zero servers is `Ok(None)`, the routine CLI case, not an
+/// anomaly — `holder_via_proc_fd` is never even called, so a lock nothing
+/// on the process table claims to own can never come back `Err` from here.
+pub(crate) fn lock_holder(servers: &[u32], lock: &Path) -> Result<Option<u32>, ()> {
     match servers {
-        [] => None,
+        [] => Ok(None),
         many => holder_via_proc_fd(many, lock),
     }
 }
@@ -343,27 +412,49 @@ pub(crate) fn lock_holder(servers: &[u32], lock: &Path) -> Option<u32> {
 /// reserved for the multi-server case. `lock` is canonicalized once before
 /// the scan so a symlinked `~/.codex` cannot defeat the match; never
 /// consulted for liveness (that is always [`lock_is_held`]'s flock).
+///
+/// `Ok(Some(pid))` — a candidate's fd table proved ownership. `Ok(None)` —
+/// every candidate's fd table was readable and none held this lock, a
+/// routine CLI thread or an idle server, never an anomaly. `Err(())` — at
+/// least one candidate's `/proc/<pid>/fd` could not be READ for a reason
+/// other than that candidate having already exited (an exited candidate is
+/// skipped exactly as before: a dead process holds no fd on anything, so
+/// its own vanished `/proc` entry is not evidence of anything) before any
+/// candidate proved ownership; the caller decides what an unreadable
+/// candidate is allowed to mean.
 #[cfg(target_os = "linux")]
-fn holder_via_proc_fd(candidates: &[u32], lock: &Path) -> Option<u32> {
+fn holder_via_proc_fd(candidates: &[u32], lock: &Path) -> Result<Option<u32>, ()> {
     let target = lock.canonicalize().unwrap_or_else(|_| lock.to_path_buf());
+    let mut unreadable = false;
     for &pid in candidates {
-        let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
-            continue;
+        let entries = match std::fs::read_dir(format!("/proc/{pid}/fd")) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => {
+                unreadable = true;
+                continue;
+            }
         };
         for entry in entries.flatten() {
             if std::fs::read_link(entry.path()).map(|t| t == target).unwrap_or(false) {
-                return Some(pid);
+                return Ok(Some(pid));
             }
         }
     }
-    None
+    if unreadable {
+        Err(())
+    } else {
+        Ok(None)
+    }
 }
 
 /// No positive ownership evidence is available on this platform, so no
 /// desktop thread is ever enrolled here — see [`UNSUPPORTED_PLATFORM`].
+/// Always `Ok(None)`, never `Err`: the platform has no failure mode to
+/// report, only nothing to find.
 #[cfg(not(target_os = "linux"))]
-fn holder_via_proc_fd(_candidates: &[u32], _lock: &Path) -> Option<u32> {
-    None
+fn holder_via_proc_fd(_candidates: &[u32], _lock: &Path) -> Result<Option<u32>, ()> {
+    Ok(None)
 }
 
 /// A thread's cwd, read ONCE per enrolment from its rollout header
@@ -412,45 +503,94 @@ fn find_rollout(dir: &Path, thread_id: &str) -> Option<PathBuf> {
     None
 }
 
-/// Assemble the live [`CodexThread`] set straight off `~/.codex` — the ONLY
-/// I/O this module performs before handing off to
-/// [`reconcile_codex_app_threads`]. No `codex_home` (env has neither
-/// `CODEX_HOME` nor `HOME`): no work, no directory read. The process table
-/// is read ONLY when at least one lock came back held, so a box with no
-/// desktop app installed forks nothing.
-///
-/// `known` is the id→cwd map of threads a `kind:"app"` record already
-/// carries (built by the caller from the current stage, BEFORE this
-/// function runs). A `sessions/**` walk ([`thread_cwd`]/[`find_rollout`],
-/// unbounded DFS) is expensive to repeat every tick for no reason: an id
-/// already `known` with a non-empty cwd carries that cwd through UNCHANGED,
-/// and the walk runs only for an id that is new or whose known cwd is
-/// empty — once per NEW thread id, never once per tick for an
-/// already-enrolled one.
-pub(crate) fn codex_app_threads(known: &BTreeMap<String, String>) -> Vec<CodexThread> {
-    let Some(home) = codex_home() else {
-        return Vec::new();
-    };
-    let locks = live_thread_locks(&home.join("thread-writer-locks"));
-    let held: Vec<PathBuf> = locks.into_iter().filter(|p| lock_is_held(p)).collect();
-    if held.is_empty() {
-        return Vec::new();
-    }
-    let procs = process_table()
-        .map(|table| parse_process_table(&table))
-        .unwrap_or_default();
-    let servers = codex_app_servers(&procs);
-    held.into_iter()
-        .filter_map(|lock| {
-            let id = lock.file_stem()?.to_str()?.to_string();
-            let pid = lock_holder(&servers, &lock)?;
-            let cwd = resolved_cwd(known, &home, &id);
-            Some(CodexThread { id, cwd, pid })
-        })
-        .collect()
+/// Assemble the live thread set straight off `~/.codex` as a [`ThreadScan`]
+/// — the ONLY I/O this module performs before handing off to
+/// [`reconcile_codex_app_threads`]. Delegates to
+/// [`codex_app_threads_with`] with the real [`process_table`]; split out so
+/// a test can inject a table (or its absence) without shelling out to a
+/// real `ps`. `known` is the id→cwd map of threads a `kind:"app"` record
+/// already carries (built by the caller from the current stage, BEFORE this
+/// function runs) — see [`codex_app_threads_with`] for what it's for.
+pub(crate) fn codex_app_threads(known: &BTreeMap<String, String>) -> ThreadScan {
+    codex_app_threads_with(known, process_table)
 }
 
-/// A thread's cwd for [`codex_app_threads`]'s assembly step: the cached
+/// The testable core of [`codex_app_threads`], taking the process-table
+/// gather as a parameter. No `codex_home` (env has neither `CODEX_HOME` nor
+/// `HOME`): no work, `Observed(empty)` — an absent desktop app is a genuine
+/// fact, not a failed observation. Every OTHER dead end is `Unknown`: an
+/// unreadable lock directory, a lock file that fails to open for any reason
+/// but having vanished, `process_table` coming back `None` while a lock is
+/// genuinely held, or an already-enrolled thread's candidate fd table going
+/// unreadable — see [`ScanFailure`] for which is which. `held` coming back
+/// empty (every lock positively released) short-circuits to
+/// `Observed(empty)` without ever calling `process_table` — a box with no
+/// desktop app installed forks nothing.
+///
+/// `known`'s `sessions/**` walk cost ([`thread_cwd`]/[`find_rollout`],
+/// unbounded DFS) is paid once per NEW thread id only: an id already
+/// `known` with a non-empty cwd carries that cwd through UNCHANGED (see
+/// [`resolved_cwd`]), never re-walked on a later tick.
+fn codex_app_threads_with(
+    known: &BTreeMap<String, String>,
+    process_table: impl Fn() -> Option<String>,
+) -> ThreadScan {
+    let Some(home) = codex_home() else {
+        return ThreadScan::Observed(Vec::new());
+    };
+    let locks = match live_thread_locks(&home.join("thread-writer-locks")) {
+        Ok(locks) => locks,
+        Err(failure) => return ThreadScan::Unknown(failure),
+    };
+
+    let mut held = Vec::new();
+    for lock in locks {
+        match lock_is_held(&lock) {
+            Some(true) => held.push(lock),
+            Some(false) => {}
+            None => return ThreadScan::Unknown(ScanFailure::LockProbeUnavailable),
+        }
+    }
+    if held.is_empty() {
+        return ThreadScan::Observed(Vec::new());
+    }
+
+    let Some(table) = process_table() else {
+        return ThreadScan::Unknown(ScanFailure::ProcessTableUnavailable);
+    };
+    let procs = parse_process_table(&table);
+    let servers = codex_app_servers(&procs);
+
+    let mut threads = Vec::new();
+    for lock in held {
+        let Some(id) = lock.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        match lock_holder(&servers, &lock) {
+            Ok(Some(pid)) => {
+                let cwd = resolved_cwd(known, &home, id);
+                threads.push(CodexThread {
+                    id: id.to_string(),
+                    cwd,
+                    pid,
+                });
+            }
+            // No proven owner among readable candidates — a CLI thread or
+            // unknown, never a desktop app record. Unchanged from before.
+            Ok(None) => {}
+            Err(()) => {
+                if known.contains_key(id) {
+                    return ThreadScan::Unknown(ScanFailure::LockOwnerUnavailable);
+                }
+                // No existing `kind:"app"` record carries this id: today's
+                // "no proven owner → no record" reading, unchanged.
+            }
+        }
+    }
+    ThreadScan::Observed(threads)
+}
+
+/// A thread's cwd for [`codex_app_threads_with`]'s assembly step: the cached
 /// value from `known` when non-empty, else a fresh [`thread_cwd`] walk.
 /// Pulled out on its own so the caching rule stays testable without a
 /// process that can genuinely hold a `/proc/<pid>/fd` on the fixture lock
@@ -463,13 +603,46 @@ fn resolved_cwd(known: &BTreeMap<String, String>, home: &Path, id: &str) -> Stri
     }
 }
 
-/// The I/O wrapper over [`reconcile_codex_app_threads`] — gathers the live
-/// thread set, reconciles under the stage lock, and re-stages `graph.json`
-/// only when something changed. Mirrors
+/// The FIRST time this process observes
+/// [`ScanFailure::ProcessTableUnavailable`], one audit line notes that the
+/// desktop-Codex scan is being skipped and existing records are being kept
+/// — the daemon's own tick has no operator watching stderr, and a "ps not
+/// on PATH" tick that just goes quiet forever would leave that fact
+/// undiscoverable. Every OTHER [`ScanFailure`], and every later
+/// `ProcessTableUnavailable` tick on this same process, stays silent: the
+/// fix is what stops a failed scan from mattering (no record is ever
+/// removed on `Unknown`), not a growing log.
+static PROCESS_TABLE_UNKNOWN_AUDITED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn audit_scan_unknown_once(failure: &ScanFailure) {
+    if !matches!(failure, ScanFailure::ProcessTableUnavailable) {
+        return;
+    }
+    if PROCESS_TABLE_UNKNOWN_AUDITED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let log = aoide_protocol::default_audit_log();
+    let _ = aoide_protocol::audit(
+        &log,
+        aoide_protocol::Door::Daemon,
+        aoide_protocol::EventClass::Audit,
+        "session.reap",
+        "skipped",
+        "desktop codex scan skipped: ps not on PATH (records kept)",
+    );
+}
+
+/// The I/O wrapper over [`reconcile_codex_app_threads`] — gathers a
+/// [`ThreadScan`], reconciles under the stage lock, and re-stages
+/// `graph.json` only when something changed. Mirrors
 /// [`super::window::sync_untracked_terminal_windows`]'s shape exactly. NO
 /// CALL SITE YET (P-CX-3 wires the listener/daemon tick); reachable only
 /// from its own tests until then — the same standing
-/// [`reconcile_codex_app_threads`] itself has carried since P-CX-1.
+/// [`reconcile_codex_app_threads`] itself has carried since P-CX-1. An
+/// `Unknown` scan takes NO stage lock and writes NOTHING —
+/// [`audit_scan_unknown_once`] notes it and this returns `false`, same as
+/// an ordinary no-op tick.
 ///
 /// Reads the stage TWICE: once here (outside the lock) to build
 /// [`codex_app_threads`]'s `known` id→cwd map off the current `kind:"app"`
@@ -488,14 +661,18 @@ pub(crate) fn sync_codex_app_threads() -> bool {
                 .collect()
         })
         .unwrap_or_default();
-    let threads = codex_app_threads(&known);
+    let scan = codex_app_threads(&known);
+    if let ThreadScan::Unknown(failure) = &scan {
+        audit_scan_unknown_once(failure);
+        return false;
+    }
     aoide_storage::fs::with_stage_lock(|| {
         let mut file: SessionsFile = match load_stage(&sessions_path()) {
             Ok(f) => f,
             Err(_) => return false,
         };
         let (sessions, changed) =
-            reconcile_codex_app_threads(std::mem::take(&mut file.sessions), &threads);
+            reconcile_codex_app_threads(std::mem::take(&mut file.sessions), &scan);
         file.sessions = sessions;
         if !changed {
             return false;
@@ -528,11 +705,11 @@ mod tests {
     fn a_live_thread_becomes_one_record_keyed_by_its_native_id() {
         let (out, changed) = reconcile_codex_app_threads(
             vec![],
-            &[thread(
+            &ThreadScan::Observed(vec![thread(
                 "01a07d89-5f9b-7900-b909-d5eb9457c195",
                 "/home/khoa/Aoide",
                 2598256,
-            )],
+            )]),
         );
         assert!(changed);
         assert_eq!(out.len(), 1);
@@ -562,14 +739,14 @@ mod tests {
     fn two_threads_of_one_app_are_two_records() {
         let (out, changed) = reconcile_codex_app_threads(
             vec![],
-            &[
+            &ThreadScan::Observed(vec![
                 thread("01a07d89-thread-one", "/home/khoa/Aoide", 2598256),
                 thread(
                     "01a08a23-thread-two",
                     "/home/khoa/Documents/Codex/2026-09-10/wha",
                     2598256,
                 ),
-            ],
+            ]),
         );
         assert!(changed);
         assert_eq!(out.len(), 2);
@@ -587,10 +764,11 @@ mod tests {
     fn a_thread_whose_lock_is_gone_loses_its_record() {
         let (first, _) = reconcile_codex_app_threads(
             vec![],
-            &[thread("01a07d89-gone", "/home/khoa/Aoide", 2598256)],
+            &ThreadScan::Observed(vec![thread("01a07d89-gone", "/home/khoa/Aoide", 2598256)]),
         );
         assert_eq!(first.len(), 1);
-        let (second, changed) = reconcile_codex_app_threads(first, &[]);
+        let (second, changed) =
+            reconcile_codex_app_threads(first, &ThreadScan::Observed(Vec::new()));
         assert!(changed);
         assert!(
             second.is_empty(),
@@ -605,7 +783,11 @@ mod tests {
         let tracked = session("01a07d89-claimed", "/home/khoa/Aoide", "working", "t", None);
         let (out, changed) = reconcile_codex_app_threads(
             vec![tracked.clone()],
-            &[thread("01a07d89-claimed", "/home/khoa/Aoide", 2598256)],
+            &ThreadScan::Observed(vec![thread(
+                "01a07d89-claimed",
+                "/home/khoa/Aoide",
+                2598256,
+            )]),
         );
         assert!(
             !changed,
@@ -622,7 +804,7 @@ mod tests {
     fn an_app_record_is_never_agent_kind_so_dedup_and_staleness_skip_it() {
         let (out, _) = reconcile_codex_app_threads(
             vec![],
-            &[thread("01a07d89-live", "/home/khoa/Aoide", 2598256)],
+            &ThreadScan::Observed(vec![thread("01a07d89-live", "/home/khoa/Aoide", 2598256)]),
         );
         let rec = &out[0];
         assert!(
@@ -645,7 +827,7 @@ mod tests {
         drifted.pid = Some(2598256);
         let (out, changed) = reconcile_codex_app_threads(
             vec![drifted],
-            &[thread("01a07d89-drift", "/home/khoa/Aoide", 2598256)],
+            &ThreadScan::Observed(vec![thread("01a07d89-drift", "/home/khoa/Aoide", 2598256)]),
         );
         assert!(
             changed,
@@ -760,7 +942,7 @@ mod tests {
         // `lock_holder` accepts, for one server or a hundred, never a
         // tie-break reserved for the multi-server case.
         let lock = Path::new("/nonexistent/thread-writer-locks/some-thread.lock");
-        assert_eq!(lock_holder(&servers, lock), None);
+        assert_eq!(lock_holder(&servers, lock), Ok(None));
     }
 
     #[test]
@@ -771,7 +953,7 @@ mod tests {
         let servers = [std::process::id()];
         assert_eq!(
             lock_holder(&servers, &lock),
-            None,
+            Ok(None),
             "one server with no fd on the lock still owns nothing"
         );
         std::fs::remove_dir_all(dir).ok();
@@ -786,7 +968,7 @@ mod tests {
         std::fs::write(&lock, b"").unwrap();
         let held = std::fs::OpenOptions::new().read(true).open(&lock).unwrap();
         let servers = [std::process::id()];
-        assert_eq!(lock_holder(&servers, &lock), Some(std::process::id()));
+        assert_eq!(lock_holder(&servers, &lock), Ok(Some(std::process::id())));
 
         // Canonicalization: a symlinked parent directory must not defeat
         // the match.
@@ -798,7 +980,7 @@ mod tests {
         let lock_via_link = link.join("held.lock");
         assert_eq!(
             lock_holder(&servers, &lock_via_link),
-            Some(std::process::id()),
+            Ok(Some(std::process::id())),
             "a symlinked parent directory must not defeat the fd match"
         );
 
@@ -821,8 +1003,8 @@ mod tests {
         let held_a = std::fs::OpenOptions::new().read(true).open(&lock_a).unwrap();
 
         let servers = [std::process::id()];
-        assert_eq!(lock_holder(&servers, &lock_a), Some(std::process::id()));
-        assert_eq!(lock_holder(&servers, &lock_b), None);
+        assert_eq!(lock_holder(&servers, &lock_a), Ok(Some(std::process::id())));
+        assert_eq!(lock_holder(&servers, &lock_b), Ok(None));
 
         let id_a = lock_a.file_stem().unwrap().to_str().unwrap().to_string();
         let id_b = lock_b.file_stem().unwrap().to_str().unwrap().to_string();
@@ -835,8 +1017,10 @@ mod tests {
 
         let desktop_thread = thread(&id_a, "/home/khoa/Aoide", std::process::id());
 
-        let (out, _changed) =
-            reconcile_codex_app_threads(vec![cli_record.clone()], &[desktop_thread]);
+        let (out, _changed) = reconcile_codex_app_threads(
+            vec![cli_record.clone()],
+            &ThreadScan::Observed(vec![desktop_thread]),
+        );
 
         let b_after = out
             .iter()
@@ -872,8 +1056,9 @@ mod tests {
         let held = std::fs::OpenOptions::new().read(true).open(&path).unwrap();
         let rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
         assert_eq!(rc, 0, "the test's own fd must acquire the lock first");
-        assert!(
+        assert_eq!(
             lock_is_held(&path),
+            Some(true),
             "a lock another open file description holds must read as live"
         );
         unsafe {
@@ -888,7 +1073,7 @@ mod tests {
         let dir = unique_stage("codex-lock-unheld");
         let path = dir.join("thread.lock");
         std::fs::write(&path, b"").unwrap();
-        assert!(!lock_is_held(&path));
+        assert_eq!(lock_is_held(&path), Some(false));
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -897,11 +1082,36 @@ mod tests {
         let dir = unique_stage("codex-lock-missing");
         let path = dir.join("thread.lock");
         assert!(!path.exists());
-        assert!(!lock_is_held(&path));
+        assert_eq!(
+            lock_is_held(&path),
+            Some(false),
+            "a missing lock file is positively released, not unknown"
+        );
         assert!(
             !path.exists(),
             "the probe must never create the file it is checking"
         );
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lock_is_held_on_an_unreadable_file_is_unknown_not_released() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, permissions cannot make a file unreadable");
+            return;
+        }
+        let dir = unique_stage("codex-lock-unreadable-file");
+        let path = dir.join("thread.lock");
+        std::fs::write(&path, b"").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            lock_is_held(&path),
+            None,
+            "an unreadable lock file is unknown, never a stand-in for released"
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         std::fs::remove_dir_all(dir).ok();
     }
 
@@ -945,8 +1155,8 @@ mod tests {
         std::env::remove_var("HOME");
         assert_eq!(codex_home(), None);
         assert!(
-            codex_app_threads(&BTreeMap::new()).is_empty(),
-            "no codex_home means no work at all"
+            matches!(codex_app_threads(&BTreeMap::new()), ThreadScan::Observed(t) if t.is_empty()),
+            "no codex_home means no work at all — a genuine fact, not a failed scan"
         );
     }
 
@@ -996,5 +1206,201 @@ mod tests {
     fn the_unsupported_platform_string_names_flock_and_the_process_table() {
         assert!(UNSUPPORTED_PLATFORM.contains("file locks"));
         assert!(UNSUPPORTED_PLATFORM.contains("process table"));
+    }
+
+    // ---- P-CX-4: a failed/incomplete scan is Unknown, never "no threads" ---
+
+    #[test]
+    fn unknown_scan_leaves_existing_app_records_completely_untouched() {
+        let (seeded, _) = reconcile_codex_app_threads(
+            vec![],
+            &ThreadScan::Observed(vec![
+                thread("01a-unknown-keep-1", "/home/khoa/Aoide", 111),
+                thread("01a-unknown-keep-2", "/home/khoa/Elsewhere", 222),
+            ]),
+        );
+        assert_eq!(seeded.len(), 2);
+
+        let (after, changed) = reconcile_codex_app_threads(
+            seeded.clone(),
+            &ThreadScan::Unknown(ScanFailure::ProcessTableUnavailable),
+        );
+        assert!(!changed, "an Unknown scan must report no change");
+        assert_eq!(after.len(), seeded.len());
+        for (before, after) in seeded.iter().zip(after.iter()) {
+            assert_eq!(after.session_id, before.session_id);
+            assert_eq!(
+                after.petname, before.petname,
+                "a petname must never be re-minted under Unknown"
+            );
+            assert_eq!(after.pid, before.pid);
+            assert_eq!(after.cwd, before.cwd);
+        }
+    }
+
+    #[test]
+    fn observed_empty_still_removes_genuinely_closed_threads() {
+        let (with_two, _) = reconcile_codex_app_threads(
+            vec![],
+            &ThreadScan::Observed(vec![
+                thread("01a-close-1", "/home/khoa/Aoide", 111),
+                thread("01a-close-2", "/home/khoa/Elsewhere", 222),
+            ]),
+        );
+        assert_eq!(with_two.len(), 2);
+        let (after, changed) =
+            reconcile_codex_app_threads(with_two, &ThreadScan::Observed(Vec::new()));
+        assert!(changed);
+        assert!(
+            after.is_empty(),
+            "a positively observed empty set still closes every app record"
+        );
+    }
+
+    #[test]
+    fn observed_subset_removes_the_dropped_thread_and_keeps_the_survivor_petname() {
+        let (with_two, _) = reconcile_codex_app_threads(
+            vec![],
+            &ThreadScan::Observed(vec![
+                thread("01a-survivor", "/home/khoa/Aoide", 111),
+                thread("01a-dropped", "/home/khoa/Elsewhere", 222),
+            ]),
+        );
+        let survivor_petname = with_two
+            .iter()
+            .find(|r| r.session_id == "01a-survivor")
+            .and_then(|r| r.petname.clone());
+
+        let (after, changed) = reconcile_codex_app_threads(
+            with_two,
+            &ThreadScan::Observed(vec![thread("01a-survivor", "/home/khoa/Aoide", 111)]),
+        );
+        assert!(changed);
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].session_id, "01a-survivor");
+        assert_eq!(
+            after[0].petname, survivor_petname,
+            "the surviving thread must keep its original petname — an in-place upsert, never a re-mint"
+        );
+    }
+
+    #[test]
+    fn lock_is_held_missing_path_is_positively_released() {
+        let dir = unique_stage("codex-lock-is-held-missing");
+        let path = dir.join("thread.lock");
+        assert_eq!(lock_is_held(&path), Some(false));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn live_thread_locks_missing_dir_is_observed_empty_shape() {
+        let dir = unique_stage("codex-locks-missing-dir");
+        let missing = dir.join("thread-writer-locks");
+        assert_eq!(live_thread_locks(&missing), Ok(Vec::new()));
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn live_thread_locks_unreadable_dir_is_unknown() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skipping: running as root, permissions cannot make a directory unreadable");
+            return;
+        }
+        let dir = unique_stage("codex-locks-unreadable-dir");
+        let locks = dir.join("thread-writer-locks");
+        std::fs::create_dir_all(&locks).unwrap();
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert_eq!(
+            live_thread_locks(&locks),
+            Err(ScanFailure::LockDirUnreadable)
+        );
+        std::fs::set_permissions(&locks, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn held_lock_with_no_process_table_is_unknown() {
+        use std::os::unix::io::AsRawFd;
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["CODEX_HOME", "HOME"]);
+        let home = unique_stage("codex-threads-no-process-table");
+        let locks_dir = home.join("thread-writer-locks");
+        std::fs::create_dir_all(&locks_dir).unwrap();
+        let lock = locks_dir.join("01a-held.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let held = std::fs::OpenOptions::new().read(true).open(&lock).unwrap();
+        let rc = unsafe { libc::flock(held.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+        assert_eq!(rc, 0, "the test's own fd must acquire the lock first");
+        std::env::set_var("CODEX_HOME", &home);
+
+        let scan = codex_app_threads_with(&BTreeMap::new(), || None);
+        assert!(
+            matches!(
+                scan,
+                ThreadScan::Unknown(ScanFailure::ProcessTableUnavailable)
+            ),
+            "a held lock with no process table must read Unknown, never Observed(empty)"
+        );
+
+        unsafe {
+            libc::flock(held.as_raw_fd(), libc::LOCK_UN);
+        }
+        drop(held);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn a_tracked_non_app_record_survives_an_unknown_scan_untouched() {
+        // Extends the P-CX-2b mixed-fixture case
+        // (`a_cli_thread_and_a_desktop_thread_side_by_side_enrol_only_the_desktop_one`
+        // above): a tracked CLI record must survive an Unknown scan exactly
+        // as untouched as it survives an Observed one.
+        let mut cli_record = session("01a-cli-tracked", "/home/khoa/Aoide", "working", "t", None);
+        cli_record.agent = "codex".to_string();
+        cli_record.pid = Some(424242);
+
+        let (out, changed) = reconcile_codex_app_threads(
+            vec![cli_record.clone()],
+            &ThreadScan::Unknown(ScanFailure::ProcessTableUnavailable),
+        );
+        assert!(!changed);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].session_id, cli_record.session_id);
+        assert_eq!(out[0].kind, cli_record.kind);
+        assert_eq!(out[0].pid, cli_record.pid);
+    }
+
+    #[test]
+    fn alternating_unknown_then_observed_same_set_causes_no_churn() {
+        let (seeded, _) = reconcile_codex_app_threads(
+            vec![],
+            &ThreadScan::Observed(vec![
+                thread("01a-alt-1", "/home/khoa/Aoide", 111),
+                thread("01a-alt-2", "/home/khoa/Elsewhere", 222),
+            ]),
+        );
+        let petnames_before: Vec<_> = seeded.iter().map(|r| r.petname.clone()).collect();
+
+        let (after_unknown, changed_1) = reconcile_codex_app_threads(
+            seeded,
+            &ThreadScan::Unknown(ScanFailure::LockProbeUnavailable),
+        );
+        assert!(!changed_1, "an Unknown pass must never churn the roster");
+
+        let (after_observed, changed_2) = reconcile_codex_app_threads(
+            after_unknown,
+            &ThreadScan::Observed(vec![
+                thread("01a-alt-1", "/home/khoa/Aoide", 111),
+                thread("01a-alt-2", "/home/khoa/Elsewhere", 222),
+            ]),
+        );
+        assert!(
+            !changed_2,
+            "re-observing the identical set right after an Unknown pass must not churn either"
+        );
+        let petnames_after: Vec<_> = after_observed.iter().map(|r| r.petname.clone()).collect();
+        assert_eq!(petnames_before, petnames_after);
     }
 }
