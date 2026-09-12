@@ -86,15 +86,18 @@ lib.mkIf config.aoide.enable {
     after = lib.optional (cfg.sessionTarget != "default.target") cfg.sessionTarget;
     partOf = lib.optional (cfg.sessionTarget != "default.target") cfg.sessionTarget;
 
-    # A minimal user unit's default PATH carries neither `ps` nor `ssh`,
-    # and the daemon's own tick needs both: one `ps` table resolves
-    # desktop-Codex thread ownership (without it the scan can only ever
-    # report Unknown, P-CX-4), and the outbox drain spawns `ssh` to tunnel
-    # a letter to a loopback-door node (without it every daemon-side
-    # delivery fails and its backoff holds the CLI's own attempt off).
+    # A minimal user unit's default PATH carries none of `ps`, `ssh` or
+    # `curl`, and the daemon's own tick needs all three: one `ps` table
+    # resolves desktop-Codex thread ownership (without it the scan can only
+    # ever report Unknown, P-CX-4); the outbox drain spawns `ssh` to tunnel
+    # a letter to a loopback-door node and then `curl` to POST it through
+    # the tunnel (`client/src/commands.rs::post_json_to_node`) — without
+    # either, every daemon-side delivery fails with a spawn error and its
+    # backoff holds the CLI's own attempt off.
     path = [
       pkgs.procps
       pkgs.openssh
+      pkgs.curl
     ];
 
     serviceConfig = {
