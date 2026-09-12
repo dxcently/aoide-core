@@ -93,6 +93,7 @@
   CLI thread or unknown and gets NO app record. A tracked non-app
   record already sitting on that id is never touched either way
   (root ruling, P-CX-2b).
+
 - **A failed or incomplete desktop-Codex scan is `Unknown`, and `Unknown`
   changes no record — only a positively observed set does (Codex ruling
   seq 211, P-CX-4).** `codex_app.rs::ThreadScan` is the seam: `Observed`
@@ -104,14 +105,12 @@
   `reconcile_codex_app_threads` returns `(sessions, false)` untouched on
   `Unknown`: nothing removed, nothing inserted, nothing upserted, no
   petname re-minted. `sync_codex_app_threads` takes no stage lock and
-  writes nothing on `Unknown` either. Conflating a failed observation with
-  a confirmed thread exit is exactly the defect this exists to close (a
-  daemon unit with no `ps` on `PATH` read every held lock as released and
-  dropped both live desktop records, which a Hyprland-listener unit with
-  `ps` then re-enrolled under fresh petnames on its own next tick — an
-  observable churn loop). Don't let a future discovery step swallow its own
-  error into an empty `Vec` "to keep the signature simple" — every dead end
-  in the gather must surface as `Unknown`, never as a silent `Observed(empty)`.
+  writes nothing on `Unknown` either. A failed observation is never a
+  confirmed exit: a discovery step that swallows its own error into an
+  empty `Vec` turns every enrolled thread into a drop-and-re-mint loop the
+  moment one writer lacks what the scan needs (the log holds the incident),
+  so every dead end in the gather surfaces as `Unknown`, never as a silent
+  `Observed(empty)`.
 
 - **`session bind` assigns continuity, never authority.** Keep the operation
   daemon-owned and local-only; no missing-daemon fallback. It does not load
