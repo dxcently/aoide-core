@@ -417,10 +417,17 @@ never the inbound/serve half (that's `aoide-server`).
   may hold that dial:** `handle_mail_send` mints and spools an outbound
   letter through `aoide_storage::mail`/`outbox` exactly as before, then —
   new at P-M2, for a non-self `to` — makes ONE best-effort call into
-  `mail_wire::drain_node` before returning, reporting only the WRITE
-  regardless of what that attempt did (spec item 8; the periodic daemon
-  tick and the door's own post-heard drain are what actually guarantee
-  delivery, this call is purely a latency shortcut). Its node-branch gate
+  `mail_wire::drain_node` before returning; the spool's own success (the
+  WRITE) is the `Outcome`, never gated on what that dial did (spec item 8;
+  the periodic daemon tick and the door's own post-heard drain are what
+  actually guarantee delivery, this call is purely a latency shortcut).
+  What the dial found IS surfaced, though: `data.delivery` is filled in
+  after the drain attempt by `delivery_projection`, the same read-only
+  join of an outbox entry with its node's `read_link_state` that
+  `handle_mail_outbox` uses — see "Status and the nodelist view" in
+  `docs/architecture/MAIL.md` for the status vocabulary. A post-spool read
+  that itself fails degrades `delivery` to `queued`/"status unavailable"
+  without ever touching the spool's own `Ok`. Its node-branch gate
   is deliberately shallow — it requires `verified` off `node_store::
   load_nodes()` and nothing more, the SAME "the client checks reachability
   of a record, never a granular capability" precedent `handle_node_spawn`
@@ -441,8 +448,12 @@ never the inbound/serve half (that's `aoide-server`).
   `handle_mail_outbox` (`mail outbox [node]`) is the spool's own read-only
   status view — an optional node arg narrows to one, otherwise every node
   `outbox::nodes_with_outbox` reports — rendering each `list_entries` row's
-  msgid/to/tries/lastTryAt/lastOutcome/refused, "outbox empty" when there is
-  nothing waiting anywhere. `handle_mail_outbox_rm` (`mail outbox rm
+  msgid/to/tries/lastTryAt/lastOutcome/refused plus the same `delivery`
+  projection `mail send` fills in (one `read_link_state` per node, joined
+  onto each of that node's entries, never copied into per-entry state);
+  "outbox empty" when there is nothing waiting anywhere. This command
+  never dials — it is the read side of the projection, not a drain.
+  `handle_mail_outbox_rm` (`mail outbox rm
   <msgid>`) is an exact-msgid removal, NOT the mailbase `mail rm`'s
   age-based prune — it walks `nodes_with_outbox` and calls
   `outbox::remove_entry(node, msgid)` on each until one actually held that

@@ -600,16 +600,20 @@
   implementation to keep in sync with the server side.
 - **`handle_mail_send` reports the WRITE, never the drain's outcome (spec
   item 8).** Minting and spooling the outbox entry is what the command's
-  `Outcome` describes; the best-effort `mail_wire::drain_node` call after
-  it is a latency shortcut only, its `Result` deliberately discarded
-  (`let _ =`). A dead node, a policy refusal, a transport failure — none
-  of these may change `mail send`'s own reported success, because the
-  entry is genuinely and durably spooled regardless of what the drain did;
-  `mail outbox` or the next periodic tick is where a caller checks what
-  actually happened to it. Don't thread the drain's `Err` back into this
-  command's own return value — that would make delivery latency (a
+  `Outcome` status describes; the best-effort `mail_wire::drain_node` call
+  after it is a latency shortcut only, and its `Err` (a genuine local I/O
+  failure inside the drain itself, never "remote unreachable") never
+  downgrades an already-durable spool to `Outcome::error`. What the drain
+  found IS read back, though — not for the `Outcome`, but to fill
+  `data.delivery` via `delivery_projection` (also used by `mail outbox`;
+  see `docs/architecture/MAIL.md` "Status and the nodelist view" for the
+  status vocabulary and its precedence). A post-spool read that itself
+  fails degrades `delivery` to `queued`/"status unavailable", never the
+  command's own `Ok`. Don't thread the drain's `Err` back into this
+  command's own return VALUE — that would make delivery latency (a
   background daemon's schedule) leak into a command that already
-  succeeded at its own job.
+  succeeded at its own job; the drain's result is data for the projection,
+  not a verdict on the spool.
 
 ## Extension points
 
@@ -643,8 +647,9 @@
   verbatim rather than re-deriving or pre-checking `allows` on this side.
   A caller that also needs to dial out on its own (as `mail send` does)
   reuses `mail_wire::drain_node`'s shape — one wire function, called
-  best-effort, its outcome never gating the command's own report — rather
-  than opening a second ad hoc POST.
+  best-effort, its outcome never gating the command's own `Outcome` status
+  (though it may feed a read-only `data.delivery` projection afterward, as
+  `mail send` does) — rather than opening a second ad hoc POST.
 
 ## Docs update required in the same commit
 
