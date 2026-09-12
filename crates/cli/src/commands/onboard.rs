@@ -42,7 +42,7 @@ pub fn register(r: &mut Registry) {
         summary: "First-boot flow: register the clone, seed songbook, wire harness hooks, delegate the nix half to `lyra onboard` when lyra is available, print the guide.",
         args: [],
         flags: [
-            flag!("harness", "string", "Comma-separated harnesses to wire (claude,kimi,pi); given at all, skips the interactive ask and wires exactly this list (default: ask on a tty, else every harness found on PATH)."),
+            flag!("harness", "string", "Comma-separated harnesses to wire (claude,kimi,pi,eidolon); given at all, skips the interactive ask and wires exactly this list (default: ask on a tty, else every harness found on PATH)."),
             flag!("yes", "bool", "Skip every interactive prompt end to end, including the lyra delegate step: use --harness if given, else every harness found on PATH."),
             flag!("out", "string", "Forwarded to `lyra onboard` as its own --out (default: lyra's own default, ./aoide.nix); omitted unless given here."),
         ],

@@ -1589,6 +1589,6 @@ mod tests {
         let data = out.data.unwrap();
         assert_eq!(data["reason"], "unknown-agent");
         assert_eq!(data["agent"], "bogus");
-        assert_eq!(data["known"], json!(["claude", "kimi", "pi"]));
+        assert_eq!(data["known"], json!(["claude", "kimi", "pi", "eidolon"]));
     }
 }
