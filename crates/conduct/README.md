@@ -388,9 +388,11 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   rule for rule (upsert in place, remove what is no longer desired,
   change-only writes) but keyed DIRECTLY by the Codex thread's own native
   id — no synthetic `win:`-style prefix, because the thread id is already a
-  stable identity. Every record it writes carries a fixed
-  `agent:"codex"`/`kind:"app"`/`state:"idle"` identity, re-applied on every
-  upsert; `windowAddress`/`workspace` are left empty for the existing
+  stable identity. A freshly enrolled record carries a fixed
+  `agent:"codex"`/`kind:"app"`/`state:"idle"` identity; an existing
+  record's `state` is `apply_codex_capture`'s own to move from there, off
+  the rollout's own turn bracket (`working`/`idle`, never `awaiting`).
+  `windowAddress`/`workspace` are left empty for the existing
   `resolve_pending_session_windows` sweep to fill — this module has no
   compositor access.
 
@@ -506,12 +508,16 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   struct's own snake_case field names, so `apply_codex_capture` remaps at
   the boundary (`MERGED_SOURCE_FIELDS`: `context_tokens` → `contextTokens`,
   `context_ceiling` → `contextCeiling`, the rest unchanged) and copies ONLY
-  the fields it actually applies — a `state`/`parentThreadId`/`nickname`
-  pointer `cap.sources` may carry is never copied, since this merge never
-  sets those VALUES. `state`, `parentSessionId`, `title`, and `nickname` are
-  untouched by this merge — later slices' own territory (S3 the state
-  consumer enumeration, S4 the subagent edge), never this one's to set. See
-  CONTRACTS.md §4 for the `sources` schema entry.
+  the fields it actually applies — a `parentThreadId`/`nickname` pointer
+  `cap.sources` may carry is never copied, since this merge never sets
+  those VALUES. `state` moved at P-CX-5 S3: `apply_codex_capture` now sets
+  it too, from `cap.state` when `Some` and different, never blanked back
+  out by a `None` read (an unreadable, missing, or momentarily empty
+  rollout) — but its `sources` pointer stays out of `MERGED_SOURCE_FIELDS`
+  on purpose, same as before S3: the VALUE moves, the provenance pointer
+  does not. `parentSessionId`, `title`, and `nickname` remain untouched by
+  this merge — later slices' own territory (S4 the subagent edge), never
+  this one's to set. See CONTRACTS.md §4 for the `sources` schema entry.
 - `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below). The socket answers exactly one command with a reply,

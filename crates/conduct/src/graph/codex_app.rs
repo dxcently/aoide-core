@@ -36,18 +36,24 @@
 //! (`send`, `session kill`) are a later slice (P-CX-3).
 //!
 //! `sync_codex_app_threads` also merges each live thread's own
-//! [`super::codex_capture::capture_for`] onto its `"app"` record (P-CX-5 S2):
-//! `say`/`tool`/`activity`/`model`/`context_tokens`/`context_ceiling`/
-//! `sources`, set only when the capture produced a value and only when it
+//! [`super::codex_capture::capture_for`] onto its `"app"` record: `state`
+//! (P-CX-5 S3, `working`/`idle` off the thread's own open-turn bracket,
+//! never `awaiting` — the fold cannot produce it) plus `say`/`tool`/
+//! `activity`/`model`/`context_tokens`/`context_ceiling`/`sources` (P-CX-5
+//! S2), each set only when the capture produced a value and only when it
 //! actually differs — the same "never clear, only set" discipline
 //! `session_store.rs`'s `refresh_transcript_fields` already holds for the
-//! very same fields. `sources` keys remap from `CodexCapture`'s own
-//! snake_case field names to `SessionRecord`'s wire camelCase
-//! (`context_tokens` → `contextTokens`, etc. — [`MERGED_SOURCE_FIELDS`]),
-//! and only ever carry an entry for a field this merge actually applies:
-//! `state`, `parentSessionId`, `title`, and `nickname` stay untouched by
-//! this merge (a later slice's own territory — S3, S4), and their pointers
-//! in `cap.sources` are never copied either. See [`apply_codex_capture`].
+//! very same fields, `state` included: a `None` read (an unreadable,
+//! missing, or empty rollout) leaves the record's last state exactly where
+//! it was rather than resetting it. `sources` keys remap from
+//! `CodexCapture`'s own snake_case field names to `SessionRecord`'s wire
+//! camelCase (`context_tokens` → `contextTokens`, etc. —
+//! [`MERGED_SOURCE_FIELDS`]), and only ever carry an entry for a field this
+//! merge actually applies from a pointer: `state`'s own pointer is never one
+//! of them (its value moves without a `sources` entry, same as before S3),
+//! and `parentSessionId`/`title`/`nickname` stay untouched by this merge
+//! altogether (S4's own territory) — their pointers in `cap.sources` are
+//! never copied either. See [`apply_codex_capture`].
 
 use super::codex_capture::{capture_for, CodexCapture};
 use super::doc::restage_graph;
@@ -150,8 +156,12 @@ pub(crate) enum ScanFailure {
 ///     P-CX-2b).
 ///
 /// Every record this function writes carries a fixed identity
-/// (`agent:"codex"`, `kind:"app"`, `state:"idle"`), re-applied on every
-/// upsert rather than assumed. `kind:"app"` is why `crate::reap::is_agent_kind`
+/// (`agent:"codex"`, `kind:"app"`), re-applied on every upsert rather than
+/// assumed. `state` is NOT part of that fixed identity past enrolment: a
+/// freshly INSERTED record starts `"idle"` (no capture has run for it yet),
+/// but an already-enrolled record's `state` is left exactly as this
+/// function found it — [`apply_codex_capture`]'s own turn-bracket read (S3)
+/// is the one writer for it from here on, never this upsert. `kind:"app"` is why `crate::reap::is_agent_kind`
 /// reads false for these records — which keeps them out of BOTH
 /// `superseded_agent_duplicates` (N threads legitimately share one app
 /// window address; that dedup would otherwise retire N−1 of them) and
@@ -212,12 +222,12 @@ pub(crate) fn reconcile_codex_app_threads(
             }
             // The fixed identity, re-applied every upsert — never left to
             // drift even if something else touched the record in between.
+            // `state` is deliberately NOT part of this — an already-enrolled
+            // record's state is `apply_codex_capture`'s to move (S3), off
+            // the fold's own turn-bracket read; forcing it back to `"idle"`
+            // here would blank a real `working` turn on every single tick.
             if rec.agent != "codex" {
                 rec.agent = "codex".to_string();
-                changed = true;
-            }
-            if rec.state != "idle" {
-                rec.state = "idle".to_string();
                 changed = true;
             }
             if rec.kind.as_deref() != Some("app") {
@@ -665,31 +675,44 @@ const MERGED_SOURCE_FIELDS: &[(&str, &str)] = &[
     ("context_ceiling", "contextCeiling"),
 ];
 
-/// Merge [`CodexCapture`]'s fields onto `rec` — `say`/`tool`/`activity`/
-/// `model`/`context_tokens`/`context_ceiling`/`sources`, each set only when
-/// `cap` produced `Some` AND the value actually differs: a quiet or
+/// Merge [`CodexCapture`]'s fields onto `rec` — `state`/`say`/`tool`/
+/// `activity`/`model`/`context_tokens`/`context_ceiling`/`sources`, each set
+/// only when `cap` produced `Some` AND the value actually differs: a quiet or
 /// partial tail read (every field `None`) changes nothing, and a value
 /// this merge already set is never blanked back out just because a LATER
 /// tick's tail window no longer covers the record that set it — the same
 /// "never clear, only set" discipline `session_store.rs`'s
-/// `refresh_transcript_fields` already holds for these very fields.
+/// `refresh_transcript_fields` already holds for these very fields, `state`
+/// included (P-CX-5 S3): an unreadable, missing, or empty rollout reads
+/// `cap.state` as `None` and leaves the record's last state exactly where it
+/// was, never resetting it to `"idle"`. `cap.state` is only ever
+/// `working`/`idle` (the fold's own vocabulary — see `codex_capture.rs`), so
+/// this merge can never write `"awaiting"` onto an app record either.
 /// `sources` is EXTENDED, never replaced, and restricted to
 /// [`MERGED_SOURCE_FIELDS`]: a `state`/`parent_thread_id`/`thread_source`/
-/// `nickname` pointer `cap.sources` may carry is never copied here, because
-/// this merge never sets those VALUES — a `sources` entry names a field
-/// THIS record actually carries from a pointed source, never a promise
-/// about one a later slice (S3, S4) has not landed yet. An entry already on
-/// `rec.sources` with no counterpart in `cap.sources` this tick is left
-/// standing — a shown datum's pointer must not vanish just because a later
-/// capture happened not to re-see the record that set it. Returns whether
-/// anything changed.
+/// `nickname` pointer `cap.sources` may carry is never copied here — `state`
+/// stays out of that list even though its VALUE now moves (its pointer is
+/// not yet part of this scheme), and `parent_thread_id`/`thread_source`/
+/// `nickname` stay out because this merge never sets those values at all —
+/// a `sources` entry names a field THIS record actually carries a pointer
+/// FOR, never a promise about one a later slice (S4) has not landed yet. An
+/// entry already on `rec.sources` with no counterpart in `cap.sources` this
+/// tick is left standing — a shown datum's pointer must not vanish just
+/// because a later capture happened not to re-see the record that set it.
+/// Returns whether anything changed.
 ///
-/// Deliberately never touches `state`, `parent_session_id`, `title`, or
-/// `nickname` even though `cap` may carry values for them — those are S3's
-/// (`state`) and S4's (the subagent edge) own slices, never this merge's.
+/// Deliberately never touches `parent_session_id`, `title`, or `nickname`
+/// even though `cap` may carry values for the lineage ones — that's S4's
+/// (the subagent edge) own slice, never this merge's.
 fn apply_codex_capture(rec: &mut SessionRecord, cap: &CodexCapture) -> bool {
     let mut changed = false;
 
+    if let Some(state) = &cap.state {
+        if rec.state != *state {
+            rec.state = state.clone();
+            changed = true;
+        }
+    }
     if let Some(say) = &cap.say {
         if rec.say.as_deref() != Some(say.as_str()) {
             rec.say = Some(say.clone());
@@ -959,25 +982,44 @@ mod tests {
     }
 
     #[test]
-    fn an_app_record_never_publishes_a_state_other_than_idle() {
-        // Simulate a record whose state drifted away from "idle" by some
-        // other path; the next reconcile must force it back.
-        let mut drifted = session("01a07d89-drift", "/home/khoa/Aoide", "working", "t", None);
-        drifted.agent = "codex".to_string();
-        drifted.kind = Some("app".to_string());
-        drifted.pid = Some(2598256);
+    fn the_upsert_leaves_an_existing_records_state_alone() {
+        // S3: the reconciler's own upsert no longer hard-sets "idle" onto an
+        // existing app record — `apply_codex_capture` is the one writer for
+        // state from here on, off the fold's turn-bracket read. A record
+        // sitting at "working" (a real open turn) must survive this pass
+        // untouched, on a tick where nothing else about it changed either.
+        let mut working = session("01a07d89-working", "/home/khoa/Aoide", "working", "t", None);
+        working.agent = "codex".to_string();
+        working.kind = Some("app".to_string());
+        working.pid = Some(2598256);
         let (out, changed) = reconcile_codex_app_threads(
-            vec![drifted],
-            &ThreadScan::Observed(vec![thread("01a07d89-drift", "/home/khoa/Aoide", 2598256)]),
+            vec![working],
+            &ThreadScan::Observed(vec![thread(
+                "01a07d89-working",
+                "/home/khoa/Aoide",
+                2598256,
+            )]),
         );
         assert!(
-            changed,
-            "correcting a drifted state must report a change"
+            !changed,
+            "an unchanged working record must report no change from this upsert alone"
         );
         assert_eq!(
-            out[0].state, "idle",
-            "an app record must never publish a state other than idle"
+            out[0].state, "working",
+            "the upsert must never force a live thread's state back to idle"
         );
+    }
+
+    #[test]
+    fn a_freshly_enrolled_app_record_still_starts_idle() {
+        // A brand NEW record (no capture has run for it yet) still starts
+        // "idle" — only an ALREADY-enrolled record's state is left alone.
+        let (out, changed) = reconcile_codex_app_threads(
+            vec![],
+            &ThreadScan::Observed(vec![thread("01a07d89-fresh", "/home/khoa/Aoide", 2598256)]),
+        );
+        assert!(changed);
+        assert_eq!(out[0].state, "idle");
     }
 
     // ---- P-CX-2: discovery fixtures --------------------------------------
@@ -1617,17 +1659,17 @@ mod tests {
     }
 
     #[test]
-    fn the_merge_never_touches_state_lineage_or_title() {
-        // `cap` carries values for `state`/`parent_thread_id`/`nickname`
-        // (a real capture off a rollout with a `session_meta` header would),
-        // but this merge must never read them: `state` is S3's slice,
-        // `parent_thread_id`/`nickname` (the subagent edge) is S4's — R2/R3
-        // forbid touching either here.
+    fn the_merge_still_never_touches_lineage_or_title() {
+        // `cap` carries values for `parent_thread_id`/`nickname` (a real
+        // capture off a rollout with a `session_meta` header would), but
+        // this merge must never read them: the subagent edge is S4's own
+        // slice — R3 forbids touching it here. `state` moved OUT of this
+        // untouched set at S3; see `a_drifted_state_is_corrected_to_the_folded_one`
+        // and friends for its own coverage.
         let mut rec = app_record("01a-lineage");
         rec.title = Some("original title".to_string());
         let before = rec.clone();
         let cap = CodexCapture {
-            state: Some("working".to_string()),
             parent_thread_id: Some("01a-parent".to_string()),
             thread_source: Some("subagent".to_string()),
             nickname: Some("Laplace".to_string()),
@@ -1636,11 +1678,94 @@ mod tests {
         let changed = apply_codex_capture(&mut rec, &cap);
         assert!(
             !changed,
-            "none of cap's set fields are ones this merge reads"
+            "none of cap's set fields here are ones this merge reads"
         );
         assert_eq!(rec.state, before.state);
         assert_eq!(rec.parent_session_id, before.parent_session_id);
         assert_eq!(rec.title, before.title);
+    }
+
+    #[test]
+    fn an_app_record_reads_working_while_its_turn_is_open() {
+        // The fold's own `working` read (an unclosed `task_started`) flips
+        // an app record off its default `idle` the moment the merge runs.
+        let mut rec = app_record("01a-mid-turn");
+        let cap = CodexCapture {
+            state: Some("working".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            apply_codex_capture(&mut rec, &cap),
+            "an open turn must flip an idle app record to working"
+        );
+        assert_eq!(rec.state, "working");
+    }
+
+    #[test]
+    fn a_drifted_state_is_corrected_to_the_folded_one() {
+        // A record sitting on a STALE state (from a prior tick's read) must
+        // be corrected the moment a fresh capture disagrees with it — in
+        // either direction, not just idle-to-working.
+        let mut gone_stale_working = app_record("01a-drift-to-idle");
+        gone_stale_working.state = "working".to_string();
+        let closed = CodexCapture {
+            state: Some("idle".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            apply_codex_capture(&mut gone_stale_working, &closed),
+            "a closed turn must correct a stale working state"
+        );
+        assert_eq!(gone_stale_working.state, "idle");
+
+        let mut gone_stale_idle = app_record("01a-drift-to-working");
+        gone_stale_idle.state = "idle".to_string();
+        let reopened = CodexCapture {
+            state: Some("working".to_string()),
+            ..Default::default()
+        };
+        assert!(
+            apply_codex_capture(&mut gone_stale_idle, &reopened),
+            "a freshly opened turn must correct a stale idle state"
+        );
+        assert_eq!(gone_stale_idle.state, "working");
+    }
+
+    #[test]
+    fn an_app_record_still_never_publishes_awaiting() {
+        // Even a record that somehow started in "awaiting" (never a real
+        // path — an app record gets no hook to ever phase it there) is
+        // corrected the moment a real capture disagrees: the fold's own
+        // vocabulary (`working`|`idle`) has no third value to preserve or
+        // invent, so this merge can never leave, or produce, "awaiting".
+        let mut rec = app_record("01a-no-awaiting");
+        rec.state = "awaiting".to_string();
+        let cap = CodexCapture {
+            state: Some("working".to_string()),
+            ..Default::default()
+        };
+        assert!(apply_codex_capture(&mut rec, &cap));
+        assert_eq!(rec.state, "working");
+        assert_ne!(rec.state, "awaiting");
+    }
+
+    #[test]
+    fn an_unreadable_rollout_leaves_the_state_alone() {
+        // The core S3 acceptance: a capture that read nothing (`cap.state`
+        // `None` — a missing, unreadable, or empty-tail rollout) must leave
+        // the record's PRIOR state exactly where it was, never resetting it
+        // to "idle" the way the old hard-set upsert used to.
+        let mut rec = app_record("01a-unreadable-state");
+        rec.state = "working".to_string();
+        let changed = apply_codex_capture(&mut rec, &CodexCapture::default());
+        assert!(
+            !changed,
+            "a None state read must never itself report a change"
+        );
+        assert_eq!(
+            rec.state, "working",
+            "a None capture must never reset an app record's state back to idle"
+        );
     }
 
     #[test]
@@ -1722,11 +1847,13 @@ mod tests {
 
     #[test]
     fn a_state_or_lineage_pointer_in_cap_sources_is_never_copied() {
-        // A capture off a `session_meta` header points `state`/
-        // `parent_thread_id`/`thread_source`/`nickname` even though this
-        // merge never applies their VALUES (S3/S4's own slices) — a
-        // `sources` entry must never promise a field the record does not
-        // actually carry from that source yet.
+        // A capture off a `session_meta`/turn-bracket header points `state`/
+        // `parent_thread_id`/`thread_source`/`nickname`. `state`'s own VALUE
+        // now moves at S3 (so `changed` is `true` here), but none of these
+        // four keys is in `MERGED_SOURCE_FIELDS` — `state`'s pointer is not
+        // yet part of that scheme, and the lineage ones are S4's own slice —
+        // so `rec.sources` must stay `None`: a `sources` entry must never
+        // promise a field the record does not actually carry a pointer for.
         let mut rec = app_record("01a-no-lineage-pointer");
         let mut sources = BTreeMap::new();
         sources.insert("state".to_string(), "/rollout.jsonl#0".to_string());
@@ -1746,9 +1873,13 @@ mod tests {
         };
         let changed = apply_codex_capture(&mut rec, &cap);
         assert!(
-            !changed,
+            changed,
+            "state's own value still moves even though its pointer is never copied"
+        );
+        assert_eq!(rec.state, "working");
+        assert_eq!(
+            rec.sources, None,
             "none of cap.sources's keys are ones this merge ever copies"
         );
-        assert_eq!(rec.sources, None);
     }
 }

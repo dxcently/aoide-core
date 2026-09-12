@@ -124,14 +124,17 @@
   alone). A tail cut that opens mid-record drops that leading fragment
   WHOLE, never parsed — the same rule an encrypted `reasoning` record and a
   truncated `task_started` already hold in the fold itself. The merge onto a
-  `kind:"app"` record (`apply_codex_capture`) touches only `say`/`tool`/
+  `kind:"app"` record (`apply_codex_capture`) touches `state`/`say`/`tool`/
   `activity`/`model`/`context_tokens`/`context_ceiling`/`sources`, each set
   only when the capture produced a value and only when it differs — never
-  blanked back out by a quiet tick. `state`, `parentSessionId`, `title`, and
-  `nickname` are deliberately untouched by that merge: `state` is a LATER
-  slice's to set only once every consumer of an app record's `state` is
-  enumerated by file:line (ruling R2), and the subagent edge
-  (`parent_thread_id`/`nickname`) is a later slice's too (R3's "one producer
+  blanked back out by a quiet tick. `state` is folded to `working`/`idle`
+  off the rollout's own open-turn bracket and NEVER `awaiting` (P-CX-5 S3,
+  every consumer of an app record's `state` enumerated by file:line under
+  ruling R2 first); a `None` read (unreadable, missing, or momentarily
+  empty rollout) leaves the record's last-known `state` alone rather than
+  resetting it. `parentSessionId`, `title`, and `nickname` remain
+  deliberately untouched by that merge — the subagent edge
+  (`parent_thread_id`/`nickname`) is a later slice's own (R3's "one producer
   per shape" also means `sources` itself never grows a second writer without
   its own slice). `capture_for` memoises per thread (a process-static, no
   signature change) so a live thread's ~1 Hz callers don't each re-scan a

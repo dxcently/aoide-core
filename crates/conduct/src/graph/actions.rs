@@ -384,6 +384,20 @@ mod tests {
         );
     }
     #[test]
+    fn killing_a_codex_app_record_in_working_state_still_refuses() {
+        // P-CX-5 S3: an app record's `state` now reads real `working`/`idle`
+        // instead of a hard-coded `idle` — `kill_target`'s refusal checks
+        // `kind`, never `state`, so a record whose turn is actually open
+        // must refuse identically to an idle one.
+        let mut app = rec("01a07d89-app-working");
+        app.kind = Some("app".to_string());
+        app.state = "working".to_string();
+        assert_eq!(
+            kill_target("01a07d89-app-working", &[app]).unwrap_err(),
+            APP_OWNS_PROCESS
+        );
+    }
+    #[test]
     fn kill_target_never_walks_through_a_subagent() {
         let mut c = rec("c");
         c.conductable = None;

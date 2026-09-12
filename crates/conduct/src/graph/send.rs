@@ -4257,6 +4257,48 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
+    fn a_codex_app_record_in_working_state_also_refuses_a_send() {
+        // P-CX-5 S3: an app record's `state` now reads real `working`/`idle`
+        // off its own rollout instead of a hard-coded `idle` — the refusal
+        // is keyed on `kind`, not `state`, and must hold exactly the same
+        // for a record whose turn is actually open.
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_AUDIT_LOG"]);
+
+        let root = unique_stage("send-codex-app-working");
+        let stage = root.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_AUDIT_LOG", root.join("log"));
+
+        let mut app = session(
+            "01a07d89-app-working",
+            "/home/khoa/Aoide",
+            "working",
+            "1",
+            None,
+        );
+        app.agent = "codex".to_string();
+        app.kind = Some("app".to_string());
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![app],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let out = session_send(&send_invocation(
+            &["hi"],
+            &[("id", "01a07d89-app-working"), ("yes", "true")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(
+            out.data.as_ref().unwrap()["reason"],
+            "codex-app-unsupported"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+    #[test]
     fn the_unsupported_refusal_names_the_app_as_the_server_owner() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_AUDIT_LOG"]);
