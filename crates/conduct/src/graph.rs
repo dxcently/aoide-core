@@ -23,6 +23,11 @@ pub use actions::{session_kill, session_project};
 // `reap.rs`'s own title refresh. Only `reconcile_codex_app_threads` itself
 // stays reachable from its own tests alone.
 mod codex_app;
+// S1 of P-CX-5 (native Codex capture, the codex-integration follow-on): the
+// PURE fold from a rollout's own JSONL lines into a `CodexCapture` — no I/O,
+// no stage, no call site yet (the bounded reader and the upsert are a later
+// slice). Reachable only from its own tests until then.
+mod codex_capture;
 mod common;
 mod conduct;
 mod doc;

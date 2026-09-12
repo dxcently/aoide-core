@@ -1,0 +1,805 @@
+//! S1 of P-CX-5 (native Codex capture, the codex-integration follow-on): the
+//! PURE fold from a Codex rollout's own JSONL lines into one
+//! [`CodexCapture`]. No I/O, no stage write, no call site yet — the bounded
+//! tail reader and the upsert onto a `kind:"app"` `SessionRecord` are a
+//! later slice; this module is reachable only from its own tests until then,
+//! the same standing every module in this crate carries at its own P-CX-1
+//! stage (see `codex_app.rs`'s module doc for the precedent).
+//!
+//! [`fold_rollout`] walks `lines` in order; `ordinal` is the line's own
+//! position in the slice, never a value read out of the record itself — the
+//! ruling that pins the pointer contract. A line that fails to parse as
+//! JSON, whether truncated by a tail cut or simply malformed, contributes
+//! nothing: nothing here ever infers a field from a record it could not
+//! read whole. Every value this fold DOES capture carries a `sources`
+//! pointer (`<path>#<ordinal>`), so a rendered datum with no pointer is a
+//! bug in a caller, never a judgement call made here.
+//!
+//! Two record shapes are recognised but always contribute nothing: a
+//! `response_item`/`reasoning` record (opaque `encrypted_content`, empty
+//! `summary`) and an `event_msg`/`item_completed` record whose item is
+//! `Reasoning` (`summary_text`/`raw_content`, always empty on disk). A
+//! reasoning trace is not on disk in any readable form, and no adjacent
+//! record is ever fashioned into one.
+//!
+//! `state` is derived from the ORDER task-lifecycle events appear in, never
+//! from elapsed time: the latest of `task_started`/`task_complete`/
+//! `turn_aborted` decides `working`/`idle`. Nothing here ever produces
+//! `awaiting` — there is no such event in the app's own records to read.
+//!
+//! `prompt` — the user's own latest turn, clipped to one line — is captured
+//! under D1 (root ruling, codex seq 228: scope is Aoide's existing session
+//! surfaces only). That authorization changes nothing about what this pure
+//! function does; it folds one more field, sourced and pointed exactly like
+//! every other.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+
+use serde_json::Value;
+
+/// One-line clip bounds, matching the shape `aoide-protocol::agents`'s own
+/// harness extractors already use (`SAY_MAX`/`TOOL_MAX`) for the same
+/// purpose — kept local rather than reached into, since that crate's own
+/// helpers are private to it.
+const SAY_MAX: usize = 160;
+const PROMPT_MAX: usize = 160;
+const TOOL_MAX: usize = 120;
+const ACTIVITY_MAX: usize = 120;
+
+/// A pure fold of one Codex rollout's own JSONL records — the shape a later
+/// slice's I/O wrapper upserts onto a `kind:"app"` `SessionRecord`. Every
+/// field starts `None`; [`fold_rollout`] is the only way to produce one with
+/// anything filled in.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct CodexCapture {
+    /// `working` while a turn's `task_started` is unclosed, `idle` once a
+    /// `task_complete`/`turn_aborted` closes it — never `awaiting`, never
+    /// downgraded by elapsed time (this fold never reads a clock).
+    pub state: Option<String>,
+    /// The tool call in flight: the latest `custom_tool_call`/`function_call`
+    /// with no later matching `*_output` for the same `call_id`. Absent when
+    /// nothing is in flight.
+    pub activity: Option<String>,
+    /// The latest completed `CommandExecution`/`McpToolCall`/`FileChange`,
+    /// one line, `<kind>: <subject>` — mirrors `tool_label`'s shape.
+    pub tool: Option<String>,
+    /// The latest agent message, clipped to one line.
+    pub say: Option<String>,
+    /// The latest user message, clipped to one line (D1 — see the module
+    /// doc).
+    pub prompt: Option<String>,
+    /// The latest turn's model, from `turn_context` — per-turn, never a
+    /// configured default for a thread that has not yet taken one.
+    pub model: Option<String>,
+    /// Occupancy: the latest `token_count`'s `last_token_usage.input_tokens`
+    /// alone — never the cumulative `total_token_usage`, never summed with
+    /// the `cached_input_tokens` field already inside it.
+    pub context_tokens: Option<u64>,
+    /// The same record's `model_context_window` — the app's own number.
+    pub context_ceiling: Option<u64>,
+    /// `session_meta.parent_thread_id`, written once at the thread's birth.
+    pub parent_thread_id: Option<String>,
+    /// `session_meta.thread_source` — `user`/`subagent`/`guardian_review`.
+    pub thread_source: Option<String>,
+    /// `session_meta.agent_nickname`.
+    pub nickname: Option<String>,
+    /// The newest `timestamp` of any record this capture actually used —
+    /// an "as of," never a wall-clock read.
+    pub captured_at: Option<String>,
+    /// Field name → `<path>#<ordinal>` pointer, filled only for a field this
+    /// fold actually set. `None` on a rollout that captured nothing at all.
+    pub sources: Option<BTreeMap<String, String>>,
+}
+
+/// `<path>#<ordinal>` — the one pointer shape every captured field uses.
+fn pointer(path: &Path, ordinal: usize) -> String {
+    format!("{}#{ordinal}", path.display())
+}
+
+/// Note that `field` was captured at `ordinal`, and widen `captured_at` to
+/// this record's own `timestamp` when it is newer than what's already held.
+/// ISO-8601 UTC timestamps of the app's own fixed format sort correctly as
+/// plain strings, so no parse is needed here.
+fn record_pointer(
+    sources: &mut BTreeMap<String, String>,
+    captured_at: &mut Option<String>,
+    field: &'static str,
+    path: &Path,
+    ordinal: usize,
+    ts: Option<&str>,
+) {
+    sources.insert(field.to_string(), pointer(path, ordinal));
+    if let Some(ts) = ts {
+        if captured_at.as_deref().map(|c| c < ts).unwrap_or(true) {
+            *captured_at = Some(ts.to_string());
+        }
+    }
+}
+
+/// Collapse a possibly-multiline string to one whitespace-normalised line,
+/// truncated at a char boundary to `max` chars with a trailing ellipsis —
+/// the same shape `aoide-protocol::agents`'s own extractors already clip a
+/// `say`/`tool` line to.
+fn one_line_clip(s: &str, max: usize) -> String {
+    let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if flat.chars().count() <= max {
+        flat
+    } else {
+        let mut out: String = flat.chars().take(max.saturating_sub(1)).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// Text out of an `AgentMessage`/`UserMessage` item's `content` — either a
+/// bare string, or an array of blocks of which only `{"type":"text",
+/// "text":…}` ones count (the shape the brief's own inventory cites for
+/// `UserMessage`). Every text block found is joined with a space; `None`
+/// when there is nothing to say.
+fn item_text(content: Option<&Value>) -> Option<String> {
+    match content? {
+        Value::String(s) => {
+            let t = s.trim();
+            (!t.is_empty()).then(|| t.to_string())
+        }
+        Value::Array(blocks) => {
+            let parts: Vec<String> = blocks
+                .iter()
+                .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .map(str::trim)
+                .filter(|t| !t.is_empty())
+                .map(str::to_string)
+                .collect();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        _ => None,
+    }
+}
+
+/// The `<kind>: <subject>` label for a completed tool item — degrades to the
+/// bare kind name when the subject can't be read, mirroring `tool_label`'s
+/// own "show the tool that ran even when its subject isn't legible" stance.
+fn tool_label_for(kind: &str, item: &Value) -> String {
+    let summary = match kind {
+        "CommandExecution" => command_execution_summary(item),
+        "McpToolCall" => mcp_tool_call_summary(item),
+        "FileChange" => file_change_summary(item),
+        _ => None,
+    };
+    match summary {
+        Some(s) => one_line_clip(&format!("{kind}: {s}"), TOOL_MAX),
+        None => kind.to_string(),
+    }
+}
+
+/// `parsed_cmd` is the app's own display-ready form when present; a raw
+/// `command` (string, or an argv array) is the fallback.
+fn command_execution_summary(item: &Value) -> Option<String> {
+    if let Some(s) = item.get("parsed_cmd").and_then(Value::as_str) {
+        return Some(s.to_string());
+    }
+    match item.get("command") {
+        Some(Value::String(s)) => Some(s.clone()),
+        Some(Value::Array(argv)) => {
+            let parts: Vec<&str> = argv.iter().filter_map(Value::as_str).collect();
+            (!parts.is_empty()).then(|| parts.join(" "))
+        }
+        _ => None,
+    }
+}
+
+fn mcp_tool_call_summary(item: &Value) -> Option<String> {
+    let server = item.get("server").and_then(Value::as_str)?;
+    let tool = item.get("tool").and_then(Value::as_str)?;
+    Some(format!("{server}/{tool}"))
+}
+
+fn file_change_summary(item: &Value) -> Option<String> {
+    let changes = item.get("changes")?.as_array()?;
+    let parts: Vec<String> = changes
+        .iter()
+        .filter_map(|c| {
+            c.get("path")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .or_else(|| c.as_str().map(str::to_string))
+        })
+        .collect();
+    (!parts.is_empty()).then(|| parts.join(", "))
+}
+
+/// Fold a Codex rollout's own JSONL lines into one [`CodexCapture`]. `path`
+/// names the rollout for the `sources` pointers this produces — this
+/// function never opens it; the bounded read is a later slice's job. A line
+/// that fails to parse, and any record type/shape this fold does not
+/// recognise, contributes nothing.
+pub(crate) fn fold_rollout(path: &Path, lines: &[String]) -> CodexCapture {
+    let mut cap = CodexCapture::default();
+    let mut sources: BTreeMap<String, String> = BTreeMap::new();
+    // `call_id` -> (ordinal, timestamp, one-line label) for a tool call
+    // issued but not yet matched by its own `*_output` record.
+    let mut in_flight: BTreeMap<String, (usize, Option<String>, String)> = BTreeMap::new();
+
+    for (ordinal, line) in lines.iter().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(record) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        let ts = record.get("timestamp").and_then(Value::as_str);
+        let Some(rtype) = record.get("type").and_then(Value::as_str) else {
+            continue;
+        };
+        let payload = record.get("payload");
+
+        match rtype {
+            "session_meta" => {
+                let Some(payload) = payload else { continue };
+                if let Some(v) = payload.get("parent_thread_id").and_then(Value::as_str) {
+                    cap.parent_thread_id = Some(v.to_string());
+                    record_pointer(
+                        &mut sources,
+                        &mut cap.captured_at,
+                        "parent_thread_id",
+                        path,
+                        ordinal,
+                        ts,
+                    );
+                }
+                if let Some(v) = payload.get("thread_source").and_then(Value::as_str) {
+                    cap.thread_source = Some(v.to_string());
+                    record_pointer(
+                        &mut sources,
+                        &mut cap.captured_at,
+                        "thread_source",
+                        path,
+                        ordinal,
+                        ts,
+                    );
+                }
+                if let Some(v) = payload.get("agent_nickname").and_then(Value::as_str) {
+                    cap.nickname = Some(v.to_string());
+                    record_pointer(
+                        &mut sources,
+                        &mut cap.captured_at,
+                        "nickname",
+                        path,
+                        ordinal,
+                        ts,
+                    );
+                }
+            }
+            "turn_context" => {
+                if let Some(v) = payload.and_then(|p| p.get("model")).and_then(Value::as_str) {
+                    cap.model = Some(v.to_string());
+                    record_pointer(
+                        &mut sources,
+                        &mut cap.captured_at,
+                        "model",
+                        path,
+                        ordinal,
+                        ts,
+                    );
+                }
+            }
+            "event_msg" => {
+                let Some(payload) = payload else { continue };
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("task_started") => {
+                        cap.state = Some("working".to_string());
+                        record_pointer(
+                            &mut sources,
+                            &mut cap.captured_at,
+                            "state",
+                            path,
+                            ordinal,
+                            ts,
+                        );
+                    }
+                    Some("task_complete") | Some("turn_aborted") => {
+                        cap.state = Some("idle".to_string());
+                        record_pointer(
+                            &mut sources,
+                            &mut cap.captured_at,
+                            "state",
+                            path,
+                            ordinal,
+                            ts,
+                        );
+                    }
+                    Some("item_completed") => {
+                        let Some(item) = payload.get("item") else {
+                            continue;
+                        };
+                        match item.get("type").and_then(Value::as_str) {
+                            Some(kind @ ("CommandExecution" | "McpToolCall" | "FileChange")) => {
+                                cap.tool = Some(tool_label_for(kind, item));
+                                record_pointer(
+                                    &mut sources,
+                                    &mut cap.captured_at,
+                                    "tool",
+                                    path,
+                                    ordinal,
+                                    ts,
+                                );
+                            }
+                            Some("AgentMessage") => {
+                                if let Some(text) = item_text(item.get("content")) {
+                                    cap.say = Some(one_line_clip(&text, SAY_MAX));
+                                    record_pointer(
+                                        &mut sources,
+                                        &mut cap.captured_at,
+                                        "say",
+                                        path,
+                                        ordinal,
+                                        ts,
+                                    );
+                                }
+                            }
+                            Some("UserMessage") => {
+                                if let Some(text) = item_text(item.get("content")) {
+                                    cap.prompt = Some(one_line_clip(&text, PROMPT_MAX));
+                                    record_pointer(
+                                        &mut sources,
+                                        &mut cap.captured_at,
+                                        "prompt",
+                                        path,
+                                        ordinal,
+                                        ts,
+                                    );
+                                }
+                            }
+                            // Reasoning, SubAgentActivity, and every other
+                            // item type contribute nothing at this slice.
+                            _ => {}
+                        }
+                    }
+                    Some("token_count") => {
+                        let Some(info) = payload.get("info") else {
+                            continue;
+                        };
+                        if let Some(n) = info
+                            .get("last_token_usage")
+                            .and_then(|u| u.get("input_tokens"))
+                            .and_then(Value::as_u64)
+                        {
+                            cap.context_tokens = Some(n);
+                            record_pointer(
+                                &mut sources,
+                                &mut cap.captured_at,
+                                "context_tokens",
+                                path,
+                                ordinal,
+                                ts,
+                            );
+                        }
+                        if let Some(n) = info.get("model_context_window").and_then(Value::as_u64) {
+                            cap.context_ceiling = Some(n);
+                            record_pointer(
+                                &mut sources,
+                                &mut cap.captured_at,
+                                "context_ceiling",
+                                path,
+                                ordinal,
+                                ts,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            "response_item" => {
+                let Some(payload) = payload else { continue };
+                match payload.get("type").and_then(Value::as_str) {
+                    Some("custom_tool_call") | Some("function_call") => {
+                        if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
+                            let name = payload.get("name").and_then(Value::as_str).unwrap_or("");
+                            let label = one_line_clip(name, ACTIVITY_MAX);
+                            in_flight.insert(
+                                call_id.to_string(),
+                                (ordinal, ts.map(str::to_string), label),
+                            );
+                        }
+                    }
+                    Some("custom_tool_call_output") | Some("function_call_output") => {
+                        if let Some(call_id) = payload.get("call_id").and_then(Value::as_str) {
+                            in_flight.remove(call_id);
+                        }
+                    }
+                    // "message" carries prompt/response too, but §3's design
+                    // sources those exclusively off `item_completed` — never
+                    // a second authority for the same datum.
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+
+    if let Some((_, (ordinal, ts, label))) = in_flight
+        .into_iter()
+        .max_by_key(|(_, (ordinal, ..))| *ordinal)
+    {
+        cap.activity = Some(label);
+        record_pointer(
+            &mut sources,
+            &mut cap.captured_at,
+            "activity",
+            path,
+            ordinal,
+            ts.as_deref(),
+        );
+    }
+
+    cap.sources = (!sources.is_empty()).then_some(sources);
+    cap
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn fixture_path() -> PathBuf {
+        PathBuf::from(
+            "/home/khoa/.codex/sessions/2026/09/12/rollout-2026-09-12T09-00-00-01a07d89-thread.jsonl",
+        )
+    }
+
+    fn task_started(ts: &str, turn_id: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"task_started","turn_id":"{turn_id}","started_at":"{ts}","model_context_window":258400,"collaboration_mode_kind":"default"}}}}"#
+        )
+    }
+
+    fn task_complete(ts: &str, turn_id: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"task_complete","turn_id":"{turn_id}","last_agent_message":"done","started_at":"{ts}","completed_at":"{ts}","duration_ms":120,"time_to_first_token_ms":40}}}}"#
+        )
+    }
+
+    fn turn_aborted(ts: &str, turn_id: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"turn_aborted","turn_id":"{turn_id}","reason":"interrupted","started_at":"{ts}","completed_at":"{ts}","duration_ms":90}}}}"#
+        )
+    }
+
+    fn turn_context(ts: &str, model: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"turn_context","payload":{{"turn_id":"t1","root_turn_id":"t1","cwd":"/home/khoa/Aoide","workspace_roots":["/home/khoa/Aoide"],"model":"{model}","effort":"medium","approval_policy":"on-request","sandbox_policy":"workspace-write","permission_profile":"default","collaboration_mode":"default","realtime_active":false}}}}"#
+        )
+    }
+
+    fn item_completed_command(ts: &str, turn_id: &str, command: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"item_completed","thread_id":"th1","turn_id":"{turn_id}","item":{{"type":"CommandExecution","command":"{command}","parsed_cmd":"{command}","cwd":"/home/khoa/Aoide","status":"completed","exit_code":0,"duration":120}},"started_at_ms":0,"completed_at_ms":120}}}}"#
+        )
+    }
+
+    fn item_completed_agent_message(ts: &str, turn_id: &str, text: &str, phase: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"item_completed","thread_id":"th1","turn_id":"{turn_id}","item":{{"type":"AgentMessage","content":[{{"type":"text","text":"{text}"}}],"phase":"{phase}"}},"started_at_ms":0,"completed_at_ms":10}}}}"#
+        )
+    }
+
+    fn item_completed_user_message(ts: &str, turn_id: &str, text: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"item_completed","thread_id":"th1","turn_id":"{turn_id}","item":{{"type":"UserMessage","content":[{{"type":"text","text":"{text}"}}]}},"started_at_ms":0,"completed_at_ms":10}}}}"#
+        )
+    }
+
+    fn item_completed_reasoning(ts: &str, turn_id: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"item_completed","thread_id":"th1","turn_id":"{turn_id}","item":{{"type":"Reasoning","summary_text":"","raw_content":[]}},"started_at_ms":0,"completed_at_ms":5}}}}"#
+        )
+    }
+
+    fn response_item_reasoning(ts: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"reasoning","summary":[],"encrypted_content":"QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFB"}}}}"#
+        )
+    }
+
+    fn token_count(
+        ts: &str,
+        input_tokens: u64,
+        cached: u64,
+        cumulative_total: u64,
+        ceiling: u64,
+    ) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"token_count","info":{{"last_token_usage":{{"input_tokens":{input_tokens},"cached_input_tokens":{cached},"output_tokens":50}},"total_token_usage":{{"total_tokens":{cumulative_total}}},"model_context_window":{ceiling}}},"rate_limits":{{}}}}}}"#
+        )
+    }
+
+    fn tool_call_issued(ts: &str, kind: &str, call_id: &str, name: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"{kind}","id":"{call_id}","call_id":"{call_id}","name":"{name}","status":"in_progress","arguments":"{{}}"}}}}"#
+        )
+    }
+
+    fn tool_call_output(ts: &str, kind: &str, call_id: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"{kind}_output","call_id":"{call_id}","output":"ok"}}}}"#
+        )
+    }
+
+    #[test]
+    fn an_unclosed_task_started_is_working() {
+        let path = fixture_path();
+        let lines = vec![task_started("2026-09-12T09:00:00.000Z", "t1")];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.state.as_deref(), Some("working"));
+        assert_eq!(
+            cap.sources.as_ref().and_then(|s| s.get("state")),
+            Some(&pointer(&path, 0))
+        );
+    }
+
+    #[test]
+    fn a_task_complete_closes_the_turn_to_idle() {
+        let path = fixture_path();
+        let lines = vec![
+            task_started("2026-09-12T09:00:00.000Z", "t1"),
+            task_complete("2026-09-12T09:00:05.000Z", "t1"),
+        ];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.state.as_deref(), Some("idle"));
+        assert_eq!(
+            cap.sources.as_ref().and_then(|s| s.get("state")),
+            Some(&pointer(&path, 1))
+        );
+    }
+
+    #[test]
+    fn a_turn_aborted_closes_it_too() {
+        let path = fixture_path();
+        let lines = vec![
+            task_started("2026-09-12T09:00:00.000Z", "t1"),
+            turn_aborted("2026-09-12T09:00:03.000Z", "t1"),
+        ];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.state.as_deref(), Some("idle"));
+    }
+
+    #[test]
+    fn a_working_turn_is_never_downgraded_by_elapsed_time() {
+        let path = fixture_path();
+        // The gap between these two timestamps is far past any plausible
+        // "the app went quiet" threshold. This fold reads no clock at all —
+        // a long silence must never flip `working` back to `idle` on its
+        // own; only a `task_complete`/`turn_aborted` record closes a turn.
+        let lines = vec![
+            task_started("2026-09-12T09:00:00.000Z", "t1"),
+            token_count("2026-09-12T09:26:00.000Z", 1000, 500, 2_000_000, 258_400),
+        ];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.state.as_deref(), Some("working"));
+    }
+
+    #[test]
+    fn a_capture_never_yields_awaiting() {
+        let path = fixture_path();
+        let never_awaiting = |lines: &[String]| {
+            let cap = fold_rollout(&path, lines);
+            assert_ne!(cap.state.as_deref(), Some("awaiting"));
+        };
+        never_awaiting(&[]);
+        never_awaiting(&[task_started("2026-09-12T09:00:00.000Z", "t1")]);
+        never_awaiting(&[
+            task_started("2026-09-12T09:00:00.000Z", "t1"),
+            task_complete("2026-09-12T09:00:05.000Z", "t1"),
+        ]);
+        never_awaiting(&[turn_context("2026-09-12T09:00:00.000Z", "gpt-6-astra")]);
+    }
+
+    #[test]
+    fn a_tool_call_with_no_output_is_the_activity() {
+        let path = fixture_path();
+        let lines = vec![tool_call_issued(
+            "2026-09-12T09:00:00.000Z",
+            "function_call",
+            "call-1",
+            "shell",
+        )];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.activity.as_deref(), Some("shell"));
+        assert_eq!(
+            cap.sources.as_ref().and_then(|s| s.get("activity")),
+            Some(&pointer(&path, 0))
+        );
+    }
+
+    #[test]
+    fn a_tool_call_with_its_output_leaves_no_activity() {
+        let path = fixture_path();
+        let lines = vec![
+            tool_call_issued(
+                "2026-09-12T09:00:00.000Z",
+                "function_call",
+                "call-1",
+                "shell",
+            ),
+            tool_call_output("2026-09-12T09:00:01.000Z", "function_call", "call-1"),
+        ];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.activity, None);
+        assert!(cap
+            .sources
+            .as_ref()
+            .map(|s| !s.contains_key("activity"))
+            .unwrap_or(true));
+    }
+
+    #[test]
+    fn the_latest_command_execution_is_the_tool_label() {
+        let path = fixture_path();
+        let lines = vec![
+            item_completed_command("2026-09-12T09:00:00.000Z", "t1", "cargo build"),
+            item_completed_command(
+                "2026-09-12T09:00:05.000Z",
+                "t1",
+                "cargo test -p aoide-conduct",
+            ),
+        ];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(
+            cap.tool.as_deref(),
+            Some("CommandExecution: cargo test -p aoide-conduct")
+        );
+        assert_eq!(
+            cap.sources.as_ref().and_then(|s| s.get("tool")),
+            Some(&pointer(&path, 1))
+        );
+    }
+
+    #[test]
+    fn the_model_comes_from_the_latest_turn_context() {
+        let path = fixture_path();
+        let lines = vec![
+            turn_context("2026-09-12T09:00:00.000Z", "gpt-6-astra"),
+            turn_context("2026-09-12T09:05:00.000Z", "gpt-6-astra-mini"),
+        ];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.model.as_deref(), Some("gpt-6-astra-mini"));
+        assert_eq!(
+            cap.sources.as_ref().and_then(|s| s.get("model")),
+            Some(&pointer(&path, 1))
+        );
+    }
+
+    #[test]
+    fn occupancy_is_last_input_tokens_never_the_cumulative_total() {
+        let path = fixture_path();
+        let lines = vec![token_count(
+            "2026-09-12T09:21:04.305Z",
+            231_126,
+            230_656,
+            25_252_358,
+            258_400,
+        )];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.context_tokens, Some(231_126));
+        assert_ne!(cap.context_tokens, Some(25_252_358));
+    }
+
+    #[test]
+    fn occupancy_never_adds_the_cached_field_on_top() {
+        let path = fixture_path();
+        let lines = vec![token_count(
+            "2026-09-12T09:21:04.305Z",
+            231_126,
+            230_656,
+            25_252_358,
+            258_400,
+        )];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.context_tokens, Some(231_126));
+        assert_ne!(cap.context_tokens, Some(231_126 + 230_656));
+    }
+
+    #[test]
+    fn the_ceiling_is_the_apps_own_model_context_window() {
+        let path = fixture_path();
+        let lines = vec![token_count(
+            "2026-09-12T09:21:04.305Z",
+            231_126,
+            230_656,
+            25_252_358,
+            258_400,
+        )];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.context_ceiling, Some(258_400));
+        assert_eq!(
+            cap.sources.as_ref().and_then(|s| s.get("context_ceiling")),
+            Some(&pointer(&path, 0))
+        );
+    }
+
+    #[test]
+    fn a_reasoning_record_contributes_nothing() {
+        let path = fixture_path();
+        let lines = vec![item_completed_reasoning("2026-09-12T09:00:00.000Z", "t1")];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap, CodexCapture::default());
+    }
+
+    #[test]
+    fn a_reasoning_record_with_encrypted_content_still_contributes_nothing() {
+        let path = fixture_path();
+        let lines = vec![response_item_reasoning("2026-09-12T09:00:00.000Z")];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap, CodexCapture::default());
+    }
+
+    #[test]
+    fn every_captured_field_carries_a_pointer_and_an_uncaptured_one_carries_none() {
+        let path = fixture_path();
+        let lines = vec![
+            turn_context("2026-09-12T09:00:00.000Z", "gpt-6-astra"),
+            item_completed_agent_message(
+                "2026-09-12T09:00:05.000Z",
+                "t1",
+                "done with the build",
+                "final_answer",
+            ),
+        ];
+        let cap = fold_rollout(&path, &lines);
+
+        assert_eq!(cap.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(cap.say.as_deref(), Some("done with the build"));
+
+        let sources = cap.sources.expect("captured fields must carry sources");
+        assert_eq!(sources.get("model"), Some(&pointer(&path, 0)));
+        assert_eq!(sources.get("say"), Some(&pointer(&path, 1)));
+
+        assert_eq!(cap.state, None);
+        assert_eq!(cap.activity, None);
+        assert_eq!(cap.tool, None);
+        assert_eq!(cap.prompt, None);
+        assert_eq!(cap.context_tokens, None);
+        assert_eq!(cap.context_ceiling, None);
+        assert_eq!(cap.parent_thread_id, None);
+        assert_eq!(cap.thread_source, None);
+        assert_eq!(cap.nickname, None);
+        for field in [
+            "state",
+            "activity",
+            "tool",
+            "prompt",
+            "context_tokens",
+            "context_ceiling",
+            "parent_thread_id",
+            "thread_source",
+            "nickname",
+        ] {
+            assert!(
+                !sources.contains_key(field),
+                "{field} was never captured and must carry no pointer"
+            );
+        }
+    }
+
+    #[test]
+    fn the_latest_user_message_is_the_prompt_and_carries_its_pointer() {
+        let path = fixture_path();
+        let lines = vec![
+            item_completed_user_message("2026-09-12T09:00:00.000Z", "t1", "first question"),
+            item_completed_user_message(
+                "2026-09-12T09:05:00.000Z",
+                "t1",
+                "run the fold tests please",
+            ),
+        ];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.prompt.as_deref(), Some("run the fold tests please"));
+        assert_eq!(
+            cap.sources.as_ref().and_then(|s| s.get("prompt")),
+            Some(&pointer(&path, 1))
+        );
+    }
+}

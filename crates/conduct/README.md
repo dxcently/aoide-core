@@ -430,6 +430,28 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   (`window.rs`) calls it too, beside every `sync_untracked_terminal_windows`
   tick (startup, reconnect, the ~5s timeout, `Appeared`, `Closed`), but only
   for PROMPTNESS on a host where that listener happens to be running.
+- `graph/codex_capture.rs` — S1 of P-CX-5, native capture from a Codex
+  thread's own rollout JSONL, beside the association `codex_app.rs` already
+  reads. `fold_rollout` is a PURE fold (no I/O, no stage, no call site yet):
+  given a rollout's lines and its own path, it produces a `CodexCapture` —
+  `state` (from the latest of `task_started`/`task_complete`/`turn_aborted`,
+  never `awaiting`, never decayed by elapsed time), `activity` (a
+  `custom_tool_call`/`function_call` with no later matching `*_output`),
+  `tool` (the latest completed `CommandExecution`/`McpToolCall`/`FileChange`,
+  one line), `say`/`prompt` (the latest `AgentMessage`/`UserMessage`, clipped
+  to one line — `prompt` per D1, codex seq 228: scope is Aoide's existing
+  session surfaces only), `model` (the latest `turn_context`), `context_tokens`/
+  `context_ceiling` (`token_count`'s `last_token_usage.input_tokens` alone —
+  never the cumulative total, never summed with the cached field already
+  inside it — and its own `model_context_window`), and `parent_thread_id`/
+  `thread_source`/`nickname` off `session_meta`. Every field is `None` on an
+  empty or unrecognised input. A `response_item`/`reasoning` record and an
+  `item_completed` item of type `Reasoning` both always contribute nothing —
+  a reasoning trace is not on disk in any readable form. Every captured field
+  carries a `sources` pointer (`<path>#<ordinal>`, `ordinal` the line's own
+  position, never a value read out of the record); an uncaptured field
+  carries none. The bounded tail reader, the `sources` field on
+  `SessionRecord`, and the upsert call site are a later slice.
 - `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below). The socket answers exactly one command with a reply,
