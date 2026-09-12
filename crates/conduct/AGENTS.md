@@ -24,6 +24,22 @@
 
 ## Invariants
 
+- **Every grouping surface that can see a non-root session calls
+  `graph::effective_project_for`, never bare `project_for`, for that
+  session (ownership-graph lane, P-OWN S-A).** `project_for` stays the
+  per-session primitive (own explicit project, else own cwd anchor) and is
+  still correct on a ROOT session — no owner to walk, so the two agree by
+  construction — but a caller that can hold a child (a `parentSessionId`
+  chain already resolved, e.g. `who.rs`'s roster and `conductor`'s
+  per-project count) must resolve through the owner chain or a child whose
+  own cwd anchors nowhere silently falls out of its parent's group. A caller
+  that only ever sees roots (`app.rs`'s `dag_rows`, `doc.rs`'s `anchors`
+  edge and its Unicode render — each splits children off first) stays on
+  `project_for`; switching it would be a no-op, never a bug, but it is also
+  never a reason to add a second resolver. `effective_project_for` never
+  writes a record and is never re-entered recursively by its own ancestor
+  walk (each hop calls `project_for` on that one ancestor).
+
 - **Codex titles use exact native thread IDs.** The reaper reads the configured
   Codex session index once per metadata pass and updates only already registered
   `agent == "codex"` records. The latest valid nonempty index title owns that

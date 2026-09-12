@@ -268,14 +268,14 @@ fn row_json(r: &Row) -> Value {
 /// for nothing).
 pub(super) fn node_list_with(_inv: &Invocation, pull: PullFn, sweep: SweepFn) -> Outcome {
     let cmd = "node.list";
-    let (_, s, h) = match super::common::load_inputs(cmd) {
+    let (p, s, h) = match super::common::load_inputs(cmd) {
         Ok(v) => v,
         Err(e) => return e,
     };
     let host = aoide_storage::display::local_host_name();
     let sweep_handle = std::thread::spawn(sweep);
 
-    let local = build_local_node(&s.sessions, &h.hooks, &host);
+    let local = build_local_node(&s.sessions, &h.hooks, &p.projects, &host);
     let nodes = aoide_storage::node_store::load_nodes();
     let probed = probe_nodes(&nodes, pull);
     let mesh_nodes: Vec<(Node, NodeView)> = probed
@@ -388,6 +388,7 @@ mod tests {
             presence: if state == "done" { "done" } else { "online" },
             cwd: "/x".to_string(),
             project: None,
+            effective_project: None,
             exempt: false,
         }
     }

@@ -445,7 +445,7 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
             let anchored = merged
                 .iter()
                 .filter(|s| {
-                    graph::project_for(s, &projects)
+                    graph::effective_project_for(s, &merged, &projects)
                         .map(|idx| projects[idx].name == p.name)
                         .unwrap_or(false)
                 })

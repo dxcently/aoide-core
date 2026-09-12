@@ -87,7 +87,7 @@ pub use self::doc::{build_graph, render, resolve_graph_document};
 // on a Stop hook, the CLI on `mail ring`, `aoide-server`'s deposit arm).
 pub use self::doorbell::{mail_ring, ring, RingReport};
 pub use self::model::{
-    anchor_for, project_for, canonical_state, merged_sessions, HookRecord, HooksFile, Project, ProjectsFile,
+    anchor_for, effective_project_for, project_for, canonical_state, merged_sessions, HookRecord, HooksFile, Project, ProjectsFile,
     SessionRecord, SessionsFile,
 };
 pub use self::pending::{pending_approve, pending_deny, pending_list};

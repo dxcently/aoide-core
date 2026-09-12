@@ -116,6 +116,13 @@ pub(super) struct SessionView {
     pub(super) presence: &'static str,
     pub(super) cwd: String,
     pub(super) project: Option<String>,
+    /// The project this session RENDERS under, resolved against the owner
+    /// chain (`model::effective_project_for`) — `None` for every row built
+    /// by [`sessions_from_graph`] (a remote node's own graph document has no
+    /// local session slice to walk owners against; S-D owns cross-host
+    /// inheritance). [`group_by_project`] prefers this over `project` when
+    /// present.
+    pub(super) effective_project: Option<String>,
     /// `SessionRecord::exempt` (task #20), carried through for the roster's
     /// one-word tag. Local rows read the real record; a node row has no
     /// cross-host exempt story yet (`grant.rs`'s module doc — out of scope,
@@ -152,16 +159,18 @@ fn session_presence(state: &str) -> &'static str {
 }
 
 /// This box's own [`NodeView`] — always `online` (we're running on it right
-/// now). `sessions`/`hooks` are the caller's already-loaded stage files
-/// (`common::load_inputs`); pure otherwise. `pub(super)` for `node_list.rs`
-/// (see [`NodeView`]'s widening note).
-pub(super) fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord], host: &str) -> NodeView {
+/// now). `sessions`/`hooks`/`projects` are the caller's already-loaded stage
+/// files (`common::load_inputs`); pure otherwise. `pub(super)` for
+/// `node_list.rs` (see [`NodeView`]'s widening note).
+pub(super) fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord], projects: &[Project], host: &str) -> NodeView {
     let merged = super::model::merged_sessions(sessions, hooks);
     let ids: HashSet<&str> = merged.iter().map(|s| s.session_id.as_str()).collect();
     let sessions = merged
         .iter()
         .map(|s| {
             let role = if resolved_parent(s, &ids).is_some() { "child" } else { "root" };
+            let effective_project = super::model::effective_project_for(s, &merged, projects)
+                .map(|i| projects[i].name.clone());
             SessionView {
                 session_id: s.session_id.clone(),
                 label: aoide_storage::display::session_label(s, host, role),
@@ -171,6 +180,7 @@ pub(super) fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord],
                 presence: session_presence(&s.state),
                 cwd: s.cwd.clone(),
                 project: s.project.clone(),
+                effective_project,
                 exempt: s.exempt,
             }
         })
@@ -217,6 +227,10 @@ pub(super) fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView>
                 project: n["project"].as_str().map(str::to_owned),
                 session_id,
                 petname,
+                // No owner chain to walk for a remote graph document (S-D
+                // owns cross-host inheritance) — a node row keeps today's
+                // `project`-only attribution verbatim.
+                effective_project: None,
                 // No cross-host exempt story yet (module doc's widening
                 // note on `SessionView::exempt`) — a node's own graph.json
                 // never carries the field either, so this always reads
@@ -464,7 +478,10 @@ fn group_by_project(nodes: Vec<NodeView>, projects: &[Project]) -> Vec<ProjectGr
     let mut buckets: std::collections::HashMap<String, Vec<SessionView>> = std::collections::HashMap::new();
     for node in nodes {
         for sv in node.sessions {
-            let name = sv.project.clone().or_else(|| project_bucket(&sv.cwd, projects)).unwrap_or_else(|| NO_PROJECT.to_string());
+            let name = sv.effective_project.clone()
+                .or_else(|| sv.project.clone())
+                .or_else(|| project_bucket(&sv.cwd, projects))
+                .unwrap_or_else(|| NO_PROJECT.to_string());
             if !buckets.contains_key(&name) {
                 order.push(name.clone());
             }
@@ -537,7 +554,7 @@ pub(super) struct Roster {
 pub(super) fn collect_roster(cmd: &str, pull: PullFn) -> Result<Roster, Outcome> {
     let (p, s, h) = super::common::load_inputs(cmd)?;
     let host = aoide_storage::display::local_host_name();
-    let local_node = build_local_node(&s.sessions, &h.hooks, &host);
+    let local_node = build_local_node(&s.sessions, &h.hooks, &p.projects, &host);
 
     let nodes = aoide_storage::node_store::load_nodes();
     let probed = probe_nodes(&nodes, pull);
@@ -777,7 +794,7 @@ mod tests {
             SessionRecord { exempt: true, ..session("s1", "/x", "idle", "1", None) },
             session("s2", "/x", "idle", "2", None),
         ];
-        let node = build_local_node(&sessions, &[], "sakaki");
+        let node = build_local_node(&sessions, &[], &[], "sakaki");
         let s1 = node.sessions.iter().find(|s| s.session_id == "s1").unwrap();
         let s2 = node.sessions.iter().find(|s| s.session_id == "s2").unwrap();
         assert!(s1.exempt);
@@ -793,8 +810,8 @@ mod tests {
             fetched_at: None,
             error: None,
             sessions: vec![
-                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, exempt: true },
-                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, exempt: false },
+                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, effective_project: None, exempt: true },
+                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, effective_project: None, exempt: false },
             ],
         }];
         let rendered = render_nodes(&nodes);
@@ -815,6 +832,7 @@ mod tests {
                 state: "idle".into(),
                 presence: "online",
                 cwd: "/x".into(), project: None,
+                effective_project: None,
                 exempt: true,
             }],
         }];
@@ -833,7 +851,7 @@ mod tests {
         locals[0].petname = Some("brave-otter".to_string());
         locals[1].petname = Some("calm-thorn".to_string());
 
-        let local_node = build_local_node(&locals, &[], "sakaki");
+        let local_node = build_local_node(&locals, &[], &[], "sakaki");
         let mesh_node = NodeView {
             name: "yomi-strix".to_string(),
             is_local: false,
@@ -848,6 +866,7 @@ mod tests {
                 state: "working".to_string(),
                 presence: "online",
                 cwd: "/y".to_string(), project: None,
+                effective_project: None,
                 exempt: false,
             }],
         };
@@ -939,9 +958,9 @@ mod tests {
             fetched_at: None,
             error: None,
             sessions: vec![
-                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/z/nowhere".into(), project: None, exempt: false },
-                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/zeta/x".into(), project: None, exempt: false },
-                SessionView { session_id: "s3".into(), label: "l3".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/alpha/x".into(), project: None, exempt: false },
+                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/z/nowhere".into(), project: None, effective_project: None, exempt: false },
+                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/zeta/x".into(), project: None, effective_project: None, exempt: false },
+                SessionView { session_id: "s3".into(), label: "l3".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/alpha/x".into(), project: None, effective_project: None, exempt: false },
             ],
         }];
         let projects = vec![project("zeta", "/proj/zeta"), project("alpha", "/proj/alpha")];
@@ -972,6 +991,7 @@ mod tests {
                 state: "working".into(),
                 presence: "online",
                 cwd: "/home/k/Aoide/pkgs/aoide".into(), project: None,
+                effective_project: None,
                 exempt: false,
             }],
         }];
@@ -979,6 +999,19 @@ mod tests {
         let groups = group_by_project(nodes, &projects);
         assert_eq!(groups.len(), 1);
         assert_eq!(groups[0].name, "aoide");
+    }
+
+    #[test]
+    fn group_by_project_buckets_a_child_under_its_owners_project() {
+        let projects = vec![project("aoide", "/home/k/Aoide")];
+        let owner = SessionRecord { project: Some("aoide".to_string()), ..session("s-root", "/home/k/Aoide", "working", "1", None) };
+        let child = session("s-child", "/tmp/elsewhere", "working", "2", Some("s-root"));
+        let node = build_local_node(&[owner, child], &[], &projects, "sakaki");
+        let groups = group_by_project(vec![node], &projects);
+        assert_eq!(groups.len(), 1, "the child's own cwd anchors nowhere, but it still lands in its owner's bucket");
+        assert_eq!(groups[0].name, "aoide");
+        let ids: Vec<&str> = groups[0].sessions.iter().map(|s| s.session_id.as_str()).collect();
+        assert!(ids.contains(&"s-child"), "{ids:?}");
     }
 
     // ── session_roster_with: the full pipeline, injected pull, real local stage I/O ──

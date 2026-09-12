@@ -889,6 +889,18 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   re-derives the real caller's identity — threading the connecting peer's
   pid into the gate itself would touch `send.rs`, out of this phase's scope
   fence.
+- **`graph::effective_project_for` — the project a session RENDERS under**
+  (ownership-graph lane, P-OWN S-A): own explicit project (`project_for`'s
+  rung 1) > the nearest ancestor whose OWN `project_for` resolves (walking
+  `parent_session_id` upward, cycle-guarded, 32-hop bounded, the same shape
+  `doorbell.rs`'s `conducted_ancestor` and `window.rs`'s
+  `windowless_by_lineage_from_parent` walk) > the subject's own cwd anchor
+  (`project_for`'s rung 3). An explicit project is never overridden, even
+  when unregistered — the walk stops there, exactly `project_for`'s own
+  behavior. Derived only: never writes a record, never changes what
+  `graph.json`'s session node publishes (`project` stays the stored value).
+  `project_for` itself is unchanged and stays the per-ancestor primitive
+  this walk calls at each hop, never re-entering itself.
 - **`session` (bare) — the ROSTER (session-surface redesign, command-defrag
   lane X, 2026-08-28; supersedes the U3 picker AND the standalone `aoide
   who` command, both retired — hard cutover, no alias).** `aoide session
@@ -896,9 +908,12 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   roster core): live presence over this box's own sessions plus every
   registered node, probed in parallel on each invocation (messaging
   workstream C2 — the exact pipeline `who` used to run, unchanged). Bare
-  groups sessions by PROJECT (`project_bucket`: a registered `projects.json`
-  name via `anchor_for`, else a `.aoide/project.json` manifest directory's
-  own basename via `walk_up`, else a trailing `(no project)` bucket);
+  groups sessions by PROJECT (a local row's `effective_project`, resolved
+  against the owner chain in `build_local_node`; else `project_bucket`: a
+  registered `projects.json` name via `anchor_for`, else a
+  `.aoide/project.json` manifest directory's own basename via `walk_up`,
+  else a trailing `(no project)` bucket — a remote row has no
+  `effective_project` and keeps this same ladder verbatim);
   `--hosts` groups by HOST instead — this host, then each node,
   byte-identical to `who`'s old rendering (`render_nodes`/`node_json`
   survive unchanged). `filter`/`--all` narrow `nodes` BEFORE either split,

@@ -648,6 +648,7 @@ mod tests {
             presence: "online",
             cwd: cwd.to_string(),
             project: None,
+            effective_project: None,
             exempt: false,
         }
     }

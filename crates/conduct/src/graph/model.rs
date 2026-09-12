@@ -48,6 +48,46 @@ pub fn project_for(session: &SessionRecord, projects: &[Project]) -> Option<usiz
     session.project.as_ref().map_or_else(|| anchor_for(&session.cwd, projects), |name| projects.iter().position(|p| &p.name == name))
 }
 
+/// The project a session RENDERS under: own explicit project > owner's
+/// effective project > own cwd anchor. Derived, never stored — see
+/// `CONTRACTS.md`'s stored-vs-effective distinction.
+/// An explicit `session.project` is never overridden — resolved or not
+/// (unregistered stops the walk right here, exactly [`project_for`]'s own
+/// behavior). Otherwise walks `parent_session_id` upward; the first
+/// ancestor whose OWN [`project_for`] resolves (explicit name or its own
+/// cwd anchor) wins — iterative, never a recursive re-entry into this
+/// function. Walk shape copied from `doorbell.rs`'s `conducted_ancestor` /
+/// `window.rs`'s `windowless_by_lineage_from_parent`: `HashSet` cycle guard,
+/// a dangling or cyclic `parentSessionId` (or an exhausted chain) falls to
+/// [`anchor_for`] on the SUBJECT's own cwd, bounded at 32 hops
+/// (`actions.rs`'s `kill_target` walk).
+pub fn effective_project_for(
+    session: &SessionRecord,
+    sessions: &[SessionRecord],
+    projects: &[Project],
+) -> Option<usize> {
+    if session.project.is_some() {
+        return project_for(session, projects);
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    seen.insert(session.session_id.as_str());
+    let mut parent_id = session.parent_session_id.as_deref();
+    for _ in 0..32 {
+        let Some(pid) = parent_id else { break };
+        if !seen.insert(pid) {
+            break; // cycle guard
+        }
+        let Some(parent) = sessions.iter().find(|s| s.session_id == pid) else {
+            break; // dangling parent link
+        };
+        if let Some(idx) = project_for(parent, projects) {
+            return Some(idx);
+        }
+        parent_id = parent.parent_session_id.as_deref();
+    }
+    anchor_for(&session.cwd, projects)
+}
+
 /// The anchoring project for a cwd: the longest matching root wins across
 /// EVERY root of EVERY project, so nested projects and a project's own
 /// second root anchor correctly. Returns an index into `projects`.
@@ -240,5 +280,127 @@ mod tests {
         // Empty/unknown never invents a signal — it rests, cold.
         assert_eq!(canonical_state(""), "idle");
         assert_eq!(canonical_state("mystery"), "idle");
+    }
+
+    // ── effective_project_for: rung 2 (owner walk) above rung 3 (own cwd) ──
+
+    fn named_project(name: &str, path: &str) -> Project {
+        Project { name: name.into(), path: path.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn effective_project_inherits_a_parent_project_from_outside_the_cwd_anchor() {
+        let projects = vec![named_project("aoide", "/home/k/Aoide")];
+        let root = SessionRecord { project: Some("aoide".into()), ..session("s-root", "/home/k/Aoide", "working", "1", None) };
+        let child = session("s-child", "/tmp/elsewhere", "working", "2", Some("s-root"));
+        let sessions = vec![root, child.clone()];
+        assert_eq!(
+            effective_project_for(&child, &sessions, &projects).map(|i| projects[i].name.as_str()),
+            Some("aoide"),
+            "the child's cwd anchors nowhere, but its owner's explicit project wins"
+        );
+    }
+
+    #[test]
+    fn effective_project_walks_nested_children_with_no_cwd_anchor() {
+        let projects = vec![named_project("aoide", "/home/k/Aoide")];
+        let root = SessionRecord { project: Some("aoide".into()), ..session("s-root", "/home/k/Aoide", "working", "1", None) };
+        let mid = session("s-mid", "/tmp/elsewhere", "working", "2", Some("s-root"));
+        let leaf = session("s-leaf", "/tmp/elsewhere-still", "working", "3", Some("s-mid"));
+        let sessions = vec![root, mid, leaf.clone()];
+        assert_eq!(
+            effective_project_for(&leaf, &sessions, &projects).map(|i| projects[i].name.as_str()),
+            Some("aoide"),
+            "two hops up the chain, past a middle ancestor with no attribution of its own"
+        );
+    }
+
+    #[test]
+    fn an_explicit_child_project_beats_the_parents() {
+        let projects = vec![named_project("aoide", "/home/k/Aoide"), named_project("other", "/home/k/Other")];
+        let root = SessionRecord { project: Some("aoide".into()), ..session("s-root", "/home/k/Aoide", "working", "1", None) };
+        let child = SessionRecord { project: Some("other".into()), ..session("s-child", "/tmp/elsewhere", "working", "2", Some("s-root")) };
+        let sessions = vec![root, child.clone()];
+        assert_eq!(
+            effective_project_for(&child, &sessions, &projects).map(|i| projects[i].name.as_str()),
+            Some("other"),
+            "an explicit choice is never overridden by the owner"
+        );
+    }
+
+    #[test]
+    fn clearing_a_child_project_resumes_inheritance() {
+        let projects = vec![named_project("aoide", "/home/k/Aoide"), named_project("other", "/home/k/Other")];
+        let root = SessionRecord { project: Some("aoide".into()), ..session("s-root", "/home/k/Aoide", "working", "1", None) };
+        let explicit_child = SessionRecord { project: Some("other".into()), ..session("s-child", "/tmp/elsewhere", "working", "2", Some("s-root")) };
+        let cleared_child = SessionRecord { project: None, ..explicit_child.clone() };
+        let sessions = vec![root, cleared_child.clone()];
+        assert_eq!(
+            effective_project_for(&explicit_child, &sessions, &projects).map(|i| projects[i].name.as_str()),
+            Some("other"),
+            "sanity: the explicit record still resolves to its own choice"
+        );
+        assert_eq!(
+            effective_project_for(&cleared_child, &sessions, &projects).map(|i| projects[i].name.as_str()),
+            Some("aoide"),
+            "--clear drops the explicit name, resuming inheritance from the owner"
+        );
+    }
+
+    #[test]
+    fn reassigning_the_parent_moves_the_whole_subtree() {
+        let projects = vec![named_project("aoide", "/home/k/Aoide"), named_project("other", "/home/k/Other")];
+        let child = session("s-child", "/tmp/elsewhere", "working", "2", Some("s-root"));
+
+        let root_aoide = SessionRecord { project: Some("aoide".into()), ..session("s-root", "/home/k/Aoide", "working", "1", None) };
+        let sessions_aoide = vec![root_aoide, child.clone()];
+        assert_eq!(
+            effective_project_for(&child, &sessions_aoide, &projects).map(|i| projects[i].name.as_str()),
+            Some("aoide")
+        );
+
+        let root_other = SessionRecord { project: Some("other".into()), ..session("s-root", "/home/k/Aoide", "working", "1", None) };
+        let sessions_other = vec![root_other, child.clone()];
+        assert_eq!(
+            effective_project_for(&child, &sessions_other, &projects).map(|i| projects[i].name.as_str()),
+            Some("other"),
+            "reassigning the parent's project moves every descendant that inherits it"
+        );
+    }
+
+    #[test]
+    fn a_missing_parent_falls_back_to_the_cwd_anchor() {
+        let projects = vec![named_project("aoide", "/home/k/Aoide")];
+        let child = session("s-child", "/home/k/Aoide/sub", "working", "1", Some("s-ghost"));
+        let sessions = vec![child.clone()]; // s-ghost is not registered anywhere
+        assert_eq!(
+            effective_project_for(&child, &sessions, &projects).map(|i| projects[i].name.as_str()),
+            Some("aoide"),
+            "a dangling parent link ends the walk; the subject's own cwd still anchors"
+        );
+    }
+
+    #[test]
+    fn a_parent_cycle_falls_back_to_the_cwd_anchor() {
+        let projects = vec![named_project("aoide", "/home/k/Aoide")];
+        let a = session("s-a", "/home/k/Aoide/sub", "working", "1", Some("s-b"));
+        let b = session("s-b", "/tmp/elsewhere", "working", "2", Some("s-a"));
+        let sessions = vec![a.clone(), b];
+        assert_eq!(
+            effective_project_for(&a, &sessions, &projects).map(|i| projects[i].name.as_str()),
+            Some("aoide"),
+            "a parent cycle is cut short by the seen-set guard, falling to the subject's own cwd"
+        );
+    }
+
+    #[test]
+    fn an_explicit_unregistered_project_resolves_to_no_group() {
+        let projects = vec![named_project("aoide", "/home/k/Aoide")];
+        let sess = SessionRecord { project: Some("ghost-project".into()), ..session("s-solo", "/home/k/Aoide/sub", "working", "1", None) };
+        assert_eq!(
+            effective_project_for(&sess, std::slice::from_ref(&sess), &projects),
+            None,
+            "an explicit but unregistered name stops the walk; it never falls through to the cwd anchor"
+        );
     }
 }
