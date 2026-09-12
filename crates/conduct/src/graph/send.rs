@@ -497,10 +497,11 @@ fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
 /// match — global env, sender-is-target's-parent, or
 /// sender-and-target-are-siblings-under-a-live-parent, see
 /// [`sibling_autogate_enabled`]) it connects to the socket, writes `<text>`
-/// (+ the TARGET's own submit keystroke on `--submit` — `\n` for most
-/// harnesses, `\r` for kimi, resolved from the target session's agent profile
-/// at delivery time via [`super::permit::profile_for_agent`], never a fixed
-/// byte), auto-renames the node to a one-line form of the text (unless the
+/// (+ the TARGET's own submit keystroke on `--submit` — `\r` for claude and
+/// kimi (Enter sends CR; a bare `\n` only inserts a newline in claude's
+/// composer, never submits), resolved from the target session's agent
+/// profile at delivery time via [`super::permit::profile_for_agent`], never a
+/// fixed byte), auto-renames the node to a one-line form of the text (unless the
 /// text is a bare keystroke answer — see [`names_the_node`]), and returns
 /// delivered. A delivered payload that names the node also carries a `from
 /// <sender>: ` provenance prefix on its first line when a sender resolves
@@ -2487,8 +2488,8 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
         assert_eq!(out.data.as_ref().unwrap()["gate"], "yes");
-        // --submit appended a newline.
-        assert_eq!(String::from_utf8(got).unwrap(), "hello world\n");
+        // --submit appended claude's submit key.
+        assert_eq!(String::from_utf8(got).unwrap(), "hello world\r");
 
         // Title auto-renamed on the record + restaged graph node.
         let s: SessionsFile = load_stage(&sessions_path()).unwrap();
@@ -2567,7 +2568,7 @@ mod tests {
         // emitted contract is untouched, but the resolved target is the same
         // session a bare `--id` would have hit.
         assert_eq!(out.data.as_ref().unwrap()["id"], id);
-        assert_eq!(String::from_utf8(got).unwrap(), "hi there\n");
+        assert_eq!(String::from_utf8(got).unwrap(), "hi there\r");
 
         // An id carrying an UNKNOWN prefix is not special-cased — it still
         // errors as an unknown session, exactly as an unrecognised id always
@@ -2921,7 +2922,7 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(
             String::from_utf8(got).unwrap(),
-            "from the-sender: fix the reaper\n",
+            "from the-sender: fix the reaper\r",
             "the delivered bytes carry the provenance prefix"
         );
 
@@ -2942,7 +2943,7 @@ mod tests {
     /// `attributed_to_target`/self-attribution exemption above does NOT
     /// apply — this is the general case, not the restore special case) is
     /// STILL delivered with no provenance prefix. Before this fix, this
-    /// exact shape delivered `from the-sender: fix the reaper\n` to a shell
+    /// exact shape delivered `from the-sender: fix the reaper\r` to a shell
     /// socket — a prefix a shell reads as the start of a command line, not
     /// attribution text, corrupting whatever command the sender meant to
     /// run. Same fixture as `delivered_payload_carries_the_provenance_
@@ -3002,7 +3003,7 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(
             String::from_utf8(got).unwrap(),
-            "fix the reaper\n",
+            "fix the reaper\r",
             "a shell target's delivered bytes carry NO provenance prefix, from anyone"
         );
 
@@ -3134,7 +3135,7 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(
             String::from_utf8(got).unwrap(),
-            "2\n",
+            "2\r",
             "a permit-shaped keystroke delivers with NO provenance prefix"
         );
 
@@ -3198,12 +3199,12 @@ mod tests {
         let delivered = String::from_utf8(got).unwrap();
         assert_eq!(
             delivered.matches('\n').count(),
-            1,
-            "exactly one newline (the --submit one), never an early-submitted line: {delivered:?}"
+            0,
+            "the embedded newline in --from must collapse to a space, never survive: {delivered:?}"
         );
         assert_eq!(
-            delivered, "from evil sender: ship it\n",
-            "the embedded newline in --from collapsed to a space, prefix stays single-line"
+            delivered, "from evil sender: ship it\r",
+            "the embedded newline in --from collapsed to a space, prefix stays single-line, submit is claude's \\r"
         );
 
         let _ = std::fs::remove_dir_all(&root);
@@ -3416,7 +3417,7 @@ mod tests {
             assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
             assert_eq!(
                 String::from_utf8(got).unwrap(),
-                "hello world\n",
+                "hello world\r",
                 "agent {tag:?} defaults to the claude fallback's newline submit"
             );
 
@@ -3567,7 +3568,7 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(
             String::from_utf8(got).unwrap(),
-            format!("{expected_prefix}ship it\n"),
+            format!("{expected_prefix}ship it\r"),
             "the delivered prefix names the sender by petname+tail, not the raw session id"
         );
 
@@ -3631,7 +3632,7 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(
             String::from_utf8(got).unwrap(),
-            "from ghost-sender: ship it\n",
+            "from ghost-sender: ship it\r",
             "an unresolvable sender falls back to the raw id, exactly as before this change"
         );
 
@@ -3811,7 +3812,7 @@ mod tests {
         // ONLY when `--from`/`AOIDE_SESSION_ID` also names it — attribution
         // stays a SEPARATE axis from the gate (module doc); with neither set
         // here, no prefix is added.
-        assert_eq!(String::from_utf8(got).unwrap(), "go\n");
+        assert_eq!(String::from_utf8(got).unwrap(), "go\r");
 
         // An UNIDENTIFIED caller (the resolver finds no seal in its
         // ancestry at all — P-ID2's "no seal in ancestry" case, e.g. a
@@ -4513,7 +4514,7 @@ mod tests {
         assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["delivered"], true);
         assert_eq!(out.data.as_ref().unwrap()["id"], id);
-        assert_eq!(String::from_utf8(got).unwrap(), "hello world\n");
+        assert_eq!(String::from_utf8(got).unwrap(), "hello world\r");
 
         let _ = std::fs::remove_dir_all(&root);
     }

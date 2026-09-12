@@ -624,7 +624,7 @@ mod tests {
         assert_eq!(out.data.as_ref().unwrap()["injected"], true);
         // The exact text (with its embedded space) rode through unmangled, +
         // the newline `submit` demands — proves the SAME injection door ran.
-        assert_eq!(String::from_utf8(got).unwrap(), "hello world\n");
+        assert_eq!(String::from_utf8(got).unwrap(), "hello world\r");
 
         // The entry is gone from the queue.
         let arr = load_pending_array().unwrap();
@@ -758,7 +758,7 @@ mod tests {
         assert_eq!(approved.status, Status::Ok, "msg: {}", approved.message);
         assert_eq!(
             String::from_utf8(got).unwrap(),
-            "from sender-a: do the thing\n",
+            "from sender-a: do the thing\r",
             "the delivered bytes name the ORIGINAL queuer, not the approver"
         );
 
@@ -824,7 +824,7 @@ mod tests {
         assert_eq!(approved.status, Status::Ok, "msg: {}", approved.message);
         assert_eq!(
             String::from_utf8(got).unwrap(),
-            "do the thing\n",
+            "do the thing\r",
             "no prefix at all — the approver's own session id must never leak in"
         );
 

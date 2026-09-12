@@ -1360,7 +1360,7 @@ mod tests {
         ]);
         let root = setup("ring-submit-key");
         let name = "claude-mail";
-        let wrap_id = "wrap-1"; // registered with agent "claude" (submit "\n")
+        let wrap_id = "wrap-1"; // registered with agent "claude" (submit "\r")
         let child_id = "wrap-1-child"; // agent "kimi" (submit "\r")
         let listener = headless_wrap(wrap_id);
         hook_child(child_id, wrap_id, "kimi");
