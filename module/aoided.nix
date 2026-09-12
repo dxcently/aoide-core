@@ -86,6 +86,12 @@ lib.mkIf config.aoide.enable {
     after = lib.optional (cfg.sessionTarget != "default.target") cfg.sessionTarget;
     partOf = lib.optional (cfg.sessionTarget != "default.target") cfg.sessionTarget;
 
+    # `procps` MUST be on the unit PATH: the daemon's own tick reads one
+    # `ps` table to resolve desktop-Codex thread ownership, and a minimal
+    # user unit's default PATH lacks it — without this the scan can only
+    # ever report Unknown (P-CX-4).
+    path = [ pkgs.procps ];
+
     serviceConfig = {
       # The `aoide` package installs both the `aoide` CLI and the `aoided`
       # daemon binary. We reference it via pkgs so this evaluates cleanly
