@@ -34,6 +34,19 @@
 //! never a reason to touch the roster (capture has no say in enrolment;
 //! `codex_app.rs`'s `ThreadScan` stays the only authority for that).
 //!
+//! Every live thread pays this on every ~1 Hz tick, so `capture_for` keeps a
+//! per-thread, process-lifetime memo: an unchanged `(len, mtime)` since the
+//! last read returns that read's own [`CodexCapture`] straight back with no
+//! file I/O at all, and a rollout that only grew (append-only, `mtime`
+//! never moving backwards) reuses the memo's own tail-alignment facts
+//! UNCHANGED — no re-scanning the bytes before the tail window a second
+//! time — for as long as that window stays within a small bounded slack
+//! past [`TAIL_BYTES`]; only once accumulated growth outruns that slack
+//! does it pay a fresh alignment scan, same as a cold cache miss. The
+//! resolved rollout path is cached the same way and re-walked only once it
+//! stops existing. A rollout that shrank or was rewritten in place (not
+//! append-only) drops its memo entry outright and recounts from scratch.
+//!
 //! Two record shapes are recognised but always contribute nothing: a
 //! `response_item`/`reasoning` record (opaque `encrypted_content`, empty
 //! `summary`) and an `event_msg`/`item_completed` record whose item is
@@ -53,7 +66,8 @@
 //! every other.
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use serde_json::Value;
 
@@ -479,6 +493,14 @@ pub(crate) fn fold_rollout_from(
 /// ordinal arithmetic in a test.
 const TAIL_BYTES: u64 = 1024 * 1024;
 
+/// How wide [`capture_for`]'s per-thread memo ever lets its read window
+/// drift, at most, before it re-anchors: `TAIL_BYTES` for the window itself
+/// plus this much slack. A purely append-only tick that stays under the cap
+/// reuses its memo's `start`/`start_ordinal`/`drop_first` untouched — the
+/// window only grows past the "ideal" `TAIL_BYTES` a little between
+/// re-anchors, never past this cap, and never unboundedly.
+const MEMO_MAX_WINDOW_BYTES: u64 = 2 * TAIL_BYTES;
+
 /// How many whole lines precede byte offset `start` in `path`'s CURRENT
 /// contents, and whether `start` itself opens mid-line. `start == 0` is
 /// always aligned — the file's own first byte starts line 0. Otherwise,
@@ -489,7 +511,10 @@ const TAIL_BYTES: u64 = 1024 * 1024;
 /// — a line the tail can only ever read PART of, so [`capture_for`] drops
 /// it rather than fold a partial record. A test with a fixture larger than
 /// [`TAIL_BYTES`] pins this arithmetic against the file's own true line
-/// numbers.
+/// numbers. This is the expensive O(`start`) prefix scan [`capture_for`]'s
+/// memo exists to avoid paying on every tick — it runs only on a rollout's
+/// first sight, a truncation/rewrite, or a re-anchor past
+/// [`MEMO_MAX_WINDOW_BYTES`], never on a plain append-only tick.
 fn tail_alignment(path: &Path, start: u64) -> std::io::Result<(usize, bool)> {
     if start == 0 {
         return Ok((0, false));
@@ -514,30 +539,160 @@ fn tail_alignment(path: &Path, start: u64) -> std::io::Result<(usize, bool)> {
     Ok((newline_count + usize::from(!aligned), !aligned))
 }
 
+/// [`capture_for`]'s per-thread memo: the resolved rollout path (so a hit
+/// skips `find_rollout`'s own `sessions/**` walk entirely, re-walked only
+/// once that path stops existing — the identical "known, unless proven
+/// stale" rule `codex_app.rs`'s own thread-cwd cache already holds for the
+/// same walk) alongside the `(len, mtime)` and tail-alignment facts that
+/// read produced. Process-lifetime only, matching this module's own
+/// one-shot audit statics — a restart simply recomputes once, same as a
+/// cold miss today.
+#[derive(Clone)]
+struct CaptureMemo {
+    path: PathBuf,
+    len: u64,
+    mtime: SystemTime,
+    start: u64,
+    start_ordinal: usize,
+    drop_first: bool,
+    capture: CodexCapture,
+}
+
+static CAPTURE_MEMO: std::sync::Mutex<BTreeMap<String, CaptureMemo>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
 /// Locate `thread_id`'s rollout under `codex_home` — [`super::codex_app::
 /// find_rollout`]'s own walk, the one discovery path [`thread_cwd`] already
 /// uses, never a second one grown here — and fold at most its last
-/// [`TAIL_BYTES`]. Every failure mode (no rollout found, the file can't be
-/// opened or read, a tail whose only content is one record too large to
-/// ever land whole in the window) yields [`CodexCapture::default`]: every
-/// field `None`, which a caller must treat as data absent, never as an
-/// idle/completion signal and never as grounds to touch a thread's
-/// enrolment — capture has no vote there.
+/// [`TAIL_BYTES`], memoised per thread (see [`CaptureMemo`]) so a live
+/// thread's own ~1 Hz callers ([`super::reap`], `window.rs`) don't each pay
+/// a fresh prefix scan and a fresh `sessions/**` walk on every tick. Every
+/// failure mode (no rollout found, the file can't be opened or read, a tail
+/// whose only content is one record too large to ever land whole in the
+/// window) yields [`CodexCapture::default`]: every field `None`, which a
+/// caller must treat as data absent, never as an idle/completion signal and
+/// never as grounds to touch a thread's enrolment — capture has no vote
+/// there.
 pub(crate) fn capture_for(codex_home: &Path, thread_id: &str) -> CodexCapture {
-    let Some(path) = super::codex_app::find_rollout(&codex_home.join("sessions"), thread_id) else {
+    let mut memo = CAPTURE_MEMO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let prior = memo.get(thread_id).cloned();
+
+    let path = match prior.as_ref().map(|p| &p.path).filter(|p| p.is_file()) {
+        Some(p) => p.clone(),
+        None => match super::codex_app::find_rollout(&codex_home.join("sessions"), thread_id) {
+            Some(p) => p,
+            None => {
+                memo.remove(thread_id);
+                return CodexCapture::default();
+            }
+        },
+    };
+
+    let Ok(meta) = std::fs::metadata(&path) else {
+        memo.remove(thread_id);
         return CodexCapture::default();
     };
-    capture_from_path(&path).unwrap_or_default()
+    let len = meta.len();
+    let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+
+    if let Some(entry) = &prior {
+        // Nothing changed since the last read: that read's own capture
+        // stands, no I/O at all.
+        if entry.path == path && entry.len == len && entry.mtime == mtime {
+            return entry.capture.clone();
+        }
+        // Append-only growth: the file only got longer and `mtime` never
+        // moved backwards. Extra whole lines before the memo's own
+        // `start` are never in play here — this is content AFTER `start`
+        // — so the memo's start/start_ordinal/drop_first stay exactly
+        // correct for the wider window `[entry.start, len)` as long as
+        // that window is still under the slack cap. No newline count, no
+        // prefix scan — just the one bounded read the fold needs anyway.
+        if entry.path == path
+            && len > entry.len
+            && mtime >= entry.mtime
+            && len - entry.start <= MEMO_MAX_WINDOW_BYTES
+        {
+            return match fold_tail(&path, entry.start, entry.start_ordinal, entry.drop_first) {
+                Ok(cap) => {
+                    memo.insert(
+                        thread_id.to_string(),
+                        CaptureMemo {
+                            path,
+                            len,
+                            mtime,
+                            start: entry.start,
+                            start_ordinal: entry.start_ordinal,
+                            drop_first: entry.drop_first,
+                            capture: cap.clone(),
+                        },
+                    );
+                    cap
+                }
+                Err(_) => {
+                    memo.remove(thread_id);
+                    CodexCapture::default()
+                }
+            };
+        }
+        // Anything else — truncation, mtime moved backwards, a rewrite in
+        // place, or growth that has outrun the slack cap — falls through
+        // to a full, fresh recompute: a memo that no longer describes an
+        // append-only future is never trusted half-way, only replaced.
+    }
+
+    match capture_from_path(&path) {
+        Ok((cap, start, start_ordinal, drop_first)) => {
+            memo.insert(
+                thread_id.to_string(),
+                CaptureMemo {
+                    path,
+                    len,
+                    mtime,
+                    start,
+                    start_ordinal,
+                    drop_first,
+                    capture: cap.clone(),
+                },
+            );
+            cap
+        }
+        Err(_) => {
+            memo.remove(thread_id);
+            CodexCapture::default()
+        }
+    }
 }
 
-/// The fallible core of [`capture_for`], split out so its `?`-heavy I/O
-/// stays out of the public, infallible signature.
-fn capture_from_path(path: &Path) -> std::io::Result<CodexCapture> {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut file = std::fs::File::open(path)?;
-    let len = file.metadata()?.len();
+/// The fallible core of [`capture_for`]'s first sight of a rollout (or a
+/// reset once its memo's growth has outrun [`MEMO_MAX_WINDOW_BYTES`]):
+/// finds `path`'s tail alignment fresh, then folds it — split out so its
+/// `?`-heavy I/O stays out of the public, infallible signature, and so its
+/// `(start, start_ordinal, drop_first)` triple is available for
+/// [`capture_for`]'s memo to reuse on a later, purely append-only tick.
+fn capture_from_path(path: &Path) -> std::io::Result<(CodexCapture, u64, usize, bool)> {
+    let len = std::fs::metadata(path)?.len();
     let start = len.saturating_sub(TAIL_BYTES);
     let (start_ordinal, drop_first) = tail_alignment(path, start)?;
+    let cap = fold_tail(path, start, start_ordinal, drop_first)?;
+    Ok((cap, start, start_ordinal, drop_first))
+}
+
+/// Reads `path` from `start` to EOF and folds it at `start_ordinal` — the
+/// shared back half of both a fresh [`capture_from_path`] and
+/// [`capture_for`]'s own memoised, append-only-growth reuse, which supplies
+/// an already-known `start`/`start_ordinal`/`drop_first` instead of paying
+/// [`tail_alignment`] again.
+fn fold_tail(
+    path: &Path,
+    start: u64,
+    start_ordinal: usize,
+    drop_first: bool,
+) -> std::io::Result<CodexCapture> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
     file.seek(SeekFrom::Start(start))?;
     let mut buf = Vec::new();
     file.read_to_end(&mut buf)?;
@@ -1193,5 +1348,216 @@ mod tests {
         let sources = cap.sources.expect("captured fields must carry pointers");
         assert_eq!(sources.get("model"), Some(&pointer(&path, 2)));
         assert_eq!(sources.get("say"), Some(&pointer(&path, 3)));
+    }
+
+    // `capture_for`'s per-thread memo (P-CX-5 S2 review follow-up): an
+    // untouched rollout costs no I/O, an append-only tick reuses its
+    // cached alignment rather than re-scanning the prefix, a truncation
+    // drops the memo outright, and a cached path that has gone missing
+    // falls back to a fresh `find_rollout` walk. `CAPTURE_MEMO` is a
+    // private module static, but these tests are a child module of
+    // `codex_capture` and so may read it directly — the same access every
+    // other test here already has to `tail_alignment`/`fold_rollout_from`.
+
+    #[test]
+    fn an_unchanged_rollout_returns_the_prior_capture_without_re_reading() {
+        let codex_home = crate::graph::testutil::unique_stage("codex-capture-memo-hit");
+        let thread_id = "00000000-0000-7000-8000-000000000015";
+        let body = format!(
+            "{}\n",
+            turn_context("2026-09-12T09:00:00.000Z", "gpt-cached")
+        );
+        let path = write_rollout(&codex_home, thread_id, &body);
+
+        let first = capture_for(&codex_home, thread_id);
+        assert_eq!(first.model.as_deref(), Some("gpt-cached"));
+
+        // The exact (len, mtime) the memo stored — recovered rather than
+        // re-derived, so the swap below matches it regardless of this
+        // filesystem's own mtime resolution.
+        let (memo_len, memo_mtime) = {
+            let memo = CAPTURE_MEMO.lock().unwrap();
+            let entry = memo
+                .get(thread_id)
+                .expect("the first capture must have memoised an entry");
+            (entry.len, entry.mtime)
+        };
+
+        // Swap in DIFFERENT content of the exact same byte length, then
+        // force the mtime back to the value the memo holds. A correct
+        // memo hit trusts an unchanged (len, mtime) alone and never opens
+        // the file again — so it must still hand back the FIRST capture,
+        // never see this swapped-in one.
+        let lying_body = format!(
+            "{}\n",
+            turn_context("2026-09-12T09:00:00.000Z", "gpt-tricky")
+        );
+        assert_eq!(lying_body.len(), body.len(), "the swap must not change len");
+        std::fs::write(&path, &lying_body).unwrap();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_modified(memo_mtime).unwrap();
+        drop(file);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), memo_len);
+
+        let second = capture_for(&codex_home, thread_id);
+        assert_eq!(
+            second.model.as_deref(),
+            Some("gpt-cached"),
+            "an unchanged (len, mtime) must return the prior capture verbatim, proving no re-read"
+        );
+    }
+
+    #[test]
+    fn an_append_only_growth_reuses_its_memo_alignment_unchanged() {
+        let codex_home = crate::graph::testutil::unique_stage("codex-capture-memo-growth");
+        let thread_id = "00000000-0000-7000-8000-000000000016";
+        let padding = "a".repeat(TAIL_BYTES as usize);
+        let filler = format!(
+            r#"{{"timestamp":"2026-09-12T08:00:00.000Z","type":"filler","padding":"{padding}"}}"#
+        );
+        let real1 = turn_context("2026-09-12T09:00:00.000Z", "gpt-first");
+        let body1 = format!("{filler}\n{real1}\n");
+        assert!(
+            body1.len() as u64 > TAIL_BYTES,
+            "fixture must exceed the tail window so the first capture has a real, non-zero start"
+        );
+        let path = write_rollout(&codex_home, thread_id, &body1);
+
+        let first = capture_for(&codex_home, thread_id);
+        assert_eq!(first.model.as_deref(), Some("gpt-first"));
+
+        let before = {
+            let memo = CAPTURE_MEMO.lock().unwrap();
+            let entry = memo
+                .get(thread_id)
+                .expect("the first capture must have memoised an entry");
+            assert!(
+                entry.start > 0,
+                "the fixture must force a non-trivial tail start"
+            );
+            (entry.start, entry.start_ordinal, entry.drop_first)
+        };
+
+        // Append-only growth, well inside the slack cap: one more whole
+        // record at the end, nothing before `start` disturbed.
+        let real2 = turn_context("2026-09-12T09:05:00.000Z", "gpt-second");
+        let body2 = format!("{body1}{real2}\n");
+        write_rollout(&codex_home, thread_id, &body2);
+        let second = capture_for(&codex_home, thread_id);
+
+        let after = {
+            let memo = CAPTURE_MEMO.lock().unwrap();
+            let entry = memo
+                .get(thread_id)
+                .expect("growth must still leave a memo entry");
+            (entry.start, entry.start_ordinal, entry.drop_first)
+        };
+        assert_eq!(
+            after, before,
+            "append-only growth inside the slack cap must reuse the memo's own alignment \
+             untouched, never recompute it from a rescanned prefix"
+        );
+
+        assert_eq!(second.model.as_deref(), Some("gpt-second"));
+        let true_ordinal = body1.lines().count(); // filler=0, real1=1, real2=2
+        assert_eq!(true_ordinal, 2);
+        let sources = second.sources.expect("captured fields must carry pointers");
+        assert_eq!(
+            sources.get("model"),
+            Some(&pointer(&path, true_ordinal)),
+            "the appended record's ordinal must still be its true line number"
+        );
+    }
+
+    #[test]
+    fn a_truncated_rollout_drops_the_memo_and_recounts_from_scratch() {
+        let codex_home = crate::graph::testutil::unique_stage("codex-capture-memo-truncate");
+        let thread_id = "00000000-0000-7000-8000-000000000017";
+        let padding = "a".repeat(TAIL_BYTES as usize);
+        let filler = format!(
+            r#"{{"timestamp":"2026-09-12T08:00:00.000Z","type":"filler","padding":"{padding}"}}"#
+        );
+        let real1 = turn_context("2026-09-12T09:00:00.000Z", "gpt-before-cut");
+        let body1 = format!("{filler}\n{real1}\n");
+        assert!(body1.len() as u64 > TAIL_BYTES);
+        let path = write_rollout(&codex_home, thread_id, &body1);
+
+        let first = capture_for(&codex_home, thread_id);
+        assert_eq!(first.model.as_deref(), Some("gpt-before-cut"));
+        assert_eq!(
+            first.sources.as_ref().and_then(|s| s.get("model")),
+            Some(&pointer(&path, 1))
+        );
+
+        // Truncation: a much smaller file at the same path — not
+        // append-only, so the memo must be dropped rather than reused
+        // half-way.
+        let body2 = format!(
+            "{}\n",
+            turn_context("2026-09-12T10:00:00.000Z", "gpt-after-cut")
+        );
+        assert!((body2.len() as u64) < body1.len() as u64);
+        write_rollout(&codex_home, thread_id, &body2);
+
+        let second = capture_for(&codex_home, thread_id);
+        assert_eq!(second.model.as_deref(), Some("gpt-after-cut"));
+        assert_eq!(
+            second.sources.as_ref().and_then(|s| s.get("model")),
+            Some(&pointer(&path, 0)),
+            "the truncated file's own fresh ordinal must be used, never the stale start_ordinal"
+        );
+
+        let entry_start = {
+            let memo = CAPTURE_MEMO.lock().unwrap();
+            memo.get(thread_id)
+                .expect("a truncation still leaves a fresh memo entry")
+                .start
+        };
+        assert_eq!(
+            entry_start, 0,
+            "the memo must be re-anchored at the truncated file's own start, not the stale one"
+        );
+    }
+
+    #[test]
+    fn a_stale_cached_path_falls_back_to_a_fresh_walk() {
+        let codex_home = crate::graph::testutil::unique_stage("codex-capture-memo-stale-path");
+        let thread_id = "00000000-0000-7000-8000-000000000018";
+        let body_a = format!(
+            "{}\n",
+            turn_context("2026-09-12T09:00:00.000Z", "gpt-old-file")
+        );
+        let path_a = write_rollout(&codex_home, thread_id, &body_a);
+
+        let first = capture_for(&codex_home, thread_id);
+        assert_eq!(first.model.as_deref(), Some("gpt-old-file"));
+
+        std::fs::remove_file(&path_a).unwrap();
+        let dir = codex_home.join("sessions");
+        let path_b = dir.join(format!("rollout-2026-09-13T09-00-00-{thread_id}.jsonl"));
+        let body_b = format!(
+            "{}\n",
+            turn_context("2026-09-13T09:00:00.000Z", "gpt-new-file")
+        );
+        std::fs::write(&path_b, &body_b).unwrap();
+
+        let second = capture_for(&codex_home, thread_id);
+        assert_eq!(
+            second.model.as_deref(),
+            Some("gpt-new-file"),
+            "a cached path that no longer exists must fall back to a fresh find_rollout walk"
+        );
+
+        let memo_path = {
+            let memo = CAPTURE_MEMO.lock().unwrap();
+            memo.get(thread_id)
+                .expect("the fresh walk still leaves a memo entry")
+                .path
+                .clone()
+        };
+        assert_eq!(
+            memo_path, path_b,
+            "the memo must now track the newly found path"
+        );
     }
 }

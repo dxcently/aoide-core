@@ -466,6 +466,22 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `None`, never treated as an idle/completion signal and never a reason to
   touch a thread's enrolment.
 
+  Every live thread pays this on every ~1 Hz tick (`reap.rs` and `window.rs`
+  are both callers, through `sync_codex_app_threads`), so `capture_for` keeps
+  a per-thread, process-lifetime memo (a plain module `static`, matching this
+  module's own one-shot audit statics — no signature change, no threading a
+  cache through the call site): an unchanged `(len, mtime)` since the last
+  read returns that read's own capture straight back with no file I/O at
+  all, and a rollout that only grew (append-only, `mtime` never moving
+  backwards) reuses the memo's own tail-alignment facts UNCHANGED — no
+  re-scanning the bytes before the tail window a second time — for as long
+  as the window stays within a small bounded slack past `TAIL_BYTES`; only
+  once accumulated growth outruns that slack does it pay a fresh alignment
+  scan, the same one it pays on a rollout's first sight. The resolved
+  rollout path is cached the same way and re-walked only once it stops
+  existing. A rollout that shrank or was rewritten in place is not
+  append-only and drops its memo entry outright, recounting from scratch.
+
   `codex_app.rs`'s `sync_codex_app_threads` is the one call site: it gathers
   one `capture_for` per live thread OUTSIDE the stage lock (alongside the
   scan's own I/O), then `apply_codex_capture` merges `say`/`tool`/`activity`/

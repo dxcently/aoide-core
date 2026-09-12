@@ -133,7 +133,14 @@
   enumerated by file:line (ruling R2), and the subagent edge
   (`parent_thread_id`/`nickname`) is a later slice's too (R3's "one producer
   per shape" also means `sources` itself never grows a second writer without
-  its own slice).
+  its own slice). `capture_for` memoises per thread (a process-static, no
+  signature change) so a live thread's ~1 Hz callers don't each re-scan a
+  rollout's whole prefix just to count newlines: an unchanged `(len, mtime)`
+  returns the prior capture with no I/O, and append-only growth reuses the
+  memo's own tail-alignment facts unchanged as long as the window stays
+  under a small bounded slack past `TAIL_BYTES` — never an unbounded read. A
+  rollout that shrank or was rewritten in place is never trusted half-way;
+  its memo entry is dropped and the read starts over from scratch.
 
 - **`session bind` assigns continuity, never authority.** Keep the operation
   daemon-owned and local-only; no missing-daemon fallback. It does not load
