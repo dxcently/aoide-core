@@ -46,6 +46,11 @@
 //! resolved rollout path is cached the same way and re-walked only once it
 //! stops existing. A rollout that shrank or was rewritten in place (not
 //! append-only) drops its memo entry outright and recounts from scratch.
+//! [`retain_capture_memo`] is `codex_app.rs::sync_codex_app_threads`'s own
+//! once-per-tick call to evict a thread's memo entry once it stops
+//! appearing among the threads that tick actually observed — a closed
+//! window or a released lock never leaves its rollout path and tail facts
+//! pinned in memory forever.
 //!
 //! Two record shapes are recognised but always contribute nothing: a
 //! `response_item`/`reasoning` record (opaque `encrypted_content`, empty
@@ -65,7 +70,7 @@
 //! function does; it folds one more field, sourced and pointed exactly like
 //! every other.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -558,8 +563,28 @@ struct CaptureMemo {
     capture: CodexCapture,
 }
 
+/// Keyed by thread id ALONE, not `(codex_home, thread_id)` — a genuinely
+/// tighter key, but one this process never needs: a single `aoided` only
+/// ever observes one desktop-Codex home (one host, one home), so a thread
+/// id is already unambiguous here. Entries are dropped only by
+/// [`retain_capture_memo`] — otherwise a thread's memo, and the tail
+/// content its `capture` still holds, would sit here forever once that
+/// thread stops being live.
 static CAPTURE_MEMO: std::sync::Mutex<BTreeMap<String, CaptureMemo>> =
     std::sync::Mutex::new(BTreeMap::new());
+
+/// Drops every memo entry whose thread id is not in `live` — called once
+/// per tick by `codex_app.rs::sync_codex_app_threads`, right after it
+/// gathers that tick's captures, with the exact thread ids the tick
+/// observed. A thread that closes its window or releases its lock stops
+/// appearing in `live` on the very next tick, and its rollout path and
+/// tail-alignment facts are freed here rather than held onto forever.
+pub(crate) fn retain_capture_memo(live: &BTreeSet<String>) {
+    let mut memo = CAPTURE_MEMO
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    memo.retain(|id, _| live.contains(id));
+}
 
 /// Locate `thread_id`'s rollout under `codex_home` — [`super::codex_app::
 /// find_rollout`]'s own walk, the one discovery path [`thread_cwd`] already
@@ -1558,6 +1583,176 @@ mod tests {
         assert_eq!(
             memo_path, path_b,
             "the memo must now track the newly found path"
+        );
+    }
+
+    #[test]
+    fn a_growth_past_the_slack_cap_reanchors_and_recaptures_the_newest_records() {
+        let codex_home = crate::graph::testutil::unique_stage("codex-capture-memo-reanchor");
+        let thread_id = "00000000-0000-7000-8000-000000000019";
+        let padding = "a".repeat(TAIL_BYTES as usize);
+        let filler = format!(
+            r#"{{"timestamp":"2026-09-12T08:00:00.000Z","type":"filler","padding":"{padding}"}}"#
+        );
+        let real1 = turn_context("2026-09-12T09:00:00.000Z", "gpt-first");
+        let body1 = format!("{filler}\n{real1}\n");
+        assert!(body1.len() as u64 > TAIL_BYTES);
+        let path = write_rollout(&codex_home, thread_id, &body1);
+
+        let first = capture_for(&codex_home, thread_id);
+        assert_eq!(first.model.as_deref(), Some("gpt-first"));
+
+        let start_before = {
+            let memo = CAPTURE_MEMO.lock().unwrap();
+            let entry = memo
+                .get(thread_id)
+                .expect("the first capture must have memoised an entry");
+            assert!(
+                entry.start > 0,
+                "the fixture must force a non-trivial tail start"
+            );
+            entry.start
+        };
+
+        // Grow well past the slack cap in one tick: a second big filler
+        // plus a final, distinguishing record.
+        let padding2 = "c".repeat(MEMO_MAX_WINDOW_BYTES as usize);
+        let filler2 = format!(
+            r#"{{"timestamp":"2026-09-12T09:30:00.000Z","type":"filler2","padding":"{padding2}"}}"#
+        );
+        let real2 = turn_context("2026-09-12T10:00:00.000Z", "gpt-second");
+        let body2 = format!("{body1}{filler2}\n{real2}\n");
+        assert!(
+            body2.len() as u64 - start_before > MEMO_MAX_WINDOW_BYTES,
+            "growth must genuinely outrun the slack cap"
+        );
+        write_rollout(&codex_home, thread_id, &body2);
+
+        let second = capture_for(&codex_home, thread_id);
+
+        let start_after = {
+            let memo = CAPTURE_MEMO.lock().unwrap();
+            memo.get(thread_id)
+                .expect("a re-anchor still leaves a memo entry")
+                .start
+        };
+        assert_ne!(
+            start_after, start_before,
+            "growth past the slack cap must re-anchor start, never reuse the old one"
+        );
+        assert_eq!(
+            start_after,
+            body2.len() as u64 - TAIL_BYTES,
+            "a re-anchor must land at the fresh ideal start, not an arbitrary one"
+        );
+
+        assert_eq!(second.model.as_deref(), Some("gpt-second"));
+        let true_ordinal = body2.lines().count() - 1; // real2 is the file's last line
+        let sources = second.sources.expect("captured fields must carry pointers");
+        assert_eq!(
+            sources.get("model"),
+            Some(&pointer(&path, true_ordinal)),
+            "a re-anchored capture's ordinal must still be its true line number"
+        );
+    }
+
+    #[test]
+    fn growth_exactly_at_the_slack_cap_reuses_one_byte_more_reanchors() {
+        let codex_home = crate::graph::testutil::unique_stage("codex-capture-memo-boundary");
+        let thread_id = "00000000-0000-7000-8000-00000000001a";
+        let padding = "a".repeat(TAIL_BYTES as usize);
+        let filler = format!(
+            r#"{{"timestamp":"2026-09-12T08:00:00.000Z","type":"filler","padding":"{padding}"}}"#
+        );
+        let real1 = turn_context("2026-09-12T09:00:00.000Z", "gpt-first");
+        let body1 = format!("{filler}\n{real1}\n");
+        assert!(body1.len() as u64 > TAIL_BYTES);
+        write_rollout(&codex_home, thread_id, &body1);
+
+        capture_for(&codex_home, thread_id);
+        let start = {
+            let memo = CAPTURE_MEMO.lock().unwrap();
+            memo.get(thread_id)
+                .expect("the first capture must have memoised an entry")
+                .start
+        };
+
+        // Grow to EXACTLY `start + MEMO_MAX_WINDOW_BYTES` — the gate's own
+        // `<=` boundary at codex_capture.rs's `capture_for` — and confirm
+        // it still reuses.
+        let target_reuse_len = start + MEMO_MAX_WINDOW_BYTES;
+        let pad_prefix = r#"{"type":"pad2","p":""}"#;
+        let need = target_reuse_len - body1.len() as u64 - 1; // -1 for this line's own trailing \n
+        let pad2 = "b".repeat(need as usize - pad_prefix.len());
+        let filler2 = format!(r#"{{"type":"pad2","p":"{pad2}"}}"#);
+        let body_reuse = format!("{body1}{filler2}\n");
+        assert_eq!(body_reuse.len() as u64, target_reuse_len);
+        write_rollout(&codex_home, thread_id, &body_reuse);
+
+        capture_for(&codex_home, thread_id);
+        let start_at_boundary = {
+            let memo = CAPTURE_MEMO.lock().unwrap();
+            memo.get(thread_id)
+                .expect("the boundary tick still memoises an entry")
+                .start
+        };
+        assert_eq!(
+            start_at_boundary, start,
+            "growth of exactly MEMO_MAX_WINDOW_BYTES must still reuse the memo's start"
+        );
+
+        // One byte more — a single bare newline, still a well-formed
+        // (empty) whole line — must re-anchor instead.
+        let body_reanchor = format!("{body_reuse}\n");
+        assert_eq!(body_reanchor.len() as u64, target_reuse_len + 1);
+        write_rollout(&codex_home, thread_id, &body_reanchor);
+
+        capture_for(&codex_home, thread_id);
+        let start_past_boundary = {
+            let memo = CAPTURE_MEMO.lock().unwrap();
+            memo.get(thread_id)
+                .expect("a re-anchor still leaves a memo entry")
+                .start
+        };
+        assert_ne!(
+            start_past_boundary, start,
+            "one byte past MEMO_MAX_WINDOW_BYTES must re-anchor, never reuse the old start"
+        );
+    }
+
+    // `retain_capture_memo` — the once-per-tick eviction `codex_app.rs`'s
+    // `sync_codex_app_threads` calls with the thread ids it actually
+    // observed.
+
+    #[test]
+    fn retain_capture_memo_drops_an_id_absent_from_live_and_keeps_a_present_one() {
+        let codex_home = crate::graph::testutil::unique_stage("codex-capture-memo-retain");
+        let gone_id = "00000000-0000-7000-8000-00000000001b";
+        let kept_id = "00000000-0000-7000-8000-00000000001c";
+        let gone_body = format!("{}\n", turn_context("2026-09-12T09:00:00.000Z", "gpt-gone"));
+        let kept_body = format!("{}\n", turn_context("2026-09-12T09:00:00.000Z", "gpt-kept"));
+        write_rollout(&codex_home, gone_id, &gone_body);
+        write_rollout(&codex_home, kept_id, &kept_body);
+
+        capture_for(&codex_home, gone_id);
+        capture_for(&codex_home, kept_id);
+        {
+            let memo = CAPTURE_MEMO.lock().unwrap();
+            assert!(memo.contains_key(gone_id));
+            assert!(memo.contains_key(kept_id));
+        }
+
+        let live: BTreeSet<String> = [kept_id.to_string()].into_iter().collect();
+        retain_capture_memo(&live);
+
+        let memo = CAPTURE_MEMO.lock().unwrap();
+        assert!(
+            !memo.contains_key(gone_id),
+            "a thread id absent from `live` must be evicted"
+        );
+        assert!(
+            memo.contains_key(kept_id),
+            "a thread id present in `live` must survive"
         );
     }
 }

@@ -140,7 +140,11 @@
   memo's own tail-alignment facts unchanged as long as the window stays
   under a small bounded slack past `TAIL_BYTES` — never an unbounded read. A
   rollout that shrank or was rewritten in place is never trusted half-way;
-  its memo entry is dropped and the read starts over from scratch.
+  its memo entry is dropped and the read starts over from scratch. The
+  memo is keyed by thread id, one `aoided` per desktop-Codex home so this
+  never collides, and `sync_codex_app_threads` calls `retain_capture_memo`
+  once per tick with that tick's own observed thread ids so a thread that
+  stops being live has its entry evicted rather than held forever.
 
 - **`session bind` assigns continuity, never authority.** Keep the operation
   daemon-owned and local-only; no missing-daemon fallback. It does not load

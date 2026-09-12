@@ -791,6 +791,12 @@ pub(crate) fn sync_codex_app_threads() -> bool {
         None => BTreeMap::new(),
     };
 
+    // A thread this tick no longer observes has its capture memo evicted
+    // right here — the exact set the scan just produced, not the roster a
+    // later reconcile settles on, so a thread never lingers in memory past
+    // the tick it stops being live.
+    super::codex_capture::retain_capture_memo(&threads.iter().map(|t| t.id.clone()).collect());
+
     aoide_storage::fs::with_stage_lock(|| {
         let mut file: SessionsFile = match load_stage(&sessions_path()) {
             Ok(f) => f,

@@ -481,6 +481,13 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   rollout path is cached the same way and re-walked only once it stops
   existing. A rollout that shrank or was rewritten in place is not
   append-only and drops its memo entry outright, recounting from scratch.
+  The memo is keyed by thread id alone, not `(codex_home, thread_id)` —
+  tighter, but unneeded, since one `aoided` only ever observes one
+  desktop-Codex home. `retain_capture_memo` is `sync_codex_app_threads`'s
+  own once-per-tick eviction: a thread absent from that tick's own observed
+  set has its memo entry dropped right there, so a closed window or a
+  released lock never pins its rollout path and tail facts in memory
+  forever.
 
   `codex_app.rs`'s `sync_codex_app_threads` is the one call site: it gathers
   one `capture_for` per live thread OUTSIDE the stage lock (alongside the
