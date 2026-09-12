@@ -177,6 +177,18 @@ impl Drop for EnvVars {
         }
     }
 }
+/// Binds `$XDG_RUNTIME_DIR` to a fresh, empty `unique_stage` dir for the
+/// returned guard's lifetime, restoring whatever it was on drop. `reap()`
+/// wires `sync_eidolon_sessions()` into every pass, and that walks
+/// `$XDG_RUNTIME_DIR/eidolon` — a test that reaches `reap()` (or
+/// `sync_eidolon_sessions`/`eidolon_presence_sessions` directly) without
+/// this inherits the ambient runtime dir and can ping whatever real eidolon
+/// socket happens to be live on the box running the suite.
+pub(crate) fn isolated_xdg_runtime(tag: &str) -> EnvVars {
+    let env = EnvVars::save(&["XDG_RUNTIME_DIR"]);
+    std::env::set_var("XDG_RUNTIME_DIR", unique_stage(tag));
+    env
+}
 /// Locate the real, already-built `aoide` binary as `current_exe()`'s
 /// sibling in the shared `target/<profile>/` dir (`current_exe()` under
 /// `cargo test` resolves to `target/<profile>/deps/aoide_conduct-<hash>` —

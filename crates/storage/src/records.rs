@@ -269,8 +269,13 @@ pub struct SessionRecord {
     /// session (`state/sessions/<sessionId>.log`, CONTRACTS.md §4) — raw bytes,
     /// append-only, unrotated. Stamped right after `do_session_start` by
     /// `set_session_log_path`, once the log file is open. Additive/v0-safe:
-    /// absent on a legacy record and on every INTERACTIVE session (conduct
-    /// never sets it when a real controlling tty is attached).
+    /// absent on a legacy record and on every INTERACTIVE `aoide conduct`
+    /// session (conduct never sets it when a real controlling tty is
+    /// attached) — EXCEPT an `agent:"eidolon"` record, where `logPath` is
+    /// never a conduct-owned pty transcript at all: it carries that
+    /// producer's own session journal, copied from its `meta.json` `log`
+    /// field and stamped by the presence reconcile on every pass, headless
+    /// or interactive alike.
     #[serde(rename = "logPath", default, skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
     /// A human-readable `adjective-noun` DISPLAY handle, minted once (see

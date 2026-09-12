@@ -2146,6 +2146,7 @@ mod tests {
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
         let stage = crate::graph::testutil::unique_stage("reap-hookfold");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let _xdg = crate::graph::testutil::isolated_xdg_runtime("reap-hookfold-xdg");
 
         let mut rec = hook_only("headless", "idle");
         rec.started_at = "2020-01-01T00:00:00Z".into(); // ancient — no transcript exists for it
@@ -2200,6 +2201,7 @@ mod tests {
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
         let stage = crate::graph::testutil::unique_stage("reap-orphan-hooks");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let _xdg = crate::graph::testutil::isolated_xdg_runtime("reap-orphan-hooks-xdg");
 
         // One live session (fresh hook, so never reaped) plus two orphan hooks
         // whose ids match no session record at all.
@@ -2527,6 +2529,7 @@ mod tests {
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
         let stage = crate::graph::testutil::unique_stage("reap-refresh");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let _xdg = crate::graph::testutil::isolated_xdg_runtime("reap-refresh-xdg");
 
         // A transcript in a project bucket that does NOT match the session's
         // cwd — the real drift (Claude Code fixes its bucket at launch, the
@@ -2688,6 +2691,7 @@ mod tests {
         let state = stage.join("state");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
         std::env::set_var("AOIDE_STATE_DIR", &state);
+        let _xdg = crate::graph::testutil::isolated_xdg_runtime("reap-ledger-xdg");
 
         let mut dead = hook_only("dead-1", "idle");
         dead.started_at = "2000-01-01T00:00:00Z".into(); // long before any real boot
@@ -3245,6 +3249,7 @@ mod tests {
         let stage = crate::graph::testutil::unique_stage("reap-spawned-shell-stale");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
         std::env::set_var("AOIDE_STATE_DIR", stage.join("state"));
+        let _xdg = crate::graph::testutil::isolated_xdg_runtime("reap-spawned-shell-stale-xdg");
 
         let log = stage.join("worker.log");
         std::fs::write(&log, b"$ the last thing that ever ran here\n").unwrap();
@@ -3358,6 +3363,7 @@ mod tests {
         let stage = crate::graph::testutil::unique_stage("reap-spawned-shell-fresh");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
         std::env::set_var("AOIDE_STATE_DIR", stage.join("state"));
+        let _xdg = crate::graph::testutil::isolated_xdg_runtime("reap-spawned-shell-fresh-xdg");
 
         let log = stage.join("worker.log");
         // Freshly written — mtime is "now", well under the band, exactly as
@@ -3400,6 +3406,7 @@ mod tests {
         let stage = crate::graph::testutil::unique_stage("reap-spawned-shell-now");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
         std::env::set_var("AOIDE_STATE_DIR", stage.join("state"));
+        let _xdg = crate::graph::testutil::isolated_xdg_runtime("reap-spawned-shell-now-xdg");
 
         let log = stage.join("worker.log");
         std::fs::write(&log, b"$ someone just ran another command here\n").unwrap();

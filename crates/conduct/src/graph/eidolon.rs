@@ -257,7 +257,11 @@ fn eidolon_state(busy: bool, tui: bool) -> &'static str {
 /// not-`done` narrowing `identity::attested_wrap` applies, minus the seal
 /// verification (this is a plain lineage read, not a security gate).
 /// `ancestry_of` is the injected walk; production passes
-/// `aoide_storage::attest::pid_ancestry`.
+/// `aoide_storage::attest::pid_ancestry`. A third "conducted ancestor" walk
+/// beside `aoide_storage::attest::attested_record` and `doorbell.rs`'s
+/// `conducted_ancestor`: `attested_record` calls `pid_ancestry` directly
+/// (not injectable), so it can't take this module's fake ancestry in a
+/// deterministic test — hence its own copy here rather than a shared call.
 fn resolve_parent(
     pid: u32,
     sessions: &[SessionRecord],
@@ -525,7 +529,7 @@ mod tests {
             id: id.to_string(),
             pid,
             cwd: cwd.to_string(),
-            log: format!("/home/khoa/.local/share/eidolon/sessions/{id}.eid"),
+            log: format!("/tmp/eid/sessions/{id}.eid"),
             model: "claude-cli:opus".to_string(),
             title: "ng".to_string(),
             busy,
@@ -543,8 +547,8 @@ mod tests {
         let (out, changed) = reconcile_eidolon_sessions(
             vec![],
             &PresenceScan::Observed(vec![presence(
-                "khoa-253b",
-                3514983,
+                "user-0001",
+                4242,
                 "/home/khoa",
                 false,
                 true,
@@ -554,16 +558,16 @@ mod tests {
         assert!(changed);
         assert_eq!(out.len(), 1);
         let r = &out[0];
-        assert_eq!(r.session_id, "khoa-253b");
+        assert_eq!(r.session_id, "user-0001");
         assert_eq!(r.agent, "eidolon");
         assert_eq!(r.kind.as_deref(), Some("agent"));
-        assert_eq!(r.pid, Some(3514983));
+        assert_eq!(r.pid, Some(4242));
         assert_eq!(r.cwd, "/home/khoa");
         assert_eq!(r.model.as_deref(), Some("claude-cli:opus"));
         assert_eq!(r.title.as_deref(), Some("ng"));
         assert_eq!(
             r.log_path.as_deref(),
-            Some("/home/khoa/.local/share/eidolon/sessions/khoa-253b.eid")
+            Some("/tmp/eid/sessions/user-0001.eid")
         );
         assert_eq!(r.state, "idle", "busy:false on a TUI owner is idle");
         assert_eq!(r.parent_session_id, None, "no ancestor -> top-level");
@@ -579,13 +583,13 @@ mod tests {
     }
 
     /// The live-target shape (`P-EIDOLON` rev 3 §1's acceptance table): a
-    /// wrap (`conduct-3513862-…`, petname `plucky-comet`), a bash shell
+    /// wrap (`conduct-4243-…`, petname `plucky-comet`), a bash shell
     /// under it, and eidolon under that — the FIRST conducted ancestor via
     /// pid ancestry is the wrap, not the intervening shell.
     #[test]
     fn the_live_target_shape_enrols_with_the_wraps_petname_untouched() {
         let mut wrap = session(
-            "conduct-3513862-1789234665",
+            "conduct-4243-1000000000",
             "/home/khoa",
             "working",
             "t",
@@ -593,19 +597,19 @@ mod tests {
         );
         wrap.agent = "shell".to_string();
         wrap.conductable = Some(true);
-        wrap.pid = Some(3513862);
+        wrap.pid = Some(4243);
         wrap.petname = Some("plucky-comet".to_string());
 
         let ancestry = |pid: u32| -> Vec<i32> {
-            assert_eq!(pid, 3514983, "walked from meta.json's own pid");
-            vec![3514983, 3513878, 3513862]
+            assert_eq!(pid, 4242, "walked from meta.json's own pid");
+            vec![4242, 4244, 4243]
         };
 
         let (out, changed) = reconcile_eidolon_sessions(
             vec![wrap.clone()],
             &PresenceScan::Observed(vec![presence(
-                "khoa-253b",
-                3514983,
+                "user-0001",
+                4242,
                 "/home/khoa",
                 false,
                 true,
@@ -615,18 +619,18 @@ mod tests {
         assert!(changed);
         assert_eq!(out.len(), 2);
 
-        let eidolon_rec = out.iter().find(|s| s.session_id == "khoa-253b").unwrap();
+        let eidolon_rec = out.iter().find(|s| s.session_id == "user-0001").unwrap();
         assert_eq!(eidolon_rec.agent, "eidolon");
         assert_eq!(eidolon_rec.kind.as_deref(), Some("agent"));
         assert_eq!(
             eidolon_rec.parent_session_id.as_deref(),
-            Some("conduct-3513862-1789234665"),
+            Some("conduct-4243-1000000000"),
             "the FIRST conducted ancestor, skipping the intervening bash shell"
         );
 
         let wrap_after = out
             .iter()
-            .find(|s| s.session_id == "conduct-3513862-1789234665")
+            .find(|s| s.session_id == "conduct-4243-1000000000")
             .unwrap();
         assert_eq!(
             wrap_after.petname, wrap.petname,
@@ -637,8 +641,8 @@ mod tests {
     #[test]
     fn a_second_reconcile_changes_nothing_and_re_mints_no_petname() {
         let scan = PresenceScan::Observed(vec![presence(
-            "khoa-253b",
-            3514983,
+            "user-0001",
+            4242,
             "/home/khoa",
             false,
             true,
@@ -838,13 +842,13 @@ mod tests {
         let root = unique_stage("eidolon-presence-root");
         std::env::set_var("XDG_RUNTIME_DIR", &root);
         let presence_dir = presence_root();
-        std::fs::create_dir_all(presence_dir.join("khoa-253b")).unwrap();
+        std::fs::create_dir_all(presence_dir.join("user-0001")).unwrap();
         std::fs::write(
-            presence_dir.join("khoa-253b").join("meta.json"),
+            presence_dir.join("user-0001").join("meta.json"),
             serde_json::json!({
-                "id": "khoa-253b",
-                "pid": 3514983,
-                "log": "/home/khoa/.local/share/eidolon/sessions/1789234755480.eid",
+                "id": "user-0001",
+                "pid": 4242,
+                "log": "/tmp/eid/sessions/1000000000000.eid",
                 "cwd": "/home/khoa",
                 "repo": null,
                 "model": "claude-cli:opus",
@@ -858,7 +862,7 @@ mod tests {
 
         use std::io::{Read, Write};
         use std::os::unix::net::UnixListener;
-        let sock_path = presence_dir.join("khoa-253b").join("sock");
+        let sock_path = presence_dir.join("user-0001").join("sock");
         let listener = UnixListener::bind(&sock_path).unwrap();
         let handle = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
@@ -867,7 +871,7 @@ mod tests {
             let _ = stream.write_all(br#"{"ok":true}"#);
         });
 
-        let table = "3514983 3513878 /home/khoa/.local/bin/eidolon\n";
+        let table = "4242 4244 /home/khoa/.local/bin/eidolon\n";
         let scan = eidolon_presence_sessions_with(|| Some(table.to_string()));
         handle.join().unwrap();
 
@@ -875,8 +879,8 @@ mod tests {
             PresenceScan::Observed(sessions) => {
                 assert_eq!(sessions.len(), 1);
                 let s = &sessions[0];
-                assert_eq!(s.id, "khoa-253b");
-                assert_eq!(s.pid, 3514983);
+                assert_eq!(s.id, "user-0001");
+                assert_eq!(s.pid, 4242);
                 assert_eq!(s.cwd, "/home/khoa");
                 assert!(s.tui, "no subcommand on the table row is the TUI");
                 assert!(!s.busy);
