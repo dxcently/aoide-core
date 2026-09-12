@@ -573,6 +573,15 @@ struct CaptureMemo {
 static CAPTURE_MEMO: std::sync::Mutex<BTreeMap<String, CaptureMemo>> =
     std::sync::Mutex::new(BTreeMap::new());
 
+/// The pure eviction rule behind [`retain_capture_memo`], split out so a
+/// test can exercise it against its own local map instead of the shared
+/// [`CAPTURE_MEMO`] static — the static is process-wide, and cargo runs
+/// this crate's tests in parallel, so a test that retained *it* directly
+/// would evict every other concurrently running test's entries too.
+fn retain_memo_in(memo: &mut BTreeMap<String, CaptureMemo>, live: &BTreeSet<String>) {
+    memo.retain(|id, _| live.contains(id));
+}
+
 /// Drops every memo entry whose thread id is not in `live` — called once
 /// per tick by `codex_app.rs::sync_codex_app_threads`, right after it
 /// gathers that tick's captures, with the exact thread ids the tick
@@ -583,7 +592,7 @@ pub(crate) fn retain_capture_memo(live: &BTreeSet<String>) {
     let mut memo = CAPTURE_MEMO
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    memo.retain(|id, _| live.contains(id));
+    retain_memo_in(&mut memo, live);
 }
 
 /// Locate `thread_id`'s rollout under `codex_home` — [`super::codex_app::
@@ -1726,26 +1735,32 @@ mod tests {
 
     #[test]
     fn retain_capture_memo_drops_an_id_absent_from_live_and_keeps_a_present_one() {
-        let codex_home = crate::graph::testutil::unique_stage("codex-capture-memo-retain");
-        let gone_id = "00000000-0000-7000-8000-00000000001b";
-        let kept_id = "00000000-0000-7000-8000-00000000001c";
-        let gone_body = format!("{}\n", turn_context("2026-09-12T09:00:00.000Z", "gpt-gone"));
-        let kept_body = format!("{}\n", turn_context("2026-09-12T09:00:00.000Z", "gpt-kept"));
-        write_rollout(&codex_home, gone_id, &gone_body);
-        write_rollout(&codex_home, kept_id, &kept_body);
-
-        capture_for(&codex_home, gone_id);
-        capture_for(&codex_home, kept_id);
-        {
-            let memo = CAPTURE_MEMO.lock().unwrap();
-            assert!(memo.contains_key(gone_id));
-            assert!(memo.contains_key(kept_id));
+        // Exercises `retain_memo_in` (the pure rule `retain_capture_memo`
+        // delegates to) against a local map only. The real `CAPTURE_MEMO`
+        // is process-wide and this crate's tests run in parallel, so a
+        // test that retained *that* static directly would evict every
+        // other concurrently running test's entries too.
+        fn synthetic_memo(model: &str) -> CaptureMemo {
+            CaptureMemo {
+                path: PathBuf::from(format!("/nonexistent/{model}.jsonl")),
+                len: 0,
+                mtime: std::time::UNIX_EPOCH,
+                start: 0,
+                start_ordinal: 0,
+                drop_first: false,
+                capture: CodexCapture::default(),
+            }
         }
 
-        let live: BTreeSet<String> = [kept_id.to_string()].into_iter().collect();
-        retain_capture_memo(&live);
+        let gone_id = "00000000-0000-7000-8000-00000000001b";
+        let kept_id = "00000000-0000-7000-8000-00000000001c";
+        let mut memo: BTreeMap<String, CaptureMemo> = BTreeMap::new();
+        memo.insert(gone_id.to_string(), synthetic_memo("gone"));
+        memo.insert(kept_id.to_string(), synthetic_memo("kept"));
 
-        let memo = CAPTURE_MEMO.lock().unwrap();
+        let live: BTreeSet<String> = [kept_id.to_string()].into_iter().collect();
+        retain_memo_in(&mut memo, &live);
+
         assert!(
             !memo.contains_key(gone_id),
             "a thread id absent from `live` must be evicted"
