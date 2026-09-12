@@ -446,7 +446,7 @@ mod tests {
 
     fn fixture_path() -> PathBuf {
         PathBuf::from(
-            "/home/khoa/.codex/sessions/2026/09/12/rollout-2026-09-12T09-00-00-01a07d89-thread.jsonl",
+            "/home/khoa/.codex/sessions/2026/09/12/rollout-2026-09-12T09-00-00-00000000-0000-7000-8000-000000000001.jsonl",
         )
     }
 
@@ -525,6 +525,46 @@ mod tests {
     fn tool_call_output(ts: &str, kind: &str, call_id: &str) -> String {
         format!(
             r#"{{"timestamp":"{ts}","type":"response_item","payload":{{"type":"{kind}_output","call_id":"{call_id}","output":"ok"}}}}"#
+        )
+    }
+
+    fn session_meta(
+        ts: &str,
+        id: &str,
+        parent_thread_id: &str,
+        thread_source: &str,
+        nickname: &str,
+    ) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"session_meta","payload":{{"session_id":"{id}","id":"{id}","parent_thread_id":"{parent_thread_id}","cwd":"/home/khoa/Aoide","originator":"codex_cli","cli_version":"1.0","source":"desktop","thread_source":"{thread_source}","agent_nickname":"{nickname}","agent_path":"","model_provider":"openai","context_window":258400,"git":{{}}}}}}"#
+        )
+    }
+
+    fn item_completed_command_with_parsed(
+        ts: &str,
+        turn_id: &str,
+        command: &str,
+        parsed_cmd: &str,
+    ) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"item_completed","thread_id":"th1","turn_id":"{turn_id}","item":{{"type":"CommandExecution","command":"{command}","parsed_cmd":"{parsed_cmd}","cwd":"/home/khoa/Aoide","status":"completed","exit_code":0,"duration":120}},"started_at_ms":0,"completed_at_ms":120}}}}"#
+        )
+    }
+
+    fn item_completed_mcp_tool_call(ts: &str, turn_id: &str, server: &str, tool: &str) -> String {
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"item_completed","thread_id":"th1","turn_id":"{turn_id}","item":{{"type":"McpToolCall","server":"{server}","tool":"{tool}","status":"completed","duration":80}},"started_at_ms":0,"completed_at_ms":80}}}}"#
+        )
+    }
+
+    fn item_completed_file_change(ts: &str, turn_id: &str, paths: &[&str]) -> String {
+        let changes: Vec<String> = paths
+            .iter()
+            .map(|p| format!(r#"{{"path":"{p}"}}"#))
+            .collect();
+        format!(
+            r#"{{"timestamp":"{ts}","type":"event_msg","payload":{{"type":"item_completed","thread_id":"th1","turn_id":"{turn_id}","item":{{"type":"FileChange","changes":[{}],"status":"completed"}},"started_at_ms":0,"completed_at_ms":40}}}}"#,
+            changes.join(",")
         )
     }
 
@@ -800,6 +840,94 @@ mod tests {
         assert_eq!(
             cap.sources.as_ref().and_then(|s| s.get("prompt")),
             Some(&pointer(&path, 1))
+        );
+    }
+
+    #[test]
+    fn a_session_meta_record_yields_parent_thread_source_and_nickname_with_pointers() {
+        let path = fixture_path();
+        let lines = vec![session_meta(
+            "2026-09-12T09:00:00.000Z",
+            "00000000-0000-7000-8000-000000000002",
+            "00000000-0000-7000-8000-000000000003",
+            "subagent",
+            "Laplace",
+        )];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(
+            cap.parent_thread_id.as_deref(),
+            Some("00000000-0000-7000-8000-000000000003")
+        );
+        assert_eq!(cap.thread_source.as_deref(), Some("subagent"));
+        assert_eq!(cap.nickname.as_deref(), Some("Laplace"));
+
+        let sources = cap
+            .sources
+            .expect("session_meta fields must carry pointers");
+        assert_eq!(sources.get("parent_thread_id"), Some(&pointer(&path, 0)));
+        assert_eq!(sources.get("thread_source"), Some(&pointer(&path, 0)));
+        assert_eq!(sources.get("nickname"), Some(&pointer(&path, 0)));
+    }
+
+    #[test]
+    fn parsed_cmd_wins_over_a_differing_raw_command() {
+        let path = fixture_path();
+        let lines = vec![item_completed_command_with_parsed(
+            "2026-09-12T09:00:00.000Z",
+            "t1",
+            "bash -lc 'cargo test -p aoide-conduct'",
+            "cargo test -p aoide-conduct",
+        )];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(
+            cap.tool.as_deref(),
+            Some("CommandExecution: cargo test -p aoide-conduct"),
+            "parsed_cmd is the app's own display-ready form and must win over the raw command"
+        );
+    }
+
+    #[test]
+    fn an_mcp_tool_call_labels_server_and_tool() {
+        let path = fixture_path();
+        let lines = vec![item_completed_mcp_tool_call(
+            "2026-09-12T09:00:00.000Z",
+            "t1",
+            "mneme",
+            "search_vault",
+        )];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.tool.as_deref(), Some("McpToolCall: mneme/search_vault"));
+    }
+
+    #[test]
+    fn a_file_change_labels_its_changed_paths() {
+        let path = fixture_path();
+        let lines = vec![item_completed_file_change(
+            "2026-09-12T09:00:00.000Z",
+            "t1",
+            &["src/graph/codex_capture.rs", "README.md"],
+        )];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(
+            cap.tool.as_deref(),
+            Some("FileChange: src/graph/codex_capture.rs, README.md")
+        );
+    }
+
+    #[test]
+    fn an_unparseable_line_contributes_nothing_and_neighbouring_ordinals_stay_correct() {
+        let path = fixture_path();
+        let lines = vec![
+            turn_context("2026-09-12T09:00:00.000Z", "gpt-6-astra"),
+            r#"{"timestamp":"2026-09-12T09:00:02.000Z","type":"turn_cont"#.to_string(),
+            turn_context("2026-09-12T09:05:00.000Z", "gpt-6-astra-mini"),
+        ];
+        let cap = fold_rollout(&path, &lines);
+        assert_eq!(cap.model.as_deref(), Some("gpt-6-astra-mini"));
+        assert_eq!(
+            cap.sources.as_ref().and_then(|s| s.get("model")),
+            Some(&pointer(&path, 2)),
+            "the truncated line at ordinal 1 must contribute nothing and must not shift the following record's ordinal"
         );
     }
 }
