@@ -112,6 +112,29 @@
   so every dead end in the gather surfaces as `Unknown`, never as a silent
   `Observed(empty)`.
 
+- **A Codex capture never enrols, removes, or revives a thread, and a field
+  it reports is `None`/unchanged unless its own record was read WHOLE
+  (P-CX-5, codex seq 228 rulings).** `graph/codex_capture.rs::capture_for`
+  is a bounded read (`TAIL_BYTES` off the END of a rollout); a missing
+  rollout, an unreadable one, or a tail whose only content is one record too
+  large to ever land whole in the window all yield `CodexCapture::default()`
+  — never inferred as idle/completion, never a reason for
+  `codex_app.rs::sync_codex_app_threads` to touch a record's roster
+  membership (that's `ThreadScan`/`reconcile_codex_app_threads`'s call
+  alone). A tail cut that opens mid-record drops that leading fragment
+  WHOLE, never parsed — the same rule an encrypted `reasoning` record and a
+  truncated `task_started` already hold in the fold itself. The merge onto a
+  `kind:"app"` record (`apply_codex_capture`) touches only `say`/`tool`/
+  `activity`/`model`/`context_tokens`/`context_ceiling`/`sources`, each set
+  only when the capture produced a value and only when it differs — never
+  blanked back out by a quiet tick. `state`, `parentSessionId`, `title`, and
+  `nickname` are deliberately untouched by that merge: `state` is a LATER
+  slice's to set only once every consumer of an app record's `state` is
+  enumerated by file:line (ruling R2), and the subagent edge
+  (`parent_thread_id`/`nickname`) is a later slice's too (R3's "one producer
+  per shape" also means `sources` itself never grows a second writer without
+  its own slice).
+
 - **`session bind` assigns continuity, never authority.** Keep the operation
   daemon-owned and local-only; no missing-daemon fallback. It does not load
   optional Mneme config, change grants, or replace executor-specific mail

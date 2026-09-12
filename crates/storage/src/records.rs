@@ -7,6 +7,8 @@
 //! `merged_sessions`, `sorted_projects`, `resolved_parent`) stay in root
 //! `graph/model.rs` — they're conduct's charter and move in Phase 3b.
 
+use std::collections::BTreeMap;
+
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
@@ -446,6 +448,21 @@ pub struct SessionRecord {
     /// `graph.json`, like `headless`/`hookAncestry`/`origin` above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub restore: Option<RestoreSnapshot>,
+    /// Field name → `<absolute rollout path>#<record ordinal>` provenance
+    /// pointer, one entry per field on THIS record some reader actually
+    /// captured off a native source rather than aoide's own hooks (P-CX-5,
+    /// codex seq 228 ruling R3). A general, additive `SessionRecord` field —
+    /// not a Codex-only one — but with exactly ONE producer today
+    /// (`graph/codex_app.rs`'s desktop-Codex capture, off a thread's own
+    /// rollout JSONL); a second producer wanting the same shape earns its
+    /// own slice, never a second field. Absent means "nothing on this
+    /// record carries a native pointer" (every legacy record, and every
+    /// record no capture reader has touched); a field with no entry here
+    /// was not captured from a pointed source, which a reader can treat as
+    /// a fact to show, never a gap to guess at. Additive/v0-safe, same
+    /// `skip_serializing_if` discipline as `harnessSessionId`/`seal` above.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sources: Option<BTreeMap<String, String>>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -780,6 +797,45 @@ mod tests {
         let legacy: SessionRecord =
             serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
         assert_eq!(legacy.context_ceiling, None);
+    }
+    #[test]
+    fn session_record_sources_round_trips_and_stays_absent_when_unset() {
+        // serde: `sources` serialises as an object when Some, and is skipped
+        // (skip_serializing_if) when None — additive/v0-safe on the wire,
+        // matching the `seal`/`harnessSessionId` fields' contract above
+        // (P-CX-5, codex seq 228 ruling R3).
+        let mut rec = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "model".to_string(),
+            "/home/khoa/.codex/sessions/rollout-x.jsonl#42".to_string(),
+        );
+        rec.sources = Some(sources.clone());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(
+            json.contains(
+                "\"sources\":{\"model\":\"/home/khoa/.codex/sessions/rollout-x.jsonl#42\"}"
+            ),
+            "serialised: {json}"
+        );
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.sources, Some(sources));
+
+        // A record with no sources omits the key entirely (no null noise) —
+        // byte-identical to a record built before this field existed — and a
+        // legacy record with no `sources` field parses to None.
+        let bare = SessionRecord {
+            session_id: "s".into(),
+            ..Default::default()
+        };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("sources"), "serialised: {bare_json}");
+        let legacy: SessionRecord =
+            serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
+        assert_eq!(legacy.sources, None);
     }
     #[test]
     fn session_records_round_trip_unknown_fields() {

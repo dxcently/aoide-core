@@ -31,11 +31,25 @@
 //! thread set ever removes an existing `kind:"app"` record.
 //!
 //! [`codex_app_threads`] assembles the live set and [`sync_codex_app_threads`]
-//! is the I/O wrapper over [`reconcile_codex_app_threads`] — but NEITHER has
-//! a call site yet. The listener/daemon-tick wiring and the taught
-//! transport/lifecycle refusals (`send`, `session kill`) are a later slice
-//! (P-CX-3). Until then this module is reachable only from its own tests.
+//! is the I/O wrapper over [`reconcile_codex_app_threads`], called from
+//! `window.rs`'s own reap tick. The taught transport/lifecycle refusals
+//! (`send`, `session kill`) are a later slice (P-CX-3).
+//!
+//! `sync_codex_app_threads` also merges each live thread's own
+//! [`super::codex_capture::capture_for`] onto its `"app"` record (P-CX-5 S2):
+//! `say`/`tool`/`activity`/`model`/`context_tokens`/`context_ceiling`/
+//! `sources`, set only when the capture produced a value and only when it
+//! actually differs — the same "never clear, only set" discipline
+//! `session_store.rs`'s `refresh_transcript_fields` already holds for the
+//! very same fields. `sources` keys remap from `CodexCapture`'s own
+//! snake_case field names to `SessionRecord`'s wire camelCase
+//! (`context_tokens` → `contextTokens`, etc. — [`MERGED_SOURCE_FIELDS`]),
+//! and only ever carry an entry for a field this merge actually applies:
+//! `state`, `parentSessionId`, `title`, and `nickname` stay untouched by
+//! this merge (a later slice's own territory — S3, S4), and their pointers
+//! in `cap.sources` are never copied either. See [`apply_codex_capture`].
 
+use super::codex_capture::{capture_for, CodexCapture};
 use super::doc::restage_graph;
 use super::model::{
     load_stage, sessions_path, write_stage, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
@@ -477,8 +491,10 @@ pub(crate) fn thread_cwd(codex_home: &Path, thread_id: &str) -> Option<String> {
 
 /// Depth-first search for `rollout-*-<thread_id>.jsonl` under `dir`
 /// (typically `sessions/<year>/<month>/<day>/`, but the walk makes no
-/// assumption about nesting depth).
-fn find_rollout(dir: &Path, thread_id: &str) -> Option<PathBuf> {
+/// assumption about nesting depth). `pub(crate)` so [`super::codex_capture::
+/// capture_for`] reuses this exact walk rather than growing a second one —
+/// the crate's own "widen it, don't fork it" rule.
+pub(crate) fn find_rollout(dir: &Path, thread_id: &str) -> Option<PathBuf> {
     let suffix = format!("-{thread_id}.jsonl");
     let mut stack = vec![dir.to_path_buf()];
     while let Some(current) = stack.pop() {
@@ -633,14 +649,105 @@ fn audit_scan_unknown_once(failure: &ScanFailure) {
     );
 }
 
+/// The subset of [`CodexCapture`]'s own (snake_case, Rust-field-name)
+/// `sources` keys this merge actually applies to `rec`, paired with the
+/// WIRE (camelCase) name a `sources` entry must carry on `SessionRecord`
+/// (`storage/src/records.rs`'s `#[serde(rename)]`s) — S1's own capture keys
+/// its internal map by Rust field name (`codex_capture.rs`'s own tests pin
+/// that); S2 remaps at this exact boundary, the one place a capture's
+/// internal shape crosses into the wire-facing record it lands on.
+const MERGED_SOURCE_FIELDS: &[(&str, &str)] = &[
+    ("say", "say"),
+    ("tool", "tool"),
+    ("activity", "activity"),
+    ("model", "model"),
+    ("context_tokens", "contextTokens"),
+    ("context_ceiling", "contextCeiling"),
+];
+
+/// Merge [`CodexCapture`]'s fields onto `rec` — `say`/`tool`/`activity`/
+/// `model`/`context_tokens`/`context_ceiling`/`sources`, each set only when
+/// `cap` produced `Some` AND the value actually differs: a quiet or
+/// partial tail read (every field `None`) changes nothing, and a value
+/// this merge already set is never blanked back out just because a LATER
+/// tick's tail window no longer covers the record that set it — the same
+/// "never clear, only set" discipline `session_store.rs`'s
+/// `refresh_transcript_fields` already holds for these very fields.
+/// `sources` is EXTENDED, never replaced, and restricted to
+/// [`MERGED_SOURCE_FIELDS`]: a `state`/`parent_thread_id`/`thread_source`/
+/// `nickname` pointer `cap.sources` may carry is never copied here, because
+/// this merge never sets those VALUES — a `sources` entry names a field
+/// THIS record actually carries from a pointed source, never a promise
+/// about one a later slice (S3, S4) has not landed yet. An entry already on
+/// `rec.sources` with no counterpart in `cap.sources` this tick is left
+/// standing — a shown datum's pointer must not vanish just because a later
+/// capture happened not to re-see the record that set it. Returns whether
+/// anything changed.
+///
+/// Deliberately never touches `state`, `parent_session_id`, `title`, or
+/// `nickname` even though `cap` may carry values for them — those are S3's
+/// (`state`) and S4's (the subagent edge) own slices, never this merge's.
+fn apply_codex_capture(rec: &mut SessionRecord, cap: &CodexCapture) -> bool {
+    let mut changed = false;
+
+    if let Some(say) = &cap.say {
+        if rec.say.as_deref() != Some(say.as_str()) {
+            rec.say = Some(say.clone());
+            changed = true;
+        }
+    }
+    if let Some(tool) = &cap.tool {
+        if rec.tool.as_deref() != Some(tool.as_str()) {
+            rec.tool = Some(tool.clone());
+            changed = true;
+        }
+    }
+    if let Some(activity) = &cap.activity {
+        if rec.activity.as_deref() != Some(activity.as_str()) {
+            rec.activity = Some(activity.clone());
+            changed = true;
+        }
+    }
+    if let Some(model) = &cap.model {
+        if rec.model.as_deref() != Some(model.as_str()) {
+            rec.model = Some(model.clone());
+            changed = true;
+        }
+    }
+    if let Some(tokens) = cap.context_tokens {
+        if rec.context_tokens != Some(tokens) {
+            rec.context_tokens = Some(tokens);
+            changed = true;
+        }
+    }
+    if let Some(ceiling) = cap.context_ceiling {
+        if rec.context_ceiling != Some(ceiling) {
+            rec.context_ceiling = Some(ceiling);
+            changed = true;
+        }
+    }
+    if let Some(cap_sources) = &cap.sources {
+        for (snake, camel) in MERGED_SOURCE_FIELDS {
+            let Some(ptr) = cap_sources.get(*snake) else {
+                continue;
+            };
+            let merged = rec.sources.get_or_insert_with(BTreeMap::new);
+            if merged.get(*camel) != Some(ptr) {
+                merged.insert((*camel).to_string(), ptr.clone());
+                changed = true;
+            }
+        }
+    }
+
+    changed
+}
+
 /// The I/O wrapper over [`reconcile_codex_app_threads`] — gathers a
-/// [`ThreadScan`], reconciles under the stage lock, and re-stages
-/// `graph.json` only when something changed. Mirrors
-/// [`super::window::sync_untracked_terminal_windows`]'s shape exactly. NO
-/// CALL SITE YET (P-CX-3 wires the listener/daemon tick); reachable only
-/// from its own tests until then — the same standing
-/// [`reconcile_codex_app_threads`] itself has carried since P-CX-1. An
-/// `Unknown` scan takes NO stage lock and writes NOTHING —
+/// [`ThreadScan`], reconciles under the stage lock, merges each live
+/// thread's own [`capture_for`] onto its `"app"` record
+/// ([`apply_codex_capture`]), and re-stages `graph.json` only when
+/// something changed. Mirrors [`super::window::sync_untracked_terminal_windows`]'s
+/// shape. An `Unknown` scan takes NO stage lock and writes NOTHING —
 /// [`audit_scan_unknown_once`] notes it and this returns `false`, same as
 /// an ordinary no-op tick.
 ///
@@ -649,8 +756,9 @@ fn audit_scan_unknown_once(failure: &ScanFailure) {
 /// records — so an already-enrolled thread's `sessions/**` walk runs once
 /// per NEW id, never once per tick — and once more inside
 /// `with_stage_lock` for the actual reconcile. The gather itself (the lock
-/// probes, the `ps` shell-out, the rollout walk for a genuinely new id)
-/// stays OUTSIDE the stage lock either way, unchanged from before.
+/// probes, the `ps` shell-out, the rollout walk for a genuinely new id, and
+/// now each live thread's bounded rollout tail) stays OUTSIDE the stage
+/// lock either way, unchanged from before.
 pub(crate) fn sync_codex_app_threads() -> bool {
     let known: BTreeMap<String, String> = load_stage::<SessionsFile>(&sessions_path())
         .map(|f| {
@@ -662,17 +770,44 @@ pub(crate) fn sync_codex_app_threads() -> bool {
         })
         .unwrap_or_default();
     let scan = codex_app_threads(&known);
-    if let ThreadScan::Unknown(failure) = &scan {
-        audit_scan_unknown_once(failure);
-        return false;
-    }
+    let threads: &Vec<CodexThread> = match &scan {
+        ThreadScan::Unknown(failure) => {
+            audit_scan_unknown_once(failure);
+            return false;
+        }
+        ThreadScan::Observed(threads) => threads,
+    };
+
+    // One bounded rollout tail per live thread, gathered here — OUTSIDE the
+    // stage lock, alongside the scan's own I/O above — then merged onto
+    // each thread's `"app"` record below. A thread whose rollout can't be
+    // found or read captures `CodexCapture::default()` (every field
+    // `None`) and changes nothing on that record.
+    let captures: BTreeMap<String, CodexCapture> = match codex_home() {
+        Some(home) => threads
+            .iter()
+            .map(|t| (t.id.clone(), capture_for(&home, &t.id)))
+            .collect(),
+        None => BTreeMap::new(),
+    };
+
     aoide_storage::fs::with_stage_lock(|| {
         let mut file: SessionsFile = match load_stage(&sessions_path()) {
             Ok(f) => f,
             Err(_) => return false,
         };
-        let (sessions, changed) =
+        let (mut sessions, mut changed) =
             reconcile_codex_app_threads(std::mem::take(&mut file.sessions), &scan);
+        for rec in sessions.iter_mut() {
+            if rec.kind.as_deref() != Some("app") {
+                continue;
+            }
+            if let Some(cap) = captures.get(&rec.session_id) {
+                if apply_codex_capture(rec, cap) {
+                    changed = true;
+                }
+            }
+        }
         file.sessions = sessions;
         if !changed {
             return false;
@@ -1402,5 +1537,212 @@ mod tests {
         );
         let petnames_after: Vec<_> = after_observed.iter().map(|r| r.petname.clone()).collect();
         assert_eq!(petnames_before, petnames_after);
+    }
+
+    // `apply_codex_capture` — the capture merge onto a `kind:"app"` record
+    // (P-CX-5 S2).
+
+    fn app_record(id: &str) -> SessionRecord {
+        let mut rec = session(
+            id,
+            "/home/khoa/Aoide",
+            "idle",
+            "2026-09-12T09:00:00.000Z",
+            None,
+        );
+        rec.kind = Some("app".to_string());
+        rec
+    }
+
+    #[test]
+    fn an_unreadable_rollout_changes_no_record() {
+        // `capture_for` on a missing/unreadable rollout yields
+        // `CodexCapture::default()` (every field `None`); merging that must
+        // change nothing and never remove/blank an existing value.
+        let mut rec = app_record("01a-unreadable");
+        rec.say = Some("still here".to_string());
+        rec.model = Some("gpt-6-astra".to_string());
+        let changed = apply_codex_capture(&mut rec, &CodexCapture::default());
+        assert!(!changed);
+        assert_eq!(rec.say.as_deref(), Some("still here"));
+        assert_eq!(rec.model.as_deref(), Some("gpt-6-astra"));
+        assert_eq!(rec.sources, None);
+    }
+
+    #[test]
+    fn a_second_identical_tick_reports_no_change() {
+        let mut rec = app_record("01a-idempotent");
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "say".to_string(),
+            "/home/khoa/.codex/sessions/rollout-x.jsonl#4".to_string(),
+        );
+        let cap = CodexCapture {
+            say: Some("building the fold".to_string()),
+            sources: Some(sources),
+            ..Default::default()
+        };
+        assert!(
+            apply_codex_capture(&mut rec, &cap),
+            "the first tick must apply the captured value"
+        );
+        let say_after_first = rec.say.clone();
+        let sources_after_first = rec.sources.clone();
+        assert!(
+            !apply_codex_capture(&mut rec, &cap),
+            "an identical second tick must report no change"
+        );
+        assert_eq!(rec.say, say_after_first);
+        assert_eq!(rec.sources, sources_after_first);
+    }
+
+    #[test]
+    fn a_quiet_capture_never_blanks_a_value_a_prior_tick_set() {
+        // A `None` field on `cap` must never regress an already-set field
+        // back to blank — the same "never clear, only set" discipline
+        // `session_store.rs`'s `refresh_transcript_fields` holds.
+        let mut rec = app_record("01a-sticky");
+        rec.say = Some("earlier say".to_string());
+        rec.model = Some("gpt-6-astra".to_string());
+        let changed = apply_codex_capture(&mut rec, &CodexCapture::default());
+        assert!(!changed);
+        assert_eq!(rec.say.as_deref(), Some("earlier say"));
+        assert_eq!(rec.model.as_deref(), Some("gpt-6-astra"));
+    }
+
+    #[test]
+    fn the_merge_never_touches_state_lineage_or_title() {
+        // `cap` carries values for `state`/`parent_thread_id`/`nickname`
+        // (a real capture off a rollout with a `session_meta` header would),
+        // but this merge must never read them: `state` is S3's slice,
+        // `parent_thread_id`/`nickname` (the subagent edge) is S4's — R2/R3
+        // forbid touching either here.
+        let mut rec = app_record("01a-lineage");
+        rec.title = Some("original title".to_string());
+        let before = rec.clone();
+        let cap = CodexCapture {
+            state: Some("working".to_string()),
+            parent_thread_id: Some("01a-parent".to_string()),
+            thread_source: Some("subagent".to_string()),
+            nickname: Some("Laplace".to_string()),
+            ..Default::default()
+        };
+        let changed = apply_codex_capture(&mut rec, &cap);
+        assert!(
+            !changed,
+            "none of cap's set fields are ones this merge reads"
+        );
+        assert_eq!(rec.state, before.state);
+        assert_eq!(rec.parent_session_id, before.parent_session_id);
+        assert_eq!(rec.title, before.title);
+    }
+
+    #[test]
+    fn sources_extends_rather_than_replaces() {
+        // A key a PRIOR tick set (and whose value `refresh`-style merges
+        // never clear) must survive a later tick whose own tail window no
+        // longer covers that record — `sources` is extended, never wiped
+        // wholesale, so a still-shown datum never loses its pointer.
+        let mut rec = app_record("01a-sources");
+        let mut existing = BTreeMap::new();
+        existing.insert(
+            "model".to_string(),
+            "/home/khoa/.codex/sessions/rollout-old.jsonl#2".to_string(),
+        );
+        rec.sources = Some(existing);
+
+        let mut fresh = BTreeMap::new();
+        fresh.insert(
+            "say".to_string(),
+            "/home/khoa/.codex/sessions/rollout-new.jsonl#9".to_string(),
+        );
+        let cap = CodexCapture {
+            say: Some("fresh say".to_string()),
+            sources: Some(fresh),
+            ..Default::default()
+        };
+        let changed = apply_codex_capture(&mut rec, &cap);
+        assert!(changed);
+        let sources = rec.sources.expect("sources must still be Some");
+        assert_eq!(
+            sources.get("model"),
+            Some(&"/home/khoa/.codex/sessions/rollout-old.jsonl#2".to_string()),
+            "a key the fresh capture didn't re-see must survive"
+        );
+        assert_eq!(
+            sources.get("say"),
+            Some(&"/home/khoa/.codex/sessions/rollout-new.jsonl#9".to_string())
+        );
+    }
+
+    #[test]
+    fn sources_keys_remap_to_the_wire_camelcase_names() {
+        // `CodexCapture::sources` keys by the struct's own snake_case field
+        // names (`codex_capture.rs`'s own tests pin that); a `sources` entry
+        // landing on `SessionRecord` must use the record's wire spelling
+        // instead (`storage/src/records.rs`'s `#[serde(rename)]`s).
+        let mut rec = app_record("01a-camelcase");
+        let mut sources = BTreeMap::new();
+        sources.insert(
+            "context_tokens".to_string(),
+            "/home/khoa/.codex/sessions/rollout-x.jsonl#5".to_string(),
+        );
+        sources.insert(
+            "context_ceiling".to_string(),
+            "/home/khoa/.codex/sessions/rollout-x.jsonl#5".to_string(),
+        );
+        let cap = CodexCapture {
+            context_tokens: Some(1234),
+            context_ceiling: Some(258_400),
+            sources: Some(sources),
+            ..Default::default()
+        };
+        assert!(apply_codex_capture(&mut rec, &cap));
+        let merged = rec.sources.expect("sources must be Some");
+        assert_eq!(
+            merged.get("contextTokens"),
+            Some(&"/home/khoa/.codex/sessions/rollout-x.jsonl#5".to_string())
+        );
+        assert_eq!(
+            merged.get("contextCeiling"),
+            Some(&"/home/khoa/.codex/sessions/rollout-x.jsonl#5".to_string())
+        );
+        assert!(
+            !merged.contains_key("context_tokens"),
+            "the snake_case capture key must never survive onto the record"
+        );
+        assert!(!merged.contains_key("context_ceiling"));
+    }
+
+    #[test]
+    fn a_state_or_lineage_pointer_in_cap_sources_is_never_copied() {
+        // A capture off a `session_meta` header points `state`/
+        // `parent_thread_id`/`thread_source`/`nickname` even though this
+        // merge never applies their VALUES (S3/S4's own slices) — a
+        // `sources` entry must never promise a field the record does not
+        // actually carry from that source yet.
+        let mut rec = app_record("01a-no-lineage-pointer");
+        let mut sources = BTreeMap::new();
+        sources.insert("state".to_string(), "/rollout.jsonl#0".to_string());
+        sources.insert(
+            "parent_thread_id".to_string(),
+            "/rollout.jsonl#0".to_string(),
+        );
+        sources.insert("thread_source".to_string(), "/rollout.jsonl#0".to_string());
+        sources.insert("nickname".to_string(), "/rollout.jsonl#0".to_string());
+        let cap = CodexCapture {
+            state: Some("working".to_string()),
+            parent_thread_id: Some("01a-parent".to_string()),
+            thread_source: Some("subagent".to_string()),
+            nickname: Some("Laplace".to_string()),
+            sources: Some(sources),
+            ..Default::default()
+        };
+        let changed = apply_codex_capture(&mut rec, &cap);
+        assert!(
+            !changed,
+            "none of cap.sources's keys are ones this merge ever copies"
+        );
+        assert_eq!(rec.sources, None);
     }
 }

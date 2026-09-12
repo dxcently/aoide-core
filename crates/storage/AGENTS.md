@@ -649,6 +649,13 @@
 
 - **A new durable record shape** adds a type to `records` and a read/write
   pair to `fs`/`stage`; existing consumers never touch raw file paths for it.
+- **`SessionRecord.sources`** is a general, additive provenance map — not a
+  Codex-only field — but carries exactly ONE producer at a time by design
+  (P-CX-5, codex seq 228 ruling R3). A second reader wanting to point at ITS
+  OWN native source earns its own slice and its own review, never a second
+  field or a second map bolted on beside it; that review updates
+  CONTRACTS.md §4's `sources` entry in the same commit, same as any other
+  wire-shape change.
 - **A new SETTABLE config key** — one whose section name and key name are
   both fixed, known ahead of time — is one row in `config::SCHEMA` plus its
   field on the matching `Config` sub-struct (`#[serde(rename)]` when the

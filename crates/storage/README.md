@@ -81,6 +81,15 @@ by decision — no embedded database yet
   deduplicated) — a legacy record predating `roots`, or a hand-edited one
   whose `path` disagrees with `roots[0]`, is read as given, never silently
   rewritten.
+- `records::SessionRecord.sources` — an optional, additive
+  `field name -> "<absolute path>#<record ordinal>"` provenance map (wire
+  name `sources`, serialised only when `Some`, CONTRACTS.md §4), for a
+  record some reader captured off a native source rather than aoide's own
+  hooks. One producer today: `aoide-conduct::graph::codex_app`'s
+  desktop-Codex capture, pointing each field it sets back at the exact line
+  of the thread's own rollout it came from. A general `SessionRecord` field,
+  not a Codex-only one — but a second producer wanting the same shape earns
+  its own slice, never a second field (P-CX-5, codex seq 228 ruling R3).
 - `config` — the portable runtime config (task #135 P-C, CONTRACTS.md §4's
   `config.toml` subsection): `$AOIDE_ROOT/config.toml`, the one file here
   that records INTENT rather than state. It exists because core is portable

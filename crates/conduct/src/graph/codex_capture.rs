@@ -1,19 +1,38 @@
-//! S1 of P-CX-5 (native Codex capture, the codex-integration follow-on): the
-//! PURE fold from a Codex rollout's own JSONL lines into one
-//! [`CodexCapture`]. No I/O, no stage write, no call site yet — the bounded
-//! tail reader and the upsert onto a `kind:"app"` `SessionRecord` are a
-//! later slice; this module is reachable only from its own tests until then,
-//! the same standing every module in this crate carries at its own P-CX-1
-//! stage (see `codex_app.rs`'s module doc for the precedent).
+//! Native Codex capture (P-CX-5, the codex-integration follow-on): a PURE
+//! fold from a Codex rollout's own JSONL lines into one [`CodexCapture`]
+//! ([`fold_rollout`]/[`fold_rollout_from`]), plus the bounded, impure reader
+//! over a live rollout ([`capture_for`]) that feeds it. `codex_app.rs`'s
+//! `sync_codex_app_threads` is the one caller: it gathers a [`CodexCapture`]
+//! per desired thread and merges `say`/`tool`/`activity`/`model`/
+//! `context_tokens`/`context_ceiling`/`sources` onto that thread's
+//! `kind:"app"` record, change-only. `state`/`parentSessionId`/`title` stay
+//! untouched by that merge — later slices' own territory, not this one's.
 //!
 //! [`fold_rollout`] walks `lines` in order; `ordinal` is the line's own
 //! position in the slice, never a value read out of the record itself — the
-//! ruling that pins the pointer contract. A line that fails to parse as
-//! JSON, whether truncated by a tail cut or simply malformed, contributes
-//! nothing: nothing here ever infers a field from a record it could not
-//! read whole. Every value this fold DOES capture carries a `sources`
-//! pointer (`<path>#<ordinal>`), so a rendered datum with no pointer is a
-//! bug in a caller, never a judgement call made here.
+//! ruling that pins the pointer contract. [`fold_rollout_from`] is the same
+//! fold with an explicit starting ordinal, for a caller (namely
+//! [`capture_for`]) handing it only the TAIL of a rollout: the lines it
+//! folds are a slice, but a pointer must still name the record's TRUE line
+//! number in the whole file. A line that fails to parse as JSON, whether
+//! truncated by a tail cut or simply malformed, contributes nothing: nothing
+//! here ever infers a field from a record it could not read whole. Every
+//! value this fold DOES capture carries a `sources` pointer
+//! (`<path>#<ordinal>`), so a rendered datum with no pointer is a bug in a
+//! caller, never a judgement call made here.
+//!
+//! [`capture_for`] locates a thread's rollout under a Codex sessions root
+//! (`super::codex_app::find_rollout`, the same walk `thread_cwd` already
+//! reuses — no second discovery path) and reads at most the last
+//! [`TAIL_BYTES`] of it. A cut that lands mid-record leaves a partial line
+//! at the front of the tail buffer; it is discarded, never parsed, the same
+//! "unreadable whole, contributes nothing" rule the fold itself holds for a
+//! truncated line anywhere else. A missing rollout, an unreadable one, or a
+//! tail whose only content is one record too large to ever appear whole in
+//! the window all yield [`CodexCapture::default`] — every field `None`,
+//! which is data absent, never an idle/completion signal on its own and
+//! never a reason to touch the roster (capture has no say in enrolment;
+//! `codex_app.rs`'s `ThreadScan` stays the only authority for that).
 //!
 //! Two record shapes are recognised but always contribute nothing: a
 //! `response_item`/`reasoning` record (opaque `encrypted_content`, empty
@@ -212,17 +231,32 @@ fn file_change_summary(item: &Value) -> Option<String> {
 
 /// Fold a Codex rollout's own JSONL lines into one [`CodexCapture`]. `path`
 /// names the rollout for the `sources` pointers this produces — this
-/// function never opens it; the bounded read is a later slice's job. A line
-/// that fails to parse, and any record type/shape this fold does not
-/// recognise, contributes nothing.
+/// function never opens it; the bounded read is [`capture_for`]'s job. A
+/// line that fails to parse, and any record type/shape this fold does not
+/// recognise, contributes nothing. Ordinals start at 0 — `lines[0]` is
+/// taken to be the rollout's own first line; a caller handing this only a
+/// TAIL of the file wants [`fold_rollout_from`] instead.
 pub(crate) fn fold_rollout(path: &Path, lines: &[String]) -> CodexCapture {
+    fold_rollout_from(path, 0, lines)
+}
+
+/// Same fold as [`fold_rollout`], but `lines[0]`'s own true line number in
+/// the file is `start_ordinal` rather than 0 — for [`capture_for`], which
+/// hands this only a bounded TAIL of a rollout and must still point at each
+/// record's real line number, not its position within that tail slice.
+pub(crate) fn fold_rollout_from(
+    path: &Path,
+    start_ordinal: usize,
+    lines: &[String],
+) -> CodexCapture {
     let mut cap = CodexCapture::default();
     let mut sources: BTreeMap<String, String> = BTreeMap::new();
     // `call_id` -> (ordinal, timestamp, one-line label) for a tool call
     // issued but not yet matched by its own `*_output` record.
     let mut in_flight: BTreeMap<String, (usize, Option<String>, String)> = BTreeMap::new();
 
-    for (ordinal, line) in lines.iter().enumerate() {
+    for (i, line) in lines.iter().enumerate() {
+        let ordinal = start_ordinal + i;
         let line = line.trim();
         if line.is_empty() {
             continue;
@@ -437,6 +471,90 @@ pub(crate) fn fold_rollout(path: &Path, lines: &[String]) -> CodexCapture {
 
     cap.sources = (!sources.is_empty()).then_some(sources);
     cap
+}
+
+/// The bounded window [`capture_for`] ever reads off the END of a rollout —
+/// enough to span many records without loading an entire day's file into
+/// memory. A fixture larger than this pins both the truncation and the
+/// ordinal arithmetic in a test.
+const TAIL_BYTES: u64 = 1024 * 1024;
+
+/// How many whole lines precede byte offset `start` in `path`'s CURRENT
+/// contents, and whether `start` itself opens mid-line. `start == 0` is
+/// always aligned — the file's own first byte starts line 0. Otherwise,
+/// alignment turns on the byte immediately before `start`: landing right
+/// after a `\n` means `start` begins a fresh line; anything else means the
+/// tail read's first bytes are the back half of a line whose front half
+/// this reader never sees, which counts as one more line before the window
+/// — a line the tail can only ever read PART of, so [`capture_for`] drops
+/// it rather than fold a partial record. A test with a fixture larger than
+/// [`TAIL_BYTES`] pins this arithmetic against the file's own true line
+/// numbers.
+fn tail_alignment(path: &Path, start: u64) -> std::io::Result<(usize, bool)> {
+    if start == 0 {
+        return Ok((0, false));
+    }
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut remaining = start;
+    let mut buf = [0u8; 64 * 1024];
+    let mut newline_count: usize = 0;
+    let mut last_byte: u8 = 0;
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        let n = file.read(&mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        newline_count += buf[..n].iter().filter(|&&b| b == b'\n').count();
+        last_byte = buf[n - 1];
+        remaining -= n as u64;
+    }
+    let aligned = last_byte == b'\n';
+    Ok((newline_count + usize::from(!aligned), !aligned))
+}
+
+/// Locate `thread_id`'s rollout under `codex_home` — [`super::codex_app::
+/// find_rollout`]'s own walk, the one discovery path [`thread_cwd`] already
+/// uses, never a second one grown here — and fold at most its last
+/// [`TAIL_BYTES`]. Every failure mode (no rollout found, the file can't be
+/// opened or read, a tail whose only content is one record too large to
+/// ever land whole in the window) yields [`CodexCapture::default`]: every
+/// field `None`, which a caller must treat as data absent, never as an
+/// idle/completion signal and never as grounds to touch a thread's
+/// enrolment — capture has no vote there.
+pub(crate) fn capture_for(codex_home: &Path, thread_id: &str) -> CodexCapture {
+    let Some(path) = super::codex_app::find_rollout(&codex_home.join("sessions"), thread_id) else {
+        return CodexCapture::default();
+    };
+    capture_from_path(&path).unwrap_or_default()
+}
+
+/// The fallible core of [`capture_for`], split out so its `?`-heavy I/O
+/// stays out of the public, infallible signature.
+fn capture_from_path(path: &Path) -> std::io::Result<CodexCapture> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let start = len.saturating_sub(TAIL_BYTES);
+    let (start_ordinal, drop_first) = tail_alignment(path, start)?;
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    let mut split: Vec<&str> = text.split('\n').collect();
+    // A trailing empty string after the file's own final `\n` is not a line.
+    if split.last() == Some(&"") {
+        split.pop();
+    }
+    // The tail's first split element is only the back half of a line whose
+    // front half this bounded read never saw — discarded WHOLE, never
+    // parsed, per the tail-parser rule (P-CX-5, codex seq 228).
+    if drop_first && !split.is_empty() {
+        split.remove(0);
+    }
+    let lines: Vec<String> = split.into_iter().map(str::to_string).collect();
+    Ok(fold_rollout_from(path, start_ordinal, &lines))
 }
 
 #[cfg(test)]
@@ -929,5 +1047,151 @@ mod tests {
             Some(&pointer(&path, 2)),
             "the truncated line at ordinal 1 must contribute nothing and must not shift the following record's ordinal"
         );
+    }
+
+    // `capture_for` — the bounded, impure reader over a live rollout.
+    // Fixtures are written by these tests themselves under a tempdir shaped
+    // like real records (`type`/`payload.type`/field names match the fixture
+    // helpers above); never a real rollout, never `~/.codex` (rulings §31).
+
+    fn write_rollout(codex_home: &Path, thread_id: &str, body: &str) -> PathBuf {
+        let dir = codex_home.join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(format!("rollout-2026-09-12T09-00-00-{thread_id}.jsonl"));
+        std::fs::write(&path, body).unwrap();
+        path
+    }
+
+    #[test]
+    fn a_missing_rollout_yields_every_field_none() {
+        let codex_home = crate::graph::testutil::unique_stage("codex-capture-missing");
+        let cap = capture_for(&codex_home, "00000000-0000-7000-8000-00000000000f");
+        assert_eq!(cap, CodexCapture::default());
+    }
+
+    #[test]
+    fn an_unreadable_rollout_yields_every_field_none() {
+        // A dangling symlink is unreadable regardless of privilege level
+        // (unlike a permission bit, which a root test runner ignores) — the
+        // file `find_rollout` locates exists as a directory entry, but
+        // opening it always fails.
+        let codex_home = crate::graph::testutil::unique_stage("codex-capture-unreadable");
+        let dir = codex_home.join("sessions");
+        std::fs::create_dir_all(&dir).unwrap();
+        let thread_id = "00000000-0000-7000-8000-000000000011";
+        let link = dir.join(format!("rollout-2026-09-12T09-00-00-{thread_id}.jsonl"));
+        std::os::unix::fs::symlink(dir.join("does-not-exist.jsonl"), &link).unwrap();
+        let cap = capture_for(&codex_home, thread_id);
+        assert_eq!(cap, CodexCapture::default());
+    }
+
+    #[test]
+    fn a_tail_shorter_than_one_record_captures_nothing() {
+        // One record, alone in the file, whose own serialised length
+        // exceeds `TAIL_BYTES` — the bounded read can never see it whole,
+        // so it must capture nothing (never a reason to infer state either
+        // way; see the module doc's "oversized record" case).
+        let codex_home = crate::graph::testutil::unique_stage("codex-capture-tailshort");
+        let thread_id = "00000000-0000-7000-8000-000000000012";
+        let padding = "a".repeat(TAIL_BYTES as usize + 1000);
+        let body = format!(
+            r#"{{"timestamp":"2026-09-12T09:00:00.000Z","type":"turn_context","payload":{{"turn_id":"t1","model":"oversized-model","padding":"{padding}"}}}}
+"#
+        );
+        assert!(
+            body.len() as u64 > TAIL_BYTES,
+            "fixture must exceed the tail window to exercise this case"
+        );
+        write_rollout(&codex_home, thread_id, &body);
+        let cap = capture_for(&codex_home, thread_id);
+        assert_eq!(
+            cap,
+            CodexCapture::default(),
+            "a record too large to ever land whole in the tail must capture nothing"
+        );
+    }
+
+    #[test]
+    fn a_partial_leading_line_is_dropped() {
+        // `line0` is a single record padded well past `TAIL_BYTES`, so the
+        // tail read's cut lands inside it; `line1` is a small, ordinary
+        // record placed entirely after the cut. If the dropped fragment of
+        // `line0` were ever parsed, `cap.model` would read its
+        // "straddle-model"; it must instead read `line1`'s own value.
+        let codex_home = crate::graph::testutil::unique_stage("codex-capture-partial");
+        let thread_id = "00000000-0000-7000-8000-000000000013";
+        let padding = "a".repeat(TAIL_BYTES as usize);
+        let line0 = format!(
+            r#"{{"timestamp":"2026-09-12T09:00:00.000Z","type":"turn_context","payload":{{"turn_id":"t0","model":"straddle-model","padding":"{padding}"}}}}"#
+        );
+        let line1 = turn_context("2026-09-12T09:05:00.000Z", "landed-model");
+        let body = format!("{line0}\n{line1}\n");
+        assert!(body.len() as u64 > TAIL_BYTES);
+        let path = write_rollout(&codex_home, thread_id, &body);
+        let cap = capture_for(&codex_home, thread_id);
+        assert_eq!(
+            cap.model.as_deref(),
+            Some("landed-model"),
+            "the dropped leading fragment must never surface its own value"
+        );
+        assert_eq!(
+            cap.sources.as_ref().and_then(|s| s.get("model")),
+            Some(&pointer(&path, 1)),
+            "line1 is the file's true second line (0-based ordinal 1)"
+        );
+    }
+
+    #[test]
+    fn an_ordinal_equals_its_line_number_minus_one() {
+        // `line0` (decoy, outside the tail window entirely) is followed by
+        // a filler line sized so the remaining bytes (filler + real1 +
+        // real2, each newline-terminated) total EXACTLY `TAIL_BYTES` — so
+        // the tail read's start lands precisely on a line boundary (right
+        // after `line0`'s own `\n`), pinning the ALIGNED half of the
+        // ordinal arithmetic (the not-aligned half is
+        // `a_partial_leading_line_is_dropped`, above).
+        let codex_home = crate::graph::testutil::unique_stage("codex-capture-ordinal");
+        let thread_id = "00000000-0000-7000-8000-000000000014";
+
+        let line0 = turn_context("2026-09-12T08:00:00.000Z", "decoy-model");
+        let real1 = turn_context("2026-09-12T09:00:00.000Z", "gpt-real-1");
+        let real2 = item_completed_agent_message(
+            "2026-09-12T09:00:05.000Z",
+            "t1",
+            "hello there",
+            "final_answer",
+        );
+
+        let want_tail_len = TAIL_BYTES as usize;
+        let real_bytes = real1.len() + 1 + real2.len() + 1;
+        let filler_prefix =
+            r#"{"timestamp":"2026-09-12T08:30:00.000Z","type":"filler","padding":""}"#;
+        let overhead = filler_prefix.len() + 1;
+        let pad_len = want_tail_len - real_bytes - overhead;
+        let padding = "a".repeat(pad_len);
+        let filler = format!(
+            r#"{{"timestamp":"2026-09-12T08:30:00.000Z","type":"filler","padding":"{padding}"}}"#
+        );
+        let tail_region = format!("{filler}\n{real1}\n{real2}\n");
+        assert_eq!(
+            tail_region.len(),
+            want_tail_len,
+            "tail_region must be exactly TAIL_BYTES so the cut lands right after line0's newline"
+        );
+
+        let body = format!("{line0}\n{tail_region}");
+        assert_eq!(body.len() as u64, TAIL_BYTES + line0.len() as u64 + 1);
+        let path = write_rollout(&codex_home, thread_id, &body);
+        let cap = capture_for(&codex_home, thread_id);
+
+        // line0 = ordinal 0 (outside the window, decoy-model must never surface)
+        // filler = ordinal 1 (unrecognised type, contributes nothing)
+        // real1  = ordinal 2 (turn_context -> model)
+        // real2  = ordinal 3 (item_completed AgentMessage -> say)
+        assert_eq!(cap.model.as_deref(), Some("gpt-real-1"));
+        assert_eq!(cap.say.as_deref(), Some("hello there"));
+        let sources = cap.sources.expect("captured fields must carry pointers");
+        assert_eq!(sources.get("model"), Some(&pointer(&path, 2)));
+        assert_eq!(sources.get("say"), Some(&pointer(&path, 3)));
     }
 }

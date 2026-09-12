@@ -139,6 +139,9 @@ pub fn upsert_session(
             // (P-C5), only for a conducted SHELL; a fresh registration has
             // not ticked yet.
             restore: None,
+            // A fresh registration carries no native-capture provenance —
+            // only Codex-app capture (`graph/codex_app.rs`) ever sets this.
+            sources: None,
             extra: Map::new(),
         });
         true

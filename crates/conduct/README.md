@@ -430,28 +430,65 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   (`window.rs`) calls it too, beside every `sync_untracked_terminal_windows`
   tick (startup, reconnect, the ~5s timeout, `Appeared`, `Closed`), but only
   for PROMPTNESS on a host where that listener happens to be running.
-- `graph/codex_capture.rs` — S1 of P-CX-5, native capture from a Codex
-  thread's own rollout JSONL, beside the association `codex_app.rs` already
-  reads. `fold_rollout` is a PURE fold (no I/O, no stage, no call site yet):
-  given a rollout's lines and its own path, it produces a `CodexCapture` —
-  `state` (from the latest of `task_started`/`task_complete`/`turn_aborted`,
-  never `awaiting`, never decayed by elapsed time), `activity` (a
-  `custom_tool_call`/`function_call` with no later matching `*_output`),
-  `tool` (the latest completed `CommandExecution`/`McpToolCall`/`FileChange`,
-  one line), `say`/`prompt` (the latest `AgentMessage`/`UserMessage`, clipped
-  to one line — `prompt` per D1, codex seq 228: scope is Aoide's existing
-  session surfaces only), `model` (the latest `turn_context`), `context_tokens`/
-  `context_ceiling` (`token_count`'s `last_token_usage.input_tokens` alone —
-  never the cumulative total, never summed with the cached field already
-  inside it — and its own `model_context_window`), and `parent_thread_id`/
+- `graph/codex_capture.rs` — native capture from a Codex thread's own rollout
+  JSONL, beside the association `codex_app.rs` already reads (P-CX-5).
+  `fold_rollout`/`fold_rollout_from` are a PURE fold (no I/O, no stage):
+  given a rollout's lines, a starting ordinal, and the rollout's own path,
+  they produce a `CodexCapture` — `state` (from the latest of
+  `task_started`/`task_complete`/`turn_aborted`, never `awaiting`, never
+  decayed by elapsed time), `activity` (a `custom_tool_call`/`function_call`
+  with no later matching `*_output`), `tool` (the latest completed
+  `CommandExecution`/`McpToolCall`/`FileChange`, one line), `say`/`prompt`
+  (the latest `AgentMessage`/`UserMessage`, clipped to one line — `prompt`
+  per D1, codex seq 228: scope is Aoide's existing session surfaces only),
+  `model` (the latest `turn_context`), `context_tokens`/`context_ceiling`
+  (`token_count`'s `last_token_usage.input_tokens` alone — never the
+  cumulative total, never summed with the cached field already inside it —
+  and its own `model_context_window`), and `parent_thread_id`/
   `thread_source`/`nickname` off `session_meta`. Every field is `None` on an
   empty or unrecognised input. A `response_item`/`reasoning` record and an
   `item_completed` item of type `Reasoning` both always contribute nothing —
   a reasoning trace is not on disk in any readable form. Every captured field
-  carries a `sources` pointer (`<path>#<ordinal>`, `ordinal` the line's own
-  position, never a value read out of the record); an uncaptured field
-  carries none. The bounded tail reader, the `sources` field on
-  `SessionRecord`, and the upsert call site are a later slice.
+  carries a `sources` pointer (`<path>#<ordinal>`, `ordinal` the record's
+  true line number in the file, never a value read out of the record
+  itself); an uncaptured field carries none.
+
+  `capture_for` is the bounded, impure reader that feeds the fold: it locates
+  a thread's rollout via `codex_app::find_rollout` (the same walk
+  `thread_cwd` already uses — no second discovery path), reads at most the
+  last `TAIL_BYTES` (1 MiB) off the END of the file, and drops the tail's own
+  leading fragment WHOLE, never parsed, whenever the cut lands mid-record —
+  `tail_alignment` computes the dropped fragment's true line count so
+  `fold_rollout_from`'s ordinals still name the file's real line numbers, not
+  a position within the tail slice. Every failure mode (no rollout found, an
+  unreadable file, a tail whose only content is one record too large to ever
+  land whole in the window) yields `CodexCapture::default()` — every field
+  `None`, never treated as an idle/completion signal and never a reason to
+  touch a thread's enrolment.
+
+  `codex_app.rs`'s `sync_codex_app_threads` is the one call site: it gathers
+  one `capture_for` per live thread OUTSIDE the stage lock (alongside the
+  scan's own I/O), then `apply_codex_capture` merges `say`/`tool`/`activity`/
+  `model`/`context_tokens`/`context_ceiling`/`sources` onto that thread's
+  `"app"` record INSIDE the lock — set only when the capture produced a
+  value and only when it actually differs, never blanked back out by a quiet
+  or partial tail read (the same "never clear, only set" discipline
+  `session_store.rs`'s `refresh_transcript_fields` holds for these same
+  fields). `sources` (`SessionRecord`, `storage/src/records.rs`) is a small
+  additive `Option<BTreeMap<String, String>>`, wire name `sources`, keyed by
+  the record's own WIRE (camelCase) field names, serialised only when
+  `Some`; the merge EXTENDS it rather than replacing it, so a value a prior
+  tick set keeps its pointer even on a tick whose tail window no longer
+  covers the record that set it. `CodexCapture::sources` itself keys by the
+  struct's own snake_case field names, so `apply_codex_capture` remaps at
+  the boundary (`MERGED_SOURCE_FIELDS`: `context_tokens` → `contextTokens`,
+  `context_ceiling` → `contextCeiling`, the rest unchanged) and copies ONLY
+  the fields it actually applies — a `state`/`parentThreadId`/`nickname`
+  pointer `cap.sources` may carry is never copied, since this merge never
+  sets those VALUES. `state`, `parentSessionId`, `title`, and `nickname` are
+  untouched by this merge — later slices' own territory (S3 the state
+  consumer enumeration, S4 the subagent edge), never this one's to set. See
+  CONTRACTS.md §4 for the `sources` schema entry.
 - `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below). The socket answers exactly one command with a reply,

@@ -67,6 +67,7 @@ pub(crate) fn session(
         seal: None,
         sealed_issued_at: None,
         restore: None,
+        sources: None,
         extra: Map::new(),
     }
 }
