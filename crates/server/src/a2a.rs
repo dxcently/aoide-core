@@ -6238,7 +6238,7 @@ mod tests {
         });
         let result = message_send(&params, &audit_log, "", ConnOrigin::Loopback, "", None, None);
         let got = acc.join().unwrap();
-        assert_eq!(String::from_utf8(got).unwrap(), "hello loopback\n");
+        assert_eq!(String::from_utf8(got).unwrap(), "hello loopback\r");
 
         let task = result.unwrap();
         assert_eq!(task["id"], id);
@@ -6312,7 +6312,7 @@ mod tests {
         });
         let result = message_send(&params, &audit_log, "", ConnOrigin::Loopback, "", None, None);
         let got = acc.join().unwrap();
-        assert_eq!(String::from_utf8(got).unwrap(), "still here\n");
+        assert_eq!(String::from_utf8(got).unwrap(), "still here\r");
         assert_eq!(result.unwrap()["id"], id);
 
         // The socket file is deleted (a rebuild tearing down the runtime
@@ -6636,7 +6636,7 @@ mod tests {
             Some("the-real-token"), None
         );
         let got = acc.join().unwrap();
-        assert_eq!(String::from_utf8(got).unwrap(), "authenticated loopback\n");
+        assert_eq!(String::from_utf8(got).unwrap(), "authenticated loopback\r");
         assert_eq!(result.unwrap()["id"], id);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -6714,7 +6714,7 @@ mod tests {
         let got = acc.join().unwrap();
         assert_eq!(
             String::from_utf8(got).unwrap(),
-            "trusted send\n",
+            "trusted send\r",
             "an autogate-marked node's non-loopback send still auto-delivers"
         );
         assert!(result.is_ok());
@@ -6812,7 +6812,7 @@ mod tests {
         let remote_origin = ConnOrigin::Remote("10.0.0.9".parse().unwrap());
         let result = message_send(&params, &audit_log, "", remote_origin, "", Some("node-secret"), None);
         let got = acc.join().unwrap();
-        assert_eq!(String::from_utf8(got).unwrap(), "token-identified send\n");
+        assert_eq!(String::from_utf8(got).unwrap(), "token-identified send\r");
         assert!(result.is_ok());
 
         let _ = std::fs::remove_dir_all(&root);
@@ -6967,7 +6967,7 @@ mod tests {
         let got = acc.join().unwrap();
         assert_eq!(
             String::from_utf8(got).unwrap(),
-            "trusted tunneled send\n",
+            "trusted tunneled send\r",
             "an autogate-marked node's signed send still auto-delivers through a loopback-classified connection"
         );
         assert!(result.is_ok(), "{:?}", result.err());
@@ -7227,7 +7227,7 @@ mod tests {
         });
         let result = message_send(&params, &audit_log, "", ConnOrigin::Loopback, "", None, None);
         let got = acc.join().unwrap();
-        assert_eq!(String::from_utf8(got).unwrap(), "off-path send\n", "no token configured: loopback still auto-delivers");
+        assert_eq!(String::from_utf8(got).unwrap(), "off-path send\r", "no token configured: loopback still auto-delivers");
         assert!(result.is_ok());
 
         let bogus_params = serde_json::json!({

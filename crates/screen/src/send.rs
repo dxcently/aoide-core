@@ -532,9 +532,9 @@ mod tests {
         assert_eq!(data["state"], "delivered");
         assert_eq!(data["sidecarStatus"], "missing");
         let delivered_text = String::from_utf8(got).unwrap();
-        // submit:true appended the trailing newline; the path is absolute.
+        // submit:true appended the target's CR submit byte; the path is absolute.
         assert!(delivered_text.starts_with("screenshot: "), "{delivered_text}");
-        assert!(delivered_text.ends_with('\n'), "{delivered_text:?}");
+        assert!(delivered_text.ends_with('\r'), "{delivered_text:?}");
 
         let _ = std::fs::remove_dir_all(&root);
     }
