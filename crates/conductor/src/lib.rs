@@ -259,6 +259,7 @@ mod tests {
             needs_sudo: None,
             context_ceiling: None,
             log_path: Some(path.to_string_lossy().into_owned()),
+            sources: None,
             petname: None,
             hook_ancestry: Vec::new(),
             headless: false,

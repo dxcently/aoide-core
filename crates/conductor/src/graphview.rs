@@ -678,6 +678,7 @@ mod tests {
             needs_sudo: None,
             context_ceiling: None,
             log_path: None,
+            sources: None,
             petname: None,
             hook_ancestry: Vec::new(),
             headless: false,
