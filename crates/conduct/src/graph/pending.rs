@@ -623,7 +623,7 @@ mod tests {
         assert_eq!(out.status, Status::Ok, "msg: {}", out.message);
         assert_eq!(out.data.as_ref().unwrap()["injected"], true);
         // The exact text (with its embedded space) rode through unmangled, +
-        // the newline `submit` demands — proves the SAME injection door ran.
+        // the CR `submit` demands — proves the SAME injection door ran.
         assert_eq!(String::from_utf8(got).unwrap(), "hello world\r");
 
         // The entry is gone from the queue.

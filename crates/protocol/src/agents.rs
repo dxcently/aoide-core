@@ -2767,7 +2767,7 @@ mod tests {
         // it as one JSON value and re-emit it as a single compact line.
         // Shape matches the live-verified meta.json (id/pid/log/cwd/repo/
         // model/started_ms/title/busy); every value is synthetic, never
-        // the real khoa-253b session.
+        // a real session.
         std::fs::write(
             &path,
             "{\n  \"id\": \"fixture-a1a1\",\n  \"pid\": 424242,\n  \"log\": \"/tmp/fixture/eidolon/session-a.eid\",\n  \"cwd\": \"/tmp/fixture-cwd\",\n  \"repo\": null,\n  \"model\": \"claude-cli:opus\",\n  \"started_ms\": 1000000000000,\n  \"title\": \"demo session\",\n  \"busy\": false\n}\n",

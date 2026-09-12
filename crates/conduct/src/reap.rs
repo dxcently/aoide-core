@@ -1792,7 +1792,7 @@ mod tests {
     /// `EIDOLON_PROFILE` the same generic way any other harness would.
     #[test]
     fn profile_for_dispatches_eidolon_records_off_their_own_agent_field() {
-        let mut rec = agent("khoa-253b", "", "2026-09-12T00:00:00Z");
+        let mut rec = agent("user-0001", "", "2026-09-12T00:00:00Z");
         rec.agent = "eidolon".into();
         assert_eq!(profile_for(&rec).name, EIDOLON_PROFILE.name);
         assert!(std::ptr::eq(profile_for(&rec), &EIDOLON_PROFILE));
