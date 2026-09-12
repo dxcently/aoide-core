@@ -3868,8 +3868,8 @@ fn handle_mail_names(_inv: &Invocation) -> Outcome {
     }
 }
 
-/// A destination-signed ack for `msgid`, already sitting in THIS box's own
-/// mailbase, claiming to be from `to_node` — the ONLY evidence
+/// A destination-signed ack for `msgid`, already sitting in `base` (THIS
+/// box's own mailbase), claiming to be from `to_node` — the ONLY evidence
 /// [`delivery_projection`] accepts for `status: "delivered"` (MAIL.md
 /// "Status and the nodelist view": never inferred from the outbox entry's
 /// own absence — `mail outbox rm` also removes it). Filing an entry whose
@@ -3877,19 +3877,18 @@ fn handle_mail_names(_inv: &Invocation) -> Outcome {
 /// through [`aoide_storage::mail::deposit`]'s own origin-signature check —
 /// [`aoide_storage::mail::file_letter`]/`file_receipt` always stamp THIS
 /// box's own name instead — so finding one here already carries that
-/// proof; this never re-verifies it. A [`aoide_storage::mail::read_base`]
-/// failure degrades to "no ack seen" rather than propagating, matching
-/// this whole check's own best-effort role inside a read-only projection.
-fn has_delivered_ack(to_node: &str, msgid: &str) -> bool {
-    aoide_storage::mail::read_base()
-        .map(|entries| {
-            entries.iter().any(|e| {
-                e.kind == aoide_storage::mail::ENTRY_TYPE_RECEIPT
-                    && e.envelope.header.from.node == to_node
-                    && e.envelope.text == msgid
-            })
-        })
-        .unwrap_or(false)
+/// proof; this never re-verifies it. `base` is a single
+/// [`aoide_storage::mail::read_base`] shared across every entry a caller
+/// projects (a `mail outbox` listing, or `mail send`'s post-spool read) —
+/// hoisted there so this check never re-parses `base.jsonl` per entry; a
+/// read failure degrades to an empty `base` (matching this check's own
+/// former "no ack seen" default), never a propagated error.
+fn has_delivered_ack(base: &[aoide_storage::mail::Entry], to_node: &str, msgid: &str) -> bool {
+    base.iter().any(|e| {
+        e.kind == aoide_storage::mail::ENTRY_TYPE_RECEIPT
+            && e.envelope.header.from.node == to_node
+            && e.envelope.text == msgid
+    })
 }
 
 fn non_empty(s: &str) -> Option<String> {
@@ -3952,7 +3951,12 @@ fn delivery_status_unavailable(err: &str) -> Value {
 ///   cleared yet.
 /// - `queued`: none of the above — nothing has ever gone wrong, or
 ///   nothing has been attempted yet.
+///
+/// `base` is the caller's own single [`aoide_storage::mail::read_base`],
+/// read once and reused across every entry the caller projects — never
+/// re-read per entry here (see [`has_delivered_ack`]).
 fn delivery_projection(
+    base: &[aoide_storage::mail::Entry],
     node: &str,
     entry: &aoide_storage::outbox::OutboxEntry,
     link: Option<&aoide_storage::outbox::LinkState>,
@@ -3960,7 +3964,7 @@ fn delivery_projection(
     if entry.refused {
         return delivery_shape("refused", non_empty(&entry.last_outcome), Some("entry"), None, false);
     }
-    if has_delivered_ack(node, &entry.envelope.msgid) {
+    if has_delivered_ack(base, node, &entry.envelope.msgid) {
         return delivery_shape("delivered", None, None, None, false);
     }
     let accepted = matches!(entry.last_outcome.as_str(), "accepted" | "duplicate");
@@ -3995,7 +3999,8 @@ fn post_send_delivery(node: &str, msgid: &str) -> Value {
         Ok(l) => l,
         Err(e) => return delivery_status_unavailable(&e),
     };
-    delivery_projection(node, entry, link.as_ref())
+    let base = aoide_storage::mail::read_base().unwrap_or_default();
+    delivery_projection(&base, node, entry, link.as_ref())
 }
 
 /// `aoide mail send --to (self|<node>)/<name> [--from <who>] -- <text …> [--json]`.
@@ -4229,10 +4234,11 @@ fn handle_mail_rm(inv: &Invocation) -> Outcome {
 /// carries `delivery` — [`delivery_projection`]'s join of the entry with
 /// its OWN node's link state, read ONCE per node (never once per entry,
 /// and never dialed at all: this command only ever reads, it drains
-/// nothing). A link-state read failure for one node degrades just that
-/// node's rows to `queued`/"status unavailable"
-/// ([`delivery_status_unavailable`]) rather than failing the whole
-/// listing.
+/// nothing). The mailbase [`has_delivered_ack`] needs is likewise read
+/// ONCE for the whole listing, not once per node or per entry. A
+/// link-state read failure for one node degrades just that node's rows to
+/// `queued`/"status unavailable" ([`delivery_status_unavailable`]) rather
+/// than failing the whole listing.
 fn handle_mail_outbox(inv: &Invocation) -> Outcome {
     let cmd = "mail.outbox";
     let target = inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty());
@@ -4243,6 +4249,7 @@ fn handle_mail_outbox(inv: &Invocation) -> Outcome {
             Err(e) => return Outcome::error(cmd, format!("state/outbox: {e}")),
         },
     };
+    let base = aoide_storage::mail::read_base().unwrap_or_default();
     let mut rows: Vec<Value> = Vec::new();
     for node in &nodes {
         let entries = match aoide_storage::outbox::list_entries(node) {
@@ -4253,7 +4260,7 @@ fn handle_mail_outbox(inv: &Invocation) -> Outcome {
         for e in &entries {
             let to = &e.envelope.header.to;
             let delivery = match &link {
-                Ok(l) => delivery_projection(node, e, l.as_ref()),
+                Ok(l) => delivery_projection(&base, node, e, l.as_ref()),
                 Err(err) => delivery_status_unavailable(err),
             };
             rows.push(json!({
@@ -6999,7 +7006,7 @@ mod tests {
             last_outcome: "curl failed".to_string(),
         };
 
-        let d = delivery_projection("osaka", &entry, Some(&link));
+        let d = delivery_projection(&[], "osaka", &entry, Some(&link));
         assert_eq!(d["status"], "retrying");
         assert_eq!(d["reason"], "curl failed");
         assert_eq!(d["reasonScope"], "link");
@@ -7023,8 +7030,8 @@ mod tests {
         aoide_storage::outbox::back_off("osaka", 1_000, "transport-error: connection refused").unwrap();
         let link = aoide_storage::outbox::read_link_state("osaka").unwrap();
 
-        let d1 = delivery_projection("osaka", &entry1, link.as_ref());
-        let d2 = delivery_projection("osaka", &entry2, link.as_ref());
+        let d1 = delivery_projection(&[], "osaka", &entry1, link.as_ref());
+        let d2 = delivery_projection(&[], "osaka", &entry2, link.as_ref());
         assert_eq!(d1["status"], "retrying");
         assert_eq!(d2["status"], "retrying");
         assert_eq!(d1["reason"], d2["reason"], "both entries reflect the SAME shared node link, never a per-entry reason");
@@ -7047,7 +7054,7 @@ mod tests {
         aoide_storage::outbox::back_off("osaka", 1_000, "transport-error: HTTP 500").unwrap();
         let link = aoide_storage::outbox::read_link_state("osaka").unwrap();
 
-        let d = delivery_projection("osaka", &entry, link.as_ref());
+        let d = delivery_projection(&[], "osaka", &entry, link.as_ref());
         assert_eq!(d["status"], "refused", "a policy refusal wins over an unrelated link failure");
         assert_eq!(d["reason"], "refused: bad-msgid: envelope msgid does not match");
         assert_eq!(d["reasonScope"], "entry");
@@ -7067,7 +7074,7 @@ mod tests {
         entry.tries = 1;
         entry.last_outcome = "accepted".to_string();
 
-        let clean = delivery_projection("osaka", &entry, None);
+        let clean = delivery_projection(&[], "osaka", &entry, None);
         assert_eq!(clean["status"], "accepted");
         assert_eq!(clean["ackPending"], true);
         assert_eq!(clean["reason"], Value::Null);
@@ -7077,7 +7084,7 @@ mod tests {
         // downgraded by it.
         aoide_storage::outbox::back_off("osaka", 2_000, "transport-error: HTTP 0").unwrap();
         let link = aoide_storage::outbox::read_link_state("osaka").unwrap();
-        let later = delivery_projection("osaka", &entry, link.as_ref());
+        let later = delivery_projection(&[], "osaka", &entry, link.as_ref());
         assert_eq!(later["status"], "accepted", "never downgraded by an unrelated later link failure");
         assert_eq!(later["ackPending"], true);
         assert_eq!(later["reason"], "transport-error: HTTP 0");
@@ -7101,7 +7108,7 @@ mod tests {
         let link = aoide_storage::outbox::read_link_state("osaka").unwrap();
         assert!(link.is_none());
 
-        let d = delivery_projection("osaka", &entry, link.as_ref());
+        let d = delivery_projection(&[], "osaka", &entry, link.as_ref());
         assert_eq!(d["status"], "accepted", "the entry's own outcome still stands");
         assert_eq!(d["reason"], Value::Null, "no stale link reason survives a cleared link");
         assert_eq!(d["nextAttemptAt"], Value::Null);
@@ -7136,7 +7143,8 @@ mod tests {
         let wrong_origin_ack = aoide_storage::mail::mint_ack("bob", to.clone(), &msgid).unwrap();
         let outcome = aoide_storage::mail::deposit(wrong_origin_ack, "test").unwrap();
         assert_eq!(outcome, aoide_storage::mail::DepositOutcome::UnverifiedOrigin);
-        assert_ne!(delivery_projection(&node_name, &entry, None)["status"], "delivered");
+        let base = aoide_storage::mail::read_base().unwrap();
+        assert_ne!(delivery_projection(&base, &node_name, &entry, None)["status"], "delivered");
 
         // Tampering `text` after sealing breaks the msgid recompute —
         // refused before origin is even checked.
@@ -7144,7 +7152,8 @@ mod tests {
         tampered.text = "not-the-real-msgid".to_string();
         let outcome = aoide_storage::mail::deposit(tampered, "test").unwrap();
         assert_eq!(outcome, aoide_storage::mail::DepositOutcome::BadMsgid);
-        assert_ne!(delivery_projection(&node_name, &entry, None)["status"], "delivered");
+        let base = aoide_storage::mail::read_base().unwrap();
+        assert_ne!(delivery_projection(&base, &node_name, &entry, None)["status"], "delivered");
 
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -7187,7 +7196,8 @@ mod tests {
         let outcome = aoide_storage::mail::deposit(ack, "test").unwrap();
         assert!(matches!(outcome, aoide_storage::mail::DepositOutcome::Filed { .. }), "a genuine, verified ack must file");
 
-        let d = delivery_projection(&node_name, &entry, None);
+        let base = aoide_storage::mail::read_base().unwrap();
+        let d = delivery_projection(&base, &node_name, &entry, None);
         assert_eq!(d["status"], "delivered", "a real ack beats the stale accepted bookkeeping");
         assert_eq!(d["ackPending"], false);
 
@@ -7229,6 +7239,52 @@ mod tests {
         let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi"], &[("to", "osaka/bob")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Error, "a local spool write failure is a command error, never a masked delivery status");
         assert!(out.data.is_none(), "an error outcome carries no delivery projection at all");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The independent-review LOW finding this pins: `handle_mail_send`'s
+    /// `Err(e) => delivery_shape("failed", …)` branch — the ONE case a
+    /// LOCAL I/O failure inside the drain attempt itself (never "the
+    /// remote node was unreachable," `mail_wire::drain_node`'s own module
+    /// doc) — had no direct test. Forces that exact `Err` the same way
+    /// `mail_wire`'s own module doc reserves it for: a genuine local I/O
+    /// failure, here `outbox::try_take_link_lock`'s `.bsy` file `open()`
+    /// failing EISDIR — done AFTER the spool write, never before, so only
+    /// the drain fails: `write_entry` only ever touches the node's own
+    /// entry file, never `.bsy` (`outbox::write_entry`'s own doc), so the
+    /// write still lands and the command still reports `Outcome::ok`
+    /// (spec item 8) with `data.delivery` alone showing the drain's local
+    /// failure.
+    #[test]
+    fn mail_send_reports_delivery_failed_when_the_drain_itself_hits_a_local_io_error() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-send-drain-local-io-error");
+
+        aoide_storage::node_store::save_nodes(&[verified_node("osaka", "http://127.0.0.1:1/")]).unwrap();
+
+        let bsy = aoide_storage::outbox::outbox_dir().join("osaka").join(".bsy");
+        std::fs::create_dir_all(&bsy).unwrap();
+
+        let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi"], &[("to", "osaka/bob")]));
+        assert_eq!(
+            out.status,
+            aoide_protocol::output::Status::Ok,
+            "the write already succeeded — a drain-local I/O failure never downgrades it, msg: {}",
+            out.message
+        );
+
+        let spooled = aoide_storage::outbox::list_entries("osaka").unwrap();
+        assert_eq!(spooled.len(), 1, "the entry is still spooled despite the drain's own local failure");
+
+        let data = out.data.unwrap();
+        assert_eq!(data["delivery"]["status"], "failed");
+        assert_eq!(data["delivery"]["reasonScope"], "local");
+        assert!(
+            data["delivery"]["reason"].as_str().unwrap().contains(".bsy"),
+            "the local I/O error text rides along, got: {:?}",
+            data["delivery"]["reason"]
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

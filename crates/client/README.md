@@ -450,15 +450,19 @@ never the inbound/serve half (that's `aoide-server`).
   `outbox::nodes_with_outbox` reports — rendering each `list_entries` row's
   msgid/to/tries/lastTryAt/lastOutcome/refused plus the same `delivery`
   projection `mail send` fills in (one `read_link_state` per node, joined
-  onto each of that node's entries, never copied into per-entry state);
-  "outbox empty" when there is nothing waiting anywhere. This command
-  never dials — it is the read side of the projection, not a drain.
-  `handle_mail_outbox_rm` (`mail outbox rm
+  onto each of that node's entries, never copied into per-entry state; the
+  mailbase read `delivery_projection`'s own ack check needs is likewise
+  read ONCE for the whole listing, not once per node or per entry, and
+  passed in — see `has_delivered_ack`/`delivery_projection` in
+  `commands.rs`); "outbox empty" when there is nothing waiting anywhere.
+  This command never dials — it is the read side of the projection, not a
+  drain. `handle_mail_outbox_rm` (`mail outbox rm
   <msgid>`) is an exact-msgid removal, NOT the mailbase `mail rm`'s
   age-based prune — it walks `nodes_with_outbox` and calls
   `outbox::remove_entry(node, msgid)` on each until one actually held that
-  msgid, erroring `not-found` if none did; neither command touches the
-  mailbase (`aoide_storage::mail`) at all —
+  msgid, erroring `not-found` if none did; neither command WRITES to the
+  mailbase (`aoide_storage::mail`) — `handle_mail_outbox`'s own delivery
+  projection still reads it (above) —
   `handle_node_allow` (`node allow <name> <cap> on|off`, P-P3, `docs/
   architecture/PAIRING.md` decision 5) is a thin wire around
   `aoide_storage::node_store::set_node_allow` — idempotent, refuses an
