@@ -666,9 +666,13 @@ pub static CLAUDE_PROFILE: AgentProfile = AgentProfile {
         approve: "1",
         deny: "3",
     }),
-    // Claude Code's composer submits on Enter, same as any ordinary line
-    // editor.
-    submit_key: "\n",
+    // A terminal's Enter key sends CR (`\r`); Claude Code binds LF (ctrl-J /
+    // shift-enter) to "insert newline" in the composer, not submit. Observed
+    // on the installed Claude Code 2.1.263 on two independent hosts: root's
+    // Osaka fixture and the yomi doorbell rig both found a bare `\n` only
+    // inserts a newline, leaving the turn unsubmitted until a bare `\r`
+    // follows.
+    submit_key: "\r",
     normalize_payload: claude_normalize_payload,
     model_ceiling: crate::model::context_ceiling_for_model,
     transcript: TranscriptSpec {
@@ -1399,6 +1403,9 @@ pub static PI_PROFILE: AgentProfile = AgentProfile {
     // there is no prompt for a summons to answer.
     permission_keys: None,
     // pi's extension is a claude-shaped input surface; Enter submits.
+    // Unverified against a live pi — this byte mirrors claude's old
+    // (pre-fix) value and has not been re-checked now that claude's own
+    // profile turned out to need `\r` instead.
     submit_key: "\n",
     normalize_payload: normalize_identity,
     model_ceiling: crate::model::context_ceiling_for_model,
@@ -1835,10 +1842,15 @@ mod tests {
 
     #[test]
     fn submit_key_is_pinned_per_profile() {
-        // claude and pi submit on Enter; kimi's TUI submits on `\r` (ground-
+        // Enter sends CR (`\r`), not LF — claude and kimi's TUIs both submit
+        // on `\r` (claude: observed on the installed Claude Code 2.1.263 on
+        // two independent hosts, root's Osaka fixture and the yomi doorbell
+        // rig, where a bare `\n` only inserted a newline; kimi: ground-
         // truthed on a live screen, see Conductor-Channel.md's `graph send`
-        // entry) — a wrong byte here types the line without submitting it.
-        assert_eq!(CLAUDE_PROFILE.submit_key, "\n");
+        // entry). pi's `\n` is unverified against a live pi, carried over
+        // from claude's old (pre-fix) value. A wrong byte here types the
+        // line without submitting it.
+        assert_eq!(CLAUDE_PROFILE.submit_key, "\r");
         assert_eq!(KIMI_PROFILE.submit_key, "\r");
         assert_eq!(PI_PROFILE.submit_key, "\n");
     }
