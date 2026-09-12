@@ -3082,8 +3082,9 @@ mod tests {
     fn a_permit_shaped_keystroke_is_delivered_with_no_prefix_even_with_a_sender() {
         // The regression that matters most: `session permit`'s bare-digit
         // verdict (or a hand-typed answer of the same shape) must reach the
-        // socket as EXACTLY the digit + newline — a provenance prefix here
-        // would corrupt the keystroke the target's TUI is waiting to read.
+        // socket as EXACTLY the digit + the target's submit key (`\r` for
+        // claude) — a provenance prefix here would corrupt the keystroke the
+        // target's TUI is waiting to read.
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -3146,7 +3147,8 @@ mod tests {
         // Regression: `--from` is raw argv — a newline is legal in it — but an
         // unsanitized sender would inject a second, EARLY-SUBMITTED line into
         // the target's TUI ahead of the real text. The delivered bytes must
-        // carry EXACTLY the one newline `--submit` asked for.
+        // carry NO embedded newline from `--from`, only the trailing `\r`
+        // `--submit` asked for.
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
             "AOIDE_STAGE_DIR",
@@ -3361,9 +3363,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
     #[test]
-    fn send_yes_to_an_unregistered_agent_defaults_to_newline_submit() {
+    fn send_yes_to_an_unregistered_agent_defaults_to_claude_cr_submit() {
         // An unregistered ("shell") or empty agent string falls back to the
-        // claude profile's `\n` — the same fallback `profile_for_agent`
+        // claude profile's `\r` — the same fallback `profile_for_agent`
         // already applies for `session permit`.
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let _env = EnvVars::save(&[
@@ -3418,7 +3420,7 @@ mod tests {
             assert_eq!(
                 String::from_utf8(got).unwrap(),
                 "hello world\r",
-                "agent {tag:?} defaults to the claude fallback's newline submit"
+                "agent {tag:?} defaults to the claude fallback's `\\r` submit"
             );
 
             let _ = std::fs::remove_dir_all(&root);

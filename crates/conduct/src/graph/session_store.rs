@@ -2223,6 +2223,7 @@ mod tests {
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE");
         let stage = unique_stage("reap");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let _xdg = isolated_xdg_runtime("reap-killed-vs-living-xdg");
 
         // A pid that can NEVER exist (above every Linux pid_max) is the killed
         // session; this very process's pid is the living one; and a hook-only
@@ -2307,6 +2308,7 @@ mod tests {
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only liveness
         let stage = unique_stage("reap-subagent-cascade");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let _xdg = isolated_xdg_runtime("reap-subagent-cascade-xdg");
 
         // A pid that cannot possibly be alive → the pid-dead signal fires for `top`.
         let dead_pid = u32::MAX;
@@ -2365,6 +2367,7 @@ mod tests {
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only liveness
         let stage = unique_stage("reap-hooksilent");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        let _xdg = isolated_xdg_runtime("reap-hooksilent-xdg");
 
         // The real "now", not a fixed date: this record must survive every
         // signal that reads the wall clock, and the pre-boot one condemns a

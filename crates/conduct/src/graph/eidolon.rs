@@ -546,13 +546,7 @@ mod tests {
     fn a_live_presence_becomes_one_record_keyed_by_its_native_id() {
         let (out, changed) = reconcile_eidolon_sessions(
             vec![],
-            &PresenceScan::Observed(vec![presence(
-                "user-0001",
-                4242,
-                "/home/khoa",
-                false,
-                true,
-            )]),
+            &PresenceScan::Observed(vec![presence("user-0001", 4242, "/home/khoa", false, true)]),
             no_ancestry,
         );
         assert!(changed);
@@ -607,13 +601,7 @@ mod tests {
 
         let (out, changed) = reconcile_eidolon_sessions(
             vec![wrap.clone()],
-            &PresenceScan::Observed(vec![presence(
-                "user-0001",
-                4242,
-                "/home/khoa",
-                false,
-                true,
-            )]),
+            &PresenceScan::Observed(vec![presence("user-0001", 4242, "/home/khoa", false, true)]),
             ancestry,
         );
         assert!(changed);
@@ -640,13 +628,8 @@ mod tests {
 
     #[test]
     fn a_second_reconcile_changes_nothing_and_re_mints_no_petname() {
-        let scan = PresenceScan::Observed(vec![presence(
-            "user-0001",
-            4242,
-            "/home/khoa",
-            false,
-            true,
-        )]);
+        let scan =
+            PresenceScan::Observed(vec![presence("user-0001", 4242, "/home/khoa", false, true)]);
         let (first, changed1) = reconcile_eidolon_sessions(vec![], &scan, no_ancestry);
         assert!(changed1);
         let petname_after_first = first[0].petname.clone();
