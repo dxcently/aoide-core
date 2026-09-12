@@ -86,11 +86,16 @@ lib.mkIf config.aoide.enable {
     after = lib.optional (cfg.sessionTarget != "default.target") cfg.sessionTarget;
     partOf = lib.optional (cfg.sessionTarget != "default.target") cfg.sessionTarget;
 
-    # `procps` MUST be on the unit PATH: the daemon's own tick reads one
-    # `ps` table to resolve desktop-Codex thread ownership, and a minimal
-    # user unit's default PATH lacks it — without this the scan can only
-    # ever report Unknown (P-CX-4).
-    path = [ pkgs.procps ];
+    # A minimal user unit's default PATH carries neither `ps` nor `ssh`,
+    # and the daemon's own tick needs both: one `ps` table resolves
+    # desktop-Codex thread ownership (without it the scan can only ever
+    # report Unknown, P-CX-4), and the outbox drain spawns `ssh` to tunnel
+    # a letter to a loopback-door node (without it every daemon-side
+    # delivery fails and its backoff holds the CLI's own attempt off).
+    path = [
+      pkgs.procps
+      pkgs.openssh
+    ];
 
     serviceConfig = {
       # The `aoide` package installs both the `aoide` CLI and the `aoided`
