@@ -103,12 +103,23 @@ other crate in this workspace sits above.
   telling the model events arrive one-way as `<channel source="aoide">`.
 - `agents` — `agent_profile`, the per-harness knowledge table (hook
   vocabulary, model ceilings, transcript layout, the hook-settings and
-  skills-directory locations, and — P-D7 — the argv that launches a harness
-  fresh and, where verified, the argv that resumes a prior session of it by
-  its own id) keyed by harness name. `on_path` (P-I2, ONBOARD.md decision
-  7) is the `AgentProfile`-shaped wrapper over `bin::on_path`, over the
-  profile's own `launch` program name — onboard's harness-picker
-  preselection.
+  skills-directory locations, the argv that launches a harness fresh and,
+  where verified, the argv that resumes a prior session of it by its own
+  id — P-D7 — and, where a harness offers one, the argv that delivers a
+  message to a live session WITHOUT the pty composer at all —
+  `native_send`, P-EIDOLON) keyed by harness name. `on_path` (P-I2,
+  ONBOARD.md decision 7) is the `AgentProfile`-shaped wrapper over
+  `bin::on_path`, over the profile's own `launch` program name — onboard's
+  harness-picker preselection. The table gains a fourth row for `eidolon`,
+  which has no hook file at all: its `hook_settings` names a Nix-owned
+  config path only so `hooks install`'s Declarative refusal has something
+  concrete to cite, its transcript is a single small swarm presence file
+  (`meta.json`) rather than an append-only per-session log, so
+  `permission_keys`, `skills_dir`, `resume_args`, and the transcript's
+  `say`/`tool`/`context_tokens` are named-absent rather than filled — and
+  it is the one profile so far with `native_send: Some(...)`, since a
+  message to it never needs the pty composer a keystroke path would
+  otherwise reach.
 - `bin` — sibling-binary resolution (`core_bin`/`rice_bin`; env override →
   sibling-of-`current_exe` → bare `PATH` name), plus `on_path` (P-I2,
   ONBOARD.md decision 3): the proactive `PATH` probe the resolver's own

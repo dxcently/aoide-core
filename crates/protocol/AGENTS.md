@@ -119,9 +119,18 @@
 
 - **A new door-shared type or macro** (something every domain crate would
   otherwise reimplement) lands in the matching module here.
-- **A new agent harness** (beyond `claude`/`kimi`/`pi`) is a new
+- **A new agent harness** (beyond `claude`/`kimi`/`pi`/`eidolon`) is a new
   `agents::agent_profile` table entry, not a scatter of `if harness == ...`
-  conditionals elsewhere.
+  conditionals elsewhere. A harness need not fill every field to qualify —
+  `eidolon` has no hook file and no live event stream, so most of its entry
+  is a taught `None`/empty value with the reason named in its own doc
+  comment, not a scatter of guesses. **`native_send`'s absence discipline
+  follows the same rule**: a harness whose only input surface is a pty
+  composer (`claude`/`kimi`/`pi`, today) leaves it `None` with a one-line
+  comment saying so — it is never set to a guessed argv, and a later
+  reader of the field checks `p.native_send.is_some()` rather than naming
+  any harness by string (`if agent == "eidolon"` is exactly the scatter
+  this table exists to avoid).
 - **A new binary needing sibling-binary resolution** adds a tier to
   `bin.rs`'s resolver; it never hardcodes a bare `PATH` name.
 - **A new feed producer/consumer** (`aoided`'s own event bus,

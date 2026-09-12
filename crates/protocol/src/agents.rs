@@ -4,7 +4,9 @@
 //! behind ONE lookup table, so a second harness lands as a new entry rather
 //! than a scatter of conditionals. The table is open (`agent_profile` returns
 //! `Option`); it holds `claude` (the first harness, moved here verbatim from
-//! `conduct`'s hook door and transcript readers), `kimi`, and `pi`.
+//! `conduct`'s hook door and transcript readers), `kimi`, `pi`, and
+//! `eidolon` (a harness with no hook file at all — see [`EIDOLON_PROFILE`]'s
+//! own doc for what that leaves absent).
 
 use serde_json::Value;
 use std::path::{Path, PathBuf};
@@ -162,6 +164,26 @@ pub struct AgentProfile {
     /// material — never a guessed flag — so `graph resurrect` (P-D8) skips
     /// it with a taught message rather than typing a wrong invocation.
     pub resume_args: Option<fn(harness_session_id: &str) -> Vec<String>>,
+    /// argv that delivers a message to a live session of this harness
+    /// WITHOUT going through its pty composer at all — for a harness whose
+    /// own native inter-session transport exists (eidolon: `eidolon send`).
+    /// Shaped like [`resume_args`] but for a different id space: `to` names
+    /// the RECIPIENT (not necessarily the caller's own session), and the
+    /// returned argv is everything AFTER the executable — the caller
+    /// resolves which literal binary is "this harness" itself (e.g. via
+    /// `/proc/<pid>/exe` — PATH does not name a stable program for every
+    /// harness). `None` for every harness with no such transport: its only
+    /// input surface is the pty composer a keystroke path already reaches.
+    /// Two contract halves a caller MUST honour, named here because both are
+    /// easy to get wrong from the argv shape alone:
+    /// - the message TEXT is never an argv word — the caller writes it to
+    ///   the spawned child's STDIN instead (see [`eidolon_native_send`]'s
+    ///   own doc for why: the child re-joins multiple text args with
+    ///   spaces, silently losing newlines);
+    /// - the child's exit 0 means the message was ACCEPTED (queued or
+    ///   delivered), never that the recipient has processed or even seen
+    ///   it — there is no synchronous "consumed" signal on this transport.
+    pub native_send: Option<fn(to: &str) -> Vec<String>>,
 }
 
 // ── claude ──────────────────────────────────────────────────────────────────
@@ -672,6 +694,9 @@ pub static CLAUDE_PROFILE: AgentProfile = AgentProfile {
     // AOIDED.md`'s L5 section — the design authority for this table, not a
     // guess made here.
     resume_args: Some(claude_resume_args),
+    // Claude Code's only input surface is the pty composer every existing
+    // keystroke path already reaches — no separate native transport.
+    native_send: None,
 };
 
 /// `claude --resume <harness_session_id>` — resume a prior claude session by
@@ -1081,6 +1106,9 @@ pub static KIMI_PROFILE: AgentProfile = AgentProfile {
     // explicitly, and the id kimi expects is the same `<session_id>` this
     // profile's transcript locator already keys `kimi_session_dir` on).
     resume_args: Some(kimi_resume_args),
+    // Kimi's only input surface is the pty composer every existing
+    // keystroke path already reaches — no separate native transport.
+    native_send: None,
 };
 
 /// `kimi --session <harness_session_id>` — resume a prior kimi session by
@@ -1412,6 +1440,10 @@ pub static PI_PROFILE: AgentProfile = AgentProfile {
     // takes a bare id + unambiguous continue semantics the way
     // `--session-id` demonstrably does.
     resume_args: Some(pi_resume_args),
+    // pi's own sub-agent children aside, its only input surface is the pty
+    // composer every existing keystroke path already reaches — no separate
+    // native transport.
+    native_send: None,
 };
 
 /// `pi --session-id <harness_session_id>` — resume a prior pi session by its
@@ -1424,8 +1456,316 @@ fn pi_resume_args(harness_session_id: &str) -> Vec<String> {
     ]
 }
 
+// ── eidolon ─────────────────────────────────────────────────────────────────
+
+/// Eidolon fires no hook event at all — its `event.rs` bus
+/// (`ToolCallStarted`/`AskUser`/`PolicyVerdict`/`ContextSize`/`TurnSettled`/
+/// `Cancelled`) is `tokio::sync::broadcast`, in-process only, and never
+/// reaches the door (P-EIDOLON brief §2, `core/src/event.rs:1-8`). Always
+/// `Unknown`; this exists only because `AgentProfile.hook_event_map` is not
+/// itself `Option`, and nothing calls it for a harness whose `hook_settings`
+/// is `Declarative` with no aoide-authored file underneath (see
+/// [`EIDOLON_PROFILE`]'s own doc).
+fn eidolon_hook_event(_: &str) -> HookClass {
+    HookClass::Unknown
+}
+
+// ── eidolon presence layout ─────────────────────────────────────────────────
+//
+// Eidolon has no hook transcript at all: its durable turn log
+// (`~/.local/share/eidolon/sessions/<epoch-ms>.eid`) is a bitcode-framed
+// binary journal (`core/src/session/log.rs:1-38`) — opened read-write by the
+// harness's own `log` subcommand, which repairs a torn tail in place, and
+// unparseable without eidolon's own decoder, so it is not a safe read
+// target here. What IS safe, small, and already JSON is the swarm presence
+// file every launch registers:
+// `$XDG_RUNTIME_DIR/eidolon/<id>/meta.json` — a single flat object
+// (id/pid/log/cwd/repo/model/started_ms/title/busy, `presence.rs:33-53`,
+// `swarm/src/lib.rs:16-31`). The id is deterministic from `(cwd, log)`
+// (`presence.rs:399-421`), never a timestamp, and that id IS this profile's
+// `session_id` — so `locate` below needs no search, no cwd bucket, no
+// directory scan: the id names its own file directly.
+
+/// Resolve an eidolon session's presence file directly:
+/// `$XDG_RUNTIME_DIR/eidolon/<session_id>/meta.json`, falling back to
+/// `std::env::temp_dir()` exactly as eidolon's own `Presence::root()` does
+/// (`presence.rs:104-110`) — a caller that only ever consulted
+/// `XDG_RUNTIME_DIR` directly would silently miss every presence dir
+/// eidolon itself would have written under the temp-dir fallback (e.g. a
+/// session started outside a login/systemd context where the var is
+/// unset). The session id here already IS the native presence id (see the
+/// layout note above), so there is nothing to search for and nothing to
+/// disambiguate by `cwd` — two live sessions sharing one cwd still resolve
+/// to two distinct files, one per session id, never a collision, and never
+/// widened to match on `cwd` the way claude/pi's locators do. `hinted` is
+/// accepted for signature parity with every other profile's locator, but it
+/// is honoured only when it already names this exact same file: the id
+/// alone derives the ONE path this session can mean, so a hint that agreed
+/// would change nothing and a hint that disagreed would be pointing at some
+/// OTHER session's file — never followed either way. `cwd` is accepted and
+/// unused for the same reason. `None` when the file does not exist (a stale
+/// or torn-down presence dir looks the same as one that never existed).
+fn eidolon_transcript_locate(
+    session_id: &str,
+    _cwd: Option<&str>,
+    _hinted: Option<&str>,
+) -> Option<PathBuf> {
+    let root = std::env::var_os("XDG_RUNTIME_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let path = root.join("eidolon").join(session_id).join("meta.json");
+    path.is_file().then_some(path)
+}
+
+/// Read eidolon's presence `meta.json`, capped at 4 KiB, parse it as ONE
+/// JSON value, and hand it back re-serialized as exactly ONE compact
+/// "line" — not `.lines()`-split like every other profile's `tail`.
+/// `meta.json` is a single flat object written temp-then-rename with
+/// `serde_json::to_vec_pretty` (`presence.rs:227-233`): it is MULTI-LINE
+/// JSON on disk, so a line-splitting tail would hand every extractor below
+/// a fragment (`"{"` on one "line", `"title": "…"` on the next) that parses
+/// as nothing. Parsing once here, at the tail boundary, and recompacting is
+/// what lets `eidolon_extract_title`/`eidolon_extract_model` stay identical
+/// in shape to every other profile's per-line `serde_json::from_str`
+/// extractor. 4 KiB is generous headroom over every real recording (the
+/// longest fields are a home-relative log path and a title, both well under
+/// a hundred bytes, and pretty-printing only adds whitespace) while still
+/// bounding a corrupt or pathological file instead of reading it whole.
+/// Empty on ANY read error, non-UTF-8 content, or a JSON parse failure
+/// (including a file truncated by the byte cap) — never a partial or
+/// best-effort line, matching the brief's "never infer from a missing or
+/// partial tail" discipline.
+fn eidolon_transcript_tail(path: &Path) -> Vec<String> {
+    use std::io::Read;
+    const CAP: u64 = 4096;
+    let Ok(f) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    let mut buf = Vec::new();
+    if f.take(CAP).read_to_end(&mut buf).is_err() {
+        return Vec::new();
+    }
+    let Ok(text) = std::str::from_utf8(&buf) else {
+        return Vec::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(text) else {
+        return Vec::new();
+    };
+    vec![value.to_string()]
+}
+
+/// Always `None`: `meta.json` carries no turn content, and the journal that
+/// does (`.eid`) is unsafe to read directly (see the layout note above) and
+/// unparseable without eidolon's own bitcode decoder. Unsupported until the
+/// producer's `--jsonl` export lands (P-EIDOLON brief §3, slice E5) — named,
+/// not silently guessed absent.
+fn eidolon_extract_say(_lines: &[String], _skip_sidechain: bool) -> Option<String> {
+    None
+}
+
+/// Always `None`, same reason as [`eidolon_extract_say`]: no tool-call
+/// record exists in `meta.json`, and the journal that has one needs the
+/// slice-E5 producer export to read safely.
+fn eidolon_extract_tool(_lines: &[String], _skip_sidechain: bool) -> Option<String> {
+    None
+}
+
+/// The session's NAME: `meta.json.title`, eidolon's own session title field
+/// (set at launch, and by the TUI's rename). `None` when absent or blank.
+fn eidolon_extract_title(lines: &[String]) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if let Some(t) = v.get("title").and_then(Value::as_str) {
+            let t = t.trim();
+            if !t.is_empty() {
+                found = Some(one_line_clip(t, 48));
+            }
+        }
+    }
+    found
+}
+
+/// The session's active model: `meta.json.model`, provider-prefixed with a
+/// COLON as eidolon itself writes it (live-verified: `"claude-cli:opus"`).
+/// Returned verbatim, unstripped — `model_ceiling` below feeds this same
+/// string straight into the shared lookup with no prefix surgery, so the
+/// display value and the ceiling lookup's input are the same string.
+/// `skip_sidechain` is a claude-ism eidolon has no concept of (P5: no
+/// sub-agent transcripts — swarm peers are independent top-level
+/// processes); accepted and ignored, matching pi/kimi's own precedent.
+fn eidolon_extract_model(lines: &[String], _skip_sidechain: bool) -> Option<String> {
+    let mut found: Option<String> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if let Some(m) = v.get("model").and_then(Value::as_str) {
+            let m = m.trim();
+            if !m.is_empty() {
+                found = Some(m.to_string());
+            }
+        }
+    }
+    found
+}
+
+/// Always `None`: `meta.json` carries no usage/token data at all.
+fn eidolon_context_tokens(_lines: &[String]) -> Option<u64> {
+    None
+}
+
+/// Eidolon has no sub-agent transcripts: swarm peers are independent
+/// top-level processes, each with its own presence dir and `.eid` file,
+/// never a child the way claude's Task or pi's Agent tool spawns one (P5,
+/// `swarm/src/lib.rs:16-31`) — always `None`, mirroring pi's own precedent
+/// ([`pi_subagents_dir`]).
+fn eidolon_subagents_dir(_session_id: &str, _cwd: Option<&str>) -> Option<PathBuf> {
+    None
+}
+
+/// Unreachable for eidolon (no sub-agent dir); mirrors the seam's signature,
+/// same as [`pi_find_subagent`].
+fn eidolon_find_subagent(_dir: &Path, _tuid: &str) -> Option<PathBuf> {
+    None
+}
+
+/// `eidolon send --from aoide --wake <to> -` — deliver a message to another
+/// live eidolon session by its native presence id, WITHOUT typing into any
+/// pty composer at all (`main.rs:155-176`, impl `:506-546`,
+/// `swarm::api::send_external` `api.rs:154-205`). `to` is the recipient's
+/// exact presence id (never the `channel` fan-out keyword — Aoide always
+/// names one session). The returned argv is everything AFTER the
+/// executable, per [`AgentProfile::native_send`]'s own contract:
+/// - `--from aoide` and `--wake` are passed explicitly rather than riding
+///   on eidolon's own defaults (`--from` defaults to `"cli"`, a direct
+///   message defaults to `wake: true`) — a default is free to change
+///   upstream; an explicit flag is not.
+/// - the trailing bare `-` is the payload sentinel: eidolon reads the
+///   message text from STDIN when the text arg is exactly `-`
+///   (`main.rs:519-525`); every other shape re-joins multiple text args
+///   with single spaces (`main.rs:518`), silently collapsing newlines. The
+///   caller MUST write the message to the spawned child's stdin — never
+///   append it as another argv word.
+/// - success is `exit 0` with one line on stdout: `delivered to <id>` (the
+///   doorbell answered) or `written to <id>'s inbox, but it is not
+///   answering; it will read it on recovery` (`api.rs:199-204`) — both are
+///   ACCEPTED, neither is a read receipt; there is no id to correlate a
+///   later reply against (`inbox.rs:15-40`'s `Envelope` carries none).
+fn eidolon_native_send(to: &str) -> Vec<String> {
+    vec![
+        "send".to_string(),
+        "--from".to_string(),
+        "aoide".to_string(),
+        "--wake".to_string(),
+        to.to_string(),
+        "-".to_string(),
+    ]
+}
+
+/// The Eidolon profile (P-EIDOLON brief rev 3, slice E1a) — bounded
+/// metadata only. Eidolon has no hook file and fires no event that reaches
+/// the door ([`eidolon_hook_event`] below is `Unknown` for everything, and
+/// `normalize_payload` is the identity no-op — both moot rather than
+/// absent, since nothing ever calls them for a harness `hook_settings`
+/// never wires a real file for), so this profile fills far less than
+/// claude/kimi/pi's own: everything it CAN report comes from the swarm
+/// presence file (`meta.json`), and every field it cannot fill is a taught
+/// refusal, not a guess:
+/// - `permission_vocab: &[]`, `subagent_tools: &[]` — no notification
+///   vocabulary and no sub-agent-spawning tool exist to name.
+/// - `permission_keys: None` — the interactive permission prompt is the
+///   TUI's own script-rebindable Rune `confirm` table
+///   (`tui/ui/default.rn:515-519`), invisible to Aoide; there is no
+///   verified prompt shape to answer, so `graph permit` refuses a summons
+///   rather than typing a guess.
+/// - `skills_dir: None` — eidolon's tools are Rune scripts and MCP, not
+///   `<name>/SKILL.md` packages; there is no directory for `hooks install`
+///   to link into.
+/// - `hook_settings.format: Declarative` — see its own field comment below;
+///   `hooks install eidolon` gets the existing Declarative short-circuit
+///   for free, same door as pi's own entry.
+/// - `launch: &["eidolon"]` — the bare program name; no subcommand launches
+///   the TUI (`main.rs:313-320`), same shape as every other profile's fresh
+///   launch.
+/// - `resume_args: None` — `eidolon resume <SESSION:PathBuf>` and
+///   `eidolon tui --session <SESSION:PathBuf>` both take a LOG PATH
+///   (`main.rs:115-131`, `:242-256`), never the session id `resume_args`'s
+///   own `fn(harness_session_id: &str)` is typed to take, and `LedgerEntry`
+///   carries no log path today (P-EIDOLON brief §7, ruling R1's default
+///   (a)). The id-to-log-path mapping is slice E4's job, not "unsupported
+///   forever" — `graph resurrect` skips it with the existing taught
+///   message meanwhile, same as any other `None` here. A live TUI's own
+///   `:resume` is separately unsupported until eidolon's own P4 lands (the
+///   presence id derives from the log path at launch, and adopting a
+///   different session in place never refreshes it — the record would go
+///   on describing the OLD log).
+/// - `native_send: Some(eidolon_native_send)` — see its own doc: the one
+///   profile where a message never needs the pty composer at all.
+/// - `transcript.say`/`tool`/`context_tokens`: always `None` — eidolon's
+///   turn content lives in the bitcode-framed `.eid` journal
+///   (`core/src/session/log.rs:1-38`), not in `meta.json`, and reading that
+///   journal safely needs the producer's own `--jsonl` export (P-EIDOLON
+///   brief §3's "producer export"), unimplemented until slice E5.
+/// - state `awaiting`/`error`/`cancel` are UNOBSERVABLE by this profile, not
+///   merely unfilled: eidolon's `AskUser`/`PolicyVerdict`/`Cancelled`
+///   events never leave its in-process bus (`core/src/event.rs:1-8`), so no
+///   slice built on this profile alone can ever assert them — a fact for
+///   the reconciler that consumes this profile, not something this file
+///   can fix.
+pub static EIDOLON_PROFILE: AgentProfile = AgentProfile {
+    name: "eidolon",
+    hook_event_map: eidolon_hook_event,
+    permission_vocab: &[],
+    subagent_tools: &[],
+    // No verified prompt shape to answer — see the profile doc above.
+    permission_keys: None,
+    // `ret` submits in eidolon's TUI, both normal and insert mode
+    // (`default.rn:771,1084`); never consulted in this slice — the native
+    // `send` transport (`native_send` below) never reaches the pty at all,
+    // and this slice's own transcript reading doesn't type anything either.
+    submit_key: "\r",
+    normalize_payload: normalize_identity,
+    model_ceiling: crate::model::context_ceiling_for_model,
+    transcript: TranscriptSpec {
+        locate: eidolon_transcript_locate,
+        tail: eidolon_transcript_tail,
+        say: eidolon_extract_say,
+        tool: eidolon_extract_tool,
+        title: eidolon_extract_title,
+        model: eidolon_extract_model,
+        context_tokens: eidolon_context_tokens,
+        subagents_dir: eidolon_subagents_dir,
+        find_subagent: eidolon_find_subagent,
+    },
+    // Eidolon has no hook file at all — its config is Nix-owned and
+    // read-only to the harness (`~/eidolon/AGENTS.md`: "Configuration is
+    // read-only to the harness... Do not add another config writer"). This
+    // names that nix-generated config path only so `hooks install`'s
+    // existing Declarative short-circuit message has something concrete and
+    // true to cite; the FORMAT is what actually matters here — `hooks
+    // install eidolon` never reads or writes this path, unlike pi's own
+    // Declarative entry, which names a real aoide-authored extension file.
+    hook_settings: SettingsSpec {
+        relative_path: ".config/eidolon/config.toml",
+        format: SettingsFormat::Declarative,
+    },
+    // No SKILL.md concept — see the profile doc above.
+    skills_dir: None,
+    launch: &["eidolon"],
+    // No `resume_args` — see the profile doc above (ruling R1, default (a)).
+    resume_args: None,
+    // The one profile with a native inter-session transport — see
+    // `eidolon_native_send`'s own doc for the two contract halves a caller
+    // must honour (stdin payload, accepted-not-consumed exit code).
+    native_send: Some(eidolon_native_send),
+};
+
 /// The profile table. New harnesses land here as another entry.
-static PROFILES: &[&AgentProfile] = &[&CLAUDE_PROFILE, &KIMI_PROFILE, &PI_PROFILE];
+static PROFILES: &[&AgentProfile] =
+    &[&CLAUDE_PROFILE, &KIMI_PROFILE, &PI_PROFILE, &EIDOLON_PROFILE];
 
 /// Look up an agent harness's profile by name (`claude`, `kimi`, …). `None`
 /// for a harness the bridge has no profile for.
@@ -1435,7 +1775,7 @@ pub fn agent_profile(name: &str) -> Option<&'static AgentProfile> {
 
 /// Every agent name with a registered profile.
 pub fn known_agents() -> &'static [&'static str] {
-    &["claude", "kimi", "pi"]
+    &["claude", "kimi", "pi", "eidolon"]
 }
 
 /// Is this profile's launch program discoverable on `PATH`? Onboard's own
@@ -1484,9 +1824,13 @@ mod tests {
         assert_eq!(p.name, "claude");
         assert_eq!(agent_profile("kimi").expect("kimi is registered").name, "kimi");
         assert_eq!(agent_profile("pi").expect("pi is registered").name, "pi");
+        assert_eq!(
+            agent_profile("eidolon").expect("eidolon is registered").name,
+            "eidolon"
+        );
         assert!(agent_profile("nope").is_none());
         assert!(agent_profile("").is_none());
-        assert_eq!(known_agents(), &["claude", "kimi", "pi"]);
+        assert_eq!(known_agents(), &["claude", "kimi", "pi", "eidolon"]);
     }
 
     #[test]
@@ -2332,5 +2676,238 @@ mod tests {
         let clipped = one_line_clip(&long, 10);
         assert_eq!(clipped.chars().count(), 10);
         assert!(clipped.ends_with('…'));
+    }
+
+    // ── the eidolon profile ─────────────────────────────────────────────────
+
+    #[test]
+    fn eidolon_hook_event_map_has_no_vocabulary() {
+        let map = EIDOLON_PROFILE.hook_event_map;
+        // No hook file, no event vocabulary at all -- every input is
+        // Unknown, including every lifecycle name the other three profiles
+        // map.
+        for evt in [
+            "SessionStart",
+            "UserPromptSubmit",
+            "PreToolUse",
+            "PostToolUse",
+            "Stop",
+            "Notification",
+            "SubagentStart",
+            "SubagentStop",
+            "SessionEnd",
+            "Zzz",
+            "",
+        ] {
+            assert_eq!(map(evt), HookClass::Unknown, "event: {evt}");
+        }
+    }
+
+    #[test]
+    fn eidolon_profile_pins_the_absent_fields_and_declarative_settings() {
+        assert!(EIDOLON_PROFILE.permission_vocab.is_empty());
+        assert!(EIDOLON_PROFILE.subagent_tools.is_empty());
+        assert!(EIDOLON_PROFILE.permission_keys.is_none());
+        assert_eq!(EIDOLON_PROFILE.submit_key, "\r");
+        assert_eq!(EIDOLON_PROFILE.skills_dir, None);
+        assert!(EIDOLON_PROFILE.resume_args.is_none());
+        assert_eq!(EIDOLON_PROFILE.launch, &["eidolon"]);
+        assert_eq!(
+            EIDOLON_PROFILE.hook_settings.relative_path,
+            ".config/eidolon/config.toml"
+        );
+        assert_eq!(EIDOLON_PROFILE.hook_settings.format, SettingsFormat::Declarative);
+
+        // No stripper: `context_ceiling_for_model` matches its family
+        // tokens as a SUBSTRING search, so the "claude-cli:" prefix is
+        // already inert. "claude-cli:opus" carries no version digits after
+        // "opus", so it falls through to the conservative 200k default
+        // (same as any other unrecognised id) -- a real versioned family
+        // id embedded in the same prefixed shape resolves exactly as it
+        // would bare.
+        let ceil = EIDOLON_PROFILE.model_ceiling;
+        assert_eq!(ceil(Some("claude-cli:opus")), 200_000);
+        assert_eq!(ceil(Some("claude-cli:claude-sonnet-5")), 1_000_000);
+        assert_eq!(ceil(Some("claude-cli:claude-haiku-4-5")), 200_000);
+        assert_eq!(ceil(None), 200_000);
+
+        // The one profile with a native inter-session transport; the three
+        // existing profiles carry none (their only input surface is the
+        // pty composer).
+        assert!(EIDOLON_PROFILE.native_send.is_some());
+        assert!(CLAUDE_PROFILE.native_send.is_none());
+        assert!(KIMI_PROFILE.native_send.is_none());
+        assert!(PI_PROFILE.native_send.is_none());
+        let send = EIDOLON_PROFILE.native_send.expect("eidolon has a native transport");
+        assert_eq!(
+            send("fixture-target-1"),
+            vec!["send", "--from", "aoide", "--wake", "fixture-target-1", "-"]
+        );
+    }
+
+    #[test]
+    fn eidolon_transcript_tail_and_extractors_fill_only_name_and_model() {
+        let path =
+            std::env::temp_dir().join(format!("aoide_eidolon_meta_{}.json", std::process::id()));
+        // Synthetic fixture, PRETTY-PRINTED (multi-line) -- eidolon writes
+        // meta.json via `serde_json::to_vec_pretty` (presence.rs:227-233),
+        // so the on-disk file is never one compact line; `tail` must parse
+        // it as one JSON value and re-emit it as a single compact line.
+        // Shape matches the live-verified meta.json (id/pid/log/cwd/repo/
+        // model/started_ms/title/busy); every value is synthetic, never
+        // the real khoa-253b session.
+        std::fs::write(
+            &path,
+            "{\n  \"id\": \"fixture-a1a1\",\n  \"pid\": 424242,\n  \"log\": \"/tmp/fixture/eidolon/session-a.eid\",\n  \"cwd\": \"/tmp/fixture-cwd\",\n  \"repo\": null,\n  \"model\": \"claude-cli:opus\",\n  \"started_ms\": 1000000000000,\n  \"title\": \"demo session\",\n  \"busy\": false\n}\n",
+        )
+        .unwrap();
+
+        let spec = &EIDOLON_PROFILE.transcript;
+        let lines = (spec.tail)(&path);
+        assert_eq!(lines.len(), 1, "the pretty-printed value recompacts to exactly one line");
+        assert!(!lines[0].contains('\n'), "the returned line is compact, not pretty-printed");
+
+        // name/model fill from title/model...
+        assert_eq!((spec.title)(&lines).as_deref(), Some("demo session"));
+        assert_eq!((spec.model)(&lines, true).as_deref(), Some("claude-cli:opus"));
+        // ...say/tool/contextTokens stay absent -- meta.json carries none of it.
+        assert!((spec.say)(&lines, true).is_none());
+        assert!((spec.tool)(&lines, true).is_none());
+        assert!((spec.context_tokens)(&lines).is_none());
+        // No sub-agent machinery for eidolon.
+        assert!((spec.subagents_dir)("fixture-a1a1", None).is_none());
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn eidolon_transcript_tail_returns_empty_on_a_read_or_parse_error() {
+        let spec = &EIDOLON_PROFILE.transcript;
+
+        // No such file -- a read error, not a panic.
+        let missing = std::env::temp_dir()
+            .join(format!("aoide_eidolon_meta_missing_{}.json", std::process::id()));
+        let _ = std::fs::remove_file(&missing);
+        assert_eq!((spec.tail)(&missing), Vec::<String>::new());
+
+        // A file that exists but is not valid JSON -- a parse error, not a
+        // panic and not a best-effort partial line.
+        let malformed = std::env::temp_dir()
+            .join(format!("aoide_eidolon_meta_malformed_{}.json", std::process::id()));
+        std::fs::write(&malformed, "{ not json").unwrap();
+        assert_eq!((spec.tail)(&malformed), Vec::<String>::new());
+
+        let _ = std::fs::remove_file(&malformed);
+    }
+
+    #[test]
+    fn eidolon_transcript_locate_keys_on_the_native_presence_id_not_cwd() {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _guard = LOCK.lock().unwrap();
+        let saved = std::env::var_os("XDG_RUNTIME_DIR");
+        let root =
+            std::env::temp_dir().join(format!("aoide_eidolon_runtime_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // Two LIVE presence dirs sharing one cwd -- the id, not the cwd,
+        // must be what disambiguates them.
+        let dir_a = root.join("eidolon").join("fixture-aaa1");
+        let dir_b = root.join("eidolon").join("fixture-bbb2");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        std::fs::create_dir_all(&dir_b).unwrap();
+        std::fs::write(
+            dir_a.join("meta.json"),
+            r#"{"id":"fixture-aaa1","pid":111,"log":"/tmp/fixture/a.eid","cwd":"/tmp/shared-cwd","repo":null,"model":"claude-cli:opus","started_ms":1,"title":"a","busy":false}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir_b.join("meta.json"),
+            r#"{"id":"fixture-bbb2","pid":222,"log":"/tmp/fixture/b.eid","cwd":"/tmp/shared-cwd","repo":null,"model":"claude-cli:opus","started_ms":2,"title":"b","busy":true}"#,
+        )
+        .unwrap();
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+
+        let spec = &EIDOLON_PROFILE.transcript;
+        // Same cwd argument passed for both lookups -- the id alone must
+        // disambiguate, never the cwd.
+        let found_a = (spec.locate)("fixture-aaa1", Some("/tmp/shared-cwd"), None).unwrap();
+        let found_b = (spec.locate)("fixture-bbb2", Some("/tmp/shared-cwd"), None).unwrap();
+        assert_ne!(found_a, found_b);
+        assert_eq!(found_a, dir_a.join("meta.json"));
+        assert_eq!(found_b, dir_b.join("meta.json"));
+
+        // A hinted path that does NOT name this session's own file is never
+        // followed -- it does not redirect session a's lookup to b's file.
+        let wrong_hint = dir_b.join("meta.json");
+        assert_eq!(
+            (spec.locate)("fixture-aaa1", None, Some(wrong_hint.to_str().unwrap())),
+            Some(dir_a.join("meta.json"))
+        );
+        // A hinted path that DOES name this exact file is (trivially)
+        // honoured -- it agrees with the id-derived path, so nothing
+        // changes.
+        let right_hint = dir_a.join("meta.json");
+        assert_eq!(
+            (spec.locate)("fixture-aaa1", None, Some(right_hint.to_str().unwrap())),
+            Some(dir_a.join("meta.json"))
+        );
+
+        // An unregistered id resolves to nothing.
+        assert!((spec.locate)("fixture-nope", Some("/tmp/shared-cwd"), None).is_none());
+
+        // XDG_RUNTIME_DIR unset falls back to `std::env::temp_dir()`,
+        // exactly like eidolon's own `Presence::root()` (presence.rs:
+        // 104-110) -- a session outside a systemd/login runtime dir (a
+        // bare `sh`, a container with no XDG env) still resolves.
+        std::env::remove_var("XDG_RUNTIME_DIR");
+        let fallback_id = format!("fixture-fallback-{}", std::process::id());
+        let fallback_dir = std::env::temp_dir().join("eidolon").join(&fallback_id);
+        let _ = std::fs::remove_dir_all(&fallback_dir);
+        std::fs::create_dir_all(&fallback_dir).unwrap();
+        std::fs::write(
+            fallback_dir.join("meta.json"),
+            r#"{"id":"fixture-fallback","pid":333,"log":"/tmp/fixture/c.eid","cwd":"/tmp/shared-cwd","repo":null,"model":"claude-cli:opus","started_ms":3,"title":"c","busy":false}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            (spec.locate)(&fallback_id, None, None),
+            Some(fallback_dir.join("meta.json"))
+        );
+        let _ = std::fs::remove_dir_all(&fallback_dir);
+
+        match saved {
+            Some(v) => std::env::set_var("XDG_RUNTIME_DIR", v),
+            None => std::env::remove_var("XDG_RUNTIME_DIR"),
+        }
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn on_path_reflects_eidolons_launch_program_via_the_bin_probe() {
+        // Same pattern as the shared `on_path_reflects_the_profiles_
+        // launch_program_via_the_bin_probe` test above, run against
+        // eidolon's own `launch` entry -- `command -v eidolon` may resolve
+        // to a different binary from the one a live session runs (nix
+        // store vs `~/.local/bin`), so this only proves "an `eidolon`
+        // exists on PATH", never "this session's binary" (dispatch's own
+        // live-facts caveat).
+        let _guard = crate::bin::path_test_lock().lock().unwrap();
+        let saved = std::env::var_os("PATH");
+        let dir = std::env::temp_dir()
+            .join(format!("aoide_agents_on_path_eidolon_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("eidolon"), "").unwrap();
+        std::env::set_var("PATH", &dir);
+
+        assert!(on_path(&EIDOLON_PROFILE), "eidolon's launch program sits on the scoped PATH");
+
+        std::fs::remove_file(dir.join("eidolon")).unwrap();
+        assert!(!on_path(&EIDOLON_PROFILE), "eidolon's launch program no longer sits on PATH");
+
+        match saved {
+            Some(v) => std::env::set_var("PATH", v),
+            None => std::env::remove_var("PATH"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
