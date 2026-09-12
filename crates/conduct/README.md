@@ -391,8 +391,12 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   stable identity. A freshly enrolled record carries a fixed
   `agent:"codex"`/`kind:"app"`/`state:"idle"` identity; an existing
   record's `state` is `apply_codex_capture`'s own to move from there, off
-  the rollout's own turn bracket (`working`/`idle`, never `awaiting`).
-  `windowAddress`/`workspace` are left empty for the existing
+  the rollout's own turn bracket (`working`/`idle`, never `awaiting` — the
+  fold's own vocabulary has no third value). `session phase`/`session end`
+  (`session_store.rs`) refuse a `kind:"app"` record outright rather than
+  stamp some other state onto it, so `apply_codex_capture` really is the
+  only writer, not just the only one anything happens to call today
+  (P-CX-5 S3b). `windowAddress`/`workspace` are left empty for the existing
   `resolve_pending_session_windows` sweep to fill — this module has no
   compositor access.
 
@@ -434,7 +438,7 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   for PROMPTNESS on a host where that listener happens to be running.
 - `graph/codex_capture.rs` — native capture from a Codex thread's own rollout
   JSONL, beside the association `codex_app.rs` already reads (P-CX-5).
-  `fold_rollout`/`fold_rollout_from` are a PURE fold (no I/O, no stage):
+  `fold_rollout_from` is a PURE fold (no I/O, no stage):
   given a rollout's lines, a starting ordinal, and the rollout's own path,
   they produce a `CodexCapture` — `state` (from the latest of
   `task_started`/`task_complete`/`turn_aborted`, never `awaiting`, never

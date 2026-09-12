@@ -265,14 +265,6 @@ pub(crate) fn codex_home() -> Option<PathBuf> {
         .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".codex")))
 }
 
-/// The taught story for a platform with neither primitive this design
-/// needs. Asserted at the const level
-/// (`tests::the_unsupported_platform_string_names_flock_and_the_process_table`)
-/// so the non-unix seam cannot rot unnoticed by drifting out of sync with
-/// what it claims to explain.
-pub(crate) const UNSUPPORTED_PLATFORM: &str =
-    "codex desktop association needs unix file locks and a POSIX process table; this platform has neither";
-
 /// List the thread-writer lock FILES under `dir` (typically
 /// `<codex_home>/thread-writer-locks`) — names only; whether one is
 /// currently HELD is [`lock_is_held`]'s question, not this one.
@@ -327,8 +319,10 @@ pub(crate) fn lock_is_held(path: &Path) -> Option<bool> {
     Some(!acquired)
 }
 
-/// No unix file locks on this platform — see [`UNSUPPORTED_PLATFORM`]. No
-/// probe, no enrolment, no code: this platform never has anything held.
+/// No unix file locks on this platform: codex desktop association needs
+/// unix file locks and a POSIX process table, and this platform has
+/// neither. No probe, no enrolment, no code: this platform never has
+/// anything held.
 #[cfg(not(unix))]
 pub(crate) fn lock_is_held(_path: &Path) -> Option<bool> {
     Some(false)
@@ -472,10 +466,11 @@ fn holder_via_proc_fd(candidates: &[u32], lock: &Path) -> Result<Option<u32>, ()
     }
 }
 
-/// No positive ownership evidence is available on this platform, so no
-/// desktop thread is ever enrolled here — see [`UNSUPPORTED_PLATFORM`].
-/// Always `Ok(None)`, never `Err`: the platform has no failure mode to
-/// report, only nothing to find.
+/// No positive ownership evidence is available on this platform (codex
+/// desktop association needs unix file locks and a POSIX process table,
+/// and this platform has neither), so no desktop thread is ever enrolled
+/// here. Always `Ok(None)`, never `Err`: the platform has no failure mode
+/// to report, only nothing to find.
 #[cfg(not(target_os = "linux"))]
 fn holder_via_proc_fd(_candidates: &[u32], _lock: &Path) -> Result<Option<u32>, ()> {
     Ok(None)
@@ -1383,12 +1378,6 @@ mod tests {
             "a genuinely new id must still get its header cwd off the rollout walk"
         );
         std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn the_unsupported_platform_string_names_flock_and_the_process_table() {
-        assert!(UNSUPPORTED_PLATFORM.contains("file locks"));
-        assert!(UNSUPPORTED_PLATFORM.contains("process table"));
     }
 
     // ---- P-CX-4: a failed/incomplete scan is Unknown, never "no threads" ---

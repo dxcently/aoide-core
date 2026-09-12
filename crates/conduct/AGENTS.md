@@ -49,17 +49,23 @@
   `conductable`/`socket` — there is no transport and no lifecycle event to
   back any of them.
 
-- **An `"app"` record refuses `send` and `kill` by NAME and never falls
-  back to another executor (P-CX-3).** `graph/send.rs::deliver_local_with`
-  checks `rec.kind.as_deref() == Some("app")` BEFORE `is_conductable_now`
-  and errors `codex-app-unsupported` — never today's `not-conductable`,
-  which implies a retry might work. `graph/actions.rs::kill_target` checks
-  the same field at the top of its walk, beside the `sub:` check, and
-  refuses with `APP_OWNS_PROCESS` — the app owns the process, never a
-  signal this crate sends. Both `--to` and A2A inject (`aoide-server`'s
-  `a2a::do_inject`) fold into `deliver_local_with` before ever reaching a
-  socket, so this is the ONE gate for every send path; don't add a second
-  `kind:"app"` check anywhere else.
+- **An `"app"` record refuses `send`, `kill`, `session phase`, and
+  `session end` by NAME and never falls back to another executor (P-CX-3,
+  P-CX-5 S3b).** `graph/send.rs::deliver_local_with` checks
+  `rec.kind.as_deref() == Some("app")` BEFORE `is_conductable_now` and
+  errors `codex-app-unsupported` — never today's `not-conductable`, which
+  implies a retry might work. `graph/actions.rs::kill_target` checks the
+  same field at the top of its walk, beside the `sub:` check, and refuses
+  with `APP_OWNS_PROCESS` — the app owns the process, never a signal this
+  crate sends. `graph/session_store.rs::do_session_phase_inner`/
+  `do_session_end_inner` check the same field (`refuse_app_record`) before
+  touching either stage file and refuse with the same `codex-app-unsupported`
+  reason `send` uses — `apply_codex_capture` is the one writer for an app
+  record's `state` from here on, and neither of these commands is it. Both
+  `--to` and A2A inject (`aoide-server`'s `a2a::do_inject`) fold into
+  `deliver_local_with` before ever reaching a socket, so that's the ONE
+  gate for every send path; don't add a second `kind:"app"` check anywhere
+  else.
 
 - **No path may synthesize a per-thread window address.** A Codex-app
   record's `windowAddress` is the window owning the process that holds that
@@ -128,12 +134,18 @@
   `activity`/`model`/`context_tokens`/`context_ceiling`/`sources`, each set
   only when the capture produced a value and only when it differs — never
   blanked back out by a quiet tick. `state` is folded to `working`/`idle`
-  off the rollout's own open-turn bracket and NEVER `awaiting` (P-CX-5 S3,
-  every consumer of an app record's `state` enumerated by file:line under
-  ruling R2 first); a `None` read (unreadable, missing, or momentarily
-  empty rollout) leaves the record's last-known `state` alone rather than
-  resetting it. `parentSessionId`, `title`, and `nickname` remain
-  deliberately untouched by that merge — the subagent edge
+  off the rollout's own open-turn bracket — the fold's own vocabulary has
+  no `awaiting` to produce (P-CX-5 S3, every consumer of an app record's
+  `state` enumerated by file:line under ruling R2 first) — and no OTHER
+  writer can land one there either: `session phase`/`session end`
+  (`session_store.rs::do_session_phase_inner`/`do_session_end_inner`)
+  refuse a `kind:"app"` record outright with `codex-app-unsupported`, the
+  same reason `send`'s own refusal already uses (P-CX-5 S3b, closing the
+  gap S3's removal of the per-tick idle reset opened: nothing else would
+  have healed a stray write). A `None` read (unreadable, missing, or
+  momentarily empty rollout) leaves the record's last-known `state` alone
+  rather than resetting it. `parentSessionId`, `title`, and `nickname`
+  remain deliberately untouched by that merge — the subagent edge
   (`parent_thread_id`/`nickname`) is a later slice's own (R3's "one producer
   per shape" also means `sources` itself never grows a second writer without
   its own slice). `capture_for` memoises per thread (a process-static, no

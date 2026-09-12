@@ -1113,6 +1113,31 @@ pub(in crate::graph) fn do_subagent_rekey(from_sub_id: &str, to_sub_id: &str) {
     });
 }
 
+/// A `kind:"app"` record's `state` comes from its rollout's turn bracket
+/// (`apply_codex_capture`, `codex_app.rs`, P-CX-5 S3) — the one writer for
+/// it from here on. `session phase`/`session end` stamping an arbitrary
+/// state onto one would stick until a later capture happened to disagree
+/// (no per-tick reset survives S3 to self-heal a stray write), so both
+/// refuse it outright — the same class of refusal `send`
+/// (`codex-app-unsupported`, `send.rs`) and `kill` (`APP_OWNS_PROCESS`,
+/// `actions.rs`) already hold for their own writes onto an app record. An
+/// id with no record yet (or any other kind) is untouched — `None`.
+fn refuse_app_record(cmd: &'static str, id: &str, sessions: &[SessionRecord]) -> Option<Outcome> {
+    let rec = sessions.iter().find(|s| s.session_id == id)?;
+    if rec.kind.as_deref() != Some("app") {
+        return None;
+    }
+    Some(
+        Outcome::error(
+            cmd,
+            format!(
+                "session `{id}` lives inside the desktop app that owns its server; aoide has no channel to it"
+            ),
+        )
+        .with_data(json!({ "reason": "codex-app-unsupported", "id": id })),
+    )
+}
+
 /// Core of `session phase`: UPSERT the hook record (audit), land the
 /// canonical live state on sessions.json (the widget file), re-stage. The whole
 /// load-modify-write is serialised against every other stage writer by the
@@ -1122,6 +1147,13 @@ pub(in crate::graph) fn do_session_phase(id: &str, phase: &str) -> Outcome {
 }
 fn do_session_phase_inner(id: &str, phase: &str) -> Outcome {
     let cmd = "session.phase";
+    let sessions: SessionsFile = match load_stage(&sessions_path()) {
+        Ok(f) => f,
+        Err(e) => return stage_error(cmd, e),
+    };
+    if let Some(out) = refuse_app_record(cmd, id, &sessions.sessions) {
+        return out;
+    }
     let mut file: HooksFile = match load_stage(&hooks_path()) {
         Ok(f) => f,
         Err(e) => return stage_error(cmd, e),
@@ -1279,6 +1311,9 @@ fn do_session_end_inner(id: &str) -> Outcome {
             format!("session `{id}` was not registered (no change)"),
         )
         .with_data(json!({ "sessionId": id }));
+    }
+    if let Some(out) = refuse_app_record(cmd, id, &s_file.sessions) {
+        return out;
     }
     let now = now_iso_utc();
     for s in s_file.sessions.iter_mut() {
@@ -2066,6 +2101,146 @@ mod tests {
             aoide_storage::tunnel::load("other-session", "node-b").is_some(),
             "another session's tunnel record is untouched",
         );
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    // ── P-CX-5 S3b: `kind:"app"` refuses `session phase`/`session end` ──
+    #[test]
+    fn a_codex_app_record_refuses_session_phase() {
+        // A `kind:"app"` record's `state` comes from its rollout's turn
+        // bracket (`apply_codex_capture`, `codex_app.rs`) — the one writer
+        // for it from here on. Before this fix a stray `session phase`
+        // self-healed within one tick (the per-tick reset re-stamped
+        // `idle`); after S3 removed that reset nothing corrects it, so it
+        // must refuse outright, same reason vocabulary as `send`'s own
+        // `codex-app-unsupported`.
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR"]);
+        let stage = unique_stage("sess-phase-app-refuse");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let mut app = session("01a07d89-app", "/home/khoa/Aoide", "idle", "1", None);
+        app.agent = "codex".to_string();
+        app.kind = Some("app".to_string());
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![app],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let out = session_phase(&flag_invocation(
+            &["session", "phase"],
+            &[("id", "01a07d89-app"), ("phase", "awaiting")],
+        ));
+        assert_eq!(
+            out.status,
+            aoide_protocol::output::Status::Error,
+            "msg: {}",
+            out.message
+        );
+        assert_eq!(
+            out.data.as_ref().unwrap()["reason"],
+            "codex-app-unsupported"
+        );
+
+        let after: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = after
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "01a07d89-app")
+            .unwrap();
+        assert_eq!(
+            rec.state, "idle",
+            "a refused session phase must not touch the record's state"
+        );
+
+        let hooks: HooksFile = load_stage(&hooks_path()).unwrap();
+        assert!(
+            !hooks.hooks.iter().any(|h| h.session_id == "01a07d89-app"),
+            "a refused session phase must not write a hook record either"
+        );
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn a_codex_app_record_refuses_session_end() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR"]);
+        let stage = unique_stage("sess-end-app-refuse");
+        let state = stage.join("state");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+
+        let mut app = session("01a07d89-app-end", "/home/khoa/Aoide", "working", "1", None);
+        app.agent = "codex".to_string();
+        app.kind = Some("app".to_string());
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![app],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let out = session_end(&flag_invocation(
+            &["session", "end"],
+            &[("id", "01a07d89-app-end")],
+        ));
+        assert_eq!(
+            out.status,
+            aoide_protocol::output::Status::Error,
+            "msg: {}",
+            out.message
+        );
+        assert_eq!(
+            out.data.as_ref().unwrap()["reason"],
+            "codex-app-unsupported"
+        );
+
+        let after: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = after
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "01a07d89-app-end")
+            .unwrap();
+        assert_eq!(
+            rec.state, "working",
+            "a refused session end must not mark the app record done"
+        );
+
+        let _ = std::fs::remove_dir_all(&stage);
+    }
+    #[test]
+    fn a_non_app_record_still_takes_the_phase() {
+        // The kind check above must never touch the ordinary path: a
+        // shell/agent/subagent/a2a record's `session phase` behaves
+        // byte-for-byte as it did before this refusal existed.
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR"]);
+        let stage = unique_stage("sess-phase-non-app-ok");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        session_start(&flag_invocation(
+            &["session", "start"],
+            &[("id", "shell-1"), ("agent", "claude"), ("cwd", "/w")],
+        ));
+
+        let out = session_phase(&flag_invocation(
+            &["session", "phase"],
+            &[("id", "shell-1"), ("phase", "awaiting")],
+        ));
+        assert_eq!(
+            out.status,
+            aoide_protocol::output::Status::Ok,
+            "msg: {}",
+            out.message
+        );
+
+        let after: SessionsFile = load_stage(&sessions_path()).unwrap();
+        let rec = after
+            .sessions
+            .iter()
+            .find(|s| s.session_id == "shell-1")
+            .unwrap();
+        assert_eq!(rec.state, "awaiting");
 
         let _ = std::fs::remove_dir_all(&stage);
     }

@@ -1,20 +1,21 @@
 //! Native Codex capture (P-CX-5, the codex-integration follow-on): a PURE
 //! fold from a Codex rollout's own JSONL lines into one [`CodexCapture`]
-//! ([`fold_rollout`]/[`fold_rollout_from`]), plus the bounded, impure reader
-//! over a live rollout ([`capture_for`]) that feeds it. `codex_app.rs`'s
+//! ([`fold_rollout_from`]), plus the bounded, impure reader over a live
+//! rollout ([`capture_for`]) that feeds it. `codex_app.rs`'s
 //! `sync_codex_app_threads` is the one caller: it gathers a [`CodexCapture`]
 //! per desired thread and merges `say`/`tool`/`activity`/`model`/
 //! `context_tokens`/`context_ceiling`/`sources` onto that thread's
 //! `kind:"app"` record, change-only. `state`/`parentSessionId`/`title` stay
 //! untouched by that merge — later slices' own territory, not this one's.
 //!
-//! [`fold_rollout`] walks `lines` in order; `ordinal` is the line's own
-//! position in the slice, never a value read out of the record itself — the
-//! ruling that pins the pointer contract. [`fold_rollout_from`] is the same
-//! fold with an explicit starting ordinal, for a caller (namely
-//! [`capture_for`]) handing it only the TAIL of a rollout: the lines it
+//! [`fold_rollout_from`] walks `lines` in order starting at `start_ordinal`
+//! — the ordinal each pointer carries is that starting point plus the
+//! line's own position in the slice, never a value read out of the record
+//! itself — the ruling that pins the pointer contract. [`capture_for`]
+//! hands it only the TAIL of a rollout (via [`fold_tail`]): the lines it
 //! folds are a slice, but a pointer must still name the record's TRUE line
-//! number in the whole file. A line that fails to parse as JSON, whether
+//! number in the whole file, hence the explicit starting ordinal rather
+//! than an assumed 0. A line that fails to parse as JSON, whether
 //! truncated by a tail cut or simply malformed, contributes nothing: nothing
 //! here ever infers a field from a record it could not read whole. Every
 //! value this fold DOES capture carries a `sources` pointer
@@ -87,8 +88,8 @@ const ACTIVITY_MAX: usize = 120;
 
 /// A pure fold of one Codex rollout's own JSONL records — the shape a later
 /// slice's I/O wrapper upserts onto a `kind:"app"` `SessionRecord`. Every
-/// field starts `None`; [`fold_rollout`] is the only way to produce one with
-/// anything filled in.
+/// field starts `None`; [`fold_rollout_from`] is the only way to produce
+/// one with anything filled in.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CodexCapture {
     /// `working` while a turn's `task_started` is unclosed, `idle` once a
@@ -252,17 +253,11 @@ fn file_change_summary(item: &Value) -> Option<String> {
 /// names the rollout for the `sources` pointers this produces — this
 /// function never opens it; the bounded read is [`capture_for`]'s job. A
 /// line that fails to parse, and any record type/shape this fold does not
-/// recognise, contributes nothing. Ordinals start at 0 — `lines[0]` is
-/// taken to be the rollout's own first line; a caller handing this only a
-/// TAIL of the file wants [`fold_rollout_from`] instead.
-pub(crate) fn fold_rollout(path: &Path, lines: &[String]) -> CodexCapture {
-    fold_rollout_from(path, 0, lines)
-}
-
-/// Same fold as [`fold_rollout`], but `lines[0]`'s own true line number in
-/// the file is `start_ordinal` rather than 0 — for [`capture_for`], which
-/// hands this only a bounded TAIL of a rollout and must still point at each
-/// record's real line number, not its position within that tail slice.
+/// recognise, contributes nothing. `lines[0]`'s own true line number in the
+/// file is `start_ordinal`, never assumed to be 0: [`capture_for`] hands
+/// this only a bounded TAIL of a rollout (via [`fold_tail`]) and must still
+/// point at each record's real line number, not its position within that
+/// tail slice; a test folding a whole small fixture from the top passes 0.
 pub(crate) fn fold_rollout_from(
     path: &Path,
     start_ordinal: usize,
@@ -879,7 +874,7 @@ mod tests {
     fn an_unclosed_task_started_is_working() {
         let path = fixture_path();
         let lines = vec![task_started("2026-09-12T09:00:00.000Z", "t1")];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.state.as_deref(), Some("working"));
         assert_eq!(
             cap.sources.as_ref().and_then(|s| s.get("state")),
@@ -894,7 +889,7 @@ mod tests {
             task_started("2026-09-12T09:00:00.000Z", "t1"),
             task_complete("2026-09-12T09:00:05.000Z", "t1"),
         ];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.state.as_deref(), Some("idle"));
         assert_eq!(
             cap.sources.as_ref().and_then(|s| s.get("state")),
@@ -909,7 +904,7 @@ mod tests {
             task_started("2026-09-12T09:00:00.000Z", "t1"),
             turn_aborted("2026-09-12T09:00:03.000Z", "t1"),
         ];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.state.as_deref(), Some("idle"));
     }
 
@@ -924,7 +919,7 @@ mod tests {
             task_started("2026-09-12T09:00:00.000Z", "t1"),
             token_count("2026-09-12T09:26:00.000Z", 1000, 500, 2_000_000, 258_400),
         ];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.state.as_deref(), Some("working"));
     }
 
@@ -932,7 +927,7 @@ mod tests {
     fn a_capture_never_yields_awaiting() {
         let path = fixture_path();
         let never_awaiting = |lines: &[String]| {
-            let cap = fold_rollout(&path, lines);
+            let cap = fold_rollout_from(&path, 0, lines);
             assert_ne!(cap.state.as_deref(), Some("awaiting"));
         };
         never_awaiting(&[]);
@@ -953,7 +948,7 @@ mod tests {
             "call-1",
             "shell",
         )];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.activity.as_deref(), Some("shell"));
         assert_eq!(
             cap.sources.as_ref().and_then(|s| s.get("activity")),
@@ -973,7 +968,7 @@ mod tests {
             ),
             tool_call_output("2026-09-12T09:00:01.000Z", "function_call", "call-1"),
         ];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.activity, None);
         assert!(cap
             .sources
@@ -993,7 +988,7 @@ mod tests {
                 "cargo test -p aoide-conduct",
             ),
         ];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(
             cap.tool.as_deref(),
             Some("CommandExecution: cargo test -p aoide-conduct")
@@ -1011,7 +1006,7 @@ mod tests {
             turn_context("2026-09-12T09:00:00.000Z", "gpt-6-astra"),
             turn_context("2026-09-12T09:05:00.000Z", "gpt-6-astra-mini"),
         ];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.model.as_deref(), Some("gpt-6-astra-mini"));
         assert_eq!(
             cap.sources.as_ref().and_then(|s| s.get("model")),
@@ -1029,7 +1024,7 @@ mod tests {
             25_252_358,
             258_400,
         )];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.context_tokens, Some(231_126));
         assert_ne!(cap.context_tokens, Some(25_252_358));
     }
@@ -1044,7 +1039,7 @@ mod tests {
             25_252_358,
             258_400,
         )];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.context_tokens, Some(231_126));
         assert_ne!(cap.context_tokens, Some(231_126 + 230_656));
     }
@@ -1059,7 +1054,7 @@ mod tests {
             25_252_358,
             258_400,
         )];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.context_ceiling, Some(258_400));
         assert_eq!(
             cap.sources.as_ref().and_then(|s| s.get("context_ceiling")),
@@ -1071,7 +1066,7 @@ mod tests {
     fn a_reasoning_record_contributes_nothing() {
         let path = fixture_path();
         let lines = vec![item_completed_reasoning("2026-09-12T09:00:00.000Z", "t1")];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap, CodexCapture::default());
     }
 
@@ -1079,7 +1074,7 @@ mod tests {
     fn a_reasoning_record_with_encrypted_content_still_contributes_nothing() {
         let path = fixture_path();
         let lines = vec![response_item_reasoning("2026-09-12T09:00:00.000Z")];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap, CodexCapture::default());
     }
 
@@ -1095,7 +1090,7 @@ mod tests {
                 "final_answer",
             ),
         ];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
 
         assert_eq!(cap.model.as_deref(), Some("gpt-6-astra"));
         assert_eq!(cap.say.as_deref(), Some("done with the build"));
@@ -1142,7 +1137,7 @@ mod tests {
                 "run the fold tests please",
             ),
         ];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.prompt.as_deref(), Some("run the fold tests please"));
         assert_eq!(
             cap.sources.as_ref().and_then(|s| s.get("prompt")),
@@ -1160,7 +1155,7 @@ mod tests {
             "subagent",
             "Laplace",
         )];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(
             cap.parent_thread_id.as_deref(),
             Some("00000000-0000-7000-8000-000000000003")
@@ -1185,7 +1180,7 @@ mod tests {
             "bash -lc 'cargo test -p aoide-conduct'",
             "cargo test -p aoide-conduct",
         )];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(
             cap.tool.as_deref(),
             Some("CommandExecution: cargo test -p aoide-conduct"),
@@ -1202,7 +1197,7 @@ mod tests {
             "mneme",
             "search_vault",
         )];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.tool.as_deref(), Some("McpToolCall: mneme/search_vault"));
     }
 
@@ -1214,7 +1209,7 @@ mod tests {
             "t1",
             &["src/graph/codex_capture.rs", "README.md"],
         )];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(
             cap.tool.as_deref(),
             Some("FileChange: src/graph/codex_capture.rs, README.md")
@@ -1229,7 +1224,7 @@ mod tests {
             r#"{"timestamp":"2026-09-12T09:00:02.000Z","type":"turn_cont"#.to_string(),
             turn_context("2026-09-12T09:05:00.000Z", "gpt-6-astra-mini"),
         ];
-        let cap = fold_rollout(&path, &lines);
+        let cap = fold_rollout_from(&path, 0, &lines);
         assert_eq!(cap.model.as_deref(), Some("gpt-6-astra-mini"));
         assert_eq!(
             cap.sources.as_ref().and_then(|s| s.get("model")),
