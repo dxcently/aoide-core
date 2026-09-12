@@ -265,17 +265,16 @@ pub struct SessionRecord {
     /// agent's.
     #[serde(rename = "needsSudo", default, skip_serializing_if = "Option::is_none")]
     pub needs_sudo: Option<bool>,
-    /// Absolute path to the pty-master transcript of a HEADLESS `aoide conduct`
+    /// Absolute path to the pty-master transcript of an `aoide conduct`
     /// session (`state/sessions/<sessionId>.log`, CONTRACTS.md §4) — raw bytes,
     /// append-only, unrotated. Stamped right after `do_session_start` by
-    /// `set_session_log_path`, once the log file is open. Additive/v0-safe:
-    /// absent on a legacy record and on every INTERACTIVE `aoide conduct`
-    /// session (conduct never sets it when a real controlling tty is
-    /// attached) — EXCEPT an `agent:"eidolon"` record, where `logPath` is
-    /// never a conduct-owned pty transcript at all: it carries that
-    /// producer's own session journal, copied from its `meta.json` `log`
-    /// field and stamped by the presence reconcile on every pass, headless
-    /// or interactive alike.
+    /// `set_session_log_path`, once the log file is open, headless and
+    /// interactive alike ("everything tees"). Additive/v0-safe: absent on a
+    /// legacy record and on a hook-only agent session (no conduct-owned pty).
+    /// An `agent:"eidolon"` record carries `logPath` with a different
+    /// referent: never a conduct-owned pty transcript, but that producer's own
+    /// session journal, copied from its `meta.json` `log` field and stamped
+    /// by the presence reconcile on every pass.
     #[serde(rename = "logPath", default, skip_serializing_if = "Option::is_none")]
     pub log_path: Option<String>,
     /// A human-readable `adjective-noun` DISPLAY handle, minted once (see
