@@ -518,6 +518,45 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   does not. `parentSessionId`, `title`, and `nickname` remain untouched by
   this merge — later slices' own territory (S4 the subagent edge), never
   this one's to set. See CONTRACTS.md §4 for the `sources` schema entry.
+- `graph/eidolon.rs` — eidolon presence reconciliation (P-EIDOLON, slice
+  E1b; readiness E2 folded in). `reconcile_eidolon_sessions` mirrors
+  `reconcile_codex_app_threads` rule for rule (upsert in place, remove what
+  is no longer desired, change-only writes, a native id a tracked
+  non-`eidolon` record already claims left entirely alone) but differs in
+  two ways eidolon's own contract forces: this IS an agent session
+  (`kind:"agent"`, not `"app"`), so `parentSessionId` is resolved here — the
+  first conducted ancestor (`conductable == Some(true)`, not `done`) up an
+  injected `/proc` ancestry walk (production: `aoide_storage::attest::
+  pid_ancestry`) — and `state` is written by this SAME function on every
+  reconcile rather than deferred to a separate capture pass: a TUI owner's
+  `busy` (`meta.json`) maps to `working`/`idle`, a non-TUI owner's `busy` is
+  eidolon's own producer-side defect (never set outside the TUI) so such a
+  record carries the literal `state:"unknown"` — `aoide_protocol::
+  canonical_state` folds that to `"idle"`, its own "no evidence" arm, never
+  a sixth state invented here. `windowAddress`/`workspace` are left empty
+  for the existing `resolve_pending_session_windows` sweep to fill, exactly
+  as codex's own module leaves them.
+
+  Discovery is read-only over `$XDG_RUNTIME_DIR/eidolon/<id>/{meta.json,
+  sock}` — the identical root eidolon's own `Presence::root()` derives, read
+  and probed here, never swept: a stale directory is the PRODUCER's own to
+  clean up. Liveness is the presence socket answering `{"op":"ping"}` with
+  `{"ok":true}` inside the same 250ms budget eidolon's own client enforces
+  — never a stat, never `/proc` — so a directory whose socket does not
+  answer simply contributes nothing to that pass's observed set (not a
+  scan failure). A `meta.json` that cannot be read or parsed for any other
+  reason invalidates the WHOLE pass (`PresenceScan::Unknown`), the same
+  "any single indeterminate step voids the observation" discipline
+  `codex_app.rs` holds; `reconcile_eidolon_sessions` changes nothing on
+  `Unknown`. TUI-vs-not is read off the presence pid's own argv against the
+  SAME parsed `ps -axo pid=,ppid=,command=` table `codex_app.rs` already
+  owns (`process_table`/`parse_process_table`) — never a second discovery
+  path, never a raw `/proc/<pid>/cmdline` read. `sync_eidolon_sessions` is
+  the one I/O wrapper (gather outside the stage lock, reconcile inside it)
+  and its one call site is the reaper tick (`reap.rs`), right beside
+  `sync_codex_app_threads`; `reap.rs::profile_for` already dispatches an
+  eidolon-enrolled record to `EIDOLON_PROFILE` for free, off `rec.agent`
+  alone, the same generic path every other harness takes.
 - `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
   below). The socket answers exactly one command with a reply,

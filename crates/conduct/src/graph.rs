@@ -32,6 +32,12 @@ mod common;
 mod conduct;
 mod doc;
 mod doorbell;
+// The P-EIDOLON adapter lane, slice E1b (readiness E2 folded in): the pure
+// presence reconciler plus its read-only discovery seam over
+// `$XDG_RUNTIME_DIR/eidolon`, mirroring `codex_app`'s split rule for rule.
+// `sync_eidolon_sessions` (re-exported below) is called from the reaper tick
+// (`reap.rs`) beside `sync_codex_app_threads`.
+mod eidolon;
 // LANE IDENTITY P-ID3: `pub(crate)`, not private — `shellbridge.rs` (a
 // SIBLING of this module, not a descendant) reuses `peer_cred`/`PeerCred`
 // for its own cross-uid accept floor rather than hand-rolling a second
@@ -161,6 +167,7 @@ pub(crate) use self::session_store::{
 pub(crate) use self::window::hyprctl_clients;
 pub(crate) use self::codex_app::codex_home;
 pub(crate) use self::codex_app::sync_codex_app_threads;
+pub(crate) use self::eidolon::sync_eidolon_sessions;
 /// Widened from `pub(crate)` to `pub` at P-A1 of the binary-split
 /// workstream: `aoide-screen` (moved out of this crate) needs the same
 /// `0x`/case-tolerant window-address comparison its own session-targeted

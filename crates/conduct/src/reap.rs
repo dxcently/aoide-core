@@ -70,8 +70,8 @@ use crate::graph::{
     canonical_state, codex_home, drop_sessions, hooks_path, hyprctl_clients, ledger_session_exit,
     lineage_of, load_stage, normalize_addr, now_iso_utc, prune_done, refresh_subagent_says,
     refresh_transcript_fields, restage_graph, sessions_path, stage_error, sync_codex_app_threads,
-    upsert_hook, write_stage, HookRecord, HooksFile, SessionRecord, SessionsFile,
-    STAGE_GRAPH_VERSION,
+    sync_eidolon_sessions, upsert_hook, write_stage, HookRecord, HooksFile, SessionRecord,
+    SessionsFile, STAGE_GRAPH_VERSION,
 };
 use aoide_protocol::output::Outcome;
 use serde_json::{json, Value};
@@ -1087,6 +1087,11 @@ pub fn reap(inv: &Invocation) -> Outcome {
     if sync_codex_app_threads() {
         outcome.changed.push("reconciled desktop codex threads".to_string());
     }
+    // Reconcile eidolon presence sessions the same way, right beside the
+    // codex-app reconcile above — same "roster change joins `changed`" rule.
+    if sync_eidolon_sessions() {
+        outcome.changed.push("reconciled eidolon presence sessions".to_string());
+    }
     // The refresh is reported but deliberately NOT folded into `changed`: that
     // vec is the sweep's ledger (what entered or left the roster), and it is
     // what decides whether the timer toasts. An agent merely speaking must not
@@ -1779,6 +1784,19 @@ fn reap_inner(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aoide_protocol::agents::EIDOLON_PROFILE;
+
+    /// `profile_for` dispatches purely off `rec.agent` (never an env var
+    /// like `CLAUDE_PROFILE`) — an eidolon-enrolled record (whatever put it
+    /// on the roster: `sync_eidolon_sessions` in production) gets
+    /// `EIDOLON_PROFILE` the same generic way any other harness would.
+    #[test]
+    fn profile_for_dispatches_eidolon_records_off_their_own_agent_field() {
+        let mut rec = agent("khoa-253b", "", "2026-09-12T00:00:00Z");
+        rec.agent = "eidolon".into();
+        assert_eq!(profile_for(&rec).name, EIDOLON_PROFILE.name);
+        assert!(std::ptr::eq(profile_for(&rec), &EIDOLON_PROFILE));
+    }
 
     #[test]
     fn codex_titles_follow_exact_ids_and_latest_nonempty_rename() {
@@ -2564,11 +2582,22 @@ mod tests {
     #[test]
     fn reap_drops_superseded_done_siblings_on_an_otherwise_quiet_pass() {
         let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
-        let _env =
-            crate::graph::testutil::EnvVars::save(&["AOIDE_STAGE_DIR", "HYPRLAND_INSTANCE_SIGNATURE"]);
+        let _env = crate::graph::testutil::EnvVars::save(&[
+            "AOIDE_STAGE_DIR",
+            "HYPRLAND_INSTANCE_SIGNATURE",
+            "XDG_RUNTIME_DIR",
+        ]);
         std::env::remove_var("HYPRLAND_INSTANCE_SIGNATURE"); // pid-only/no-window liveness
         let stage = crate::graph::testutil::unique_stage("reap-superseded-done");
         std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        // Isolate from any real presence root: this pass must stay quiet
+        // (`sessions_path` alone decides the roster), never enrol a real
+        // eidolon session merely because the host it runs on happens to
+        // have one live.
+        std::env::set_var(
+            "XDG_RUNTIME_DIR",
+            crate::graph::testutil::unique_stage("reap-superseded-done-runtime"),
+        );
 
         let now = now_iso_utc();
         let mk = |id: &str, win: &str, state: &str| {

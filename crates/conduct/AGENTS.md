@@ -149,6 +149,88 @@
   once per tick with that tick's own observed thread ids so a thread that
   stops being live has its entry evicted rather than held forever.
 
+- **An eidolon presence record is keyed by its native id verbatim, exactly
+  like a Codex thread (P-EIDOLON, slice E1b).** `graph/eidolon.rs::
+  reconcile_eidolon_sessions` writes `sessionId` as `meta.json`'s own `id`
+  unchanged — no `eidolon:`-style wrapper prefix. Unlike a Codex-app record
+  this one carries `kind:"agent"`, not `"app"`: an eidolon session IS a
+  conducted-adjacent agent session, a normal dedup/staleness candidate once
+  enrolled.
+
+- **Eidolon liveness is the presence socket answering `{"op":"ping"}` with
+  `{"ok":true}`, never a stat, never `/proc`.** `socket_answers`
+  (`eidolon.rs`) connects the `UnixStream`, applies the SAME 250ms
+  read/write timeout eidolon's own client enforces, and reads any other
+  outcome — no listener, a refused connection, a timeout, a reply that
+  isn't exactly `{"ok":true}` — as not live. A directory whose socket does
+  not answer simply contributes nothing to that pass's observed set; it is
+  never treated as a scan failure the way an unreadable `meta.json` is.
+
+- **Aoide never sweeps or writes under the eidolon presence root.**
+  `$XDG_RUNTIME_DIR/eidolon` is read-only territory: this crate lists it and
+  reads `meta.json`/probes `sock`, and nothing here ever removes a stale
+  directory, writes a file under it, or runs the `eidolon` binary. A
+  presence entry whose socket has gone quiet loses its Aoide-side record
+  the next `Observed` pass finds it missing (below); the directory itself
+  stays the producer's own to clean up.
+
+- **TUI-vs-not is read off the SAME parsed `ps` table `codex_app.rs` already
+  owns — no second discovery path.** `eidolon.rs::is_tui_argv` classifies a
+  presence pid's argv (no subcommand, or an explicit `tui` token, is the
+  TUI) against a row of `codex_app::process_table`/`parse_process_table`'s
+  output; a presence pid absent from that table degrades to `tui: false`
+  (never a guessed `working`/`idle`), never a second `ps` invocation or a
+  raw `/proc/<pid>/cmdline` read.
+
+- **State is folded from `busy`+TUI-ness by the SAME function that
+  reconciles the roster (E2 folded into E1b) — a TUI owner's `busy` is a
+  real fact, anything else is the literal `"unknown"`.** A TUI owner's
+  `busy:true`/`false` maps to `working`/`idle`; eidolon's own producer never
+  sets `busy` outside the TUI (a permanent defect on its side, not a gap
+  here), so a non-TUI owner's record carries `state:"unknown"` rather than
+  a guessed verdict — `aoide_protocol::canonical_state("unknown") ==
+  "idle"` is the vocabulary's own fold for that, pinned by its own test, and
+  is NOT a bug to route around. `awaiting`/`error`/`cancel` are never
+  produced by this function: eidolon's pending-approval and streaming
+  events live only on its own in-process event bus, never in `meta.json`.
+
+- **`parentSessionId` is resolved here, unlike a Codex-app record.** The
+  first ancestor up the presence pid's own `/proc` chain
+  (`aoide_storage::attest::pid_ancestry` in production, injected as a pure
+  closure for tests) that is itself `conductable == Some(true)` and not
+  `done` becomes the parent; no such ancestor leaves the record top-level.
+  The wrap's own record — and its petname — is only ever READ by this walk,
+  never written.
+
+- **A petname mints only on insert, never on an upsert of an
+  already-enrolled record.** `reconcile_eidolon_sessions` calls
+  `aoide_storage::petname::mint_for` exactly once per NEW presence id, the
+  same insert-only timing `reconcile_codex_app_threads` holds; a rescan of
+  an unchanged presence must never re-mint one, and `windowAddress`/
+  `workspace` are left empty here for the existing
+  `resolve_pending_session_windows` sweep to fill — this module has no
+  compositor access either.
+
+- **A record whose presence stops being observed is dropped only on an
+  `Observed` pass, never on `Unknown` — identical to the Codex ruling
+  (P-CX-4) applied to this module.** `eidolon.rs::PresenceScan` is the seam:
+  `Observed` carries positive evidence for every directory under the
+  presence root, including a positively observed empty set (a missing root
+  is `Observed(empty)`, not `Unknown` — no eidolon session has ever
+  registered, a genuine fact); `Unknown` means the root could not be listed,
+  a `meta.json` could not be read/parsed for a reason other than simply
+  having vanished since the listing, or the process table came back absent
+  while at least one socket answered. `reconcile_eidolon_sessions` returns
+  `(sessions, false)` untouched on `Unknown`, and `sync_eidolon_sessions`
+  takes no stage lock and writes nothing either.
+
+- **The reaper dispatches an eidolon record's profile off `rec.agent` alone,
+  never an env var.** `reap.rs::profile_for` already resolves any record
+  generically via `aoide_protocol::agents::agent_profile(&rec.agent)`; an
+  `agent:"eidolon"` record enrolled by `sync_eidolon_sessions` reaches
+  `EIDOLON_PROFILE` through that same one path, with no eidolon-specific
+  branch added to `profile_for` itself.
+
 - **`session bind` assigns continuity, never authority.** Keep the operation
   daemon-owned and local-only; no missing-daemon fallback. It does not load
   optional Mneme config, change grants, or replace executor-specific mail
