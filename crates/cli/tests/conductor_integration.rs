@@ -224,7 +224,10 @@ fn app_loads_recomputes_selects_and_dispatches_against_the_tempdir() {
         .collect::<Vec<_>>()
         .join("\n");
     assert!(joined.contains("aoide"), "SESSION panel shows a project");
-    assert!(joined.contains("SESSION"), "active panel title rendered");
+    assert!(
+        joined.contains("Agents"),
+        "active panel label rendered (board::NAV names the Session panel Agents)"
+    );
 
     // cleanup
     std::env::remove_var("AOIDE_STAGE_DIR");
