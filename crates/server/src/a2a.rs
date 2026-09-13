@@ -1082,37 +1082,6 @@ fn spawn_died_immediately_message(agent_cmd: &str, status: std::process::ExitSta
     )
 }
 
-/// Spawn a NEW conducted session running the CONFIGURED agent (never a
-/// client-supplied command — see the security-model note above `SessionRef`).
-/// Detached: launched via the aoide binary's own `conduct` subcommand
-/// (`std::env::current_exe()`), `setsid`'d so it survives this handler
-/// thread, stdio nulled, and reaped on a parked thread (see below) — it
-/// stays parented to the long-lived `a2a serve` daemon for its whole life.
-/// `aoide-conduct`'s `spawn` (P2 of the conducted-agents plan) now
-/// generalizes exactly this detach/register/reap shape as its own command; a
-/// later phase can have this handler ride on it instead of hand-rolling the
-/// same mechanics here.
-///
-/// `node_name` is the resolved, PAIRED, spawn-allowed node `message_send`'s
-/// gate already proved before calling this (P-P3, PAIRING.md decision 6) —
-/// never optional at this call site, since the gate refuses outright
-/// otherwise. Stamped directly onto the spawned record as `origin =
-/// "node:<name>"` by [`stamp_spawn_origin`] below (LANE IDENTITY P-ID0,
-/// G16/G5 — this door is the authenticated writer, not the child's env; see
-/// that function's doc) and folded into this call's own audit line, so the
-/// spawned session's provenance is visible both in the audit log and on the
-/// record itself, end to end.
-///
-/// **Bounded liveness check (task #103).** `cmd.spawn()` below only proves
-/// the wrapper process itself launched — a caller was previously handed a
-/// `submitted` Task the instant that call returned, with no confirmation the
-/// wrapper's OWN exec of the configured agent ever succeeded (a missing
-/// `spawnAgent` binary on this unit's PATH is the exact defect this closes).
-/// [`poll_bounded_exit`] gives the wrapper `SPAWN_LIVENESS_ATTEMPTS ×
-/// SPAWN_LIVENESS_INTERVAL` to prove it's still running before the ack goes
-/// out; a wrapper that exits inside that window gets
-/// [`spawn_died_immediately_message`]'s taught refusal instead of a phantom
-/// session id.
 /// Build the spawned child's `Command`, env-sanitized, cwd-bound (when
 /// `spawn_cwd` resolves), and detached — everything up to but NOT including
 /// `.spawn()`. Split out of [`do_spawn`] so the env-clearing shape here is
@@ -1194,6 +1163,11 @@ fn resolve_bounded_spawn_cwd(
     if registered && path.is_absolute() && path.is_dir() {
         return Some(spawn_cwd.to_string());
     }
+    let reason = if registered {
+        "registered project root is not an absolute directory"
+    } else {
+        "not a registered project root"
+    };
     let _ = audit(
         audit_log,
         Door::A2a,
@@ -1201,13 +1175,44 @@ fn resolve_bounded_spawn_cwd(
         "a2a.message/send",
         "skipped",
         &format!(
-            "ignoring configured spawn cwd `{spawn_cwd}` for the spawned child — not a \
-             registered project root — inheriting the daemon's own cwd instead"
+            "ignoring configured spawn cwd `{spawn_cwd}` for the spawned child — {reason} — \
+             inheriting the daemon's own cwd instead"
         ),
     );
     None
 }
 
+/// Spawn a NEW conducted session running the CONFIGURED agent (never a
+/// client-supplied command — see the security-model note above `SessionRef`).
+/// Detached: launched via the aoide binary's own `conduct` subcommand
+/// (`std::env::current_exe()`), `setsid`'d so it survives this handler
+/// thread, stdio nulled, and reaped on a parked thread (see below) — it
+/// stays parented to the long-lived `a2a serve` daemon for its whole life.
+/// `aoide-conduct`'s `spawn` (P2 of the conducted-agents plan) now
+/// generalizes exactly this detach/register/reap shape as its own command; a
+/// later phase can have this handler ride on it instead of hand-rolling the
+/// same mechanics here.
+///
+/// `node_name` is the resolved, PAIRED, spawn-allowed node `message_send`'s
+/// gate already proved before calling this (P-P3, PAIRING.md decision 6) —
+/// never optional at this call site, since the gate refuses outright
+/// otherwise. Stamped directly onto the spawned record as `origin =
+/// "node:<name>"` by [`stamp_spawn_origin`] below (LANE IDENTITY P-ID0,
+/// G16/G5 — this door is the authenticated writer, not the child's env; see
+/// that function's doc) and folded into this call's own audit line, so the
+/// spawned session's provenance is visible both in the audit log and on the
+/// record itself, end to end.
+///
+/// **Bounded liveness check (task #103).** `cmd.spawn()` below only proves
+/// the wrapper process itself launched — a caller was previously handed a
+/// `submitted` Task the instant that call returned, with no confirmation the
+/// wrapper's OWN exec of the configured agent ever succeeded (a missing
+/// `spawnAgent` binary on this unit's PATH is the exact defect this closes).
+/// [`poll_bounded_exit`] gives the wrapper `SPAWN_LIVENESS_ATTEMPTS ×
+/// SPAWN_LIVENESS_INTERVAL` to prove it's still running before the ack goes
+/// out; a wrapper that exits inside that window gets
+/// [`spawn_died_immediately_message`]'s taught refusal instead of a phantom
+/// session id.
 fn do_spawn(
     agent_cmd: &str,
     prompt: &str,
@@ -5066,18 +5071,33 @@ mod tests {
         // The Osaka wrong-ancestry bug: the `aoide-a2a` unit's own
         // environment can carry the operator's live `AOIDE_SESSION_ID`
         // (inherited from whatever terminal the unit itself descends from),
-        // and a spawned child must never see it. Proven via
+        // and a spawned child must never see it. First proven via
         // `Command::get_envs()` (stable since Rust 1.57): it enumerates only
         // the EXPLICIT `.env()`/`.env_remove()` calls a `Command` carries — a
-        // removed var reports `Some(None)`, an explicitly-set var reports
-        // `Some(Some(value))`, and a var the `Command` never mentions is
-        // simply ABSENT from the map, meaning ordinary fork/exec inheritance
-        // still applies to it. That absence is exactly how a "sibling var
-        // passes through" is proven here: the removal targets
+        // removed var reports `Some(None)`, and a var the `Command` never
+        // mentions is simply ABSENT from the map, meaning ordinary fork/exec
+        // inheritance still applies to it. Then proven for real: with a
+        // sibling var and a synthetic session id actually set in THIS
+        // process's own environment, the child is actually spawned (stdio
+        // re-piped over `spawn_child_command`'s null default — `Command`'s
+        // builder setters are last-call-wins, so re-configuring after the
+        // fact is safe) and its own stdout is read back, showing the sibling
+        // var passed through by ordinary inheritance while
+        // `AOIDE_SESSION_ID` did not — the removal targets
         // `AOIDE_SESSION_ORIGIN`/`AOIDE_SESSION_ID` by name, nothing else.
-        let cmd = spawn_child_command(
-            Path::new("/bin/true"),
-            &["conduct".to_string()],
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_sibling = std::env::var("AOIDE_A2A_SIBLING_TEST_VAR").ok();
+        let saved_session_id = std::env::var("AOIDE_SESSION_ID").ok();
+        std::env::set_var("AOIDE_A2A_SIBLING_TEST_VAR", "sibling-ok");
+        std::env::set_var("AOIDE_SESSION_ID", "a2a-test-synthetic-session-id");
+
+        let mut cmd = spawn_child_command(
+            Path::new("/bin/sh"),
+            &[
+                "-c".to_string(),
+                "printf '%s|%s' \"$AOIDE_A2A_SIBLING_TEST_VAR\" \"${AOIDE_SESSION_ID:-unset}\""
+                    .to_string(),
+            ],
             Path::new("/tmp/aoide-a2a-test-audit-does-not-need-to-exist.log"),
             None,
         );
@@ -5093,12 +5113,32 @@ mod tests {
             Some(&None),
             "the pre-existing AOIDE_SESSION_ORIGIN removal must still be present, unreplaced: {envs:?}"
         );
+
+        let output = cmd
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawning /bin/sh must succeed in the test sandbox");
         assert!(
-            !envs.contains_key(std::ffi::OsStr::new("AOIDE_A2A_SIBLING_TEST_VAR")),
-            "a sibling var the removal never names is untouched by this Command — it passes \
-             through by ordinary inheritance, proving the removal is targeted, not a blanket \
-             env_clear: {envs:?}"
+            output.status.success(),
+            "the child must exit cleanly: {output:?}"
         );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout),
+            "sibling-ok|unset",
+            "the sibling var passes through untouched and AOIDE_SESSION_ID is gone, proven by \
+             an actually spawned child reading its own environment back — not just the \
+             Command's builder state"
+        );
+
+        match saved_sibling {
+            Some(v) => std::env::set_var("AOIDE_A2A_SIBLING_TEST_VAR", v),
+            None => std::env::remove_var("AOIDE_A2A_SIBLING_TEST_VAR"),
+        }
+        match saved_session_id {
+            Some(v) => std::env::set_var("AOIDE_SESSION_ID", v),
+            None => std::env::remove_var("AOIDE_SESSION_ID"),
+        }
     }
 
     #[test]
