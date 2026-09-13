@@ -860,16 +860,23 @@ fn project_action_args(name: &str, action: &str, fields: &Value) -> Option<Vec<V
                 if !aoide_storage::node_store::valid_node_name(host_name) {
                     return None;
                 }
-                let raw_roots = item.get("roots").and_then(Value::as_array);
                 let mut roots = Vec::new();
-                if let Some(raw_roots) = raw_roots {
-                    for r in raw_roots {
-                        let r = r.as_str()?;
-                        if !safe_action_path(r) {
-                            return None;
+                match item.get("roots") {
+                    None => {}
+                    Some(Value::Array(raw_roots)) => {
+                        for r in raw_roots {
+                            let r = r.as_str()?;
+                            if !safe_action_path(r) {
+                                return None;
+                            }
+                            roots.push(r.to_string());
                         }
-                        roots.push(r.to_string());
                     }
+                    // Present but not an array: the same whole-action
+                    // refusal `paths` and `hosts` itself hold below — an
+                    // absent `roots` key is the only shape that means
+                    // "membership-only".
+                    Some(_) => return None,
                 }
                 hosts.push((host_name.to_string(), roots));
             }
@@ -2433,6 +2440,75 @@ mod tests {
                 "n1proj",
                 "removehost",
                 &json!({"hosts": [{"name": "", "roots": []}]})
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn an_edit_with_a_host_and_no_roots_reexecs_add_and_keeps_its_roots() {
+        // Membership-only: an `edit --host` with nothing to replace with
+        // would wipe an existing host's roots, so an empty-roots host
+        // re-execs `add` instead (membership kept, roots untouched) — see
+        // the doc comment above `project_action_args`.
+        let plan = project_action_args(
+            "n1proj",
+            "edit",
+            &json!({
+                "paths": ["/srv/n1proj"],
+                "hosts": [{"name": "n1", "roots": []}],
+            }),
+        )
+        .expect("edit must build a plan");
+        assert_eq!(
+            plan,
+            vec![
+                sv(&["project", "edit", "n1proj", "/srv/n1proj"]),
+                sv(&["project", "add", "n1proj", "--host", "n1"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn an_edit_with_a_host_and_roots_reexecs_edit_with_those_roots() {
+        // Non-empty roots replace that host's roots exactly, via `edit`.
+        let plan = project_action_args(
+            "n1proj",
+            "edit",
+            &json!({
+                "paths": ["/srv/n1proj"],
+                "hosts": [{"name": "n1", "roots": ["/srv/n1/proj"]}],
+            }),
+        )
+        .expect("edit must build a plan");
+        assert_eq!(
+            plan,
+            vec![
+                sv(&["project", "edit", "n1proj", "/srv/n1proj"]),
+                sv(&["project", "edit", "n1proj", "/srv/n1/proj", "--host", "n1"]),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_host_entry_with_a_non_array_roots_field_refuses_the_whole_action() {
+        // A present-but-non-array `roots` is a bad element, same as an
+        // ill-shaped host name or path — never silently read as "no roots".
+        // An ABSENT `roots` key is the only shape that still means
+        // membership-only (covered above).
+        assert_eq!(
+            project_action_args(
+                "n1proj",
+                "create",
+                &json!({"paths": ["/srv/n1proj"], "hosts": [{"name": "n1", "roots": "not-an-array"}]})
+            ),
+            None
+        );
+        assert_eq!(
+            project_action_args(
+                "n1proj",
+                "edit",
+                &json!({"paths": ["/srv/n1proj"], "hosts": [{"name": "n1", "roots": 42}]})
             ),
             None
         );
