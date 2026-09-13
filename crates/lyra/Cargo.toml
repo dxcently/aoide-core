@@ -45,6 +45,12 @@ aoide-screen = { workspace = true }
 # — the same DI-seam consumer `aoide-cli` is, reading LYRA's own assembled
 # registry + dispatcher rather than core's.
 aoide-server = { workspace = true }
+# `commands::preview_tools`'s `--what element` shot: the canvas's own
+# element-kind ipc call is permanently broken by design, so an element shot
+# is a full widget capture CROPPED here in Rust instead (coordinator-
+# authorized exception -- the workspace already ships this at 0.25 with png
+# for `aoide-screen`'s own decode boundary, `crates/screen/src/diff.rs`).
+image = { workspace = true }
 
 [dev-dependencies]
 # `commands::onboard`'s scratch-dir tests (rerun semantics, checkout-root

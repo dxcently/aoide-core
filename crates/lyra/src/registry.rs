@@ -13,7 +13,15 @@
 //! reply-code display dialog (net zero — one path dies, one lands). `lyra
 //! reload` (design settled 2026-08-31) repurposed `quickshell.reload` into
 //! `reload`, the one mode-aware iteration command — the SAME net-zero swap
-//! shape. See `commands/mod.rs::all()` for the assembly order.
+//! shape. P1 added `preview`, `preview.set` (an isolated quickshell canvas
+//! for one widget); a same-lane follow-up added `preview.declare` (the
+//! canvas's counterpart of `rice declare`). P6 added `preview.shot`,
+//! `preview.tree`, `preview.notes` — shell-first agent tools over that same
+//! canvas (a screenshot, the live/static-joined item tree, and a
+//! scaffolding notes store). I1 added `icon.collections`, `icon.list`,
+//! `icon.resolve` (the pinned icon collections, resolved into the facet's own
+//! SVG tree). See `commands/mod.rs::all()` for the assembly
+//! order.
 
 pub use aoide_protocol::registry::*;
 
@@ -121,6 +129,9 @@ mod tests {
             "element.seed",
             "guide",
             "herald.push",
+            "icon.collections",
+            "icon.list",
+            "icon.resolve",
             "livery.emit",
             "livery.lint",
             "livery.resolve",
@@ -128,6 +139,12 @@ mod tests {
             "onboard",
             "pair.ask",
             "pair.show",
+            "preview",
+            "preview.declare",
+            "preview.notes",
+            "preview.set",
+            "preview.shot",
+            "preview.tree",
             "quickshell.healthcheck",
             "reload",
             "rice.back",
