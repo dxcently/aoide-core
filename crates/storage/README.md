@@ -80,7 +80,13 @@ by decision — no embedded database yet
   the one enumeration path every reader uses (path first, then `roots`,
   deduplicated) — a legacy record predating `roots`, or a hand-edited one
   whose `path` disagrees with `roots[0]`, is read as given, never silently
-  rewritten.
+  rewritten. `Project.hosts: Vec<ProjectHost>` (P-14 M1) is a SEPARATE,
+  additive list of other registered nodes this project ORGANIZATIONALLY
+  belongs to, each carrying its own verbatim (unvalidated, uncanonicalized)
+  root list — absent/empty stays off the wire, so a project no `--host`
+  invocation ever touched round-trips byte-identical. `Project::roots()`
+  never reads it: local anchoring and host membership are two disjoint
+  facts about a project.
 - `records::SessionRecord.sources` — an optional, additive
   `field name -> "<absolute path>#<record ordinal>"` provenance map (wire
   name `sources`, serialised only when `Some`, CONTRACTS.md §4), for a

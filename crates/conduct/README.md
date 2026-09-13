@@ -571,19 +571,32 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   alone, the same generic path every other harness takes.
 - `shellbridge`, `herald` — files only; their CLI commands (registry lines)
   moved to `lyra` at P-A2, but both stay resident here (see charter smudge
-  below). The socket answers exactly one command with a reply,
-  `sessionaction`: a closed five-action whitelist (`undying`, `project`,
-  `kill`, `createproject`, `editproject`) that re-execs `aoide session
-  project|kill|grant undying` or `aoide project add|edit` through aoided
-  with `--json` and writes one JSON reply line before the connection
-  closes. `createproject` is two invocations in order — `project add
-  <name> <paths…> --new`, then `session project --id <id> --project
-  <name>` to assign it — that stop at the first failure and report a
-  partial honestly rather than rolling back. The `project` field is a
-  JSON string (`""` clears; a missing or non-string value is refused);
-  names may carry ordinary spaces; `paths` has no count cap; the reply
-  carries the CLI outcome's `data` verbatim when there is one. Every other
-  socket command stays fire-and-forget.
+  below). The socket answers two commands with a reply, run through the
+  same sequencer over either subject a command names by: a SESSION id
+  (`sessionaction`) or a PROJECT name (`projectaction`, zero-session — no
+  session id anywhere on that wire, in its plan, its reply, or its audit
+  line; the reply's identity key is `name` where `sessionaction`'s is
+  `sessionId`). `sessionaction` is a closed five-action whitelist
+  (`undying`, `project`, `kill`, `createproject`, `editproject`) that
+  re-execs `aoide session project|kill|grant undying` or `aoide project
+  add|edit` through aoided with `--json` and writes one JSON reply line
+  before the connection closes. `createproject` is two invocations in
+  order — `project add <name> <paths…> --new`, then `session project --id
+  <id> --project <name>` to assign it — that stop at the first failure and
+  report a partial honestly rather than rolling back. The `project` field
+  is a JSON string (`""` clears; a missing or non-string value is
+  refused); names may carry ordinary spaces; `paths` has no count cap; the
+  reply carries the CLI outcome's `data` verbatim when there is one.
+  `projectaction` is a closed three-action whitelist (`create`, `edit`,
+  `removehost`) for the song-side project picker to create or edit a
+  project — local roots and per-host membership together — without ever
+  needing a session to hang the request off of: `create`/`edit` run
+  `project add|edit <name> <paths…>` then, per entry in an optional
+  `hosts` array, `project add|edit <name> <roots…> --host <host>` (`edit`
+  with no roots for a host uses `add` instead, so a host with nothing to
+  replace keeps its existing roots rather than being wiped); `removehost`
+  runs `project remove <name> --host <host>` and requires exactly one host.
+  Every other socket command stays fire-and-forget.
 - `commands` — this crate's CLI commands: 19 paths registered in one
   `register()` call (`conduct/src/commands/graph.rs`, still that file's name
   post-cutover) — the `graph` family narrowed at task #101 R1 to the bare

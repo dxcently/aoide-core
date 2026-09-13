@@ -445,12 +445,14 @@ mod tests {
                 path: "/a".into(),
                 roots: Vec::new(),
                 auto_resume: false,
+                hosts: Vec::new(),
             },
             super::super::model::Project {
                 name: "b".into(),
                 path: "/b".into(),
                 roots: Vec::new(),
                 auto_resume: false,
+                hosts: Vec::new(),
             },
         ];
         let mut a = rec("a");
@@ -516,6 +518,7 @@ mod tests {
                     path: "/elsewhere".into(),
                     roots: Vec::new(),
                     auto_resume: false,
+                    hosts: Vec::new(),
                 }],
                 ..Default::default()
             },

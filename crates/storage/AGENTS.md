@@ -3,15 +3,23 @@
 - **Explicit project membership survives UPSERT.** `SessionRecord.project`
   names a registered project independently of cwd. The exit ledger retains
   it; an unset field means automatic cwd anchoring.
-- **A project is a set of anchor roots.** `Project.path` is always the
-  first root, mirrored at `roots[0]`; `Project.roots` is the FULL ordered
-  root list (ROOTS SERIALIZED COMPLETE) — always written by
-  `project add`/`project edit`/`project remove`, never omitted or
-  extras-only. A legacy record predating this field, or one hand-edited so
-  `roots[0]` disagrees with `path`, still reads correctly: read roots
-  through `Project::roots()`, never the raw fields directly — that is the
-  one place the path-first, deduped ordering is guaranteed, and reading it
-  never rewrites the record.
+- **A project is a set of anchor roots, plus a set of host memberships.**
+  `Project.path` is always the first LOCAL root, mirrored at `roots[0]`;
+  `Project.roots` is the FULL ordered local root list (ROOTS SERIALIZED
+  COMPLETE) — always written by `project add`/`project edit`/
+  `project remove`, never omitted or extras-only. A legacy record predating
+  this field, or one hand-edited so `roots[0]` disagrees with `path`, still
+  reads correctly: read roots through `Project::roots()`, never the raw
+  fields directly — that is the one place the path-first, deduped ordering
+  is guaranteed, and reading it never rewrites the record. Separately,
+  `Project.hosts` (P-14 M1) is a `Vec<ProjectHost>` naming other registered
+  nodes this project is a member of, each with its OWN root list — additive
+  and `skip_serializing_if`-empty like `autoResume`, so a project untouched
+  by `--host` stays byte-identical on the wire. A host root is a verbatim
+  string never validated against this machine's filesystem (no `is_dir`, no
+  canonicalization — the host is the only one who can check it) and never
+  read by `Project::roots()`, which stays local-only. Membership is
+  organizational only: it grants no reach, pairs, or dials.
 
 ## Invariants
 

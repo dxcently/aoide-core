@@ -53,6 +53,33 @@ pub struct Project {
     /// hand-editing `projects.json`.
     #[serde(rename = "autoResume", default, skip_serializing_if = "is_false")]
     pub auto_resume: bool,
+    /// The other registered nodes this project is ORGANIZATIONALLY a member
+    /// of (P-14 M1, `docs/architecture/TASK-REGISTER.md` §14) — additive,
+    /// absent/`vec![]` on a project untouched by `--host` reads and
+    /// serializes byte-identical to before this field existed
+    /// (`skip_serializing_if`, the `auto_resume` discipline above copied
+    /// verbatim). Written only by `project add|edit|remove --host <node>`
+    /// under the same stage lock local roots go through; membership is
+    /// organizational only — it grants no reach, pairs, or dials, and is
+    /// never consulted by anchoring (`Project::roots()` stays local-only).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<ProjectHost>,
+}
+
+/// One registered node a [`Project`] is ORGANIZATIONALLY a member of (P-14
+/// M1). `name` is a registered `Node.name`
+/// (`node_store.rs::valid_node_name`/`load_nodes`) — the same noun, never a
+/// second spelling; existence is the command's check (`project add|edit
+/// --host`), never serde's. `roots` are that host's OWN roots, verbatim
+/// strings: never inferred from a local path, never existence-checked here
+/// or anywhere — there is no validity/liveness field, a remote root is
+/// unvalidated by construction until something checks it through the host.
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
+pub struct ProjectHost {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub roots: Vec<String>,
 }
 
 impl Project {
@@ -682,6 +709,41 @@ mod tests {
         assert_eq!(p.roots(), vec!["/a", "/b"]);
         let json = serde_json::to_string(&p).unwrap();
         assert!(json.contains("\"roots\":[\"/b\",\"/a\"]"), "serialised: {json}");
+    }
+    #[test]
+    fn a_legacy_project_without_hosts_reads_back_unchanged() {
+        // P-14 M1: a `projects.json` record predating `hosts` parses to an
+        // empty membership list and re-serializes byte-identically — no
+        // `"hosts":[]` ever appears on a project the new code never touched.
+        let raw = r#"{"name":"aoide","path":"/home/x/Aoide","roots":["/home/x/Aoide"]}"#;
+        let p: Project = serde_json::from_str(raw).unwrap();
+        assert!(p.hosts.is_empty());
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(!json.contains("hosts"), "serialised: {json}");
+        assert_eq!(json, raw, "an untouched legacy record round-trips byte-identical");
+    }
+    #[test]
+    fn project_hosts_round_trip_and_stay_off_the_wire_when_empty() {
+        let bare = Project { name: "aoide".into(), path: "/a".into(), ..Default::default() };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("hosts"), "serialised: {bare_json}");
+
+        let hosted = Project {
+            name: "aoide".into(),
+            path: "/a".into(),
+            hosts: vec![
+                ProjectHost { name: "n1".into(), roots: vec!["/srv/n1/proj".into()] },
+                ProjectHost { name: "n2".into(), roots: vec![] },
+            ],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&hosted).unwrap();
+        assert!(
+            json.contains(r#""hosts":[{"name":"n1","roots":["/srv/n1/proj"]},{"name":"n2","roots":[]}]"#),
+            "serialised: {json}"
+        );
+        let back: Project = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.hosts, hosted.hosts, "hosts round-trips exactly");
     }
     #[test]
     fn session_record_harness_session_id_round_trips_and_stays_absent_when_unset() {

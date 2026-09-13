@@ -6,7 +6,7 @@ use super::common::{load_inputs, require_args, stage_error};
 use super::doc::{build_graph, prune_done, render, restage_graph, would_cycle};
 use super::model::{
     hooks_path, load_stage, projects_path, sessions_path, sorted_projects,
-    write_stage, HooksFile, Project, ProjectsFile, SessionsFile, STAGE_GRAPH_VERSION,
+    write_stage, HooksFile, Project, ProjectHost, ProjectsFile, SessionsFile, STAGE_GRAPH_VERSION,
 };
 use aoide_protocol::{Door, Invocation};
 use aoide_protocol::output::Outcome;
@@ -81,14 +81,67 @@ fn validate_root(cmd: &str, name: &str, path: &str) -> Result<(), Outcome> {
     Ok(())
 }
 
+/// Validate a `--host <node>` value: a registered node, checked inside the
+/// SAME `with_stage_lock` hold as the mutation it gates, so nothing can
+/// deregister between the check and the write (P-14 M1 §2c rule 1). A
+/// malformed name and an unregistered one refuse identically — the caller
+/// gets one taught reason, `unknown-host`, and zero writes either way.
+/// Shared by `project add|edit|remove --host`.
+fn validate_host(cmd: &str, host: &str) -> Result<(), Outcome> {
+    let registered = aoide_storage::node_store::valid_node_name(host)
+        && aoide_storage::node_store::load_nodes()
+            .iter()
+            .any(|n| n.name == host);
+    if !registered {
+        return Err(Outcome::error(
+            cmd,
+            format!("no host named `{host}` is registered — register it with `aoide node add` first"),
+        )
+        .with_data(json!({ "reason": "unknown-host", "host": host })));
+    }
+    Ok(())
+}
+
+/// Validate one candidate HOST root (§2c rule 2) — absolute and
+/// control-character-free, like [`validate_root`], but deliberately WITHOUT
+/// its `is_dir` check or any canonicalization: a host root names a path on
+/// a NODE this instance cannot see, so existence is that host's problem,
+/// never checked here. `ProjectHost.roots` stores it verbatim.
+fn validate_host_root(cmd: &str, host: &str, path: &str) -> Result<(), Outcome> {
+    let p = std::path::Path::new(path);
+    let ok = !path.is_empty() && p.is_absolute() && !path.chars().any(char::is_control);
+    if !ok {
+        let why = if path.is_empty() {
+            "empty"
+        } else if !p.is_absolute() {
+            "not an absolute path"
+        } else {
+            "contains control characters"
+        };
+        return Err(Outcome::usage(
+            cmd,
+            format!(
+                "invalid root `{path}` for host `{host}` ({why}) — a host root is an absolute \
+                 path on that node, unchecked locally"
+            ),
+        )
+        .with_data(json!({ "reason": "invalid-host-root", "host": host, "path": path })));
+    }
+    Ok(())
+}
+
 /// `project add <name> [<path>...]` — register a project, or grow an
 /// existing one with more anchor roots. With no path, the current working
 /// directory supplies exactly one root, so a bare `aoide project add <name>`
 /// registers the dir you're in — and a session started there anchors to it
 /// by cwd prefix. `--new` refuses a name that already exists instead of
-/// adding to it. DAEMON-OWNED (`local_daemon`, above): a CLI caller forwards
-/// to `aoided`; only the door check and arg parsing happen out here, the
-/// actual mutation is [`add_roots`].
+/// adding to it. `--host <node>` (P-14 M1) re-scopes the same positional
+/// path list from LOCAL to that host's own roots — a bare `--host <node>`
+/// with no path is membership-only and NEVER falls back to the cwd default,
+/// the one local-add convenience `--host` deliberately drops. DAEMON-OWNED
+/// (`local_daemon`, above): a CLI caller forwards to `aoided`; only the door
+/// check and arg parsing happen out here, the actual mutation is
+/// [`add_roots`].
 pub fn project_add(inv: &Invocation) -> Outcome {
     if let Some(out) = local_daemon(inv) {
         return out;
@@ -98,8 +151,14 @@ pub fn project_add(inv: &Invocation) -> Outcome {
         Err(e) => return e,
     };
     let name = args[0].clone();
+    let host = inv.flags.get("host").cloned();
     let paths: Vec<String> = if inv.args.len() > 1 {
         inv.args[1..].to_vec()
+    } else if host.is_some() {
+        // Membership-only under `--host`: never the cwd default local `add`
+        // uses, since a bare path here would silently register the CALLER's
+        // local cwd as a REMOTE root on that host.
+        Vec::new()
     } else {
         match std::env::current_dir() {
             Ok(d) => vec![d.to_string_lossy().into_owned()],
@@ -114,8 +173,14 @@ pub fn project_add(inv: &Invocation) -> Outcome {
     // `--auto-resume` (P-D8, `docs/architecture/AOIDED.md`'s "L5"): opts this
     // project into the daemon's boot-time auto-resume sweep. Only ever sets
     // it true here — `project edit` never touches it (see this crate's own
-    // `AGENTS.md`).
-    add_roots(&name, &paths, inv.flag_present("new"), inv.flag_present("auto-resume"))
+    // `AGENTS.md`). Untouched by every `--host` path (§2c rule 5).
+    add_roots(
+        &name,
+        &paths,
+        inv.flag_present("new"),
+        inv.flag_present("auto-resume"),
+        host.as_deref(),
+    )
 }
 
 /// The local mutation behind `project add`, run inside ONE [`with_stage_lock`]
@@ -125,8 +190,11 @@ pub fn project_add(inv: &Invocation) -> Outcome {
 /// (only one lock holder observes the empty registry; the other sees the
 /// first's write). `roots` is written as the FULL ordered root list, `path`
 /// mirrored at `roots[0]` (ROOTS SERIALIZED COMPLETE) — never "just the new
-/// ones appended to whatever was on disk."
-fn add_roots(name: &str, paths: &[String], new: bool, auto_resume: bool) -> Outcome {
+/// ones appended to whatever was on disk." `host` re-scopes `paths` onto
+/// that host's OWN root list (P-14 M1 §2b/§2c) instead of the local one —
+/// see the dedicated branch below; local roots and `autoResume` are never
+/// touched by a host call.
+fn add_roots(name: &str, paths: &[String], new: bool, auto_resume: bool, host: Option<&str>) -> Outcome {
     with_stage_lock(|| {
         let mut file: ProjectsFile = match load_stage(&projects_path()) {
             Ok(f) => f,
@@ -135,7 +203,7 @@ fn add_roots(name: &str, paths: &[String], new: bool, auto_resume: bool) -> Outc
 
         // `--new` refuses a name that already exists BEFORE any path
         // validation or write — the invocation was well-formed, the world
-        // disagreed.
+        // disagreed. Applies identically under `--host`.
         if new && file.projects.iter().any(|p| p.name == name) {
             return Outcome::error(
                 "project.add",
@@ -144,6 +212,94 @@ fn add_roots(name: &str, paths: &[String], new: bool, auto_resume: bool) -> Outc
                 ),
             )
             .with_data(json!({ "reason": "exists", "name": name }));
+        }
+
+        if let Some(host) = host {
+            if let Err(e) = validate_host("project.add", host) {
+                return e;
+            }
+            // Validate EVERY host root before mutating anything — same
+            // all-or-nothing rule the local branch holds below.
+            for path in paths {
+                if let Err(e) = validate_host_root("project.add", host, path) {
+                    return e;
+                }
+            }
+
+            let mut changed: Vec<String> = Vec::new();
+            if !file.projects.iter().any(|p| p.name == name) {
+                // A project may be registered FIRST via host membership
+                // alone — local presence is not a precondition.
+                file.projects.push(Project { name: name.to_string(), ..Default::default() });
+                changed.push(format!("registered project {name} (host-only)"));
+            }
+            let existing = file.projects.iter_mut().find(|p| p.name == name).unwrap();
+            if !existing.hosts.iter().any(|h| h.name == host) {
+                existing.hosts.push(ProjectHost { name: host.to_string(), roots: Vec::new() });
+                changed.push(format!("project {name}: host {host} added"));
+            }
+            let hrec = existing.hosts.iter_mut().find(|h| h.name == host).unwrap();
+            let mut added_roots: Vec<String> = Vec::new();
+            for path in paths {
+                if !hrec.roots.contains(path) {
+                    hrec.roots.push(path.clone());
+                    added_roots.push(path.clone());
+                }
+            }
+            for r in &added_roots {
+                changed.push(format!("project {name}: host {host} root → {r}"));
+            }
+
+            let message = if !added_roots.is_empty() {
+                if added_roots.len() == 1 {
+                    format!("added root {} to project `{name}` host `{host}`", added_roots[0])
+                } else {
+                    format!("added roots {} to project `{name}` host `{host}`", added_roots.join(", "))
+                }
+            } else if !changed.is_empty() {
+                format!("project `{name}`: host `{host}` membership added")
+            } else if paths.is_empty() {
+                format!("project `{name}` already has host `{host}` (no change)")
+            } else {
+                format!(
+                    "project `{name}` host `{host}` already has root {} (no change)",
+                    paths.join(", ")
+                )
+            };
+
+            if !changed.is_empty() {
+                file.schema_version = STAGE_GRAPH_VERSION.to_string();
+                file.projects.sort_by(|a, b| a.name.cmp(&b.name));
+                if let Err(e) = write_stage(&projects_path(), &file) {
+                    return stage_error("project.add", e);
+                }
+                match restage_graph() {
+                    Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+                    Err(e) => return stage_error("project.add", e),
+                }
+            }
+
+            let (final_path, final_roots, final_hosts, final_auto_resume) = file
+                .projects
+                .iter()
+                .find(|p| p.name == name)
+                .map(|p| {
+                    (
+                        p.path.clone(),
+                        p.roots().into_iter().map(str::to_string).collect::<Vec<_>>(),
+                        p.hosts.clone(),
+                        p.auto_resume,
+                    )
+                })
+                .unwrap_or_default();
+            return Outcome::ok("project.add", message).changed(changed).with_data(json!({
+                "name": name,
+                "path": final_path,
+                "roots": final_roots,
+                "autoResume": final_auto_resume,
+                "hosts": final_hosts,
+                "file": projects_path().to_string_lossy(),
+            }));
         }
 
         // Validate EVERY root before mutating anything — one bad path in the
@@ -212,6 +368,7 @@ fn add_roots(name: &str, paths: &[String], new: bool, auto_resume: bool) -> Outc
                     path: first.clone(),
                     roots: full,
                     auto_resume,
+                    hosts: Vec::new(),
                 });
                 changed.push(format!("registered project {name} → {first}"));
                 if auto_resume {
@@ -244,17 +401,24 @@ fn add_roots(name: &str, paths: &[String], new: bool, auto_resume: bool) -> Outc
         }
         // Read the record back out post-write so `path`/`roots` describe the
         // FINAL state, never the just-appended locals.
-        let (final_path, final_roots): (String, Vec<String>) = file
+        let (final_path, final_roots, final_hosts): (String, Vec<String>, Vec<ProjectHost>) = file
             .projects
             .iter()
             .find(|p| p.name == name)
-            .map(|p| (p.path.clone(), p.roots().into_iter().map(str::to_string).collect()))
+            .map(|p| {
+                (
+                    p.path.clone(),
+                    p.roots().into_iter().map(str::to_string).collect(),
+                    p.hosts.clone(),
+                )
+            })
             .unwrap_or_default();
         Outcome::ok("project.add", message).changed(changed).with_data(json!({
             "name": name,
             "path": final_path,
             "roots": final_roots,
             "autoResume": final_auto_resume,
+            "hosts": final_hosts,
             "file": projects_path().to_string_lossy(),
         }))
     })
@@ -269,7 +433,7 @@ fn add_roots(name: &str, paths: &[String], new: bool, auto_resume: bool) -> Outc
 /// mutation [`add_roots`] a live daemon runs once one exists, with the same
 /// validation. Every other project mutation goes through `local_daemon`.
 pub fn register_bootstrap_project(name: &str, path: &str, auto_resume: bool) -> Outcome {
-    add_roots(name, &[path.to_string()], false, auto_resume)
+    add_roots(name, &[path.to_string()], false, auto_resume, None)
 }
 
 /// `project remove <name> [<path>]` — unregister a whole project, or one of
@@ -277,9 +441,12 @@ pub fn register_bootstrap_project(name: &str, path: &str, auto_resume: bool) -> 
 /// today's behaviour byte-for-byte. Matching is exact string equality
 /// against the stored root — no trailing-slash normalization, no
 /// canonicalization, and no `is_dir` check: a root whose directory has
-/// since been deleted must still be removable. DAEMON-OWNED (`local_daemon`,
-/// above): a CLI caller forwards to `aoided`; the actual mutation is
-/// [`remove_roots`].
+/// since been deleted must still be removable. `--host <node>` (P-14 M1)
+/// re-scopes the same PATH slot to that host: bare `--host <node>` drops
+/// the whole membership (roots included), `--host <node> <path>` drops just
+/// that one host root and leaves the membership (even at zero roots).
+/// DAEMON-OWNED (`local_daemon`, above): a CLI caller forwards to `aoided`;
+/// the actual mutation is [`remove_roots`].
 pub fn project_remove(inv: &Invocation) -> Outcome {
     if let Some(out) = local_daemon(inv) {
         return out;
@@ -290,20 +457,29 @@ pub fn project_remove(inv: &Invocation) -> Outcome {
     };
     let name = args[0].clone();
     let path = inv.args.get(1).cloned();
-    remove_roots(&name, path.as_deref())
+    let host = inv.flags.get("host").cloned();
+    remove_roots(&name, path.as_deref(), host.as_deref())
 }
 
 /// The local mutation behind `project remove`, run inside ONE
 /// [`with_stage_lock`] hold — the load, the root-membership check, and the
 /// write all happen under the same lock. `roots` is rewritten as the FULL
 /// remaining root list, `path` mirrored at `roots[0]` (ROOTS SERIALIZED
-/// COMPLETE), same as [`add_roots`]/[`edit_roots`].
-fn remove_roots(name: &str, path: Option<&str>) -> Outcome {
+/// COMPLETE), same as [`add_roots`]/[`edit_roots`]. `host` diverts entirely
+/// into the host-membership branch below; local roots are never touched by
+/// a host call.
+fn remove_roots(name: &str, path: Option<&str>, host: Option<&str>) -> Outcome {
     with_stage_lock(|| {
         let mut file: ProjectsFile = match load_stage(&projects_path()) {
             Ok(f) => f,
             Err(e) => return stage_error("project.remove", e),
         };
+
+        if let Some(host) = host {
+            if let Err(e) = validate_host("project.remove", host) {
+                return e;
+            }
+        }
 
         let Some(existing) = file.projects.iter().find(|p| p.name == name) else {
             return Outcome::ok(
@@ -312,6 +488,90 @@ fn remove_roots(name: &str, path: Option<&str>) -> Outcome {
             )
             .with_data(json!({ "name": name }));
         };
+
+        if let Some(host) = host {
+            if !existing.hosts.iter().any(|h| h.name == host) {
+                return Outcome::ok(
+                    "project.remove",
+                    format!("project `{name}` has no host `{host}` (no change)"),
+                )
+                .with_data(json!({ "name": name, "host": host }));
+            }
+            return match path {
+                None => {
+                    // Bare `--host <node>`: drop the whole membership.
+                    let existing = file.projects.iter_mut().find(|p| p.name == name).unwrap();
+                    existing.hosts.retain(|h| h.name != host);
+                    file.schema_version = STAGE_GRAPH_VERSION.to_string();
+                    if let Err(e) = write_stage(&projects_path(), &file) {
+                        return stage_error("project.remove", e);
+                    }
+                    let mut changed = vec![format!("project {name}: removed host {host}")];
+                    match restage_graph() {
+                        Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+                        Err(e) => return stage_error("project.remove", e),
+                    }
+                    let final_hosts = file
+                        .projects
+                        .iter()
+                        .find(|p| p.name == name)
+                        .map(|p| p.hosts.clone())
+                        .unwrap_or_default();
+                    Outcome::ok("project.remove", format!("removed host `{host}` from project `{name}`"))
+                        .changed(changed)
+                        .with_data(json!({
+                            "name": name,
+                            "hosts": final_hosts,
+                            "file": projects_path().to_string_lossy(),
+                        }))
+                }
+                Some(p) => {
+                    let has_root = existing
+                        .hosts
+                        .iter()
+                        .find(|h| h.name == host)
+                        .is_some_and(|h| h.roots.iter().any(|r| r == p));
+                    if !has_root {
+                        return Outcome::ok(
+                            "project.remove",
+                            format!("project `{name}` host `{host}` has no root {p} (no change)"),
+                        )
+                        .with_data(json!({ "name": name, "host": host, "path": p }));
+                    }
+                    // Membership stays even at zero remaining roots — only a
+                    // bare `--host <node>` (above) drops it.
+                    let existing = file.projects.iter_mut().find(|pr| pr.name == name).unwrap();
+                    let hrec = existing.hosts.iter_mut().find(|h| h.name == host).unwrap();
+                    hrec.roots.retain(|r| r != p);
+                    file.schema_version = STAGE_GRAPH_VERSION.to_string();
+                    if let Err(e) = write_stage(&projects_path(), &file) {
+                        return stage_error("project.remove", e);
+                    }
+                    let mut changed = vec![format!("project {name}: host {host} removed root {p}")];
+                    match restage_graph() {
+                        Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+                        Err(e) => return stage_error("project.remove", e),
+                    }
+                    let final_hosts = file
+                        .projects
+                        .iter()
+                        .find(|pr| pr.name == name)
+                        .map(|pr| pr.hosts.clone())
+                        .unwrap_or_default();
+                    Outcome::ok(
+                        "project.remove",
+                        format!("removed root {p} from project `{name}` host `{host}`"),
+                    )
+                    .changed(changed)
+                    .with_data(json!({
+                        "name": name,
+                        "hosts": final_hosts,
+                        "file": projects_path().to_string_lossy(),
+                    }))
+                }
+            };
+        }
+
         let roots: Vec<String> = existing.roots().into_iter().map(str::to_string).collect();
 
         let Some(path) = path else {
@@ -404,9 +664,11 @@ fn remove_roots(name: &str, path: Option<&str>) -> Outcome {
 /// outright. The first path becomes `path`, the rest follow it into
 /// `roots`; duplicates collapse, order is the order given. The name is
 /// immutable (`add`/`remove` are the only ways a project appears or
-/// disappears) and `autoResume` is never touched. DAEMON-OWNED
-/// (`local_daemon`, above): a CLI caller forwards to `aoided`; the actual
-/// mutation is [`edit_roots`].
+/// disappears) and `autoResume` is never touched. `--host <node>` (P-14 M1)
+/// re-scopes the same path list onto that host's OWN roots — replaced
+/// exactly, same as the local case, while local roots and every OTHER host
+/// stay untouched. DAEMON-OWNED (`local_daemon`, above): a CLI caller
+/// forwards to `aoided`; the actual mutation is [`edit_roots`].
 pub fn project_edit(inv: &Invocation) -> Outcome {
     if let Some(out) = local_daemon(inv) {
         return out;
@@ -417,7 +679,8 @@ pub fn project_edit(inv: &Invocation) -> Outcome {
     };
     let name = args[0].clone();
     let paths: Vec<String> = inv.args[1..].to_vec();
-    edit_roots(&name, &paths)
+    let host = inv.flags.get("host").cloned();
+    edit_roots(&name, &paths, host.as_deref())
 }
 
 /// The local mutation behind `project edit`, run inside ONE
@@ -425,7 +688,10 @@ pub fn project_edit(inv: &Invocation) -> Outcome {
 /// validation, and the write all happen under the same lock. `roots` is
 /// written as the FULL deduped list given, `path` mirrored at `roots[0]`
 /// (ROOTS SERIALIZED COMPLETE), same as [`add_roots`]/[`remove_roots`].
-fn edit_roots(name: &str, paths: &[String]) -> Outcome {
+/// `host` diverts into the host-root-replace branch below, upserting that
+/// host's membership if it wasn't already one — local roots and every other
+/// host are never touched by a host call.
+fn edit_roots(name: &str, paths: &[String], host: Option<&str>) -> Outcome {
     with_stage_lock(|| {
         let mut file: ProjectsFile = match load_stage(&projects_path()) {
             Ok(f) => f,
@@ -437,6 +703,67 @@ fn edit_roots(name: &str, paths: &[String]) -> Outcome {
                 format!("no project named `{name}` — register it first with `project add`"),
             )
             .with_data(json!({ "reason": "unknown", "name": name }));
+        }
+
+        if let Some(host) = host {
+            if let Err(e) = validate_host("project.edit", host) {
+                return e;
+            }
+            for path in paths {
+                if let Err(e) = validate_host_root("project.edit", host, path) {
+                    return e;
+                }
+            }
+            let mut deduped: Vec<String> = Vec::new();
+            for path in paths {
+                if !deduped.contains(path) {
+                    deduped.push(path.clone());
+                }
+            }
+
+            let existing = file.projects.iter().find(|p| p.name == name).unwrap();
+            let current = existing.hosts.iter().find(|h| h.name == host).map(|h| h.roots.clone());
+            if current.as_deref() == Some(deduped.as_slice()) {
+                return Outcome::ok(
+                    "project.edit",
+                    format!("project `{name}` host `{host}` already has exactly those roots (no change)"),
+                )
+                .with_data(json!({ "name": name, "hosts": existing.hosts.clone() }));
+            }
+
+            let existing = file.projects.iter_mut().find(|p| p.name == name).unwrap();
+            match existing.hosts.iter_mut().find(|h| h.name == host) {
+                Some(hrec) => hrec.roots = deduped.clone(),
+                None => existing.hosts.push(ProjectHost { name: host.to_string(), roots: deduped.clone() }),
+            }
+
+            file.schema_version = STAGE_GRAPH_VERSION.to_string();
+            if let Err(e) = write_stage(&projects_path(), &file) {
+                return stage_error("project.edit", e);
+            }
+            let mut changed: Vec<String> = deduped
+                .iter()
+                .map(|r| format!("project {name}: host {host} root {r}"))
+                .collect();
+            match restage_graph() {
+                Ok(g) => changed.push(g.to_string_lossy().into_owned()),
+                Err(e) => return stage_error("project.edit", e),
+            }
+            let final_hosts =
+                file.projects.iter().find(|p| p.name == name).map(|p| p.hosts.clone()).unwrap_or_default();
+            return Outcome::ok(
+                "project.edit",
+                format!(
+                    "replaced the roots of project `{name}` host `{host}` → {}",
+                    deduped.join(", ")
+                ),
+            )
+            .changed(changed)
+            .with_data(json!({
+                "name": name,
+                "hosts": final_hosts,
+                "file": projects_path().to_string_lossy(),
+            }));
         }
 
         // Validate EVERY path before any mutation — one bad path refuses the
@@ -477,11 +804,23 @@ fn edit_roots(name: &str, paths: &[String]) -> Outcome {
         if let Err(e) = write_stage(&projects_path(), &file) {
             return stage_error("project.edit", e);
         }
-        let (final_path, final_roots, final_auto_resume): (String, Vec<String>, bool) = file
+        let (final_path, final_roots, final_auto_resume, final_hosts): (
+            String,
+            Vec<String>,
+            bool,
+            Vec<ProjectHost>,
+        ) = file
             .projects
             .iter()
             .find(|p| p.name == name)
-            .map(|p| (p.path.clone(), p.roots().into_iter().map(str::to_string).collect(), p.auto_resume))
+            .map(|p| {
+                (
+                    p.path.clone(),
+                    p.roots().into_iter().map(str::to_string).collect(),
+                    p.auto_resume,
+                    p.hosts.clone(),
+                )
+            })
             .unwrap_or_default();
         let mut changed: Vec<String> = final_roots
             .iter()
@@ -501,12 +840,17 @@ fn edit_roots(name: &str, paths: &[String]) -> Outcome {
             "path": final_path,
             "roots": final_roots,
             "autoResume": final_auto_resume,
+            "hosts": final_hosts,
             "file": projects_path().to_string_lossy(),
         }))
     })
 }
 
-/// `project list` — the registered anchor roots.
+/// `project list` — the registered anchor roots, plus every host membership
+/// (P-14 M1): `data.projects[].hosts` is the `Project` record serialized
+/// as-is (`skip_serializing_if`-empty), so this needs no separate mirroring
+/// logic — it already reads back exactly what `project add|edit|remove
+/// --host` wrote.
 pub fn project_list(_inv: &Invocation) -> Outcome {
     let file: ProjectsFile = match load_stage(&projects_path()) {
         Ok(f) => f,
@@ -518,6 +862,9 @@ pub fn project_list(_inv: &Invocation) -> Outcome {
         message.push_str(&format!("\n◆ {}  {}", p.name, p.path));
         for r in p.roots().into_iter().skip(1) {
             message.push_str(&format!("\n     {r}"));
+        }
+        for h in &p.hosts {
+            message.push_str(&format!("\n     @{} {}", h.name, h.roots.join(", ")));
         }
     }
     Outcome::ok("project.list", message).with_data(json!({ "projects": projects }))
@@ -884,6 +1231,23 @@ mod tests {
     }
     fn daemon_invocation(path: &[&str], args: &[&str]) -> Invocation {
         project_invocation(path, args, &[])
+    }
+    /// A synthetic minimal registered node for `--host` tests — never a
+    /// real host name, petname, pid, or path (test-fixture discipline).
+    fn synthetic_node(name: &str) -> aoide_storage::node_store::Node {
+        aoide_storage::node_store::Node {
+            name: name.into(),
+            url: format!("http://{name}.invalid:8710/"),
+            autogate: false,
+            token_file: None,
+            bearer_secret: None,
+            hub: false,
+            pubkey: None,
+            verified: false,
+            allows: Vec::new(),
+            via: None,
+            added_at: "2026-01-01T00:00:00Z".into(),
+        }
     }
 
     #[test]
@@ -1440,6 +1804,269 @@ mod tests {
         let _ = std::fs::remove_dir_all(&stage);
     }
 
+    // ── P-14 M1: host membership (`--host <node>` on add/edit/remove) ──
+
+    #[test]
+    fn an_unregistered_host_is_refused_and_writes_nothing() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR"]);
+        let stage = unique_stage("host-unknown-refused");
+        let state = unique_stage("host-unknown-refused-state");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        // No node registered at all — `n1` is unknown by construction.
+
+        let out = project_add(&project_invocation(
+            &["project", "add"],
+            &["proj"],
+            &[("host", "n1")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "unknown-host");
+        assert_eq!(out.data.as_ref().unwrap()["host"], "n1");
+
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        assert!(file.projects.is_empty(), "an unknown host writes nothing");
+
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_host_root_is_never_inferred_from_the_local_cwd() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR"]);
+        let saved_cwd = std::env::current_dir().ok();
+        let stage = unique_stage("host-no-cwd-default");
+        let state = unique_stage("host-no-cwd-default-state");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        aoide_storage::node_store::save_nodes(&[synthetic_node("n1")]).unwrap();
+        // A real, existing cwd — if `--host` ever fell back to it (the local
+        // `add` convenience), this would silently register the CALLER's
+        // local directory as a remote root on `n1`.
+        std::env::set_current_dir(&stage).unwrap();
+
+        let out = project_add(&project_invocation(
+            &["project", "add"],
+            &["proj"],
+            &[("host", "n1")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        let p = file.projects.iter().find(|p| p.name == "proj").unwrap();
+        assert!(p.path.is_empty(), "no local root was ever set: {p:?}");
+        assert!(p.roots.is_empty(), "no local root was ever set: {p:?}");
+        assert_eq!(p.hosts, vec![ProjectHost { name: "n1".into(), roots: vec![] }]);
+
+        if let Some(c) = saved_cwd {
+            std::env::set_current_dir(c).unwrap();
+        }
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn a_host_root_needs_no_local_directory() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR"]);
+        let stage = unique_stage("host-root-no-local-dir");
+        let state = unique_stage("host-root-no-local-dir-state");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        aoide_storage::node_store::save_nodes(&[synthetic_node("n1")]).unwrap();
+
+        // `/srv/n1/proj` exists on no filesystem this test runs on — a
+        // host root is never `is_dir`-checked, never canonicalized.
+        let out = project_add(&project_invocation(
+            &["project", "add"],
+            &["proj", "/srv/n1/proj"],
+            &[("host", "n1")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{out:?}");
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        let p = file.projects.iter().find(|p| p.name == "proj").unwrap();
+        assert_eq!(
+            p.hosts,
+            vec![ProjectHost { name: "n1".into(), roots: vec!["/srv/n1/proj".into()] }]
+        );
+
+        // A relative host root, by contrast, IS refused — absolute is still
+        // required, just never checked against THIS machine's filesystem.
+        let out = project_add(&project_invocation(
+            &["project", "add"],
+            &["proj", "relative/path"],
+            &[("host", "n1")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Usage);
+        assert_eq!(out.data.as_ref().unwrap()["reason"], "invalid-host-root");
+
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn an_offline_selected_host_is_retained_across_a_local_root_edit() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR"]);
+        let stage = unique_stage("host-retained-across-edit");
+        let state = unique_stage("host-retained-across-edit-state");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        aoide_storage::node_store::save_nodes(&[synthetic_node("n1")]).unwrap();
+        let (a, b) = (stage.join("a"), stage.join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let (a, b) = (a.to_string_lossy().into_owned(), b.to_string_lossy().into_owned());
+
+        project_add(&project_invocation(&["project", "add"], &["proj", &a], &[]));
+        project_add(&project_invocation(
+            &["project", "add"],
+            &["proj", "/srv/n1/proj"],
+            &[("host", "n1")],
+        ));
+
+        // A plain local edit — `--host` absent — never even reads `hosts`,
+        // let alone touches it, however unreachable that host currently is.
+        let out = project_edit(&daemon_invocation(&["project", "edit"], &["proj", &b]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        let p = file.projects.iter().find(|p| p.name == "proj").unwrap();
+        assert_eq!(p.path, b, "the local edit took effect");
+        assert_eq!(
+            p.hosts,
+            vec![ProjectHost { name: "n1".into(), roots: vec!["/srv/n1/proj".into()] }],
+            "host membership survives a local-only edit untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn multi_root_edit_preserves_session_assignments() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR"]);
+        let stage = unique_stage("multi-root-edit-sessions");
+        let state = unique_stage("multi-root-edit-sessions-state");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        aoide_storage::node_store::save_nodes(&[synthetic_node("n1")]).unwrap();
+        let (a, b, c) = (stage.join("a"), stage.join("b"), stage.join("c"));
+        for d in [&a, &b, &c] {
+            std::fs::create_dir_all(d).unwrap();
+        }
+        let (a, b, c) = (
+            a.to_string_lossy().into_owned(),
+            b.to_string_lossy().into_owned(),
+            c.to_string_lossy().into_owned(),
+        );
+
+        project_add(&project_invocation(&["project", "add"], &["proj", &a], &[]));
+        project_add(&project_invocation(
+            &["project", "add"],
+            &["proj", "/srv/n1/proj"],
+            &[("host", "n1")],
+        ));
+        // A session explicitly assigned to `proj` (`session project --id`'s
+        // own field) — `edit_roots` never opens `sessions.json` at all.
+        let mut rec = session("s1", &a, "working", "1", None);
+        rec.project = Some("proj".into());
+        write_stage(&sessions_path(), &SessionsFile { schema_version: "0".into(), sessions: vec![rec] })
+            .unwrap();
+
+        // Replace the LOCAL roots with a fresh multi-root list.
+        let out = project_edit(&daemon_invocation(&["project", "edit"], &["proj", &b, &c]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        let p = file.projects.iter().find(|p| p.name == "proj").unwrap();
+        assert_eq!(p.roots(), vec![b.as_str(), c.as_str()]);
+        assert_eq!(
+            p.hosts,
+            vec![ProjectHost { name: "n1".into(), roots: vec!["/srv/n1/proj".into()] }],
+            "host membership survives a multi-root local edit"
+        );
+
+        let sf: SessionsFile = load_stage(&sessions_path()).unwrap();
+        assert_eq!(
+            sf.sessions[0].project.as_deref(),
+            Some("proj"),
+            "the session's explicit project assignment survives a root edit untouched"
+        );
+
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn project_remove_host_drops_membership_but_leaves_local_roots() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR"]);
+        let stage = unique_stage("remove-host-membership");
+        let state = unique_stage("remove-host-membership-state");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        aoide_storage::node_store::save_nodes(&[synthetic_node("n1")]).unwrap();
+        let a = stage.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let a = a.to_string_lossy().into_owned();
+
+        project_add(&project_invocation(&["project", "add"], &["proj", &a], &[]));
+        project_add(&project_invocation(
+            &["project", "add"],
+            &["proj", "/srv/n1/proj"],
+            &[("host", "n1")],
+        ));
+
+        let out = project_remove(&project_invocation(&["project", "remove"], &["proj"], &[("host", "n1")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+
+        let file: ProjectsFile = load_stage(&projects_path()).unwrap();
+        let p = file.projects.iter().find(|p| p.name == "proj").unwrap();
+        assert_eq!(p.path, a, "local roots are untouched");
+        assert!(p.hosts.is_empty(), "the whole host membership is dropped: {:?}", p.hosts);
+
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
+    #[test]
+    fn project_list_json_mirrors_hosts() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_STATE_DIR"]);
+        let stage = unique_stage("list-mirrors-hosts");
+        let state = unique_stage("list-mirrors-hosts-state");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_STATE_DIR", &state);
+        aoide_storage::node_store::save_nodes(&[synthetic_node("n1")]).unwrap();
+        let a = stage.join("a");
+        std::fs::create_dir_all(&a).unwrap();
+        let a = a.to_string_lossy().into_owned();
+
+        project_add(&project_invocation(&["project", "add"], &["proj", &a], &[]));
+        project_add(&project_invocation(
+            &["project", "add"],
+            &["proj", "/srv/n1/proj"],
+            &[("host", "n1")],
+        ));
+
+        let out = project_list(&invocation(&["project", "list"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok);
+        let rows = out.data.as_ref().unwrap()["projects"].as_array().unwrap();
+        let row = rows.iter().find(|r| r["name"] == "proj").unwrap();
+        assert_eq!(
+            row["hosts"],
+            json!([{"name": "n1", "roots": ["/srv/n1/proj"]}]),
+            "`data.projects[].hosts` mirrors the stored record: {row}"
+        );
+
+        let _ = std::fs::remove_dir_all(&stage);
+        let _ = std::fs::remove_dir_all(&state);
+    }
+
     // ── DAEMON-OWNED ATOMIC MUTATIONS: the `with_stage_lock` hold really
     // serializes concurrent local mutators, and a `Door::Cli` caller with
     // no daemon listening really errors instead of silently going local ──
@@ -1466,11 +2093,11 @@ mod tests {
         let (b1, b2) = (barrier.clone(), barrier.clone());
         let t1 = std::thread::spawn(move || {
             b1.wait();
-            add_roots("racer", &[a], true, false)
+            add_roots("racer", &[a], true, false, None)
         });
         let t2 = std::thread::spawn(move || {
             b2.wait();
-            add_roots("racer", &[b], true, false)
+            add_roots("racer", &[b], true, false, None)
         });
         let (r1, r2) = (t1.join().unwrap(), t2.join().unwrap());
 
@@ -1517,7 +2144,7 @@ mod tests {
         // Register the project up front so both racers hit the existing-
         // project append arm (not the create arm, exercised above).
         assert_eq!(
-            add_roots("shared", &[base.clone()], false, false).status,
+            add_roots("shared", std::slice::from_ref(&base), false, false, None).status,
             aoide_protocol::output::Status::Ok
         );
 
@@ -1526,11 +2153,11 @@ mod tests {
         let (xc, yc) = (x.clone(), y.clone());
         let t1 = std::thread::spawn(move || {
             b1.wait();
-            add_roots("shared", &[xc], false, false)
+            add_roots("shared", &[xc], false, false, None)
         });
         let t2 = std::thread::spawn(move || {
             b2.wait();
-            add_roots("shared", &[yc], false, false)
+            add_roots("shared", &[yc], false, false, None)
         });
         let (r1, r2) = (t1.join().unwrap(), t2.join().unwrap());
         assert_eq!(r1.status, aoide_protocol::output::Status::Ok);

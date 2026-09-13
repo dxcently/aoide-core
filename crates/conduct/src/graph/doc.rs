@@ -54,13 +54,21 @@ pub fn build_graph(
     let mut edges: Vec<Value> = Vec::new();
 
     for p in &projects {
-        nodes.push(json!({
+        let mut node = json!({
             "id": format!("project:{}", p.name),
             "kind": "project",
             "name": p.name,
             "path": p.path,
             "roots": p.roots(),
-        }));
+        });
+        // Host membership (P-14 M1) rides only when non-empty, same
+        // ride-only-when-present rule the session node's `title`/`petname`
+        // fields already hold below — a project no `--host` invocation ever
+        // touched stays byte-for-byte as before this field existed.
+        if !p.hosts.is_empty() {
+            node["hosts"] = json!(p.hosts);
+        }
+        nodes.push(node);
     }
     for s in &sessions {
         let mut node = json!({
@@ -799,6 +807,29 @@ mod tests {
             json!(["/a"]),
             "roots is ALWAYS present, even for a one-root project"
         );
+    }
+    #[test]
+    fn the_graph_project_node_carries_hosts_only_when_non_empty() {
+        use crate::graph::model::ProjectHost;
+        let projects = vec![
+            Project {
+                name: "hosted".into(),
+                path: "/a".into(),
+                hosts: vec![ProjectHost { name: "n1".into(), roots: vec!["/srv/n1/a".into()] }],
+                ..Default::default()
+            },
+            Project {
+                name: "local-only".into(),
+                path: "/a".into(),
+                ..Default::default()
+            },
+        ];
+        let doc = build_graph(&projects, &[], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let hosted = nodes.iter().find(|n| n["id"] == "project:hosted").unwrap();
+        assert_eq!(hosted["hosts"], json!([{"name": "n1", "roots": ["/srv/n1/a"]}]));
+        let local = nodes.iter().find(|n| n["id"] == "project:local-only").unwrap();
+        assert!(local.get("hosts").is_none(), "no hosts field when empty: {local}");
     }
     #[test]
     fn render_shows_a_projects_extra_roots_under_its_head() {

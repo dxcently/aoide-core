@@ -288,30 +288,44 @@
   socket path `shellbridge` owns. Don't move the files to chase the commands —
   see `docs/architecture/PACKAGE-LAYOUT.md`'s "Charter exceptions" for the
   full reasoning before touching either.
-- **`sessionaction`'s five-action whitelist never becomes a translator.**
-  `session_action_args` is the ONE authority for the whitelist and the ONE
-  call site for the gate; nothing else builds argv from wire values it did
-  not validate. `safe_session_id` (session ids: no whitespace) and `safe_action_value`
-  (project/create/edit names: ordinary spaces allowed) are two different
-  checks — an id is a bookkeeping key, a name is user-facing text — and
-  both reject empty, `-`-prefixed, or control-charactered strings before
-  they reach an argv; `safe_action_path` is the rule for path arguments —
-  absolute and control-free, whitespace included — with no count cap: the
-  wire line's own length is the only bound. The `project` field must be a
-  JSON string: `""` is the clear request, and a missing key, `null`, or a
-  non-string value is refused outright, never read as a clear. The reply
-  forwards the CLI outcome's `data` verbatim under `"data"` when the
-  envelope has one and omits the key otherwise — never reshape it. The reply is one JSON line on its own dedicated
-  connection and the QML callback contract is exactly-once. A multi-step
-  action (`createproject`'s add-then-assign) stops at its first failure and
-  reports the partial state honestly rather than rolling back. The bridge
-  never pre-checks what the CLI already refuses — `project add --new` owns
-  "this name exists," not this file. No reply channel on the connection
-  means no dispatch at all. The audit line carries only the action name and
-  status, never an argument value. The accept loop gives every connection
-  its own thread, with no read timeout added: a client is allowed to idle
-  (the bar's own shared socket does, between human gestures), and one that
-  does must never starve another's.
+- **The bridge's action whitelists never become a translator.** It is no
+  longer just five session actions: `session_action_args` (subject: a
+  session id) and `project_action_args` (subject: a project name, no
+  session id anywhere — not on the wire, in its plan, its reply, or its
+  audit line) are each the ONE authority for their own closed whitelist and
+  the ONE call site `parse_command`'s wire gate consults for it; nothing
+  else builds argv from wire values it did not validate. Both plans run
+  through the same subject-agnostic sequencer (`ActionSubject`,
+  `dispatch_session_action`/`run_session_step`/`session_action_reply`) so
+  the two whitelists share one runner instead of two copies of it — the
+  five original session actions are byte-identical through that sequencer
+  to before the split. `safe_session_id` (session ids: no whitespace) and
+  `safe_action_value` (project/host/create/edit names: ordinary spaces
+  allowed) are two different checks — an id is a bookkeeping key, a name is
+  user-facing text — and both reject empty, `-`-prefixed, or
+  control-charactered strings before they reach an argv; `safe_action_path`
+  is the rule for path arguments — absolute and control-free, whitespace
+  included — with no count cap: the wire line's own length is the only
+  bound. A host name in `projectaction`'s `hosts` array is checked with
+  `valid_node_name` alone — pure, no `load_nodes()` call at the bridge
+  layer, since the CLI is the one authority for whether a host is actually
+  registered. The `project` field must be a JSON string: `""` is the clear
+  request, and a missing key, `null`, or a non-string value is refused
+  outright, never read as a clear. The reply forwards the CLI outcome's
+  `data` verbatim under `"data"` when the envelope has one and omits the
+  key otherwise — never reshape it. The reply is one JSON line on its own
+  dedicated connection and the QML callback contract is exactly-once. A
+  multi-step action (`createproject`'s add-then-assign, or a
+  `projectaction` with hosts) stops at its first failure and reports the
+  partial state honestly rather than rolling back. The bridge never
+  pre-checks what the CLI already refuses — `project add --new` owns "this
+  name exists," `--host` owns "this host is registered," neither is this
+  file's job. No reply channel on the connection means no dispatch at all.
+  The audit line carries only the action name and status, never an
+  argument value. The accept loop gives every connection its own thread,
+  with no read timeout added: a client is allowed to idle (the bar's own
+  shared socket does, between human gestures), and one that does must
+  never starve another's.
 - **`normalize_addr` is `pub`, not `pub(crate)`, on purpose** — `screen`
   reaches it directly rather than duplicating it. Don't narrow it back
   without checking that dependency first.
@@ -1413,7 +1427,7 @@
 - `doorbell.rs` changes update `docs/architecture/MAIL.md`'s "Delivery and
   the doorbell" section — that document is the design's canonical prose
   statement, this file only the invariants an editor must hold.
-- A change to shellbridge's `sessionaction` whitelist or reply shape
-  updates `ShellBridge.qml`'s protocol comment and
+- A change to shellbridge's `sessionaction`/`projectaction` whitelists or
+  reply shape updates `ShellBridge.qml`'s protocol comment and
   `concepts/cli/Doors-and-Nodes.md`'s socket-command list, in the same
   commit.

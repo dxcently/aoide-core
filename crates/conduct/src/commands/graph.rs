@@ -55,6 +55,7 @@ pub fn register(r: &mut Registry) {
         flags: [
             flag!("auto-resume", "bool", "Opt this project into the daemon's boot-time auto-resume sweep (`resurrect --project <name>` on `run_loop` entry, once per boot). Only ever sets it true — hand-edit projects.json to clear it."),
             flag!("new", "bool", "Refuse if the project name already exists instead of adding roots to it."),
+            flag!("host", "string", "Re-scope the path list to that REGISTERED node's own roots instead of local ones — adds it as a member and appends any given roots (idempotent per root). With no path, membership-only; never falls back to the cwd default. Refused (unknown-host, zero writes) if the node isn't registered."),
         ],
         gated: false,
         implemented: true,
@@ -74,7 +75,9 @@ pub fn register(r: &mut Registry) {
             arg!("name", "string", true, "Project name to remove."),
             arg!("path", "string", false, "One root to remove instead of the whole project; removing the last root removes the project."),
         ],
-        flags: [],
+        flags: [
+            flag!("host", "string", "Re-scope PATH to that host's own roots: bare `--host <node>` drops the whole membership (roots included); `--host <node> <path>` drops just that one host root and leaves the membership, even at zero roots."),
+        ],
         gated: false,
         implemented: true,
         handler: crate::graph::project_remove,
@@ -379,7 +382,9 @@ pub fn register(r: &mut Registry) {
             arg!("name", "string", true, "Project name to edit; must already be registered."),
             arg!("path", "string", true, "The project's new root path; give one or more. The first becomes the project's primary root, the rest follow in order."),
         ],
-        flags: [],
+        flags: [
+            flag!("host", "string", "Re-scope the path list to REPLACE that host's own roots exactly, instead of the local ones — local roots and every other host stay untouched. Upserts the membership if it wasn't already one."),
+        ],
         gated: false,
         implemented: true,
         handler: crate::graph::project_edit,

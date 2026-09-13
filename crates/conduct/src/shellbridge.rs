@@ -80,6 +80,14 @@ pub enum BridgeCommand {
     RecheckSessions,
     /// Acknowledged session-menu action, routed through the core CLI.
     SessionAction { session_id: String, action: String, fields: Value },
+    /// `{ "cmd": "projectaction", "action": "create|edit|removehost", "name":
+    /// "…", "paths": […], "hosts": […] }` — zero-session project creation,
+    /// editing, or host-removal from the song-side project picker (P-14 M1
+    /// §2d). Unlike [`Self::SessionAction`] this carries no session id
+    /// anywhere: the reply's identity key is `"name"`. `fields` is the
+    /// ENTIRE parsed wire object — `paths`/`hosts` sit at the top level, not
+    /// nested under a `fields` key, matching the wire shape exactly.
+    ProjectAction { name: String, action: String, fields: Value },
     /// `{ "cmd": "heraldpush", "notification": { … } }` — file one notification
     /// into `stage/herald.json`. Sent by `aoide herald push` (dunst's `script`
     /// hook) and by `graph permit` for a summons; NOT by QML, which only reads
@@ -168,6 +176,14 @@ pub fn parse_command(line: &str) -> Option<BridgeCommand> {
             let fields = v.get("fields").cloned().unwrap_or_else(|| json!({}));
             session_action_args(&session_id, &action, &fields)?;
             Some(BridgeCommand::SessionAction { session_id, action, fields })
+        }
+        "projectaction" => {
+            let name = v.get("name")?.as_str()?.trim().to_string();
+            let action = v.get("action")?.as_str()?.to_string();
+            // `fields` here IS the whole wire object — `paths`/`hosts` live
+            // at the top level (§2d's wire shape), never nested.
+            project_action_args(&name, &action, &v)?;
+            Some(BridgeCommand::ProjectAction { name, action, fields: v })
         }
         "focuswindow" => {
             let address = v
@@ -613,6 +629,66 @@ fn safe_action_path(s: &str) -> bool {
     s.starts_with('/') && !s.chars().any(char::is_control)
 }
 
+/// Which kind of thing a bridge action's plan is about: a session id (the
+/// original five session-menu actions, `sessionaction`) or a project name
+/// (zero-session project creation/editing, `projectaction`, P-14 M1 §2d).
+/// [`run_session_step`]/[`dispatch_session_action`] are generic over this so
+/// the two whitelists share one sequencer instead of two copies of it — the
+/// five pre-existing session actions run through the exact same code path as
+/// before, byte-identical reply and audit shapes included.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActionSubject<'a> {
+    Session(&'a str),
+    Project(&'a str),
+}
+
+impl<'a> ActionSubject<'a> {
+    /// The reply/audit identity key: `"sessionId"` for a session action
+    /// (unchanged), `"name"` for a project action (brief §2d).
+    fn key(self) -> &'static str {
+        match self {
+            Self::Session(_) => "sessionId",
+            Self::Project(_) => "name",
+        }
+    }
+
+    /// The raw id/name this subject carries.
+    fn value(self) -> &'a str {
+        match self {
+            Self::Session(s) | Self::Project(s) => s,
+        }
+    }
+
+    /// The noun used in a generated fallback message (`"session grant done"`
+    /// vs `"project create done"`).
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Session(_) => "session",
+            Self::Project(_) => "project",
+        }
+    }
+
+    /// The audit event-name prefix — kept byte-identical to the pre-existing
+    /// `"sessionaction"`/`"sessionaction-failed"`/`"sessionaction-partial"`
+    /// literals for a session subject.
+    fn event_prefix(self) -> &'static str {
+        match self {
+            Self::Session(_) => "sessionaction",
+            Self::Project(_) => "projectaction",
+        }
+    }
+
+    /// Dispatch to whichever whitelist owns this subject — the ONE call site
+    /// both [`dispatch_session_action`] and `parse_command`'s wire gates
+    /// consult.
+    fn plan(self, action: &str, fields: &Value) -> Option<Vec<Vec<String>>> {
+        match self {
+            Self::Session(id) => session_action_args(id, action, fields),
+            Self::Project(name) => project_action_args(name, action, fields),
+        }
+    }
+}
+
 /// The closed, five-action session-menu whitelist — a PLAN, not one argv.
 /// One action is one or two invocations, run in order, stopping at the first
 /// failure; `Option<Vec<Vec<String>>>` is deliberate over a single-argv
@@ -742,6 +818,122 @@ fn session_action_args(session_id: &str, action: &str, fields: &Value) -> Option
     }
 }
 
+/// The project-scoped, zero-session whitelist (`projectaction`, P-14 M1
+/// §2d) — mirrors [`session_action_args`] exactly: a PLAN of one or more
+/// argv vectors, run in order by the same sequencer ([`dispatch_session_action`]
+/// via [`ActionSubject::plan`]), shape-only checks (never state — the CLI
+/// stays the one authority for whether a name or host actually exists), one
+/// bad element anywhere refuses the whole action. No session id appears
+/// anywhere in this function or in anything it builds.
+///
+/// Wire shape: `{"cmd":"projectaction","action":"create|edit|removehost",
+/// "name":"…","paths":[…],"hosts":[{"name":"…","roots":[…]}]}` —
+/// `fields` here IS the whole parsed wire object, so `paths`/`hosts` are
+/// read at the top level, never nested under a `fields` key.
+///
+/// - `create`: `project add <name> <paths…> --new`, then per host `project
+///   add <name> <roots…> --host <h>` (roots may be empty — membership-only,
+///   the same shape `--host` with no roots gives the CLI directly, §2b).
+/// - `edit`: `project edit <name> <paths…>`, then per host: non-empty roots
+///   → `project edit <name> <roots…> --host <h>` (replace that host's roots
+///   exactly); empty roots → `project add <name> --host <h>` (membership
+///   only — an `edit --host` with nothing to replace with would wipe an
+///   existing host's roots, which is never the intent here).
+/// - `removehost`: `project remove <name> --host <h>`, refused unless
+///   exactly one host is given.
+fn project_action_args(name: &str, action: &str, fields: &Value) -> Option<Vec<Vec<String>>> {
+    if !safe_action_value(name) {
+        return None;
+    }
+
+    // Every host entry, validated shape-only: a real object, a name that
+    // passes the same pure check the CLI's own `--host` validator starts
+    // with (`valid_node_name` — no I/O, registration is the CLI's job), and
+    // roots that are all real paths. One bad element anywhere in this array
+    // refuses the whole action, same as `paths` below.
+    let hosts: Vec<(String, Vec<String>)> = match fields.get("hosts") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut hosts = Vec::with_capacity(items.len());
+            for item in items {
+                let host_name = item.get("name")?.as_str()?;
+                if !aoide_storage::node_store::valid_node_name(host_name) {
+                    return None;
+                }
+                let raw_roots = item.get("roots").and_then(Value::as_array);
+                let mut roots = Vec::new();
+                if let Some(raw_roots) = raw_roots {
+                    for r in raw_roots {
+                        let r = r.as_str()?;
+                        if !safe_action_path(r) {
+                            return None;
+                        }
+                        roots.push(r.to_string());
+                    }
+                }
+                hosts.push((host_name.to_string(), roots));
+            }
+            hosts
+        }
+        Some(_) => return None,
+    };
+
+    match action {
+        "removehost" => {
+            if hosts.len() != 1 {
+                return None;
+            }
+            let (host_name, _roots) = &hosts[0];
+            Some(vec![vec![
+                "project".to_string(),
+                "remove".to_string(),
+                name.to_string(),
+                "--host".to_string(),
+                host_name.clone(),
+            ]])
+        }
+        "create" | "edit" => {
+            let raw_paths = fields.get("paths").and_then(Value::as_array)?;
+            // An empty list is `None`, not an instruction to erase — the
+            // same rule `createproject`/`editproject` hold above.
+            if raw_paths.is_empty() {
+                return None;
+            }
+            let mut paths = Vec::with_capacity(raw_paths.len());
+            for p in raw_paths {
+                let p = p.as_str()?;
+                if !safe_action_path(p) {
+                    return None;
+                }
+                paths.push(p.to_string());
+            }
+
+            let mut plan = Vec::with_capacity(1 + hosts.len());
+            let mut first = vec![
+                "project".to_string(),
+                if action == "create" { "add".to_string() } else { "edit".to_string() },
+                name.to_string(),
+            ];
+            first.extend(paths);
+            if action == "create" {
+                first.push("--new".to_string());
+            }
+            plan.push(first);
+
+            for (host_name, roots) in hosts {
+                let verb = if action == "create" || roots.is_empty() { "add" } else { "edit" };
+                let mut step = vec!["project".to_string(), verb.to_string(), name.to_string()];
+                step.extend(roots);
+                step.push("--host".to_string());
+                step.push(host_name);
+                plan.push(step);
+            }
+            Some(plan)
+        }
+        _ => None,
+    }
+}
+
 /// The `status`-is-ok flag, `message`, and optional `data` payload of one
 /// `--json` envelope, from whichever stream carried it. `data` is `None`
 /// when the key is absent — carried through verbatim by
@@ -755,7 +947,7 @@ fn outcome_envelope(stream: &str) -> Option<(bool, String, Option<Value>)> {
     Some((ok, message, data))
 }
 
-/// Shape the ONE JSON reply line for an acknowledged session action — pure
+/// Shape the ONE JSON reply line for an acknowledged bridge action — pure
 /// and total, mirroring [`classify_recheck`]'s own rule: success is the real
 /// output, not the exit status. `--json` puts its envelope on a DIFFERENT
 /// stream depending on where the command failed: a dispatched command
@@ -763,9 +955,11 @@ fn outcome_envelope(stream: &str) -> Option<(bool, String, Option<Value>)> {
 /// prints it on stderr with an empty stdout (`protocol/src/door.rs:800-814`)
 /// — exactly the path `createproject`/`editproject` take until slice A
 /// lands, so reading stdout alone would hand QML a raw JSON blob as its
-/// "message".
+/// "message". `subject` is generic over `sessionaction`/`projectaction`
+/// (P-14 M1 §2d) — a session subject reproduces every field byte-identical
+/// to before that split.
 fn session_action_reply(
-    session_id: &str,
+    subject: ActionSubject,
     action: &str,
     exited_ok: bool,
     stdout: &str,
@@ -774,12 +968,13 @@ fn session_action_reply(
     let (ok, message, data) = match outcome_envelope(stdout).or_else(|| outcome_envelope(stderr)) {
         Some((status_ok, msg, data)) => {
             let ok = exited_ok && status_ok;
+            let noun = subject.noun();
             let message = if !msg.is_empty() {
                 msg
             } else if ok {
-                format!("session {action} done")
+                format!("{noun} {action} done")
             } else {
-                format!("session {action} failed")
+                format!("{noun} {action} failed")
             };
             (ok, message, data)
         }
@@ -800,8 +995,8 @@ fn session_action_reply(
         "ok": ok,
         "message": message,
         "action": action,
-        "sessionId": session_id,
     });
+    reply[subject.key()] = json!(subject.value());
     if let Some(data) = data {
         reply["data"] = data;
     }
@@ -814,14 +1009,14 @@ fn session_action_reply(
 /// pattern `dispatch_usage_refresh`/`dispatch_recheck_sessions` already use.
 /// This call is NOT inside `with_stage_lock` — see `protocol::bin`'s module
 /// doc for why that would matter if it ever were.
-fn run_session_step(session_id: &str, action: &str, argv: &[String]) -> Value {
+fn run_session_step(subject: ActionSubject, action: &str, argv: &[String]) -> Value {
     match std::process::Command::new(daemon::bin::core_bin())
         .args(argv)
         .arg("--json")
         .output()
     {
         Ok(out) => session_action_reply(
-            session_id,
+            subject,
             action,
             out.status.success(),
             &String::from_utf8_lossy(&out.stdout),
@@ -829,12 +1024,15 @@ fn run_session_step(session_id: &str, action: &str, argv: &[String]) -> Value {
         ),
         // The first TWO argv elements only — always the command path, never
         // a value — same discipline every audit line here holds.
-        Err(e) => json!({
-            "ok": false,
-            "message": format!("spawning `aoide {} {}`: {e}", argv[0], argv[1]),
-            "action": action,
-            "sessionId": session_id,
-        }),
+        Err(e) => {
+            let mut reply = json!({
+                "ok": false,
+                "message": format!("spawning `aoide {} {}`: {e}", argv[0], argv[1]),
+                "action": action,
+            });
+            reply[subject.key()] = json!(subject.value());
+            reply
+        }
     }
 }
 
@@ -847,68 +1045,95 @@ fn run_session_step(session_id: &str, action: &str, argv: &[String]) -> Value {
 /// `partial` gets its own event name so an operator scanning the log can see
 /// a half-applied action without reading the message. The dispatched
 /// commands are separately audited by the child processes' own `dispatch`
-/// inside `aoided`; this line records only that the desk asked.
-fn audit_session_action(action: &str, event: &str, outcome: &str) {
+/// inside `aoided`; this line records only that the desk asked. `subject`'s
+/// noun (`"session"`/`"project"`) is the only thing that varies from the
+/// original `"session action …"` wording, so a session subject's message is
+/// byte-identical to before the `projectaction` split.
+fn audit_bridge_action(subject: ActionSubject, action: &str, event: &str, outcome: &str) {
     let _ = daemon::audit(
         &daemon::default_audit_log(),
         daemon::Door::Daemon,
         daemon::EventClass::Audit,
         "shellbridge",
         event,
-        &format!("session action {action}: {outcome}"),
+        &format!("{} action {action}: {outcome}", subject.noun()),
     );
 }
 
-/// The sequencer: run one acknowledged session action's whole plan, on the
+/// The sequencer: run one acknowledged bridge action's whole plan, on the
 /// CALLER's thread — `handle_conn` is what detaches it. Rebuilds the plan
-/// through [`session_action_args`], the SAME authority `parse_command`'s
-/// wire gate already consulted; a `None` here is unreachable through the
-/// wire but total by construction, never a panic. Steps run in order,
-/// stopping at the first failure: a failing FIRST step returns that reply
-/// unchanged (nothing ran, nothing changed); a failing LATER step means an
-/// earlier step already changed the world, so the reply says so honestly
-/// (`partial: true`) rather than rolling back — deleting a project the
-/// operator may already want, to tidy up a failure they can see and fix in
-/// one click, is worse than the partial state. No retries, no queueing: one
-/// spawn per step, one reply per action.
-fn dispatch_session_action(session_id: &str, action: &str, fields: &Value) -> Value {
-    let Some(plan) = session_action_args(session_id, action, fields) else {
-        return json!({
+/// through [`ActionSubject::plan`] — [`session_action_args`] or
+/// [`project_action_args`], the SAME authority `parse_command`'s wire gate
+/// already consulted; a `None` here is unreachable through the wire but
+/// total by construction, never a panic. Steps run in order, stopping at the
+/// first failure: a failing FIRST step returns that reply unchanged (nothing
+/// ran, nothing changed); a failing LATER step means an earlier step already
+/// changed the world, so the reply says so honestly (`partial: true`) rather
+/// than rolling back — deleting a project the operator may already want, to
+/// tidy up a failure they can see and fix in one click, is worse than the
+/// partial state. No retries, no queueing: one spawn per step, one reply per
+/// action. Generic over [`ActionSubject`] (P-14 M1 §2d) — a session subject
+/// runs the exact same five actions, byte-identical replies and audit
+/// lines, as before the split.
+fn dispatch_session_action(subject: ActionSubject, action: &str, fields: &Value) -> Value {
+    let Some(plan) = subject.plan(action, fields) else {
+        let mut reply = json!({
             "ok": false,
-            "message": "unsupported session action",
+            "message": format!("unsupported {} action", subject.noun()),
             "action": action,
-            "sessionId": session_id,
         });
+        reply[subject.key()] = json!(subject.value());
+        return reply;
     };
 
     let mut last = Value::Null;
     for (i, argv) in plan.iter().enumerate() {
-        let reply = run_session_step(session_id, action, argv);
+        let reply = run_session_step(subject, action, argv);
         let step_ok = reply.get("ok").and_then(Value::as_bool).unwrap_or(false);
         if !step_ok {
             if i == 0 {
-                audit_session_action(action, "sessionaction-failed", "failed");
+                audit_bridge_action(
+                    subject,
+                    action,
+                    &format!("{}-failed", subject.event_prefix()),
+                    "failed",
+                );
                 return reply;
             }
-            // Take the created name from the PLAN, never re-reading
-            // `fields`, so the plan stays the single authority for what
-            // actually ran.
-            let name = plan[0].get(2).map(String::as_str).unwrap_or("");
             let cli_message = reply.get("message").and_then(Value::as_str).unwrap_or("");
-            audit_session_action(action, "sessionaction-partial", "partial");
-            return json!({
+            audit_bridge_action(
+                subject,
+                action,
+                &format!("{}-partial", subject.event_prefix()),
+                "partial",
+            );
+            let message = match subject {
+                // Take the created name from the PLAN, never re-reading
+                // `fields`, so the plan stays the single authority for what
+                // actually ran. Wording unchanged from before the split.
+                ActionSubject::Session(_) => {
+                    let name = plan[0].get(2).map(String::as_str).unwrap_or("");
+                    format!("project {name} created; assigning the session failed: {cli_message}")
+                }
+                ActionSubject::Project(name) => {
+                    format!(
+                        "project {name} partially updated; step {} failed: {cli_message}",
+                        i + 1
+                    )
+                }
+            };
+            let mut reply = json!({
                 "ok": false,
-                "message": format!(
-                    "project {name} created; assigning the session failed: {cli_message}"
-                ),
+                "message": message,
                 "partial": true,
                 "action": action,
-                "sessionId": session_id,
             });
+            reply[subject.key()] = json!(subject.value());
+            return reply;
         }
         last = reply;
     }
-    audit_session_action(action, "sessionaction", "ok");
+    audit_bridge_action(subject, action, subject.event_prefix(), "ok");
     last
 }
 
@@ -1234,7 +1459,29 @@ fn handle_conn(stream: UnixStream) {
                 };
                 std::thread::spawn(move || {
                     use std::io::Write;
-                    let _ = writeln!(reply, "{}", dispatch_session_action(&session_id, &action, &fields));
+                    let subject = ActionSubject::Session(&session_id);
+                    let _ = writeln!(reply, "{}", dispatch_session_action(subject, &action, &fields));
+                });
+                return;
+            }
+            Some(BridgeCommand::ProjectAction { name, action, fields }) => {
+                // Same one-shot-connection discipline as `SessionAction`
+                // above: no reply channel means the action does not run.
+                let Some(mut reply) = reply.take() else {
+                    let _ = daemon::audit(
+                        &daemon::default_audit_log(),
+                        daemon::Door::Daemon,
+                        daemon::EventClass::Audit,
+                        "shellbridge",
+                        "projectaction-noreply",
+                        &format!("project action {action}: no reply channel; not dispatched"),
+                    );
+                    return;
+                };
+                std::thread::spawn(move || {
+                    use std::io::Write;
+                    let subject = ActionSubject::Project(&name);
+                    let _ = writeln!(reply, "{}", dispatch_session_action(subject, &action, &fields));
                 });
                 return;
             }
@@ -1848,6 +2095,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn parse_command_accepts_a_projectaction_with_no_session_id() {
+        // P-14 M1 §2d: `projectaction` is zero-session — no `sessionId`
+        // anywhere on the wire, in the parsed command, or in `fields`.
+        let line = r#"{"cmd":"projectaction","action":"create","name":"n1proj","paths":["/srv/n1proj"]}"#;
+        match parse_command(line) {
+            Some(BridgeCommand::ProjectAction { name, action, fields }) => {
+                assert_eq!(name, "n1proj");
+                assert_eq!(action, "create");
+                assert!(fields.get("sessionId").is_none());
+            }
+            other => panic!("expected a ProjectAction, got {other:?}"),
+        }
+    }
+
     // -- parse gate: rejection --
 
     #[test]
@@ -2110,12 +2372,78 @@ mod tests {
         );
     }
 
+    // -- projectaction argv exactness (P-14 M1 §2d) --
+
+    #[test]
+    fn project_action_args_builds_a_zero_session_create_plan() {
+        let plan = project_action_args(
+            "n1proj",
+            "create",
+            &json!({
+                "paths": ["/srv/n1proj"],
+                "hosts": [{"name": "n1", "roots": ["/srv/n1/proj"]}],
+            }),
+        )
+        .expect("create must build a plan");
+        assert_eq!(
+            plan,
+            vec![
+                sv(&["project", "add", "n1proj", "/srv/n1proj", "--new"]),
+                sv(&["project", "add", "n1proj", "/srv/n1/proj", "--host", "n1"]),
+            ]
+        );
+        // No session id in any step of the plan.
+        for step in &plan {
+            assert!(!step.contains(&"--id".to_string()));
+        }
+    }
+
+    #[test]
+    fn project_action_args_refuses_a_create_with_no_paths() {
+        // An "exact replacement"/creation with nothing to place is a
+        // mistake, never an instruction to erase — same rule
+        // `createproject`/`editproject` hold above.
+        assert_eq!(project_action_args("n1proj", "create", &json!({"paths": []})), None);
+        assert_eq!(project_action_args("n1proj", "create", &json!({})), None);
+        assert_eq!(project_action_args("n1proj", "edit", &json!({"paths": []})), None);
+    }
+
+    #[test]
+    fn project_action_args_refuses_an_ill_shaped_host_name() {
+        // One bad host entry refuses the whole action — the same
+        // whole-array discipline `paths` holds.
+        assert_eq!(
+            project_action_args(
+                "n1proj",
+                "create",
+                &json!({"paths": ["/srv/n1proj"], "hosts": [{"name": "-rf", "roots": []}]})
+            ),
+            None
+        );
+        assert_eq!(
+            project_action_args(
+                "n1proj",
+                "create",
+                &json!({"paths": ["/srv/n1proj"], "hosts": [{"name": "N1", "roots": []}]})
+            ),
+            None
+        );
+        assert_eq!(
+            project_action_args(
+                "n1proj",
+                "removehost",
+                &json!({"hosts": [{"name": "", "roots": []}]})
+            ),
+            None
+        );
+    }
+
     // -- reply shaping --
 
     #[test]
     fn a_session_action_reply_reports_an_ok_outcome_with_its_own_message() {
         let reply = session_action_reply(
-            "s1",
+            ActionSubject::Session("s1"),
             "project",
             true,
             r#"{"status":"ok","command":"session.project","message":"session project updated","gated":false}"#,
@@ -2132,7 +2460,7 @@ mod tests {
     fn a_session_action_reply_carries_the_cli_outcomes_data_verbatim() {
         // A `kill` reply can show the resolved target/pid this way.
         let reply = session_action_reply(
-            "s1",
+            ActionSubject::Session("s1"),
             "kill",
             true,
             r#"{"status":"ok","command":"session.kill","message":"session killed","data":{"pid":1234,"target":"s1"}}"#,
@@ -2145,7 +2473,7 @@ mod tests {
     #[test]
     fn a_session_action_reply_reports_an_error_outcome_as_not_ok() {
         let reply = session_action_reply(
-            "s1",
+            ActionSubject::Session("s1"),
             "kill",
             false,
             r#"{"status":"error","command":"session.kill","message":"session is not registered locally","gated":true}"#,
@@ -2160,7 +2488,7 @@ mod tests {
     #[test]
     fn a_session_action_reply_reads_a_usage_envelope_off_stderr() {
         let reply = session_action_reply(
-            "s1",
+            ActionSubject::Session("s1"),
             "createproject",
             false,
             "",
@@ -2172,12 +2500,17 @@ mod tests {
 
     #[test]
     fn a_session_action_reply_falls_back_when_neither_stream_is_an_envelope() {
-        let reply =
-            session_action_reply("s1", "kill", false, "boom", "aoided must be running for session management");
+        let reply = session_action_reply(
+            ActionSubject::Session("s1"),
+            "kill",
+            false,
+            "boom",
+            "aoided must be running for session management",
+        );
         assert_eq!(reply["ok"], false);
         assert_eq!(reply["message"], "aoided must be running for session management");
 
-        let reply = session_action_reply("s1", "kill", false, "", "");
+        let reply = session_action_reply(ActionSubject::Session("s1"), "kill", false, "", "");
         assert_eq!(reply["ok"], false);
         assert_ne!(reply["message"].as_str().unwrap_or(""), "");
     }
@@ -2185,7 +2518,7 @@ mod tests {
     #[test]
     fn a_session_action_reply_is_one_wire_line() {
         let reply = session_action_reply(
-            "s1",
+            ActionSubject::Session("s1"),
             "project",
             true,
             r#"{"status":"ok","command":"session.project","message":"a\nb"}"#,
