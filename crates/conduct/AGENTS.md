@@ -199,11 +199,13 @@
   is the one writer of a `kind:"app"` record's `parent_session_id`; it sets
   the edge only when ALL of: `cap.parent_thread_id` is `Some(pt)`; `pt` is
   not the record's own id (no self-loop); a record with `session_id == pt`
-  EXISTS in the sessions roster in ANY state — an exited/`"done"` parent
-  still anchors lineage, since it once genuinely spawned this thread, while
-  a native id naming no local record at all is dropped as unresolvable
-  provenance, never written as a promise; and the edge would not close a
-  cycle (`doc.rs::would_cycle`, the same guard `manage.rs::link` and
+  EXISTS in the sessions roster, regardless of that record's own `state`
+  string — a FUNCTION-level rule, not a modeled process-exit path, since
+  `reconcile_codex_app_threads` already drops a dead app thread's record
+  before this function ever runs against the same tick's roster; a native
+  id naming no local record at all is dropped as unresolvable provenance,
+  never written as a promise; and the edge would not close a cycle
+  (`doc.rs::would_cycle`, the same guard `manage.rs::link` and
   `session_store.rs`'s reparent already use — no third cycle-detection
   shape in this crate). It is idempotent: a resumed thread's `session_meta`
   re-read on every capture reapplies the identical edge as a no-op, never
@@ -214,6 +216,40 @@
   `send.rs::deliver_local_with`'s `codex-app-unsupported` refusals still
   fire on the very first `kind:"app"` hop, before either ever reaches a
   parent walk — an ancestry edge is not a transport or a kill grant.
+
+- **Lineage candidates are checked one edge at a time against the LIVE
+  roster, never a snapshot frozen before the tick's own edges land
+  (root order seq 404 fix).** `codex_app.rs::apply_codex_merges` is
+  `sync_codex_app_threads`'s one caller of both `apply_codex_capture` and
+  `apply_codex_lineage`: every `"app"` record's capture is applied first
+  (no cross-record read needed there), then every candidate parent edge is
+  collected and applied IN ORDER, each one judged against `sessions` as it
+  stands at that moment — including any edge an earlier candidate in the
+  SAME pass already wrote. A prior implementation judged every candidate
+  against ONE snapshot taken before the pass started; that let two app
+  records captured in the same tick whose own `session_meta` each named the
+  OTHER as parent both look acyclic against the same starting picture and
+  both land, a two-node cycle. The live-roster check closes that: the
+  second candidate checked finds the first's edge already in place and its
+  own candidate refuses via the ordinary cycle check — no new rule, the
+  same per-record gates applied against a moving target instead of a frozen
+  one.
+
+- **`thread_source` publishes as `SessionRecord.native_role`
+  (`nativeRole` on the wire), never a `kind` reclassification (root order
+  seq 404).** `codex_app.rs::apply_codex_capture` sets it from
+  `cap.thread_source` verbatim, ALWAYS-SET like `say`/`tool`/`model` (never
+  fill-once like `title`'s `nickname`), through the same
+  `MERGED_SOURCE_FIELDS` table those fields use (`thread_source` →
+  `nativeRole`) — so its `sources` pointer rides the same way, and a
+  capture read failure never clears a previously published value. A
+  desktop-Codex `kind:"app"` record stays `"app"` regardless of what
+  `native_role` says: today's tree-nesting rendering keys off `kind`, so
+  `parentSessionId` alone does not nest an app child under its root
+  (root order seq 404) — publishing `nativeRole` beside `parentSessionId`
+  is what lets such a consumer recognize the relationship explicitly,
+  rather than this crate ever reclassifying `kind` to `"subagent"` for
+  presentation.
 
 - **An eidolon presence record is keyed by its native id verbatim, exactly
   like a Codex thread (P-EIDOLON, slice E1b).** `graph/eidolon.rs::

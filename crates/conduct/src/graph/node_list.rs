@@ -523,6 +523,7 @@ mod tests {
             model: None,
             kind: None,
             parent: None,
+            native_role: None,
         }
     }
 

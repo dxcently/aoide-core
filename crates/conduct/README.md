@@ -505,9 +505,10 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
 
   `codex_app.rs`'s `sync_codex_app_threads` is the one call site: it gathers
   one `capture_for` per live thread OUTSIDE the stage lock (alongside the
-  scan's own I/O), then `apply_codex_capture` merges `say`/`tool`/`activity`/
-  `model`/`context_tokens`/`context_ceiling`/`sources` onto that thread's
-  `"app"` record INSIDE the lock — set only when the capture produced a
+  scan's own I/O), then `apply_codex_merges` (`apply_codex_capture` then
+  `apply_codex_lineage`) merges `say`/`tool`/`activity`/`model`/
+  `context_tokens`/`context_ceiling`/`native_role`/`sources` onto that
+  thread's `"app"` record INSIDE the lock — set only when the capture produced a
   value and only when it actually differs, never blanked back out by a quiet
   or partial tail read (the same "never clear, only set" discipline
   `session_store.rs`'s `refresh_transcript_fields` holds for these same
@@ -519,28 +520,39 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   covers the record that set it. `CodexCapture::sources` itself keys by the
   struct's own snake_case field names, so `apply_codex_capture` remaps at
   the boundary (`MERGED_SOURCE_FIELDS`: `context_tokens` → `contextTokens`,
-  `context_ceiling` → `contextCeiling`, the rest unchanged) and copies ONLY
-  the fields it actually applies — a `parentThreadId`/`thread_source`
-  pointer `cap.sources` may carry is never copied, since this merge never
-  sets those VALUES. `state` moved at P-CX-5 S3: `apply_codex_capture` now
-  sets it too, from `cap.state` when `Some` and different, never blanked
-  back out by a `None` read (an unreadable, missing, or momentarily empty
-  rollout) — but its `sources` pointer stays out of `MERGED_SOURCE_FIELDS`
-  on purpose, same as before S3: the VALUE moves, the provenance pointer
-  does not. `title` joined the merge at S4, FILL-ONCE: a captured
-  `nickname` lands on `rec.title` only while the record's own title is
-  empty, never overwriting one already set, with its `sources` pointer
-  stamped under the wire name `title` (outside `MERGED_SOURCE_FIELDS`,
-  since that list is unconditional and this fill is not). `parentSessionId`
-  is S4's other half, but never `apply_codex_capture`'s to set:
-  `apply_codex_lineage` folds a captured `parent_thread_id` into the edge
-  on its own, since it needs the FULL sessions roster (existence,
-  self-reference, and cycle checks via `doc.rs::would_cycle`) that this
-  merge never sees. The edge grants no authority — `kind`/`agent` stay
-  `"app"`/`"codex"` through it, so `send`'s `codex-app-unsupported` and
-  `kill_target`'s `APP_OWNS_PROCESS` refusals fire identically before
-  either ever reaches a parent walk. See CONTRACTS.md §4 for the `sources`
-  schema entry.
+  `context_ceiling` → `contextCeiling`, `thread_source` → `nativeRole`, the
+  rest unchanged) and copies ONLY the fields it actually applies — a
+  `parentThreadId` pointer `cap.sources` may carry is never copied, since
+  this merge never sets that VALUE (`apply_codex_lineage` does, below).
+  `state` moved at P-CX-5 S3: `apply_codex_capture` now sets it too, from
+  `cap.state` when `Some` and different, never blanked back out by a `None`
+  read (an unreadable, missing, or momentarily empty rollout) — but its
+  `sources` pointer stays out of `MERGED_SOURCE_FIELDS` on purpose, same as
+  before S3: the VALUE moves, the provenance pointer does not. `title`
+  joined the merge at S4, FILL-ONCE: a captured `nickname` lands on
+  `rec.title` only while the record's own title is empty, never overwriting
+  one already set, with its `sources` pointer stamped under the wire name
+  `title` (outside `MERGED_SOURCE_FIELDS`, since that list is unconditional
+  and this fill is not). `native_role` joined at root order seq 404,
+  ALWAYS-SET like `say`/`tool`/`model` rather than fill-once like `title`: a
+  captured `thread_source` (`session_meta`'s own `user`/`subagent`/
+  `guardian_review`) lands verbatim on `rec.native_role`, wire name
+  `nativeRole`, whenever `Some` and different — a published fact beside
+  `kind`, never a reclassification of it (a nested app child still reads
+  `kind:"app"`). `parentSessionId` is S4's other half, but never
+  `apply_codex_capture`'s to set: `apply_codex_lineage` folds a captured
+  `parent_thread_id` into the edge on its own, since it needs the FULL
+  sessions roster (existence, self-reference, and cycle checks via
+  `doc.rs::would_cycle`) that this merge never sees — checked ONE EDGE AT A
+  TIME against the LIVE roster by `apply_codex_merges` (the caller both
+  functions share), never a snapshot frozen before the tick's own edges
+  start landing, so two app records captured in the same tick whose own
+  `session_meta` each name the OTHER as parent can never both pass. The
+  edge grants no authority — `kind`/`agent` stay `"app"`/`"codex"` through
+  it, so `send`'s `codex-app-unsupported` and `kill_target`'s
+  `APP_OWNS_PROCESS` refusals fire identically before either ever reaches a
+  parent walk. See CONTRACTS.md §4 for the `sources`/`nativeRole` schema
+  entries.
 - `graph/eidolon.rs` — eidolon presence reconciliation (P-EIDOLON, slice
   E1b; readiness E2 folded in). `reconcile_eidolon_sessions` mirrors
   `reconcile_codex_app_threads` rule for rule (upsert in place, remove what

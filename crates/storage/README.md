@@ -96,6 +96,14 @@ by decision — no embedded database yet
   of the thread's own rollout it came from. A general `SessionRecord` field,
   not a Codex-only one — but a second producer wanting the same shape earns
   its own slice, never a second field (P-CX-5, codex seq 228 ruling R3).
+- `records::SessionRecord.native_role` — an optional, additive string (wire
+  name `nativeRole`, serialised only when `Some`, root order seq 404): the
+  native harness's own thread-role label, verbatim (`session_meta.
+  thread_source`'s `user`/`subagent`/`guardian_review` off a desktop-Codex
+  rollout, today's one producer — `aoide-conduct::graph::codex_app`'s
+  capture merge). A published FACT, not a reclassification: `kind` is
+  untouched by it, so a record this crate calls `"app"` stays `"app"`
+  regardless of what native harness role it also carries.
 - `config` — the portable runtime config (task #135 P-C, CONTRACTS.md §4's
   `config.toml` subsection): `$AOIDE_ROOT/config.toml`, the one file here
   that records INTENT rather than state. It exists because core is portable

@@ -1797,6 +1797,7 @@ mod tests {
             exempt: false,
             harness_session_id: None,
             resumed_from: None,
+            native_role: None,
             origin: None,
             seal: None,
             sealed_issued_at: None,

@@ -57,17 +57,25 @@
 //! record's own title is empty/`None`, never overwriting one already set
 //! (by a real `session send` auto-rename or otherwise), with its `sources`
 //! entry stamped under the wire name `title` (never `nickname`, which is
-//! not a `SessionRecord` field) only the tick it actually fires —
-//! `thread_source` is parsed by [`super::codex_capture`] but never merged
-//! onto any field of this record. `parentSessionId` is S4's other half but
-//! never this same function's to set: [`apply_codex_lineage`] folds a
-//! captured `parent_thread_id` into the edge on its own, because the
+//! not a `SessionRecord` field) only the tick it actually fires.
+//! `thread_source` joins the same merge (root order seq 404), but
+//! ALWAYS-SET like `say`/`tool`/`model` rather than fill-once like
+//! `title`: it lands verbatim on `rec.native_role`, wire name `nativeRole`,
+//! in [`MERGED_SOURCE_FIELDS`] alongside them — publishing what the native
+//! harness itself calls this thread's role (`subagent`, `guardian_review`,
+//! …), never a classification this crate invents or reclassifies `kind`
+//! from. `parentSessionId` is S4's other half but never this same
+//! function's to set: [`apply_codex_lineage`] folds a captured
+//! `parent_thread_id` into the edge on its own, because the
 //! existence/self-reference/cycle checks it needs read the FULL sessions
-//! roster this merge never sees. The edge grants no authority — `kind`/
-//! `agent` stay `"app"`/`"codex"` through it, so `session kill`'s
-//! `APP_OWNS_PROCESS` and `send`'s `codex-app-unsupported` refusals fire
-//! identically before either ever reaches a parent walk. See
-//! [`apply_codex_capture`] and [`apply_codex_lineage`].
+//! roster this merge never sees — one edge at a time against the LIVE
+//! roster as it stands mid-tick, never a frozen snapshot taken before the
+//! tick's own edges start landing (see [`apply_codex_merges`] for why).
+//! The edge grants no authority — `kind`/`agent` stay `"app"`/`"codex"`
+//! through it, so `session kill`'s `APP_OWNS_PROCESS` and `send`'s
+//! `codex-app-unsupported` refusals fire identically before either ever
+//! reaches a parent walk. See [`apply_codex_capture`] and
+//! [`apply_codex_lineage`].
 
 use super::codex_capture::{capture_for, CodexCapture};
 use super::doc::{restage_graph, would_cycle};
@@ -680,7 +688,10 @@ fn audit_scan_unknown_once(failure: &ScanFailure) {
 /// whenever `cap_sources` carries it, but `title`'s own pointer only ever
 /// moves the tick a `nickname` actually fills an empty title — a
 /// conditional rule this uniform list cannot express, so [`apply_codex_capture`]
-/// stamps it in its own small block instead.
+/// stamps it in its own small block instead. `thread_source` → `nativeRole`
+/// (root order seq 404) belongs here rather than beside `nickname`: unlike
+/// `title`, `rec.native_role` is always-set (never fill-once), so the same
+/// unconditional copy every other entry gets is exactly right.
 const MERGED_SOURCE_FIELDS: &[(&str, &str)] = &[
     ("say", "say"),
     ("tool", "tool"),
@@ -688,41 +699,53 @@ const MERGED_SOURCE_FIELDS: &[(&str, &str)] = &[
     ("model", "model"),
     ("context_tokens", "contextTokens"),
     ("context_ceiling", "contextCeiling"),
+    ("thread_source", "nativeRole"),
 ];
 
 /// Merge [`CodexCapture`]'s fields onto `rec` — `state`/`say`/`tool`/
-/// `activity`/`model`/`context_tokens`/`context_ceiling`/`sources`/`title`,
-/// each set only when `cap` produced `Some` AND the value actually differs: a
-/// quiet or partial tail read (every field `None`) changes nothing, and a
-/// value this merge already set is never blanked back out just because a
-/// LATER tick's tail window no longer covers the record that set it — the
-/// same "never clear, only set" discipline `session_store.rs`'s
-/// `refresh_transcript_fields` already holds for these very fields, `state`
-/// included (P-CX-5 S3): an unreadable, missing, or empty rollout reads
-/// `cap.state` as `None` and leaves the record's last state exactly where it
-/// was, never resetting it to `"idle"`. `cap.state` is only ever
-/// `working`/`idle` (the fold's own vocabulary — see `codex_capture.rs`), so
-/// this merge can never write `"awaiting"` onto an app record either.
+/// `activity`/`model`/`context_tokens`/`context_ceiling`/`native_role`/
+/// `sources`/`title`, each set only when `cap` produced `Some` AND the value
+/// actually differs: a quiet or partial tail read (every field `None`)
+/// changes nothing, and a value this merge already set is never blanked back
+/// out just because a LATER tick's tail window no longer covers the record
+/// that set it — the same "never clear, only set" discipline
+/// `session_store.rs`'s `refresh_transcript_fields` already holds for these
+/// very fields, `state` included (P-CX-5 S3): an unreadable, missing, or
+/// empty rollout reads `cap.state` as `None` and leaves the record's last
+/// state exactly where it was, never resetting it to `"idle"`. `cap.state`
+/// is only ever `working`/`idle` (the fold's own vocabulary — see
+/// `codex_capture.rs`), so this merge can never write `"awaiting"` onto an
+/// app record either.
 /// `sources` is EXTENDED, never replaced, and restricted to
 /// [`MERGED_SOURCE_FIELDS`] plus `title`'s own conditional stamp below: a
-/// `state`/`parent_thread_id`/`thread_source` pointer `cap.sources` may
-/// carry is never copied here — `state` stays out of that list even though
-/// its VALUE now moves (its pointer is not yet part of this scheme), and
-/// `parent_thread_id`/`thread_source` stay out because this merge never
-/// sets those values at all — a `sources` entry names a field THIS record
-/// actually carries a pointer FOR, never a promise about a field a
-/// different function (or no function) sets. An entry already on
-/// `rec.sources` with no counterpart in `cap.sources` this tick is left
-/// standing — a shown datum's pointer must not vanish just because a later
-/// capture happened not to re-see the record that set it. Returns whether
-/// anything changed.
+/// `state`/`parent_thread_id` pointer `cap.sources` may carry is never
+/// copied here — `state` stays out of that list even though its VALUE now
+/// moves (its pointer is not yet part of this scheme), and
+/// `parent_thread_id` stays out because this merge never sets that value at
+/// all (that's [`apply_codex_lineage`]'s alone) — a `sources` entry names a
+/// field THIS record actually carries a pointer FOR, never a promise about
+/// a field a different function (or no function) sets. `thread_source` is
+/// the one exception to "this merge never sets it": it lands verbatim on
+/// `rec.native_role` (root order seq 404) through the same
+/// [`MERGED_SOURCE_FIELDS`] table as `say`/`tool`/`model`, so its pointer
+/// DOES land under the wire name `nativeRole` whenever `cap_sources` carries
+/// one. An entry already on `rec.sources` with no counterpart in
+/// `cap.sources` this tick is left standing — a shown datum's pointer must
+/// not vanish just because a later capture happened not to re-see the
+/// record that set it. Returns whether anything changed.
 ///
 /// `title` joins the merge at S4 (P-CX-5 S4), FILL-ONCE only: a captured
 /// `nickname` lands on `rec.title` while the record's own title is
 /// empty/`None`, and never overwrites one already set — by a real
 /// `session send` auto-rename, an operator edit, or an earlier tick's own
-/// fill. `thread_source` is parsed by `codex_capture.rs` but never merged
-/// onto any field here or anywhere else in this module.
+/// fill. `native_role` joins at root order seq 404, ALWAYS-SET like
+/// `say`/`tool`/`model`: a captured `thread_source` lands on
+/// `rec.native_role` verbatim, unconditionally, every tick it differs —
+/// publishing the native harness's own thread-role label, never a
+/// classification this crate invents. `rec.kind` is untouched by it either
+/// way (still `"app"`, re-applied every upsert by
+/// [`reconcile_codex_app_threads`]): `native_role` is a published fact
+/// beside `kind`, never a substitute for it.
 ///
 /// Deliberately never touches `parent_session_id` even though `cap` may
 /// carry a value for it — [`apply_codex_lineage`] is that edge's one
@@ -773,6 +796,12 @@ fn apply_codex_capture(rec: &mut SessionRecord, cap: &CodexCapture) -> bool {
             changed = true;
         }
     }
+    if let Some(role) = &cap.thread_source {
+        if rec.native_role.as_deref() != Some(role.as_str()) {
+            rec.native_role = Some(role.clone());
+            changed = true;
+        }
+    }
     if let Some(nickname) = &cap.nickname {
         let title_empty = rec.title.as_deref().is_none_or(str::is_empty);
         if title_empty {
@@ -813,11 +842,18 @@ fn apply_codex_capture(rec: &mut SessionRecord, cap: &CodexCapture) -> bool {
 ///   * `cap.parent_thread_id` is `Some(pt)`;
 ///   * `pt` is not `rec.session_id` itself (a self-referential id writes
 ///     no edge, never a self-loop);
-///   * a record with `session_id == pt` EXISTS somewhere in `sessions` —
-///     in ANY state, an exited/`"done"` parent still anchors lineage,
-///     since it once genuinely spawned this thread; a dangling native id
-///     naming no local record at all is dropped as unresolvable provenance,
-///     never written as a promise; and
+///   * a record with `session_id == pt` EXISTS somewhere in `sessions` — the
+///     check is purely "does an id equal to `pt` appear," regardless of
+///     that record's own `state` string. This is a FUNCTION-level rule, not
+///     a modeled process-exit path: `reconcile_codex_app_threads` already
+///     drops a dead app thread's record (its lock gone) BEFORE this
+///     function ever runs against the same tick's roster, so an `"app"`
+///     parent found here has never actually exited mid-tick — a record
+///     sitting in a non-default `state` string (a synthetic `"done"` in
+///     this crate's own tests, say) still anchors lineage simply because it
+///     exists, the same as any other. A dangling native id naming no local
+///     record at all is dropped as unresolvable provenance, never written
+///     as a promise; and
 ///   * linking would not close a cycle ([`would_cycle`], the same guard
 ///     `manage.rs`'s `link` and `session_store.rs`'s reparent already use —
 ///     no third cycle-detection shape in this crate).
@@ -832,11 +868,15 @@ fn apply_codex_capture(rec: &mut SessionRecord, cap: &CodexCapture) -> bool {
 /// so `graph/actions.rs::kill_target`'s `APP_OWNS_PROCESS` refusal and
 /// `graph/send.rs::deliver_local_with`'s `codex-app-unsupported` refusal
 /// both still fire on the very first `kind:"app"` hop, before either ever
-/// reaches a parent walk. `sessions` is a snapshot taken BEFORE this tick's
-/// own merges (see the call site in [`sync_codex_app_threads`]) — a
-/// dangling or cyclic candidate is judged against the graph as it stood at
-/// the start of the tick, never against a sibling edge this same pass is
-/// still in the middle of writing.
+/// reaches a parent walk. `sessions` MUST be the LIVE vector as it stands
+/// at the call site, never a snapshot taken before the tick's own edges
+/// start landing: [`sync_codex_app_threads`] applies one candidate edge at
+/// a time, in the roster's own order, so a candidate checked here sees
+/// every edge an EARLIER candidate in the SAME tick already wrote. That is
+/// what stops two app records captured in the same tick whose own
+/// `session_meta` each name the OTHER as parent from both passing — the
+/// second one checked finds the first's edge already in place, and its own
+/// candidate would close a cycle through it.
 fn apply_codex_lineage(
     rec: &mut SessionRecord,
     cap: &CodexCapture,
@@ -861,10 +901,82 @@ fn apply_codex_lineage(
     true
 }
 
+/// One tick's whole merge pass over an already-reconciled `sessions` vector
+/// — [`apply_codex_capture`] for every `"app"` record with a capture this
+/// tick, then [`apply_codex_lineage`] for the same records, PURE (no I/O,
+/// no stage lock) so a test can drive it directly with synthetic sessions
+/// and captures. Split into two loops rather than one, in this order,
+/// because the two need different views of `sessions`:
+///
+///   1. `apply_codex_capture` touches only the record it is given — no
+///      cross-record read — so a single `iter_mut()` pass applies every
+///      capture's `say`/`tool`/`model`/`native_role`/etc. in any order.
+///   2. `apply_codex_lineage` reads the FULL roster (existence, self,
+///      [`would_cycle`]) to decide whether ITS OWN candidate edge is safe —
+///      so it CANNOT run inside the same `iter_mut()` (that would need a
+///      mutable and an immutable borrow of `sessions` at once) and, more
+///      importantly, must not be judged against a snapshot frozen before
+///      this tick's own edges start landing: two app records captured in
+///      the SAME tick whose own `session_meta` each name the OTHER as
+///      parent would both look acyclic against an identical starting
+///      picture, and BOTH edges would land — a two-node cycle. Collecting
+///      every candidate index first, then applying them ONE AT A TIME
+///      against `sessions` as it currently stands (cloning just the one
+///      record under test, so the borrow checker never needs a live `&mut`
+///      and a live `&` on the same vector), means the second of a mutual
+///      pair sees the first's edge already written and refuses via the
+///      ordinary cycle check — no new rule, just the existing per-record
+///      gates applied against a moving target instead of a frozen one.
+///
+/// Returns whether anything changed.
+fn apply_codex_merges(
+    sessions: &mut [SessionRecord],
+    captures: &BTreeMap<String, CodexCapture>,
+) -> bool {
+    let mut changed = false;
+
+    for rec in sessions.iter_mut() {
+        if rec.kind.as_deref() != Some("app") {
+            continue;
+        }
+        if let Some(cap) = captures.get(&rec.session_id) {
+            if apply_codex_capture(rec, cap) {
+                changed = true;
+            }
+        }
+    }
+
+    let candidates: Vec<usize> = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, rec)| {
+            rec.kind.as_deref() == Some("app")
+                && captures
+                    .get(&rec.session_id)
+                    .is_some_and(|cap| cap.parent_thread_id.is_some())
+        })
+        .map(|(i, _)| i)
+        .collect();
+    for idx in candidates {
+        let id = sessions[idx].session_id.clone();
+        let Some(cap) = captures.get(&id) else {
+            continue;
+        };
+        let mut rec = sessions[idx].clone();
+        if apply_codex_lineage(&mut rec, cap, sessions) {
+            sessions[idx] = rec;
+            changed = true;
+        }
+    }
+
+    changed
+}
+
 /// The I/O wrapper over [`reconcile_codex_app_threads`] — gathers a
 /// [`ThreadScan`], reconciles under the stage lock, merges each live
 /// thread's own [`capture_for`] onto its `"app"` record
-/// ([`apply_codex_capture`]), and re-stages `graph.json` only when
+/// ([`apply_codex_merges`], which internally calls [`apply_codex_capture`]
+/// then [`apply_codex_lineage`]), and re-stages `graph.json` only when
 /// something changed. Mirrors [`super::window::sync_untracked_terminal_windows`]'s
 /// shape. An `Unknown` scan takes NO stage lock and writes NOTHING —
 /// [`audit_scan_unknown_once`] notes it and this returns `false`, same as
@@ -923,23 +1035,8 @@ pub(crate) fn sync_codex_app_threads() -> bool {
         };
         let (mut sessions, mut changed) =
             reconcile_codex_app_threads(std::mem::take(&mut file.sessions), &scan);
-        // Snapshot BEFORE this tick's own merges — `apply_codex_lineage`'s
-        // existence/cycle checks judge a candidate parent against the graph
-        // as it stood at the start of the tick, never against a sibling
-        // edge this same pass is still in the middle of writing.
-        let lineage_snapshot = sessions.clone();
-        for rec in sessions.iter_mut() {
-            if rec.kind.as_deref() != Some("app") {
-                continue;
-            }
-            if let Some(cap) = captures.get(&rec.session_id) {
-                if apply_codex_capture(rec, cap) {
-                    changed = true;
-                }
-                if apply_codex_lineage(rec, cap, &lineage_snapshot) {
-                    changed = true;
-                }
-            }
+        if apply_codex_merges(&mut sessions, &captures) {
+            changed = true;
         }
         file.sessions = sessions;
         if !changed {
@@ -1758,13 +1855,15 @@ mod tests {
 
     #[test]
     fn the_merge_still_never_sets_parent_session_id_and_never_overwrites_a_title() {
-        // `cap` carries values for `parent_thread_id`/`nickname` (a real
-        // capture off a rollout with a `session_meta` header would).
-        // `parent_session_id` is never this function's to set — that's
-        // `apply_codex_lineage`'s own slice, covered separately below.
-        // `title` DOES join this merge at S4, but fill-once only: a
+        // `cap` carries values for `parent_thread_id`/`thread_source`/
+        // `nickname` (a real capture off a rollout with a `session_meta`
+        // header would). `parent_session_id` is never this function's to
+        // set — that's `apply_codex_lineage`'s own slice, covered separately
+        // below. `title` DOES join this merge at S4, but fill-once only: a
         // record whose title is already set (as this one's is) must never
-        // have it overwritten by a captured `nickname`.
+        // have it overwritten by a captured `nickname`. `native_role` DOES
+        // join this merge (root order seq 404), always-set — so `changed`
+        // is `true` here purely from that field moving.
         let mut rec = app_record("01a-lineage");
         rec.title = Some("original title".to_string());
         let before = rec.clone();
@@ -1776,12 +1875,13 @@ mod tests {
         };
         let changed = apply_codex_capture(&mut rec, &cap);
         assert!(
-            !changed,
-            "parent_thread_id is never this function's field, and an already-set title is never overwritten"
+            changed,
+            "native_role moves even though parent_thread_id is never this function's field and an already-set title is never overwritten"
         );
         assert_eq!(rec.state, before.state);
         assert_eq!(rec.parent_session_id, before.parent_session_id);
         assert_eq!(rec.title, before.title);
+        assert_eq!(rec.native_role.as_deref(), Some("subagent"));
     }
 
     #[test]
@@ -1945,14 +2045,17 @@ mod tests {
     }
 
     #[test]
-    fn a_state_or_lineage_pointer_in_cap_sources_is_never_copied() {
+    fn a_state_or_lineage_pointer_in_cap_sources_is_never_copied_but_native_role_is() {
         // A capture off a `session_meta`/turn-bracket header points `state`/
         // `parent_thread_id`/`thread_source`/`nickname`. `state`'s own VALUE
         // still moves (so `changed` is `true` here), but `state`/
-        // `parent_thread_id`/`thread_source` are never in `MERGED_SOURCE_FIELDS`
-        // and `parent_session_id` is never this function's field at all — so
-        // `rec.sources` must stay `None`. The title is pre-set here
-        // specifically so the `nickname` fill-once rule (its own coverage:
+        // `parent_thread_id` are never in `MERGED_SOURCE_FIELDS` and
+        // `parent_session_id` is never this function's field at all — so
+        // neither contributes a `rec.sources` entry. `thread_source` DOES
+        // (root order seq 404, under the wire name `nativeRole`) — it is the
+        // one exception, not excluded alongside its `session_meta` siblings.
+        // The title is pre-set here specifically so the `nickname` fill-once
+        // rule (its own coverage:
         // `a_nickname_fills_an_empty_title_and_never_overwrites_one`) can
         // never fire and confound this test's own question: a `sources`
         // entry must never promise a field the record does not actually
@@ -1981,9 +2084,12 @@ mod tests {
             "state's own value still moves even though its pointer is never copied"
         );
         assert_eq!(rec.state, "working");
+        assert_eq!(rec.native_role.as_deref(), Some("subagent"));
+        let sources = rec.sources.expect("thread_source's pointer must land");
+        assert_eq!(sources.len(), 1, "state/parent_thread_id/nickname (title already set) contribute no entry: {sources:?}");
         assert_eq!(
-            rec.sources, None,
-            "none of cap.sources's keys are ones this merge ever copies"
+            sources.get("nativeRole"),
+            Some(&"/rollout.jsonl#0".to_string())
         );
     }
 
@@ -2069,9 +2175,12 @@ mod tests {
 
     #[test]
     fn an_exited_parent_still_anchors_the_edge() {
-        // `canonical_state(&s.state) == "done"` — an exited thread — still
-        // EXISTS in the sessions vec; the rule only asks for existence, in
-        // ANY state, since a done parent once genuinely spawned this thread.
+        // A record sitting on a synthetic `"done"` state string still
+        // EXISTS in the sessions vec; the rule is FUNCTION-level existence
+        // regardless of `state`, not a modeled process-exit path — a real
+        // exited app thread's record is already gone by the time this runs
+        // (`reconcile_codex_app_threads` drops it first). This fixture just
+        // proves the check reads existence, not the state string.
         let mut exited_parent = app_record("01a-root");
         exited_parent.state = "done".to_string();
         let mut child = app_record("01a-child");
@@ -2297,5 +2406,121 @@ mod tests {
             Some("aoide"),
             "the child must inherit its parent's effective project through this slice's own edge"
         );
+    }
+
+    // ---- root order seq 404: `thread_source` -> `native_role` ----------
+
+    #[test]
+    fn a_thread_source_is_published_as_native_role_and_kind_stays_app() {
+        let mut rec = app_record("01a-native-role");
+        let cap = CodexCapture {
+            thread_source: Some("subagent".to_string()),
+            ..Default::default()
+        };
+        assert!(apply_codex_capture(&mut rec, &cap));
+        assert_eq!(rec.native_role.as_deref(), Some("subagent"));
+        assert_eq!(
+            rec.kind.as_deref(),
+            Some("app"),
+            "a published native role is never a kind reclassification"
+        );
+    }
+
+    #[test]
+    fn native_role_survives_a_capture_read_failure() {
+        let mut rec = app_record("01a-native-role-sticky");
+        rec.native_role = Some("subagent".to_string());
+        let changed = apply_codex_capture(&mut rec, &CodexCapture::default());
+        assert!(
+            !changed,
+            "a None thread_source read must never itself report a change"
+        );
+        assert_eq!(
+            rec.native_role.as_deref(),
+            Some("subagent"),
+            "a None capture must never clear a previously published native role"
+        );
+    }
+
+    // ---- the two-pass lineage fix: no frozen pre-tick snapshot ----------
+
+    #[test]
+    fn two_same_tick_captures_pointing_at_each_other_write_at_most_one_edge() {
+        // Two app records captured in the SAME tick whose own `session_meta`
+        // each name the OTHER as parent — checked one edge at a time against
+        // the LIVE vector, never a snapshot frozen before either edge landed,
+        // so at most one direction of the mutual pair can ever pass.
+        let a = app_record("01a-mutual-a");
+        let b = app_record("01a-mutual-b");
+        let mut sessions = vec![a, b];
+        let mut captures = BTreeMap::new();
+        captures.insert(
+            "01a-mutual-a".to_string(),
+            CodexCapture {
+                parent_thread_id: Some("01a-mutual-b".to_string()),
+                ..Default::default()
+            },
+        );
+        captures.insert(
+            "01a-mutual-b".to_string(),
+            CodexCapture {
+                parent_thread_id: Some("01a-mutual-a".to_string()),
+                ..Default::default()
+            },
+        );
+
+        assert!(apply_codex_merges(&mut sessions, &captures));
+
+        let a_parent = sessions
+            .iter()
+            .find(|s| s.session_id == "01a-mutual-a")
+            .unwrap()
+            .parent_session_id
+            .clone();
+        let b_parent = sessions
+            .iter()
+            .find(|s| s.session_id == "01a-mutual-b")
+            .unwrap()
+            .parent_session_id
+            .clone();
+        assert!(
+            !(a_parent.is_some() && b_parent.is_some()),
+            "both edges landing would BE a two-node cycle: a={a_parent:?} b={b_parent:?}"
+        );
+        assert!(
+            a_parent.is_some() || b_parent.is_some(),
+            "the first candidate checked has nothing yet refusing it"
+        );
+        // `would_cycle(sessions, child, parent)` asks a HYPOTHETICAL —
+        // "would child->parent close a loop" — which trivially answers
+        // `true` once one real edge exists between the two (exactly what a
+        // legitimate single-direction edge looks like from the far end), so
+        // it is the wrong tool to ask "does a cycle exist right now." Walk
+        // each record's own `parent_session_id` chain instead and confirm
+        // it terminates without ever revisiting its own starting id.
+        for start in ["01a-mutual-a", "01a-mutual-b"] {
+            let mut seen = std::collections::HashSet::new();
+            let mut cur = start.to_string();
+            loop {
+                assert!(seen.insert(cur.clone()), "cycle detected starting from {start}");
+                match sessions
+                    .iter()
+                    .find(|s| s.session_id == cur)
+                    .and_then(|s| s.parent_session_id.clone())
+                {
+                    Some(next) => cur = next,
+                    None => break,
+                }
+            }
+        }
+        // Whichever edge landed is a VALID one: its own parent points at
+        // the other record, which carries no parent back onto it.
+        if let Some(p) = &a_parent {
+            assert_eq!(p, "01a-mutual-b");
+            assert_eq!(b_parent, None);
+        } else if let Some(p) = &b_parent {
+            assert_eq!(p, "01a-mutual-a");
+            assert_eq!(a_parent, None);
+        }
     }
 }

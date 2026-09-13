@@ -494,6 +494,21 @@ pub struct SessionRecord {
     /// `skip_serializing_if` discipline as `harnessSessionId`/`seal` above.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sources: Option<BTreeMap<String, String>>,
+    /// The native harness's own thread-role label for this record — today,
+    /// `session_meta.thread_source` off a desktop-Codex rollout header
+    /// (`user`/`subagent`/`guardian_review`, verbatim, never inferred or
+    /// enumerated here), published unconditionally by
+    /// `aoide-conduct::graph::codex_app`'s capture merge (root order seq
+    /// 404) whenever the native harness reports one. A PUBLISHED FACT, not a
+    /// reclassification: `kind` stays exactly what it was (`"app"` for a
+    /// desktop-Codex record) regardless of this field — a graph/roster
+    /// consumer wanting to NEST a parented app thread under its root reads
+    /// `nativeRole` beside `parentSessionId`, rather than this crate ever
+    /// flipping `kind` to `"subagent"` for presentation. Additive/v0-safe:
+    /// absent on a legacy record and on every record no native harness has
+    /// ever published one for.
+    #[serde(rename = "nativeRole", default, skip_serializing_if = "Option::is_none")]
+    pub native_role: Option<String>,
     #[serde(flatten)]
     pub extra: Map<String, Value>,
 }
@@ -902,6 +917,29 @@ mod tests {
         let legacy: SessionRecord =
             serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
         assert_eq!(legacy.sources, None);
+    }
+    #[test]
+    fn a_legacy_record_without_native_role_reads_back_unchanged() {
+        // serde: `nativeRole` serialises as a string when Some, and is
+        // skipped (skip_serializing_if) when None — additive/v0-safe on the
+        // wire, same discipline as `sources`/`seal` above (root order seq
+        // 404).
+        let mut rec = SessionRecord { session_id: "s".into(), ..Default::default() };
+        rec.native_role = Some("subagent".to_string());
+        let json = serde_json::to_string(&rec).unwrap();
+        assert!(json.contains("\"nativeRole\":\"subagent\""), "serialised: {json}");
+        let back: SessionRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.native_role, rec.native_role);
+
+        // A record with no nativeRole omits the key entirely (no null
+        // noise), and a legacy record predating the field parses to `None`
+        // and reads back unchanged.
+        let bare = SessionRecord { session_id: "s".into(), ..Default::default() };
+        let bare_json = serde_json::to_string(&bare).unwrap();
+        assert!(!bare_json.contains("nativeRole"), "serialised: {bare_json}");
+        let legacy: SessionRecord =
+            serde_json::from_str(r#"{ "sessionId": "s", "windowAddress": "0x1" }"#).unwrap();
+        assert_eq!(legacy.native_role, None);
     }
     #[test]
     fn session_records_round_trip_unknown_fields() {

@@ -123,6 +123,14 @@ pub fn build_graph(
         if let Some(pn) = &s.petname {
             node["petname"] = json!(pn);
         }
+        // The native harness's own thread-role label (root order seq 404) —
+        // `subagent`/`guardian_review`/… verbatim off `SessionRecord.
+        // native_role`, rides only when the native harness published one.
+        // `role` above (from `kind`) is untouched: a nested app child still
+        // publishes `role:"app"`, never reclassified for this.
+        if let Some(nr) = &s.native_role {
+            node["nativeRole"] = json!(nr);
+        }
         // The agent's latest words (transcript tail), when it has spoken.
         if let Some(say) = &s.say {
             node["say"] = json!(say);
@@ -995,6 +1003,30 @@ mod tests {
         let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
         assert_eq!(node_a["petname"], json!("brave-otter"));
         assert!(node_b.get("petname").is_none());
+    }
+    #[test]
+    fn the_graph_session_node_carries_native_role_only_when_present() {
+        // Root order seq 404: `nativeRole` rides onto a session node only
+        // when the native harness published one — `role` (from `kind`)
+        // stays `"app"` regardless, never reclassified for this.
+        let with_role = SessionRecord {
+            session_id: "a".into(),
+            kind: Some("app".into()),
+            native_role: Some("subagent".into()),
+            ..Default::default()
+        };
+        let without_role = SessionRecord {
+            session_id: "b".into(),
+            kind: Some("app".into()),
+            ..Default::default()
+        };
+        let doc = build_graph(&[], &[with_role, without_role], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node_a = nodes.iter().find(|n| n["id"] == "session:a").unwrap();
+        let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
+        assert_eq!(node_a["nativeRole"], json!("subagent"));
+        assert_eq!(node_a["role"], json!("app"), "kind stays app, never reclassified");
+        assert!(node_b.get("nativeRole").is_none());
     }
     #[test]
     fn graph_json_publishes_effective_project_on_a_child_outside_its_cwd_anchor() {

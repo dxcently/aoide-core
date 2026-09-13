@@ -153,6 +153,12 @@ pub(super) struct SessionView {
     /// for `role`, its `from` minus the `session:` prefix. `None` for a
     /// root session on either side.
     pub(super) parent: Option<String>,
+    /// The native harness's own thread-role label (`SessionRecord.native_role`
+    /// / the node's own `nativeRole` key, root order seq 404) — `subagent`,
+    /// `guardian_review`, … verbatim, never inferred here. Same absent-stays-
+    /// absent discipline as `title`/`model`; `kind` above is untouched by it
+    /// either way (a nested app child still reads `kind:"app"`).
+    pub(super) native_role: Option<String>,
 }
 
 /// One node (this box, or one registered node) as the host-grouped rendering
@@ -212,6 +218,7 @@ pub(super) fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord],
                 model: s.model.clone(),
                 kind: s.kind.clone(),
                 parent,
+                native_role: s.native_role.clone(),
             }
         })
         .collect();
@@ -270,6 +277,7 @@ pub(super) fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView>
                 model: n["model"].as_str().map(String::from),
                 kind: n["role"].as_str().map(String::from),
                 parent,
+                native_role: n["nativeRole"].as_str().map(String::from),
             }
         })
         .collect()
@@ -498,6 +506,9 @@ fn session_view_json(s: &SessionView) -> Value {
     });
     if let Some(ep) = &s.effective_project {
         v["effectiveProject"] = json!(ep);
+    }
+    if let Some(nr) = &s.native_role {
+        v["nativeRole"] = json!(nr);
     }
     v
 }
@@ -971,8 +982,8 @@ mod tests {
             fetched_at: None,
             error: None,
             sessions: vec![
-                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, effective_project: None, exempt: true, title: None, model: None, kind: None, parent: None },
-                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, effective_project: None, exempt: false, title: None, model: None, kind: None, parent: None },
+                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, effective_project: None, exempt: true, title: None, model: None, kind: None, parent: None, native_role: None },
+                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, effective_project: None, exempt: false, title: None, model: None, kind: None, parent: None, native_role: None },
             ],
         }];
         let rendered = render_nodes(&nodes);
@@ -995,7 +1006,7 @@ mod tests {
                 cwd: "/x".into(), project: None,
                 effective_project: None,
                 exempt: true,
-                title: None, model: None, kind: None, parent: None,
+                title: None, model: None, kind: None, parent: None, native_role: None,
             }],
         }];
         let rendered = render_groups(&groups);
@@ -1030,7 +1041,7 @@ mod tests {
                 cwd: "/y".to_string(), project: None,
                 effective_project: None,
                 exempt: false,
-                title: None, model: None, kind: None, parent: None,
+                title: None, model: None, kind: None, parent: None, native_role: None,
             }],
         };
         (vec![local_node, mesh_node], locals)
@@ -1121,9 +1132,9 @@ mod tests {
             fetched_at: None,
             error: None,
             sessions: vec![
-                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/z/nowhere".into(), project: None, effective_project: None, exempt: false, title: None, model: None, kind: None, parent: None },
-                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/zeta/x".into(), project: None, effective_project: None, exempt: false, title: None, model: None, kind: None, parent: None },
-                SessionView { session_id: "s3".into(), label: "l3".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/alpha/x".into(), project: None, effective_project: None, exempt: false, title: None, model: None, kind: None, parent: None },
+                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/z/nowhere".into(), project: None, effective_project: None, exempt: false, title: None, model: None, kind: None, parent: None, native_role: None },
+                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/zeta/x".into(), project: None, effective_project: None, exempt: false, title: None, model: None, kind: None, parent: None, native_role: None },
+                SessionView { session_id: "s3".into(), label: "l3".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/alpha/x".into(), project: None, effective_project: None, exempt: false, title: None, model: None, kind: None, parent: None, native_role: None },
             ],
         }];
         let projects = vec![project("zeta", "/proj/zeta"), project("alpha", "/proj/alpha")];
@@ -1156,7 +1167,7 @@ mod tests {
                 cwd: "/home/k/Aoide/pkgs/aoide".into(), project: None,
                 effective_project: None,
                 exempt: false,
-                title: None, model: None, kind: None, parent: None,
+                title: None, model: None, kind: None, parent: None, native_role: None,
             }],
         }];
         let projects = vec![project("aoide", "/home/k/Aoide")];
@@ -1477,5 +1488,33 @@ mod tests {
         let row = &remote["sessions"][0];
         assert_eq!(row["project"], "aoide", "the stored value still publishes");
         assert!(row.get("effectiveProject").is_none(), "no owner chain to walk on a remote row");
+    }
+
+    // ── `session --json` rows: additive `nativeRole` (root order seq 404) ─
+
+    #[test]
+    fn session_json_rows_carry_native_role_only_when_present() {
+        let _env = Env::set_up("native-role-json");
+        let sf = super::super::model::SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![
+                session("s-root", "/home/k/Aoide", "working", "1", None),
+                SessionRecord {
+                    native_role: Some("subagent".to_string()),
+                    ..session("s-child", "/home/k/Aoide", "working", "2", Some("s-root"))
+                },
+            ],
+        };
+        super::super::model::write_stage(&super::super::model::sessions_path(), &sf).unwrap();
+
+        let out = session_roster_with(&hosts_invocation(&[], &[]), never_called_pull());
+        let data = out.data.unwrap();
+        let sessions = data["nodes"][0]["sessions"].as_array().unwrap();
+        let root = sessions.iter().find(|s| s["sessionId"] == "s-root").unwrap();
+        let child = sessions.iter().find(|s| s["sessionId"] == "s-child").unwrap();
+        assert!(root.get("nativeRole").is_none(), "a root with no published role stays absent");
+        assert_eq!(child["nativeRole"], "subagent");
+        // Built from the SAME `session_view_json`, so the project grouping
+        // agrees by construction — no second check needed.
     }
 }

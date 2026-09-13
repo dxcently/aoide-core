@@ -142,6 +142,10 @@ pub fn upsert_session(
             // A fresh registration carries no native-capture provenance —
             // only Codex-app capture (`graph/codex_app.rs`) ever sets this.
             sources: None,
+            // A fresh registration carries no native harness role — only a
+            // desktop-Codex capture merge (`graph/codex_app.rs`) ever
+            // publishes one, after the fact.
+            native_role: None,
             extra: Map::new(),
         });
         true
