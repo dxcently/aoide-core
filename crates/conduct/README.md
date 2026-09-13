@@ -905,8 +905,15 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `windowless_by_lineage_from_parent` walk) > the subject's own cwd anchor
   (`project_for`'s rung 3). An explicit project is never overridden, even
   when unregistered — the walk stops there, exactly `project_for`'s own
-  behavior. Derived only: never writes a record, never changes what
-  `graph.json`'s session node publishes (`project` stays the stored value).
+  behavior. Derived only: never writes a record, never changes the STORED
+  `project` a session's record or `graph.json` node carries. Published
+  additively (P-OWN S-A2) as `effectiveProject` — string, present only when
+  the resolver resolves one — on `graph.json`'s session node (`doc.rs`'s
+  node builder, beside the unchanged `project`) and on `aoide session
+  --json` rows (`who.rs`'s `node_json`/`group_json`, via the shared
+  `session_view_json`, beside the unchanged `project`); absent on every
+  remote row (no local session slice to walk an owner chain against — S-D's
+  territory) and on `node list` rows (that command's own concern).
   `project_for` itself is unchanged and stays the per-ancestor primitive
   this walk calls at each hop, never re-entering itself.
 - **`session` (bare) — the ROSTER (session-surface redesign, command-defrag

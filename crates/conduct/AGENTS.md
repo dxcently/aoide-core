@@ -40,6 +40,19 @@
   writes a record and is never re-entered recursively by its own ancestor
   walk (each hop calls `project_for` on that one ancestor).
 
+- **A widget consumes the published `effectiveProject`, never re-derives it
+  (P-OWN S-A2).** `doc.rs`'s session-node builder and `who.rs`'s
+  `session_view_json` (shared by `node_json`/`group_json`) are the only two
+  call sites that turn `effective_project_for` into JSON; both publish it
+  additively — string, present only when the resolver resolves one, beside
+  the STORED `project`, which stays untouched at both sites. No third
+  publish site, no QML-side/client-side re-derivation of ownership from
+  `parentSessionId` plus `project` — a consumer that needs the rendered
+  group reads `effectiveProject` off the document it already has. Absent on
+  every remote row (`sessions_from_graph` has no local session slice to
+  walk an owner chain against) and on `node list` rows (that command's own
+  concern) — never invented for either.
+
 - **Codex titles use exact native thread IDs.** The reaper reads the configured
   Codex session index once per metadata pass and updates only already registered
   `agent == "codex"` records. The latest valid nonempty index title owns that

@@ -149,6 +149,15 @@ pub fn build_graph(
             node["needsSudo"] = json!(true);
         }
         if let Some(project) = &s.project { node["project"] = json!(project); }
+        // The project this session RENDERS under (`model::effective_project_for`,
+        // own explicit project > owner's effective project > own cwd anchor) —
+        // additive, rides beside the STORED `project` above only when the
+        // resolver resolves one, so a legacy/unresolvable record stays
+        // byte-for-byte as before. `project` above is untouched: it keeps
+        // publishing the stored value, resolved or not.
+        if let Some(i) = super::model::effective_project_for(s, &sessions, &projects) {
+            node["effectiveProject"] = json!(projects[i].name);
+        }
         nodes.push(node);
         if let Some(parent) = resolved_parent(s, &ids) {
             edges.push(json!({
@@ -955,6 +964,32 @@ mod tests {
         let node_b = nodes.iter().find(|n| n["id"] == "session:b").unwrap();
         assert_eq!(node_a["petname"], json!("brave-otter"));
         assert!(node_b.get("petname").is_none());
+    }
+    #[test]
+    fn graph_json_publishes_effective_project_on_a_child_outside_its_cwd_anchor() {
+        // The child's own cwd anchors nowhere; its owner's explicit project
+        // is the resolver's rung 2 — additive `effectiveProject` carries that
+        // resolved value while the STORED `project` (absent on the child)
+        // keeps publishing untouched.
+        let projects = vec![Project { name: "aoide".into(), path: "/home/k/Aoide".into(), ..Default::default() }];
+        let root = SessionRecord { project: Some("aoide".into()), ..session("s-root", "/home/k/Aoide", "working", "1", None) };
+        let child = session("s-child", "/tmp/elsewhere", "working", "2", Some("s-root"));
+        let doc = build_graph(&projects, &[root, child], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node_child = nodes.iter().find(|n| n["id"] == "session:s-child").unwrap();
+        assert_eq!(node_child["effectiveProject"], json!("aoide"));
+        assert!(node_child.get("project").is_none(), "the stored project stays absent on the child");
+    }
+    #[test]
+    fn graph_json_omits_effective_project_when_nothing_resolves() {
+        // No projects registered, no parent to inherit from, no cwd anchor:
+        // the resolver yields `None` and the key stays off the node entirely
+        // — never a dangling `effectiveProject: null`.
+        let solo = session("s-solo", "/tmp/nowhere", "working", "1", None);
+        let doc = build_graph(&[], &[solo], &[]);
+        let nodes = doc["nodes"].as_array().unwrap();
+        let node = nodes.iter().find(|n| n["id"] == "session:s-solo").unwrap();
+        assert!(node.get("effectiveProject").is_none());
     }
     #[test]
     fn graph_node_carries_context_tokens_only_when_known() {

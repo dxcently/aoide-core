@@ -419,18 +419,31 @@ fn node_json(n: &NodeView) -> Value {
         "presence": n.presence,
         "fetchedAt": n.fetched_at,
         "error": n.error,
-        "sessions": n.sessions.iter().map(|s| json!({
-            "sessionId": s.session_id,
-            "label": s.label,
-            "petname": s.petname,
-            "agent": s.agent,
-            "state": s.state,
-            "presence": s.presence,
-            "cwd": s.cwd,
-            "project": s.project,
-            "exempt": s.exempt,
-        })).collect::<Vec<_>>(),
+        "sessions": n.sessions.iter().map(session_view_json).collect::<Vec<_>>(),
     })
+}
+
+/// One [`SessionView`] row's JSON shape, shared by [`node_json`] (host-
+/// grouped) and [`group_json`] (project-grouped) — `effectiveProject` rides
+/// beside the stored `project` only when the resolver resolved one
+/// (`None` for every remote row, `build_local_node`'s module doc), the same
+/// present-only-when-known convention `doc.rs`'s node builder uses.
+fn session_view_json(s: &SessionView) -> Value {
+    let mut v = json!({
+        "sessionId": s.session_id,
+        "label": s.label,
+        "petname": s.petname,
+        "agent": s.agent,
+        "state": s.state,
+        "presence": s.presence,
+        "cwd": s.cwd,
+        "project": s.project,
+        "exempt": s.exempt,
+    });
+    if let Some(ep) = &s.effective_project {
+        v["effectiveProject"] = json!(ep);
+    }
+    v
 }
 
 /// The trailing catch-all bucket name for a session whose cwd resolves
@@ -524,17 +537,7 @@ fn render_groups(groups: &[ProjectGroup]) -> String {
 fn group_json(g: &ProjectGroup) -> Value {
     json!({
         "name": g.name,
-        "sessions": g.sessions.iter().map(|s| json!({
-            "sessionId": s.session_id,
-            "label": s.label,
-            "petname": s.petname,
-            "agent": s.agent,
-            "state": s.state,
-            "presence": s.presence,
-            "cwd": s.cwd,
-            "project": s.project,
-            "exempt": s.exempt,
-        })).collect::<Vec<_>>(),
+        "sessions": g.sessions.iter().map(session_view_json).collect::<Vec<_>>(),
     })
 }
 
@@ -1258,5 +1261,60 @@ mod tests {
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0]["name"], "aoide");
         assert_eq!(projects[0]["sessions"][0]["sessionId"], "r1");
+    }
+
+    // ── `session --json` rows: additive `effectiveProject` (S-A2) ────────
+
+    #[test]
+    fn session_json_rows_carry_effective_project_beside_the_stored_one() {
+        let _env = Env::set_up("effective-project-json");
+        let sf = super::super::model::SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![
+                SessionRecord { project: Some("aoide".to_string()), ..session("s-root", "/home/k/Aoide", "working", "1", None) },
+                SessionRecord { project: Some("other".to_string()), ..session("s-child", "/tmp/elsewhere", "working", "2", Some("s-root")) },
+            ],
+        };
+        super::super::model::write_stage(&super::super::model::sessions_path(), &sf).unwrap();
+        let pf = super::super::model::ProjectsFile {
+            schema_version: "0".to_string(),
+            projects: vec![project("aoide", "/home/k/Aoide"), project("other", "/home/k/Other")],
+        };
+        super::super::model::write_stage(&super::super::model::projects_path(), &pf).unwrap();
+
+        let out = session_roster_with(&hosts_invocation(&[], &[]), never_called_pull());
+        let data = out.data.unwrap();
+        let sessions = data["nodes"][0]["sessions"].as_array().unwrap();
+        let child = sessions.iter().find(|s| s["sessionId"] == "s-child").unwrap();
+        // The child's own explicit choice is never overridden by its owner —
+        // both keys carry it, equal to each other.
+        assert_eq!(child["project"], "other");
+        assert_eq!(child["effectiveProject"], "other");
+    }
+
+    #[test]
+    fn remote_rows_never_carry_effective_project() {
+        let _env = Env::set_up("effective-project-remote");
+        aoide_storage::node_store::save_nodes(&[node("yomi-strix")]).unwrap();
+        // The remote node's own graph.json publishes a resolvable stored
+        // `project` on its session — `sessions_from_graph` has no owner
+        // chain to walk (no local session slice for a remote document), so
+        // `effectiveProject` must stay absent regardless.
+        let pull: PullFn = Arc::new(|_: &Node| {
+            Ok(json!({
+                "schemaVersion": "0",
+                "nodes": [{ "id": "session:r1", "kind": "session", "state": "working", "cwd": "/x", "agent": "claude", "project": "aoide" }],
+                "edges": [],
+            }))
+        });
+        let out = session_roster_with(&hosts_invocation(&[], &[]), pull);
+        let data = out.data.unwrap();
+        let nodes = data["nodes"].as_array().unwrap();
+        // Match on `isLocal: false`, not the name alone — this box's own
+        // host can legitimately share the fixture's registered node name.
+        let remote = nodes.iter().find(|n| n["isLocal"] == false).unwrap();
+        let row = &remote["sessions"][0];
+        assert_eq!(row["project"], "aoide", "the stored value still publishes");
+        assert!(row.get("effectiveProject").is_none(), "no owner chain to walk on a remote row");
     }
 }
