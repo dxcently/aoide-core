@@ -426,7 +426,18 @@ the inbound half of the two-door contract (the outbound half is
   lookup keyed on the receipt's own verified origin and acked msgid, so a
   forged or stale ack simply retires nothing). A **duplicate** re-sends the ack only
   when the original filing was a letter, and is a silent no-op otherwise,
-  so an ack is never itself acked. Every `outbox` call here runs strictly
+  so an ack is never itself acked — but `spool_and_drain_ack` spools that
+  resend through `aoide_storage::outbox::write_ack_if_absent`, not a bare
+  write (mail register §26 outbox fix): a redelivery is skipped only while
+  an ack for the same msgid is still sitting undelivered in the origin's
+  outbox, so a permanently-dead link that keeps redelivering the same
+  duplicate spools exactly one ack, not one per redelivery, while a
+  genuine loss (the earlier ack's own entry has since retired) still
+  correctly respools — see that function's own doc for why this is not a
+  permanent ledger, and `storage`'s own `outbox::has_pending_ack_unlocked`
+  doc for why the pending check is a single marker-file stat, never a
+  directory scan, against a spool that can hold tens of thousands of
+  entries. Every `outbox` call here runs strictly
   AFTER `mail::deposit` has already released its own lock — `mail` and
   `outbox` share the identical non-reentrant stage-lock primitive, so
   nesting one inside the other would deadlock a process against itself.

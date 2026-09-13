@@ -601,6 +601,22 @@
   `aoide_conduct::mail_bridge`, and `handle_mail_send`'s one-shot attempt
   right after it spools — so there is exactly one `aoide/mailDeposit` wire
   implementation to keep in sync with the server side.
+- **`drain_node` never attempts more than `DRAIN_BATCH_CAP` (50) entries
+  in one call, and always records a `TransportFailed` on the entry it hit
+  before backing off (mail register §26 outbox fix).** Both are load-bearing:
+  the cap bounds one tick's cost against an unbounded backlog rather than
+  scaling with it, and the per-entry bookkeeping (`tries`/`last_try_at`/
+  `last_outcome`, written via `outbox::write_entry` before the
+  `outbox::back_off` call) is what makes `mail outbox --json`'s tries
+  histogram and `lastOutcomeCounts` (see `commands::outbox_node_summary`)
+  meaningful for a link that has been dead a long time — don't move the
+  `back_off` call ahead of the entry write, and don't drop the cap without
+  re-checking `a_drain_never_attempts_more_than_the_batch_cap_per_call`.
+  `drain_all`'s per-node loop is unaffected by either change: one node's
+  `TransportFailed` break stays scoped to that node's own iteration, never
+  short-circuiting the loop over other nodes (see
+  `aoide_conduct::mail_bridge`'s own
+  `one_dead_nodes_entries_never_block_another_nodes_drain`).
 - **`handle_mail_send` reports the WRITE, never the drain's outcome (spec
   item 8).** Minting and spooling the outbox entry is what the command's
   `Outcome` status describes; the best-effort `mail_wire::drain_node` call

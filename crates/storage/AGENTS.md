@@ -655,6 +655,62 @@
   does not remove it — the kill-list discipline `undying`/`manifest`
   above hold for their own state applies here too: only an explicit
   human action or a genuine delivery confirmation removes a record.
+- **`write_ack_if_absent` gates on PENDING state, never a permanent
+  ledger (mail register §26 outbox fix).** A duplicate letter redelivery
+  mints a fresh ack via `mail::mint_ack` on every call — the gate lives
+  entirely in `outbox::write_ack_if_absent`, which skips the spool only
+  when an ack for the same `(node, acked_msgid)` pair is CURRENTLY sitting
+  undelivered in that node's outbox, checked and written atomically under
+  the crate-wide stage lock. A permanent ledger keyed by `(node,
+  acked_msgid)` that never clears was tried first and rejected: it broke
+  the spec-mandated behavior that a duplicate whose ack genuinely never
+  arrived (the ack's spool entry was already retired/removed some other
+  way) must respool — MAIL.md item 5. Don't reintroduce a permanent
+  "already acked" ledger in this module without re-checking
+  `a2a::a_duplicate_of_a_filed_letter_respools_its_ack`.
+- **`has_pending_ack_unlocked` is a marker-file read-plus-one-stat, NEVER a
+  directory scan (review round 2 — the fix's first cut walked and parsed
+  every file in the node's spool under the crate-wide stage lock on every
+  ack deposit; the live osaka spool held 16.5k+ files, so that scan was
+  itself a fresh incident in the exact path this fix exists to close).**
+  `ack_marker_path(node, acked_msgid)` — `<node>/.ack/<acked_msgid>`,
+  content = the pending entry's own msgid, never empty — is written by
+  `write_ack_if_absent` in the SAME locked closure as the ack entry it
+  covers (entry first, marker second: a crash between the two leaves a
+  real entry with no marker, which just risks one harmless extra spool on
+  the next redelivery, never a marker with no entry that would block
+  respooling forever), and cleared by `remove_entry`, which reads the ONE
+  file it is about to delete (never the directory) to learn whether it's
+  a receipt-kind entry and, if so, which `acked_msgid` marker to drop
+  (falling back to a scan scoped to `.ack/` ONLY, never the node
+  directory, on the rare unreadable/unparsable-entry removal — a
+  best-effort net for a corrupted file, not the hot path). Every
+  entry-removal call site — `mail_wire::drain_node`'s `Delivered`
+  confirmation, `mail outbox rm`, `retire_by_ack`'s letter-entry removal
+  (a no-op marker-wise, since letters have no marker) — goes through this
+  one `remove_entry`, so none of them need their own awareness of the
+  marker. Don't reintroduce a directory scan on the deposit path, and
+  don't move marker creation ahead of the entry write.
+- **The gate self-heals an orphaned marker; an out-of-band mover need not
+  touch `.ack/` (review round 3).** `has_pending_ack_unlocked` never
+  trusts the marker's mere existence — it reads the msgid the marker
+  names and confirms `entry_path(node, that msgid)` still exists before
+  answering "pending," deleting the marker on the spot the moment it
+  finds one whose entry is gone (an unreadable/malformed marker is
+  treated identically). This matters because the planned archive/prune
+  step (explicitly out of scope for this pass) is expected to `mv`
+  receipt entries straight out of a node's directory with no idea `.ack/`
+  exists — it never has to know or care, since the very next deposit
+  attempt against that `acked_msgid` discovers and clears the orphan
+  itself rather than being silently suppressed forever.
+- **Backoff has a ceiling now (`BACKOFF_CEILING_SECS`, 15 min).**
+  `back_off` still doubles from `DRAIN_BACKOFF_FLOOR_SECS` on every
+  failure, but caps at the ceiling instead of doubling forever — a link
+  stuck on a permanent transport failure (a missing `ssh` binary, a dead
+  host) settles onto a fixed re-probe schedule rather than backing off
+  into hours/days. This is a dedicated constant, not a reuse of
+  `aoide_protocol::dialog::SPAWN_BACKOFF_MAX` — that ceiling is sized for
+  a respawned process, not an outbox link.
 
 ## Extension points
 

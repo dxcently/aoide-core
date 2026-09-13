@@ -33,6 +33,15 @@ use aoide_storage::mail::Envelope;
 use aoide_storage::node_store::Node;
 use serde_json::{json, Value};
 
+/// The most entries [`drain_node`] will attempt in one call, regardless of
+/// how many are spooled — bounds one tick's cost when a spool has grown
+/// large (a runaway producer, or simply a backlog), so `drain_all`'s
+/// per-tick cost never scales with total spool depth. An entry that
+/// delivers/retires this pass falls out of the NEXT call's list on its own;
+/// this cap only matters when a single call would otherwise walk the whole
+/// spool.
+const DRAIN_BATCH_CAP: usize = 50;
+
 fn unix_now() -> i64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0) as i64
 }
@@ -173,12 +182,22 @@ pub fn drain_node(node_name: &str) -> Result<(), String> {
         }
     }
 
-    for entry in aoide_storage::outbox::list_entries(node_name)? {
+    for entry in aoide_storage::outbox::list_entries(node_name)?.into_iter().take(DRAIN_BATCH_CAP) {
         if entry.refused {
             continue;
         }
         match attempt_deposit(node, &entry.envelope) {
             DepositAttempt::TransportFailed(reason) => {
+                // Record the attempt on the entry that actually hit the
+                // failure BEFORE backing off the link — otherwise `tries`/
+                // `lastOutcome` for the whole batch stay exactly where they
+                // were on a dead link, which is indistinguishable from a
+                // drain that never even tried.
+                let mut updated = entry;
+                updated.tries += 1;
+                updated.last_try_at = aoide_storage::time::now_iso_utc();
+                updated.last_outcome = format!("transport: {reason}");
+                aoide_storage::outbox::write_entry(node_name, &updated)?;
                 aoide_storage::outbox::back_off(node_name, now_epoch, &reason)?;
                 break;
             }
@@ -262,6 +281,75 @@ mod tests {
         let link = aoide_storage::outbox::read_link_state("elsewhere").unwrap();
         assert!(link.is_some(), "the link backs off after an unreachable attempt");
 
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `TransportFailed` must record `tries`/`lastTryAt`/`lastOutcome` on
+    /// the ENTRY that hit it before backing off the link — pins the fix for
+    /// the bug where the whole batch's bookkeeping stayed at `tries: 0`
+    /// forever on a dead link (the outbox investigation's own finding:
+    /// 16.5k entries sitting at `tries=0` because `TransportFailed` broke
+    /// out of the loop before touching a single entry).
+    #[test]
+    fn a_transport_failure_records_tries_and_outcome_on_the_entry_it_hit() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("transport-failure-records-entry");
+
+        aoide_storage::node_store::save_nodes(&[unpaired_node("elsewhere")]).unwrap();
+
+        let env = aoide_storage::mail::mint_outbound_letter("alice", "elsewhere", "bob", "hi").unwrap();
+        aoide_storage::outbox::write_entry("elsewhere", &OutboxEntry::fresh(env)).unwrap();
+
+        drain_node("elsewhere").unwrap();
+
+        let entries = aoide_storage::outbox::list_entries("elsewhere").unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].tries, 1, "the entry the transport failure hit must record the attempt");
+        assert!(!entries[0].last_try_at.is_empty(), "lastTryAt must be stamped");
+        assert!(
+            entries[0].last_outcome.contains("transport"),
+            "lastOutcome must say this was a transport failure: {}",
+            entries[0].last_outcome
+        );
+        assert!(!entries[0].refused, "a transport failure never sets refused");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_drain_never_attempts_more_than_the_batch_cap_per_call() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("drain-batch-cap");
+
+        let (listener, port) = fake_deposit_server(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"accepted"}}"#,
+        );
+        let mut node = unpaired_node("elsewhere");
+        node.url = format!("http://127.0.0.1:{port}/");
+        aoide_storage::node_store::save_nodes(&[node]).unwrap();
+
+        // More entries than the batch cap — every entry is a receipt, so a
+        // `Delivered` outcome retires it outright; the number remaining
+        // after one drain call proves the cap was actually enforced rather
+        // than the whole spool draining in one pass.
+        let extra = DRAIN_BATCH_CAP + 10;
+        for i in 0..extra {
+            let to = aoide_storage::mail::Address { node: "origin-node".to_string(), name: "bob".to_string() };
+            let env = aoide_storage::mail::mint_ack("alice", to, &format!("acked-{i}")).unwrap();
+            aoide_storage::outbox::write_entry("elsewhere", &OutboxEntry::fresh(env)).unwrap();
+        }
+        assert_eq!(aoide_storage::outbox::list_entries("elsewhere").unwrap().len(), extra);
+
+        drain_node("elsewhere").unwrap();
+
+        let remaining = aoide_storage::outbox::list_entries("elsewhere").unwrap().len();
+        assert_eq!(
+            remaining,
+            extra - DRAIN_BATCH_CAP,
+            "one drain call must retire at most DRAIN_BATCH_CAP entries, leaving the rest for the next tick"
+        );
+
+        drop(listener);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

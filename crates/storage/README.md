@@ -570,12 +570,40 @@ by decision — no embedded database yet
   is always spooled under its own `to.node`, so indexing by the ack's
   already-origin-verified `from.node` IS the signer check, and keying by
   `msgid` makes a wrong `text` a plain miss) and the link-state
-  trio (`read_link_state`/`back_off`/`clear_link_state`, backoff via
-  `aoide_protocol::dialog::next_spawn_backoff` off a
-  `DRAIN_BACKOFF_FLOOR_SECS` floor). No network, no HTTP, no tunnel — the
-  actual dial+POST lives in `aoide-client::mail_wire`, a thin bridge in
-  `aoide-conduct::mail_bridge`, the same split `tunnel` above already
-  holds between record CRUD (here) and the ssh child process (`client`).
+  trio (`read_link_state`/`back_off`/`clear_link_state`, backoff off a
+  `DRAIN_BACKOFF_FLOOR_SECS` floor doubling up to its own
+  `BACKOFF_CEILING_SECS` (15 min) ceiling — deliberately not
+  `aoide_protocol::dialog::SPAWN_BACKOFF_MAX`, which is sized for a
+  respawned process, not a link stuck on a permanent transport failure).
+  `write_ack_if_absent` is the ack-redelivery gate the outbox fix (mail
+  register §26) adds: it spools a freshly minted ack only when no ack for
+  the same `(node, acked_msgid)` pair is ALREADY sitting undelivered in
+  that node's spool, so a duplicate letter redelivered while its ack is
+  still in flight mints nothing new. It is deliberately not a permanent
+  ledger — once the pending ack is actually delivered and its entry
+  retired, the next redelivery finds nothing pending and correctly
+  respools, preserving MAIL.md item 5 (a duplicate re-sends the ack
+  because the sender's earlier one evidently never arrived). The pending
+  check is a single `exists()` stat on a per-`acked_msgid` marker file
+  (`<node>/.ack/<acked_msgid>`, zero bytes, never data) — NOT a directory
+  scan (review round 2): a live spool can hold tens of thousands of
+  entries, and walking/parsing every file in it under the crate-wide
+  stage lock on every ack deposit would itself become a fresh
+  latency/contention incident on exactly the node this fix is for. The
+  marker is written in the same locked section as the ack entry
+  (`write_ack_if_absent`) and cleared in the same locked section as that
+  entry's own removal (`remove_entry`, which reads the ONE file it is
+  about to delete — never the directory — to decide whether to clear a
+  marker), so every retirement path (a drain's delivery confirmation, an
+  explicit `mail outbox rm`) keeps the marker's presence exactly in sync
+  with the entry's. No network,
+  no HTTP, no tunnel — the actual dial+POST lives in
+  `aoide-client::mail_wire` (bounded to `DRAIN_BATCH_CAP` entries per
+  `drain_node` call, and recording `tries`/`lastOutcome`/`lastTryAt` on
+  the entry a transport failure actually hit before backing off), a thin
+  bridge in `aoide-conduct::mail_bridge`, the same split `tunnel` above
+  already holds between record CRUD (here) and the ssh child process
+  (`client`).
 - `identity` — this instance's lazily-minted ed25519 keypair (pairing
   workstream P-P1, `docs/architecture/PAIRING.md`, CONTRACTS.md §4's
   `state/identity/` subsection): `state/identity/ed25519.key` (the raw

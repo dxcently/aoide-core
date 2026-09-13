@@ -393,15 +393,24 @@ never the inbound/serve half (that's `aoide-server`).
   this one arm here, since a drain only ever needs "not currently
   deliverable," never which shape carried that news; the link is fine
   either way, this ONE entry isn't), and `TransportFailed(reason)` (no
-  response at all — the LINK is the suspect). `drain_node`'s loop walks every
-  non-refused entry oldest first, stopping outright on the first
+  response at all — the LINK is the suspect). `drain_node`'s loop walks up
+  to `DRAIN_BATCH_CAP` (50) non-refused entries oldest first — a per-call
+  bound so one tick's cost never scales with an unbounded backlog (mail
+  register §26 outbox fix; a stuck link that had piled up 16k+ undelivered
+  entries is what motivated the cap) — stopping outright on the first
   `TransportFailed` (hammering the rest of the queue against a dead link
   gains nothing) but continuing past a `Refused` (that one entry is the
-  problem, not the link). A receipt's own successful deposit — accepted OR
-  duplicate, either way the far end has it now — IS its confirmation
-  (ruling 4: no separate ack-of-an-ack), so `drain_node` removes it
-  outright; an ordinary letter waits for a REAL ack instead, only having
-  its `tries`/`last_try_at`/`last_outcome` bookkeeping updated. **Two
+  problem, not the link). Before backing off the link on a
+  `TransportFailed`, `drain_node` now records the attempt on the entry it
+  actually hit — `tries`/`last_try_at`/`last_outcome` — THEN calls
+  `outbox::back_off`; previously the loop broke before touching that
+  entry's own bookkeeping at all, leaving every entry behind a dead link
+  frozen at `tries: 0` forever. A receipt's own successful deposit —
+  accepted OR duplicate, either way the far end has it now — IS its
+  confirmation (ruling 4: no separate ack-of-an-ack), so `drain_node`
+  removes it outright; an ordinary letter waits for a REAL ack instead,
+  only having its `tries`/`last_try_at`/`last_outcome` bookkeeping
+  updated. **Two
   locks, never nested** (mirrors `aoide_storage::outbox`'s own module
   doc): `drain_node` takes `.bsy` via `try_take_link_lock` — non-blocking,
   per-node, held across the whole function, safe to span network I/O — and
@@ -469,8 +478,17 @@ never the inbound/serve half (that's `aoide-server`).
   read ONCE for the whole listing, not once per node or per entry, and
   passed in — see `has_delivered_ack`/`delivery_projection` in
   `commands.rs`); "outbox empty" when there is nothing waiting anywhere.
-  This command never dials — it is the read side of the projection, not a
-  drain. `handle_mail_outbox_rm` (`mail outbox rm
+  `--json` additionally carries `data.summary`, one entry per node
+  (`outbox_node_summary`, mail register §26 outbox fix): `depth` (entry
+  count), `oldestMintedAtAgeSecs` (age of the oldest entry's
+  `envelope.header.mintedAt`, `null` if the node has no entries or an
+  unparseable timestamp), `tries` (a histogram keyed by `tries` value as a
+  string), `lastOutcomeCounts` (keyed by `lastOutcome`, or the literal
+  `"(none)"` for an entry that hasn't failed yet), and `refused` (count of
+  entries parked `refused: true`). This is a summary added onto the
+  existing `mail outbox --json` payload, not a new subcommand — the
+  per-entry `rows` it sits beside are unchanged. This command never
+  dials — it is the read side of the projection, not a drain. `handle_mail_outbox_rm` (`mail outbox rm
   <msgid>`) is an exact-msgid removal, NOT the mailbase `mail rm`'s
   age-based prune — it walks `nodes_with_outbox` and calls
   `outbox::remove_entry(node, msgid)` on each until one actually held that

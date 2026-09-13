@@ -4234,6 +4234,43 @@ fn handle_mail_rm(inv: &Invocation) -> Outcome {
     }
 }
 
+/// One node's `mail outbox --json` summary — depth, oldest `mintedAt` age,
+/// a `tries` histogram, distinct `lastOutcome` counts, and how many entries
+/// are parked `refused`. Computed straight off the same `entries` a node's
+/// rows already carry, never a second `list_entries` read: the outbox
+/// investigation's own point was that a flooded spool (16.5k duplicate
+/// receipts sitting at `tries=0`) is invisible in the row-by-row listing
+/// alone — a summary is the shape an operator actually needs to notice
+/// that before it happens again.
+fn outbox_node_summary(entries: &[aoide_storage::outbox::OutboxEntry]) -> Value {
+    let depth = entries.len();
+    let now = aoide_storage::time::parse_iso_utc(&aoide_storage::time::now_iso_utc());
+    let oldest_minted_at_age_secs = entries
+        .iter()
+        .filter_map(|e| aoide_storage::time::parse_iso_utc(&e.envelope.header.minted_at))
+        .min()
+        .zip(now)
+        .map(|(oldest, now)| (now - oldest).max(0));
+    let mut tries_histogram: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut last_outcome_counts: std::collections::BTreeMap<String, u64> = std::collections::BTreeMap::new();
+    let mut refused = 0u64;
+    for e in entries {
+        *tries_histogram.entry(e.tries.to_string()).or_insert(0) += 1;
+        let outcome_key = if e.last_outcome.is_empty() { "(none)".to_string() } else { e.last_outcome.clone() };
+        *last_outcome_counts.entry(outcome_key).or_insert(0) += 1;
+        if e.refused {
+            refused += 1;
+        }
+    }
+    json!({
+        "depth": depth,
+        "oldestMintedAtAgeSecs": oldest_minted_at_age_secs,
+        "tries": tries_histogram,
+        "lastOutcomeCounts": last_outcome_counts,
+        "refused": refused,
+    })
+}
+
 /// `aoide mail outbox [<node>] [--json]` — every entry still waiting,
 /// optionally filtered to one node. An unknown/empty node reports an empty
 /// list, never an error — the same "absent is just nothing there yet"
@@ -4245,7 +4282,10 @@ fn handle_mail_rm(inv: &Invocation) -> Outcome {
 /// ONCE for the whole listing, not once per node or per entry. A
 /// link-state read failure for one node degrades just that node's rows to
 /// `queued`/"status unavailable" ([`delivery_status_unavailable`]) rather
-/// than failing the whole listing.
+/// than failing the whole listing. `data.summary` adds
+/// [`outbox_node_summary`]'s per-node depth/age/tries/outcome/refused
+/// rollup beside the row-by-row `data.entries` — no new subcommand, the
+/// same envelope, just a second field.
 fn handle_mail_outbox(inv: &Invocation) -> Outcome {
     let cmd = "mail.outbox";
     let target = inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty());
@@ -4258,11 +4298,21 @@ fn handle_mail_outbox(inv: &Invocation) -> Outcome {
     };
     let base = aoide_storage::mail::read_base().unwrap_or_default();
     let mut rows: Vec<Value> = Vec::new();
+    let mut summary = serde_json::Map::new();
     for node in &nodes {
         let entries = match aoide_storage::outbox::list_entries(node) {
             Ok(es) => es,
             Err(e) => return Outcome::error(cmd, format!("state/outbox: {e}")),
         };
+        // Non-empty outboxes only, matching `nodes_with_outbox`'s own
+        // no-arg-listing semantics (CONTRACTS.md delta point 3) — an
+        // explicitly named but empty node gets no summary entry either,
+        // so `summary`'s key set means the same thing whether it was
+        // populated by a bare `mail outbox` sweep or a `mail outbox
+        // <node>` narrowing.
+        if !entries.is_empty() {
+            summary.insert(node.clone(), outbox_node_summary(&entries));
+        }
         let link = aoide_storage::outbox::read_link_state(node);
         for e in &entries {
             let to = &e.envelope.header.to;
@@ -4307,7 +4357,7 @@ fn handle_mail_outbox(inv: &Invocation) -> Outcome {
             .join("\n")
     };
     Outcome::ok(cmd, format!("{n} entr{} waiting\n{body}", if n == 1 { "y" } else { "ies" }))
-        .with_data(json!({ "entries": rows }))
+        .with_data(json!({ "entries": rows, "summary": Value::Object(summary) }))
 }
 
 /// `aoide mail outbox rm <msgid> [--json]` — explicit retirement (spec item
@@ -7030,6 +7080,59 @@ mod tests {
 
         let missing = handle_mail_outbox(&mail_inv(&["mail", "outbox"], &["nobody"]));
         assert!(missing.data.unwrap()["entries"].as_array().unwrap().is_empty(), "a node with nothing waiting reports an empty list, not an error");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn mail_outbox_json_carries_a_per_node_summary() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("mail-outbox-summary");
+
+        let fresh = aoide_storage::mail::mint_outbound_letter("here", "osaka", "bob", "hi").unwrap();
+        aoide_storage::outbox::write_entry("osaka", &aoide_storage::outbox::OutboxEntry::fresh(fresh)).unwrap();
+
+        let mut retried = aoide_storage::outbox::OutboxEntry::fresh(
+            aoide_storage::mail::mint_outbound_letter("here", "osaka", "carol", "hi again").unwrap(),
+        );
+        retried.tries = 3;
+        retried.last_outcome = "transport: HTTP 0".to_string();
+        aoide_storage::outbox::write_entry("osaka", &retried).unwrap();
+
+        let mut refused = aoide_storage::outbox::OutboxEntry::fresh(
+            aoide_storage::mail::mint_outbound_letter("here", "osaka", "dave", "bad").unwrap(),
+        );
+        refused.tries = 1;
+        refused.refused = true;
+        refused.last_outcome = "refused: bad-msgid".to_string();
+        aoide_storage::outbox::write_entry("osaka", &refused).unwrap();
+
+        let out = handle_mail_outbox(&mail_inv(&["mail", "outbox"], &[]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "msg: {}", out.message);
+        let data = out.data.unwrap();
+        let summary = &data["summary"]["osaka"];
+        assert_eq!(summary["depth"], 3, "three entries spooled for osaka");
+        assert_eq!(summary["refused"], 1, "exactly one entry is parked refused");
+        assert_eq!(summary["tries"]["0"], 1, "one entry never attempted");
+        assert_eq!(summary["tries"]["1"], 1, "one entry attempted once (the refused one)");
+        assert_eq!(summary["tries"]["3"], 1, "one entry attempted three times");
+        assert_eq!(summary["lastOutcomeCounts"]["(none)"], 1, "the fresh entry has no recorded outcome yet");
+        assert_eq!(summary["lastOutcomeCounts"]["transport: HTTP 0"], 1);
+        assert_eq!(summary["lastOutcomeCounts"]["refused: bad-msgid"], 1);
+        assert!(summary["oldestMintedAtAgeSecs"].as_i64().unwrap() >= 0, "a freshly minted entry's age is never negative");
+
+        assert!(data["summary"]["nobody"].is_null(), "a node nobody spooled to never appears in the summary");
+
+        // Review round 2: an EXPLICITLY named node (`mail outbox <node>`)
+        // with an empty outbox gets no summary entry either — the key set
+        // means the same thing regardless of which listing shape produced
+        // it (CONTRACTS.md delta point 3).
+        let explicit_empty = handle_mail_outbox(&mail_inv(&["mail", "outbox", "nobody"], &[]));
+        assert_eq!(explicit_empty.status, aoide_protocol::output::Status::Ok, "msg: {}", explicit_empty.message);
+        assert!(
+            explicit_empty.data.unwrap()["summary"]["nobody"].is_null(),
+            "naming an empty node explicitly still gets no summary entry"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

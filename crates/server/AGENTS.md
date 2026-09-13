@@ -571,7 +571,21 @@
   filing was a letter re-sends the ack (the sender's earlier ack evidently
   never arrived); every other duplicate is a silent no-op — the
   `letter`/`receipt` vocabulary has no third shape to stop an ack-of-an-ack
-  from ping-ponging forever, so don't ack a receipt.
+  from ping-ponging forever, so don't ack a receipt. **The resend goes
+  through `outbox::write_ack_if_absent`, never `write_entry` directly
+  (mail register §26 outbox fix)** — it mints via `mail::mint_ack` on
+  every duplicate as before, but only spools when no ack for the same
+  `(origin, acked_msgid)` is already sitting undelivered in that node's
+  outbox, so a link redelivering the same duplicate thousands of times
+  (a dead transport, e.g. a missing `ssh` binary) spools one ack instead
+  of one per redelivery. This is NOT a permanent "already acked" ledger:
+  once the pending ack's own entry retires (a real delivery, or `mail
+  outbox rm`), the next redelivery correctly finds nothing pending and
+  respools — preserving the "sender's earlier ack evidently never
+  arrived" invariant above for a genuine loss. Don't add a ledger that
+  survives the pending entry's own removal here; a prior attempt at
+  exactly that broke
+  `a2a::tests::a_duplicate_of_a_filed_letter_respools_its_ack`.
 
 ## Extension points
 

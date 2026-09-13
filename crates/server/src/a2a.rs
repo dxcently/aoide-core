@@ -1862,13 +1862,26 @@ fn mail_deposit(params: &Value, ctx: &RequestCtx) -> Result<Value, (i64, String)
 /// best-effort drain that node once. Shared by `mail_deposit`'s `Filed`
 /// letter arm and its `Duplicate{filed_letter: true}` arm — the ack is
 /// identical either way, just re-sent on the duplicate path.
+///
+/// Spooled via `aoide_storage::outbox::write_ack_if_absent`, never the bare
+/// `write_entry`: a `Duplicate` redelivery of a letter whose ack is STILL
+/// sitting undelivered in the outbox spools nothing new — without this
+/// gate, a sender that keeps redelivering because its earlier ack never
+/// arrived drove this function to mint a brand-new ack envelope, with a
+/// brand-new msgid, on every single redelivery (the outbox investigation's
+/// own root cause). Once that pending ack is actually delivered (removed by
+/// `mail_wire::drain_node`'s `Delivered` arm), the next redelivery finds
+/// nothing pending and respools — spec item 5's "a duplicate re-sends the
+/// ack because the sender's earlier one evidently never arrived" still
+/// holds for a genuine loss; see `write_ack_if_absent`'s own doc.
 fn spool_and_drain_ack(envelope: &aoide_storage::mail::Envelope, acked_msgid: &str) {
     let Ok(ack) = aoide_storage::mail::mint_ack(&envelope.header.to.name, envelope.header.from.clone(), acked_msgid)
     else {
         return;
     };
     let origin_node = envelope.header.from.node.clone();
-    if aoide_storage::outbox::write_entry(&origin_node, &aoide_storage::outbox::OutboxEntry::fresh(ack)).is_ok() {
+    let entry = aoide_storage::outbox::OutboxEntry::fresh(ack);
+    if aoide_storage::outbox::write_ack_if_absent(&origin_node, acked_msgid, &entry) == Ok(true) {
         let _ = aoide_conduct::mail_bridge::drain_node(&origin_node);
     }
 }
@@ -9903,6 +9916,55 @@ mod tests {
         let after = aoide_storage::outbox::list_entries(&origin_name).unwrap();
         assert_eq!(after.len(), 1, "a duplicate of a filed LETTER respools its ack");
         assert_eq!(after[0].envelope.header.kind, aoide_storage::mail::ENTRY_TYPE_RECEIPT);
+
+        mail_deposit_cleanup(&root, saved_state, saved_stage);
+    }
+
+    #[test]
+    fn repeated_duplicate_redeliveries_spool_exactly_one_ack() {
+        // The outbox investigation's own root cause: a sender that never
+        // sees its ack redelivers the SAME letter, `mail::deposit`
+        // correctly classifies each redelivery as `Duplicate{filed_letter:
+        // true}`, and `spool_and_drain_ack` used to mint a BRAND-NEW ack
+        // envelope — new msgid, new file — on every single one, with the
+        // ack still sitting undelivered in the spool the whole time (never
+        // removed, so this never depends on `mail_deposit`'s own
+        // best-effort drain succeeding or failing). This pins the ledger
+        // fix: N redeliveries of the same letter must leave exactly ONE
+        // spooled ack for that (reader, msgid), not N.
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let saved_state = std::env::var("AOIDE_STATE_DIR").ok();
+        let saved_stage = std::env::var("AOIDE_STAGE_DIR").ok();
+        let root = mail_deposit_root("dup-flood-one-ack");
+        act_as(&root, "here");
+
+        let origin_name = setup_verifiable_origin(&["message"]);
+        let mut nodes = aoide_storage::node_store::load_nodes();
+        nodes[0].url = "http://127.0.0.1:1/".to_string();
+        aoide_storage::node_store::save_nodes(&nodes).unwrap();
+
+        let envelope = aoide_storage::mail::mint_outbound_letter("alice", "here", "conductor", "hi").unwrap();
+        let audit_log = root.join("log");
+        let ctx = mail_deposit_ctx(&audit_log, Some(&origin_name));
+        let params = json!({ "envelope": envelope });
+
+        let first = mail_deposit(&params, &ctx).unwrap();
+        assert_eq!(first["status"], "accepted");
+        let first_spool = aoide_storage::outbox::list_entries(&origin_name).unwrap();
+        assert_eq!(first_spool.len(), 1, "the first filing spools exactly one ack");
+        let ack_msgid = first_spool[0].envelope.msgid.clone();
+
+        // The ack is deliberately left in the spool (undelivered) across
+        // every redelivery below — exactly the "dead link" condition that
+        // produced 16.5k duplicates.
+        for _ in 0..10 {
+            let redelivered = mail_deposit(&params, &ctx).unwrap();
+            assert_eq!(redelivered["status"], "duplicate");
+        }
+
+        let spool = aoide_storage::outbox::list_entries(&origin_name).unwrap();
+        assert_eq!(spool.len(), 1, "ten redeliveries must still leave exactly one spooled ack");
+        assert_eq!(spool[0].envelope.msgid, ack_msgid, "the surviving ack is the ORIGINAL one, never re-minted");
 
         mail_deposit_cleanup(&root, saved_state, saved_stage);
     }
