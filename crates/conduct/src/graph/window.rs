@@ -8,7 +8,8 @@ use super::codex_app::sync_codex_app_threads;
 use super::conduct::proc_cwd;
 use super::doc::restage_graph;
 use super::model::{
-    load_stage, sessions_path, write_stage, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
+    canonical_state, load_stage, sessions_path, write_stage, SessionRecord, SessionsFile,
+    STAGE_GRAPH_VERSION,
 };
 use aoide_storage::fs::with_stage_lock;
 use serde_json::Value;
@@ -328,7 +329,16 @@ pub(in crate::graph) fn ancestry_parent(sessions: &[SessionRecord]) -> Option<St
 ///      ambient id an OUTER terminal wrap set, which can be a stale
 ///      ancestor rather than the true launching agent — exactly the
 ///      "spawned wraps parent under the terminal as siblings" bug this
-///      whole precedence order exists to fix.
+///      whole precedence order exists to fix. S-B (the Osaka wrong-ancestry
+///      fix's belt-and-braces half): the ambient id must ALSO name a record
+///      in `sessions` that is still live (`canonical_state(&s.state) !=
+///      "done"`) — a value naming no record at all, or a record that has
+///      already ended, is refused outright rather than adopted as a parent.
+///      This alone would not have caught the Osaka case (the leaked id
+///      named the User's own LIVE session), so it is depth, not the fix —
+///      see `aoide-server`'s `a2a.rs::spawn_child_command` doc comment for
+///      the actual fix, the daemon clearing its own `AOIDE_SESSION_ID`
+///      before it ever reaches a spawned child's env.
 pub(in crate::graph) fn resolve_registration_parent(
     explicit: Option<&str>,
     id: &str,
@@ -343,6 +353,12 @@ pub(in crate::graph) fn resolve_registration_parent(
     std::env::var("AOIDE_SESSION_ID")
         .ok()
         .filter(|p| !p.is_empty() && p != id)
+        .filter(|p| {
+            sessions
+                .iter()
+                .find(|s| &s.session_id == p)
+                .is_some_and(|s| canonical_state(&s.state) != "done")
+        })
 }
 
 /// Is `rec` itself a headless conducted wrap — the PERMANENT windowless
@@ -1768,9 +1784,13 @@ mod tests {
         );
 
         // Tier 3: no explicit flag, no ancestry match — the ambient env,
-        // guarded against naming the record's OWN fresh id.
+        // guarded against naming the record's OWN fresh id AND (S-B) required
+        // to name a still-live record; the fixture supplies that live record
+        // so this precedence test keeps proving tier 3 fires at all — the
+        // refusal shapes get their own tests below.
+        let env_sid_live = session("env-sid", "/w", "working", "3", None);
         assert_eq!(
-            resolve_registration_parent(None, "new-id", &[]),
+            resolve_registration_parent(None, "new-id", &[env_sid_live]),
             Some("env-sid".to_string())
         );
         std::env::set_var("AOIDE_SESSION_ID", "new-id");
@@ -1781,5 +1801,46 @@ mod tests {
         );
         std::env::remove_var("AOIDE_SESSION_ID");
         assert_eq!(resolve_registration_parent(None, "new-id", &[]), None);
+    }
+
+    #[test]
+    fn the_ambient_parent_fallback_refuses_a_session_id_with_no_live_record() {
+        // S-B: an `AOIDE_SESSION_ID` naming NO record at all (a leaked or
+        // stale id from some other door/host) must never become a parent —
+        // there is nothing to check liveness against, so it is refused, not
+        // trusted on the strength of the env var alone.
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_SESSION_ID"]);
+        std::env::set_var("AOIDE_SESSION_ID", "ghost-sid");
+        assert_eq!(resolve_registration_parent(None, "new-id", &[]), None);
+    }
+
+    #[test]
+    fn the_ambient_parent_fallback_refuses_an_ended_session_id() {
+        // S-B: the ambient id resolves to a REAL record, but that record has
+        // already ended (`state: "done"`) — still refused. This is the
+        // belt-and-braces half of the Osaka fix: a stale id from ANY door
+        // must not resurrect a dead session as a live parent.
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_SESSION_ID"]);
+        std::env::set_var("AOIDE_SESSION_ID", "ended-sid");
+        let mut ended = session("ended-sid", "/w", "working", "9", None);
+        ended.state = "done".into();
+        assert_eq!(resolve_registration_parent(None, "new-id", &[ended]), None);
+    }
+
+    #[test]
+    fn the_ambient_parent_fallback_still_accepts_a_live_local_session() {
+        // S-B's positive case: an ambient id naming a genuinely LIVE local
+        // record still resolves as a tier-3 parent — the fix narrows tier 3,
+        // it doesn't disable it.
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_SESSION_ID"]);
+        std::env::set_var("AOIDE_SESSION_ID", "live-sid");
+        let live = session("live-sid", "/w", "working", "9", None);
+        assert_eq!(
+            resolve_registration_parent(None, "new-id", &[live]),
+            Some("live-sid".to_string())
+        );
     }
 }

@@ -357,7 +357,15 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   headless wrap never even attempts discovery. `ancestry_parent`/
   `resolve_registration_parent` (the `--parent` flag > `/proc` ancestry ↔
   `hookAncestry` > `AOIDE_SESSION_ID` env precedence `wrap`/`conduct`/`spawn`
-  registration resolve their parent through).
+  registration resolve their parent through). The ambient-env tier is
+  LIVENESS-gated, not merely a non-empty/not-self check: the id must also
+  name a record in `sessions` whose `canonical_state` is not `"done"`, so a
+  stale or foreign value surviving in a spawner's environment (the Osaka
+  wrong-ancestry shape — see `aoide-server`'s `a2a.rs::spawn_child_command`
+  doc comment for the actual fix, an explicit `env_remove` on that door's
+  spawned child) can no longer resolve a parent that no longer exists;
+  finding no live record at that id falls through to no parent from this
+  tier at all, same as an empty or self-referential id always has.
   A sibling mechanism (`session_store::stamp_attested_parent`, called from
   `send.rs`'s `hook_ensure_session` on the per-turn registration self-heal
   and the idle phase hook — never a tool/subagent hook, which fires on every

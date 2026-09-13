@@ -195,6 +195,7 @@ fn node_pair_hostname_arm_single_match_reaches_the_shared_run_pair_request_over_
             port_b,
             &PathBuf::from("/dev/null"),
             "",
+            "",
             "advertise-node-b",
             "",
             "",

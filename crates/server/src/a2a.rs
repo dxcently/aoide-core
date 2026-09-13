@@ -49,8 +49,8 @@
 //! (they only ever touched session state), so they're untouched.
 
 use aoide_conduct::graph::{
-    canonical_state, load_stage, now_iso_utc, resolve_graph_document, session_send,
-    sessions_path, SessionRecord, SessionsFile,
+    canonical_state, load_stage, now_iso_utc, resolve_graph_document, session_send, sessions_path,
+    Project, ProjectsFile, SessionRecord, SessionsFile,
 };
 use aoide_protocol::output::Status;
 use aoide_protocol::registry::{Command, Registry};
@@ -162,6 +162,23 @@ pub fn resolve_spawn_agent(inv: &Invocation) -> String {
         .get("spawn-agent")
         .cloned()
         .or_else(|| std::env::var("AOIDE_A2A_SPAWN_AGENT").ok())
+        .unwrap_or_default()
+}
+
+/// Resolve `aoide.a2a.spawnCwd`: the working directory `do_spawn`'s spawned
+/// child is launched in, when set. `--spawn-cwd` flag → `AOIDE_A2A_SPAWN_CWD`
+/// env (set by the `aoide-a2a` systemd unit) → default `""` (empty = inherit
+/// the daemon's own cwd, today's behavior). Mirrors [`resolve_spawn_agent`]'s
+/// exact precedence shape. The client NEVER supplies this — only the
+/// operator. Unbounded by itself: [`do_spawn`] applies the value only when it
+/// names a REGISTERED project root (see its own doc comment) — this function
+/// just resolves the configured string, the same way [`resolve_spawn_agent`]
+/// resolves a command line without validating it.
+pub fn resolve_spawn_cwd(inv: &Invocation) -> String {
+    inv.flags
+        .get("spawn-cwd")
+        .cloned()
+        .or_else(|| std::env::var("AOIDE_A2A_SPAWN_CWD").ok())
         .unwrap_or_default()
 }
 
@@ -1096,7 +1113,108 @@ fn spawn_died_immediately_message(agent_cmd: &str, status: std::process::ExitSta
 /// out; a wrapper that exits inside that window gets
 /// [`spawn_died_immediately_message`]'s taught refusal instead of a phantom
 /// session id.
-fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path, node_name: &str) -> Result<Value, (i64, String)> {
+/// Build the spawned child's `Command`, env-sanitized, cwd-bound (when
+/// `spawn_cwd` resolves), and detached — everything up to but NOT including
+/// `.spawn()`. Split out of [`do_spawn`] so the env-clearing shape here is
+/// directly unit-testable via `Command::get_envs()`/`Command::get_current_dir()`
+/// without an OS-level process spawn (`do_spawn` always launches
+/// `std::env::current_exe()`, which under `cargo test` is the TEST binary —
+/// see `spawn_inject_prompts_success_branch_files_the_opening_turn_into_the_
+/// mailbase`'s doc comment for why no test here drives that spawn).
+fn spawn_child_command(
+    aoide_bin: &Path,
+    argv: &[String],
+    audit_log: &Path,
+    cwd: Option<&str>,
+) -> std::process::Command {
+    let mut cmd = std::process::Command::new(aoide_bin);
+    cmd.args(argv)
+        .env("AOIDE_AUDIT_LOG", audit_log)
+        // No `AOIDE_SESSION_ORIGIN` on the child (LANE IDENTITY P-ID0,
+        // G16/G5 — reversed from the pre-P-ID0 shape): threading a `node:*`
+        // origin through inherited env was unauthenticated, since any
+        // same-uid process can set that same var on itself before invoking
+        // `aoide conduct` directly. `stamp_spawn_origin` below stamps the
+        // record from THIS door instead, once the child registers. Cleared
+        // explicitly in case `a2a serve`'s own env ever carried one.
+        .env_remove("AOIDE_SESSION_ORIGIN")
+        // No `AOIDE_SESSION_ID` on the child either (S-B, the Osaka
+        // wrong-ancestry fix): the `aoide-a2a` systemd unit's own environment
+        // can carry the OPERATOR's live terminal session id (set by that
+        // terminal's own `aoide conduct` wrap, inherited by every process the
+        // unit's shell forks), and a spawned child's tier-3 ambient-parent
+        // fallback (`window.rs::resolve_registration_parent`) would otherwise
+        // adopt it as `parentSessionId` — a spawned agent parented under a
+        // human's unrelated terminal. A real `aoide conduct` launched from an
+        // agent's own shell still inherits the id ITS OWN wrap exported
+        // (`conduct.rs::session_conduct`'s ordinary local-inheritance path) —
+        // only this door, the one place a daemon's ambient env reaches an
+        // unrelated freshly-spawned session, clears it.
+        .env_remove("AOIDE_SESSION_ID")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
+    // SAFETY: `setsid()` is async-signal-safe and is the only call made in
+    // this pre_exec hook (same discipline as `graph/conduct.rs::spawn_on_pty`'s
+    // pre_exec) — it detaches the child into its own session so it survives
+    // this HTTP handler thread's lifetime. A failure here (already a session
+    // leader — vanishingly unlikely for a freshly-forked child) is not fatal
+    // to the spawn; the child would just inherit our process group instead.
+    unsafe {
+        cmd.pre_exec(|| {
+            let _ = libc::setsid();
+            Ok(())
+        });
+    }
+    cmd
+}
+
+/// Bound `spawn_cwd` (resolved by [`resolve_spawn_cwd`]) against the
+/// currently REGISTERED project roots and, on acceptance, return the exact
+/// string to hand to `Command::current_dir`. Refuses (returns `None`, having
+/// audited exactly once) anything that is not byte-identical to some
+/// project's own root — unregistered, a relative path, or a root that no
+/// longer exists on disk — since the client never supplies this value and an
+/// operator typo must degrade to "inherit", never to an arbitrary directory.
+/// An empty `spawn_cwd` (the default — no override configured) is the quiet
+/// no-op, not an audited reject.
+fn resolve_bounded_spawn_cwd(
+    spawn_cwd: &str,
+    projects: &[Project],
+    audit_log: &Path,
+) -> Option<String> {
+    if spawn_cwd.is_empty() {
+        return None;
+    }
+    let path = std::path::Path::new(spawn_cwd);
+    let registered = projects.iter().any(|p| p.roots().contains(&spawn_cwd));
+    if registered && path.is_absolute() && path.is_dir() {
+        return Some(spawn_cwd.to_string());
+    }
+    let _ = audit(
+        audit_log,
+        Door::A2a,
+        EventClass::Audit,
+        "a2a.message/send",
+        "skipped",
+        &format!(
+            "ignoring configured spawn cwd `{spawn_cwd}` for the spawned child — not a \
+             registered project root — inheriting the daemon's own cwd instead"
+        ),
+    );
+    None
+}
+
+fn do_spawn(
+    agent_cmd: &str,
+    prompt: &str,
+    audit_log: &Path,
+    node_name: &str,
+    spawn_cwd: &str,
+) -> Result<Value, (i64, String)> {
     let id = format!("a2a-{}-{}", std::process::id(), unix_ts_now());
     let aoide_bin = std::env::current_exe()
         .map_err(|e| (-32603_i64, format!("resolving the aoide binary: {e}")))?;
@@ -1112,32 +1230,13 @@ fn do_spawn(agent_cmd: &str, prompt: &str, audit_log: &Path, node_name: &str) ->
     argv.extend(agent_cmd.split_whitespace().map(str::to_string));
 
     let origin = format!("node:{node_name}");
-    let mut cmd = std::process::Command::new(&aoide_bin);
-    cmd.args(&argv)
-        .env("AOIDE_AUDIT_LOG", audit_log)
-        // No `AOIDE_SESSION_ORIGIN` on the child (LANE IDENTITY P-ID0,
-        // G16/G5 — reversed from the pre-P-ID0 shape): threading a `node:*`
-        // origin through inherited env was unauthenticated, since any
-        // same-uid process can set that same var on itself before invoking
-        // `aoide conduct` directly. `stamp_spawn_origin` below stamps the
-        // record from THIS door instead, once the child registers. Cleared
-        // explicitly in case `a2a serve`'s own env ever carried one.
-        .env_remove("AOIDE_SESSION_ORIGIN")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    // SAFETY: `setsid()` is async-signal-safe and is the only call made in
-    // this pre_exec hook (same discipline as `graph/conduct.rs::spawn_on_pty`'s
-    // pre_exec) — it detaches the child into its own session so it survives
-    // this HTTP handler thread's lifetime. A failure here (already a session
-    // leader — vanishingly unlikely for a freshly-forked child) is not fatal
-    // to the spawn; the child would just inherit our process group instead.
-    unsafe {
-        cmd.pre_exec(|| {
-            let _ = libc::setsid();
-            Ok(())
-        });
-    }
+    // Project roots are already loaded the same way `session_ref_lookup`
+    // loads `sessions.json` off the stage — a missing/corrupt file degrades
+    // to an empty registry, so a misconfigured `spawn_cwd` never blocks a
+    // spawn, only its cwd bound.
+    let pf: ProjectsFile = load_stage(&aoide_storage::stage::projects_path()).unwrap_or_default();
+    let bounded_cwd = resolve_bounded_spawn_cwd(spawn_cwd, &pf.projects, audit_log);
+    let mut cmd = spawn_child_command(&aoide_bin, &argv, audit_log, bounded_cwd.as_deref());
 
     match cmd.spawn() {
         Ok(mut child) => {
@@ -1331,6 +1430,7 @@ fn message_send(
     params: &Value,
     audit_log: &Path,
     spawn_agent: &str,
+    spawn_cwd: &str,
     origin: ConnOrigin,
     expected_token: &str,
     presented_token: Option<&str>,
@@ -1461,7 +1561,7 @@ fn message_send(
         SendAction::Spawn { agent_cmd } => {
             if spawn_admitted(resolved_node) {
                 let node = resolved_node.expect("spawn_admitted only returns true when resolved_node is Some").0;
-                do_spawn(&agent_cmd, &prompt, audit_log, &node.name)
+                do_spawn(&agent_cmd, &prompt, audit_log, &node.name, spawn_cwd)
             } else {
                 let (code, msg) = spawn_refusal(resolved_node);
                 let _ = audit(
@@ -2233,6 +2333,7 @@ fn pair_poll(params: &Value, audit_log: &Path) -> Result<Value, (i64, String)> {
 struct RequestCtx<'a> {
     audit_log: &'a Path,
     spawn_agent: &'a str,
+    spawn_cwd: &'a str,
     origin: ConnOrigin,
     node_name: &'a str,
     self_url: &'a str,
@@ -2278,6 +2379,7 @@ fn handle_jsonrpc(req: &Value, ctx: &RequestCtx) -> Value {
             &params,
             ctx.audit_log,
             ctx.spawn_agent,
+            ctx.spawn_cwd,
             ctx.origin,
             ctx.expected_token,
             ctx.presented_token,
@@ -2406,6 +2508,7 @@ fn stream_task<W: Write>(
     method: &str,
     audit_log: &Path,
     spawn_agent: &str,
+    spawn_cwd: &str,
     origin: ConnOrigin,
     expected_token: &str,
     presented_token: Option<&str>,
@@ -2436,7 +2539,7 @@ fn stream_task<W: Write>(
     } else {
         match method {
             "message/stream" => {
-                message_send(&params, audit_log, spawn_agent, origin, expected_token, presented_token, signed_node_name)
+                message_send(&params, audit_log, spawn_agent, spawn_cwd, origin, expected_token, presented_token, signed_node_name)
             }
             _ /* tasks/resubscribe */ => {
                 match params.get("id").and_then(Value::as_str).filter(|s| !s.is_empty()) {
@@ -3057,6 +3160,7 @@ fn route(
     port: u16,
     audit_log: &Path,
     spawn_agent: &str,
+    spawn_cwd: &str,
     node_name: &str,
     origin: ConnOrigin,
     expected_token: &str,
@@ -3115,6 +3219,7 @@ fn route(
                 let ctx = RequestCtx {
                     audit_log,
                     spawn_agent,
+                    spawn_cwd,
                     origin,
                     node_name,
                     self_url: &self_url,
@@ -3312,6 +3417,7 @@ pub fn serve(
     port: u16,
     audit_log: &Path,
     spawn_agent: &str,
+    spawn_cwd: &str,
     node_name: &str,
     expected_token: &str,
     bearer_secret: &str,
@@ -3394,6 +3500,7 @@ pub fn serve(
         let bind = bind.to_string();
         let audit_log = audit_log.to_path_buf();
         let spawn_agent = spawn_agent.to_string();
+        let spawn_cwd = spawn_cwd.to_string();
         let node_name = node_name.to_string();
         let bearer_cfg = bearer_cfg.clone();
         std::thread::spawn(move || {
@@ -3404,6 +3511,7 @@ pub fn serve(
                 port,
                 &audit_log,
                 &spawn_agent,
+                &spawn_cwd,
                 &node_name,
                 &bearer_cfg,
                 registry,
@@ -3424,6 +3532,7 @@ fn handle_connection(
     port: u16,
     audit_log: &Path,
     spawn_agent: &str,
+    spawn_cwd: &str,
     node_name: &str,
     bearer_cfg: &InboundBearerConfig,
     registry: &Registry,
@@ -3532,6 +3641,7 @@ fn handle_connection(
             &method,
             audit_log,
             spawn_agent,
+            spawn_cwd,
             origin,
             &expected_token,
             req.bearer.as_deref(),
@@ -3545,6 +3655,7 @@ fn handle_connection(
         port,
         audit_log,
         spawn_agent,
+        spawn_cwd,
         node_name,
         origin,
         &expected_token,
@@ -3596,6 +3707,7 @@ mod tests {
         RequestCtx {
             audit_log,
             spawn_agent,
+            spawn_cwd: "",
             origin: ConnOrigin::Loopback,
             node_name: "aoide",
             self_url: "http://127.0.0.1:8710/",
@@ -4254,6 +4366,7 @@ mod tests {
         let ctx = |presented: Option<&'static str>| RequestCtx {
             audit_log: Path::new("/dev/null"),
             spawn_agent: "",
+            spawn_cwd: "",
             origin: ConnOrigin::Loopback,
             node_name: "aoide",
             self_url: "http://127.0.0.1:8710/",
@@ -4385,6 +4498,7 @@ mod tests {
             "tasks/resubscribe",
             Path::new("/dev/null"),
             "",
+            "",
             ConnOrigin::Loopback,
             "s3cr3t",
             None,
@@ -4473,6 +4587,7 @@ mod tests {
             "message/stream",
             &audit_log,
             "",
+            "",
             ConnOrigin::Loopback,
             "s3cr3t",
             None,
@@ -4550,6 +4665,7 @@ mod tests {
             &req,
             "tasks/resubscribe",
             Path::new("/dev/null"),
+            "",
             "",
             ConnOrigin::Loopback,
             "",
@@ -4860,6 +4976,7 @@ mod tests {
             &params,
             Path::new("/dev/null"),
             "claude",
+            "",
             ConnOrigin::Loopback,
             "expected-secret",
             None, None
@@ -4871,6 +4988,7 @@ mod tests {
             &params,
             Path::new("/dev/null"),
             "claude",
+            "",
             ConnOrigin::Loopback,
             "expected-secret",
             Some("wrong-secret"), None
@@ -4932,6 +5050,142 @@ mod tests {
             "never echoes flag values back — taught, not a raw command dump: {msg}"
         );
         assert!(!msg.contains("PATH="), "no env leakage");
+    }
+
+    // ── S-B: spawn env sanitize + bounded spawn cwd ──────────────────────────
+    //
+    // `spawn_child_command` and `resolve_bounded_spawn_cwd` are `do_spawn`'s
+    // own pure-ish halves, factored out exactly so they're testable without a
+    // real OS-level spawn — same "never through `do_spawn` itself" precedent
+    // `spawn_inject_prompts_success_branch_files_the_opening_turn_into_the_
+    // mailbase`'s doc comment states for `current_exe()` resolving to the
+    // TEST binary under `cargo test`.
+
+    #[test]
+    fn a2a_spawn_clears_the_daemons_own_session_id_from_the_child() {
+        // The Osaka wrong-ancestry bug: the `aoide-a2a` unit's own
+        // environment can carry the operator's live `AOIDE_SESSION_ID`
+        // (inherited from whatever terminal the unit itself descends from),
+        // and a spawned child must never see it. Proven via
+        // `Command::get_envs()` (stable since Rust 1.57): it enumerates only
+        // the EXPLICIT `.env()`/`.env_remove()` calls a `Command` carries — a
+        // removed var reports `Some(None)`, an explicitly-set var reports
+        // `Some(Some(value))`, and a var the `Command` never mentions is
+        // simply ABSENT from the map, meaning ordinary fork/exec inheritance
+        // still applies to it. That absence is exactly how a "sibling var
+        // passes through" is proven here: the removal targets
+        // `AOIDE_SESSION_ORIGIN`/`AOIDE_SESSION_ID` by name, nothing else.
+        let cmd = spawn_child_command(
+            Path::new("/bin/true"),
+            &["conduct".to_string()],
+            Path::new("/tmp/aoide-a2a-test-audit-does-not-need-to-exist.log"),
+            None,
+        );
+        let envs: std::collections::HashMap<&std::ffi::OsStr, Option<&std::ffi::OsStr>> =
+            cmd.get_envs().collect();
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("AOIDE_SESSION_ID")),
+            Some(&None),
+            "AOIDE_SESSION_ID must be explicitly removed from the child, not merely absent: {envs:?}"
+        );
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("AOIDE_SESSION_ORIGIN")),
+            Some(&None),
+            "the pre-existing AOIDE_SESSION_ORIGIN removal must still be present, unreplaced: {envs:?}"
+        );
+        assert!(
+            !envs.contains_key(std::ffi::OsStr::new("AOIDE_A2A_SIBLING_TEST_VAR")),
+            "a sibling var the removal never names is untouched by this Command — it passes \
+             through by ordinary inheritance, proving the removal is targeted, not a blanket \
+             env_clear: {envs:?}"
+        );
+    }
+
+    #[test]
+    fn a2a_spawn_uses_a_registered_project_root_as_the_child_cwd() {
+        let root = std::env::temp_dir().join(format!(
+            "aoide-a2a-spawncwd-ok-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root_str = root.to_string_lossy().into_owned();
+        let projects = vec![Project {
+            name: "aoide".into(),
+            path: root_str.clone(),
+            ..Default::default()
+        }];
+        let audit_log = root.join("audit.log");
+
+        let resolved = resolve_bounded_spawn_cwd(&root_str, &projects, &audit_log);
+        assert_eq!(
+            resolved,
+            Some(root_str),
+            "a byte-identical registered, existing root is accepted"
+        );
+        assert!(
+            std::fs::read_to_string(&audit_log)
+                .unwrap_or_default()
+                .is_empty(),
+            "the accept path never audits — only the reject path does"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a2a_spawn_ignores_an_unregistered_spawn_cwd_and_audits_it() {
+        let registered_root = std::env::temp_dir().join(format!(
+            "aoide-a2a-spawncwd-registered-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let unregistered_dir = std::env::temp_dir().join(format!(
+            "aoide-a2a-spawncwd-unregistered-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&registered_root).unwrap();
+        std::fs::create_dir_all(&unregistered_dir).unwrap();
+        let projects = vec![Project {
+            name: "aoide".into(),
+            path: registered_root.to_string_lossy().into_owned(),
+            ..Default::default()
+        }];
+        let audit_log = registered_root.join("audit.log");
+
+        let unregistered_str = unregistered_dir.to_string_lossy().into_owned();
+        let resolved = resolve_bounded_spawn_cwd(&unregistered_str, &projects, &audit_log);
+        assert_eq!(
+            resolved, None,
+            "a real, existing directory that is simply not a registered root is still refused"
+        );
+
+        let log = std::fs::read_to_string(&audit_log).unwrap_or_default();
+        assert!(
+            log.contains("\"door\":\"a2a\""),
+            "audited through Door::A2a: {log}"
+        );
+        assert!(
+            log.contains("\"status\":\"skipped\""),
+            "the reject path audits exactly once, as \"skipped\": {log}"
+        );
+        assert!(
+            log.contains(&unregistered_str),
+            "names the rejected path, never silently: {log}"
+        );
+
+        let _ = std::fs::remove_dir_all(&registered_root);
+        let _ = std::fs::remove_dir_all(&unregistered_dir);
     }
 
     // ── Spawn gate table (P-P3, PAIRING.md decision 6) ───────────────────────
@@ -5666,6 +5920,7 @@ mod tests {
             &body["params"],
             &root.join("log"),
             "claude",
+            "",
             ConnOrigin::Loopback,
             "",
             None,
@@ -5706,7 +5961,17 @@ mod tests {
 
         let params = json!({ "message": { "parts": [{ "kind": "text", "text": "hi" }] } });
         let remote_origin = ConnOrigin::Remote("10.0.0.5".parse().unwrap());
-        let err = message_send(&params, &root.join("log"), "claude", remote_origin, "", None, None).unwrap_err();
+        let err = message_send(
+            &params,
+            &root.join("log"),
+            "claude",
+            "",
+            remote_origin,
+            "",
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.0, -32006, "resolved to a REAL node, but `spawn` is not in its allows");
 
         let _ = std::fs::remove_dir_all(&root);
@@ -5746,7 +6011,17 @@ mod tests {
 
         let params = json!({ "message": { "parts": [{ "kind": "text", "text": "hi" }] } });
         let remote_origin = ConnOrigin::Remote("10.0.0.5".parse().unwrap());
-        let err = message_send(&params, &root.join("log"), "claude", remote_origin, "", None, None).unwrap_err();
+        let err = message_send(
+            &params,
+            &root.join("log"),
+            "claude",
+            "",
+            remote_origin,
+            "",
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(
             err.0, -32006,
             "paired AND `spawn` in allows, but resolved ONLY via address — still refused"
@@ -5784,6 +6059,7 @@ mod tests {
             &params,
             &root.join("log"),
             "claude",
+            "",
             ConnOrigin::Loopback,
             "the-door-wide-secret",
             Some("the-door-wide-secret"), // matches expected_token exactly.
@@ -5837,7 +6113,7 @@ mod tests {
             "message": { "parts": [{ "kind": "text", "text": "inject me" }], "contextId": id }
         });
         let remote_origin = ConnOrigin::Remote("10.0.0.9".parse().unwrap());
-        let result = message_send(&params, &audit_log, "", remote_origin, "", None, None);
+        let result = message_send(&params, &audit_log, "", "", remote_origin, "", None, None);
         let task = result.expect("a pending send is still an Ok Task, not a JSON-RPC error");
         assert_eq!(task["id"], id);
         assert_eq!(
@@ -5921,7 +6197,7 @@ mod tests {
             "message": { "parts": [{ "kind": "text", "text": "who sent this" }], "contextId": id }
         });
         let remote_origin = ConnOrigin::Remote("10.0.0.9".parse().unwrap());
-        let result = message_send(&params, &audit_log, "", remote_origin, "", None, None);
+        let result = message_send(&params, &audit_log, "", "", remote_origin, "", None, None);
         assert!(result.is_ok(), "still a submitted Task, never a JSON-RPC error");
 
         let pending: serde_json::Value =
@@ -5991,7 +6267,16 @@ mod tests {
         // (`resolve_node` needs a token or a matching address); it resolves
         // here purely because `signed_node_name` is `Some`.
         let remote_origin = ConnOrigin::Remote("203.0.113.1".parse().unwrap());
-        let result = message_send(&params, &audit_log, "", remote_origin, "", None, Some("signed-node"));
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            "",
+            remote_origin,
+            "",
+            None,
+            Some("signed-node"),
+        );
         assert!(result.is_ok());
 
         let pending: serde_json::Value =
@@ -6066,6 +6351,7 @@ mod tests {
         let result = message_send(
             &params,
             &audit_log,
+            "",
             "",
             remote_origin,
             "",
@@ -6158,6 +6444,7 @@ mod tests {
             &params,
             &audit_log,
             "",
+            "",
             remote_origin,
             "",
             Some("real-secret"),
@@ -6236,7 +6523,16 @@ mod tests {
         let params = serde_json::json!({
             "message": { "parts": [{ "kind": "text", "text": "hello loopback" }], "contextId": id }
         });
-        let result = message_send(&params, &audit_log, "", ConnOrigin::Loopback, "", None, None);
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            "",
+            ConnOrigin::Loopback,
+            "",
+            None,
+            None,
+        );
         let got = acc.join().unwrap();
         assert_eq!(String::from_utf8(got).unwrap(), "hello loopback\r");
 
@@ -6310,7 +6606,16 @@ mod tests {
         let params = serde_json::json!({
             "message": { "parts": [{ "kind": "text", "text": "still here" }], "contextId": id }
         });
-        let result = message_send(&params, &audit_log, "", ConnOrigin::Loopback, "", None, None);
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            "",
+            ConnOrigin::Loopback,
+            "",
+            None,
+            None,
+        );
         let got = acc.join().unwrap();
         assert_eq!(String::from_utf8(got).unwrap(), "still here\r");
         assert_eq!(result.unwrap()["id"], id);
@@ -6322,8 +6627,17 @@ mod tests {
         let params2 = serde_json::json!({
             "message": { "parts": [{ "kind": "text", "text": "too late" }], "contextId": id }
         });
-        let err = message_send(&params2, &audit_log, "", ConnOrigin::Loopback, "", None, None)
-            .expect_err("a missing socket must be a structured error, not a failed connect");
+        let err = message_send(
+            &params2,
+            &audit_log,
+            "",
+            "",
+            ConnOrigin::Loopback,
+            "",
+            None,
+            None,
+        )
+        .expect_err("a missing socket must be a structured error, not a failed connect");
         assert_eq!(err.0, -32004);
         assert_eq!(err.1, "session not conductable");
 
@@ -6382,7 +6696,16 @@ mod tests {
         let params = serde_json::json!({
             "message": { "parts": [{ "kind": "text", "text": "hello from a node" }], "contextId": id }
         });
-        let result = message_send(&params, &audit_log, "", ConnOrigin::Loopback, "", None, None);
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            "",
+            ConnOrigin::Loopback,
+            "",
+            None,
+            None,
+        );
         let _ = acc.join().unwrap();
         assert!(result.is_ok(), "{:?}", result.err());
 
@@ -6551,7 +6874,16 @@ mod tests {
         let params = serde_json::json!({
             "message": { "parts": [{ "kind": "text", "text": "spoofed loopback" }], "contextId": id }
         });
-        let result = message_send(&params, &audit_log, "", ConnOrigin::Loopback, "the-real-token", None, None);
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            "",
+            ConnOrigin::Loopback,
+            "the-real-token",
+            None,
+            None,
+        );
         let task = result.expect("the uniform arm always answers Ok, never a JSON-RPC error");
         assert_eq!(
             task["status"]["state"], "submitted",
@@ -6630,6 +6962,7 @@ mod tests {
         let result = message_send(
             &params,
             &audit_log,
+            "",
             "",
             ConnOrigin::Loopback,
             "the-real-token",
@@ -6710,7 +7043,7 @@ mod tests {
             "message": { "parts": [{ "kind": "text", "text": "trusted send" }], "contextId": id }
         });
         let remote_origin = ConnOrigin::Remote("10.0.0.9".parse().unwrap());
-        let result = message_send(&params, &audit_log, "", remote_origin, "", None, None);
+        let result = message_send(&params, &audit_log, "", "", remote_origin, "", None, None);
         let got = acc.join().unwrap();
         assert_eq!(
             String::from_utf8(got).unwrap(),
@@ -6810,7 +7143,16 @@ mod tests {
             "message": { "parts": [{ "kind": "text", "text": "token-identified send" }], "contextId": id }
         });
         let remote_origin = ConnOrigin::Remote("10.0.0.9".parse().unwrap());
-        let result = message_send(&params, &audit_log, "", remote_origin, "", Some("node-secret"), None);
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            "",
+            remote_origin,
+            "",
+            Some("node-secret"),
+            None,
+        );
         let got = acc.join().unwrap();
         assert_eq!(String::from_utf8(got).unwrap(), "token-identified send\r");
         assert!(result.is_ok());
@@ -6886,7 +7228,16 @@ mod tests {
         // (`classify_origin`, `peer_addr()`) exactly like this. Before the
         // P-S6 narrowing, `should_deliver_now(Loopback, _)` was
         // unconditionally `true`, so this would have auto-delivered.
-        let result = message_send(&params, &audit_log, "", ConnOrigin::Loopback, "", None, Some("tunneled-node"));
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            "",
+            ConnOrigin::Loopback,
+            "",
+            None,
+            Some("tunneled-node"),
+        );
         assert!(result.is_ok(), "{:?}", result.err());
         assert!(listener.accept().is_err(), "a signed, non-autogate node's send must never touch the socket, loopback or not");
 
@@ -6958,6 +7309,7 @@ mod tests {
         let result = message_send(
             &params,
             &audit_log,
+            "",
             "",
             ConnOrigin::Loopback,
             "",
@@ -7051,7 +7403,16 @@ mod tests {
                 });
                 // Loopback origin too — the uniform answer holds even for the
                 // origin that would otherwise get the automatic trust pass.
-                let result = message_send(&params, &audit_log, "", ConnOrigin::Loopback, "s3cr3t", presented, None);
+                let result = message_send(
+                    &params,
+                    &audit_log,
+                    "",
+                    "",
+                    ConnOrigin::Loopback,
+                    "s3cr3t",
+                    presented,
+                    None,
+                );
                 let task = result.expect("uniform arm always answers Ok, never a JSON-RPC error");
                 assert_eq!(task["id"], id);
                 assert_eq!(task["contextId"], id);
@@ -7142,7 +7503,16 @@ mod tests {
         let params = serde_json::json!({
             "message": { "parts": [{ "kind": "text", "text": "authed send" }], "contextId": real_id }
         });
-        let result = message_send(&params, &audit_log, "", remote_origin, "s3cr3t", Some("s3cr3t"), None);
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            "",
+            remote_origin,
+            "s3cr3t",
+            Some("s3cr3t"),
+            None,
+        );
         let task = result.expect("a valid bearer still resolves the real Inject decision");
         assert_eq!(task["id"], real_id);
         assert_eq!(task["status"]["state"], "submitted");
@@ -7157,15 +7527,33 @@ mod tests {
         let bogus_params = serde_json::json!({
             "message": { "parts": [{ "kind": "text", "text": "x" }], "contextId": bogus_id }
         });
-        let bogus_err =
-            message_send(&bogus_params, &audit_log, "", remote_origin, "s3cr3t", Some("s3cr3t"), None).unwrap_err();
+        let bogus_err = message_send(
+            &bogus_params,
+            &audit_log,
+            "",
+            "",
+            remote_origin,
+            "s3cr3t",
+            Some("s3cr3t"),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(bogus_err.0, -32001);
 
         let noncond_params = serde_json::json!({
             "message": { "parts": [{ "kind": "text", "text": "x" }], "contextId": noncond_id }
         });
-        let noncond_err =
-            message_send(&noncond_params, &audit_log, "", remote_origin, "s3cr3t", Some("s3cr3t"), None).unwrap_err();
+        let noncond_err = message_send(
+            &noncond_params,
+            &audit_log,
+            "",
+            "",
+            remote_origin,
+            "s3cr3t",
+            Some("s3cr3t"),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(noncond_err.0, -32004);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -7225,7 +7613,16 @@ mod tests {
         let params = serde_json::json!({
             "message": { "parts": [{ "kind": "text", "text": "off-path send" }], "contextId": real_id }
         });
-        let result = message_send(&params, &audit_log, "", ConnOrigin::Loopback, "", None, None);
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            "",
+            ConnOrigin::Loopback,
+            "",
+            None,
+            None,
+        );
         let got = acc.join().unwrap();
         assert_eq!(String::from_utf8(got).unwrap(), "off-path send\r", "no token configured: loopback still auto-delivers");
         assert!(result.is_ok());
@@ -7233,13 +7630,33 @@ mod tests {
         let bogus_params = serde_json::json!({
             "message": { "parts": [{ "kind": "text", "text": "x" }], "contextId": bogus_id }
         });
-        let bogus_err = message_send(&bogus_params, &audit_log, "", ConnOrigin::Loopback, "", None, None).unwrap_err();
+        let bogus_err = message_send(
+            &bogus_params,
+            &audit_log,
+            "",
+            "",
+            ConnOrigin::Loopback,
+            "",
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(bogus_err.0, -32001);
 
         let noncond_params = serde_json::json!({
             "message": { "parts": [{ "kind": "text", "text": "x" }], "contextId": noncond_id }
         });
-        let noncond_err = message_send(&noncond_params, &audit_log, "", ConnOrigin::Loopback, "", None, None).unwrap_err();
+        let noncond_err = message_send(
+            &noncond_params,
+            &audit_log,
+            "",
+            "",
+            ConnOrigin::Loopback,
+            "",
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(noncond_err.0, -32004);
 
         let _ = std::fs::remove_dir_all(&root);
@@ -7332,7 +7749,16 @@ mod tests {
         // "server-secret" is configured server-wide; "node-secret" (what's
         // presented) does NOT match it — only the per-node autogate match
         // saves this from the #50 uniform guard.
-        let result = message_send(&params, &audit_log, "", remote_origin, "server-secret", Some("node-secret"), None);
+        let result = message_send(
+            &params,
+            &audit_log,
+            "",
+            "",
+            remote_origin,
+            "server-secret",
+            Some("node-secret"),
+            None,
+        );
         let task = result.expect("autogate exempts this send from the #50 guard, so it's still an Ok Task");
         assert_eq!(task["id"], id);
         assert_eq!(task["status"]["state"], "submitted");
@@ -8727,6 +9153,7 @@ mod tests {
             8710,
             Path::new("/dev/null"),
             "",
+            "",
             "aoide",
             ConnOrigin::Loopback,
             "",
@@ -8751,6 +9178,7 @@ mod tests {
             "127.0.0.1",
             8710,
             Path::new("/dev/null"),
+            "",
             "",
             "aoide",
             ConnOrigin::Loopback,
@@ -8793,6 +9221,7 @@ mod tests {
                 8710,
                 Path::new("/dev/null"),
                 "",
+                "",
                 "aoide",
                 ConnOrigin::Loopback,
                 "",
@@ -8828,6 +9257,7 @@ mod tests {
             "127.0.0.1",
             8710,
             Path::new("/dev/null"),
+            "",
             "",
             "aoide",
             ConnOrigin::Loopback,
@@ -8872,6 +9302,7 @@ mod tests {
             8710,
             Path::new("/dev/null"),
             "",
+            "",
             "aoide",
             ConnOrigin::Loopback,
             "s3cr3t",
@@ -8904,6 +9335,7 @@ mod tests {
             "127.0.0.1",
             8710,
             Path::new("/dev/null"),
+            "",
             "",
             "aoide",
             ConnOrigin::Loopback,
@@ -9152,6 +9584,7 @@ mod tests {
         RequestCtx {
             audit_log,
             spawn_agent: "",
+            spawn_cwd: "",
             origin: ConnOrigin::Loopback,
             node_name: "",
             self_url: "",

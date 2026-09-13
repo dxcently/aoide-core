@@ -206,6 +206,31 @@ the inbound half of the two-door contract (the outbound half is
   `spawnAgent` binary on this unit's PATH) exits inside that window and
   gets a taught JSON-RPC error instead, closing the gap where a caller was
   handed a session id for a spawn that had already failed.
+  **The spawned child's environment and cwd are sanitized, never trusted
+  from the daemon's own ambient env.** `spawn_child_command` explicitly
+  `.env_remove()`s both `AOIDE_SESSION_ORIGIN` (P-ID0/G16/G5 — an
+  unauthenticated origin claim) and `AOIDE_SESSION_ID`: the `aoide-a2a`
+  unit's own environment can carry the OPERATOR's live terminal session id,
+  inherited from whatever shell the unit itself descends from, and without
+  this removal a freshly-spawned child would adopt it as its
+  `parentSessionId` via `window.rs`'s ambient-parent fallback — a spawned
+  agent parented under an unrelated human terminal. A real `aoide conduct`
+  launched from an agent's own shell is untouched by this: it inherits
+  whatever ITS OWN wrap exported, the ordinary local-inheritance path;
+  only this door's spawn clears the ambient value first. The child's
+  working directory follows the same distrust: `resolve_spawn_cwd` reads
+  `--spawn-cwd` then `AOIDE_A2A_SPAWN_CWD` (mirroring
+  `resolve_spawn_agent`'s own precedence, resolved once at `a2a serve`
+  launch), but `do_spawn` only ever calls `current_dir` on a value
+  `resolve_bounded_spawn_cwd` has matched byte-identically against a
+  REGISTERED project root (`Project::roots()`, loaded off
+  `aoide_storage::stage::projects_path()` the same way session state is
+  loaded off its own stage file) that still exists as a directory on disk.
+  Anything else — unregistered, relative, a root that no longer exists —
+  is ignored, the spawn inherits the daemon's own cwd exactly as before,
+  and the reject is audited exactly once (`Door::A2a`, `EventClass::Audit`,
+  `"a2a.message/send"`, `"skipped"`) so a misconfigured value degrades
+  quietly instead of ever placing a spawn in an arbitrary directory.
   **Inbound bearer verification (task #84)** resolves the door's expected
   `Authorization: Bearer` token through `aoide-secrets`'s broker rather
   than only reading a static token file: `--bearer-secret <name>` (or
