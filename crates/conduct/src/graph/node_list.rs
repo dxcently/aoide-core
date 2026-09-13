@@ -51,6 +51,22 @@
 //! sweep heard this instance itself (`discover::is_self_target` — the same
 //! name/loopback guard `node invite` uses), and a self-heard advertisement
 //! never becomes a candidate row.
+//!
+//! ## `--mesh` (P-14 M2): the per-refresh widget document
+//!
+//! One flag on this same command, no new command path. It reuses the exact
+//! same local build + probe fan-out above — one prober, still — but skips
+//! [`SweepFn`] entirely rather than running it and filtering its result
+//! afterward: [`assemble_roster`] is called with an empty heard slice, so a
+//! discovery candidate is absent BY CONSTRUCTION and `advertising` reads
+//! `false` throughout. [`mesh_document`] then stages a widget-shaped JSON
+//! document (node-scoped session `id`s, `title`/`model`/`kind`/`parent`
+//! enrichment, `liveSessions`/`cachedSessions` tallies) atomically to
+//! [`mesh_path`] — the same `state/stage/` roster `graph::pending_path`/
+//! `herald::herald_path` already write to, so a widget `FileView`s it
+//! exactly like `aoide usage`'s `state/usage.json`. Bare `node list` (no
+//! `--mesh`) is untouched: same sweep, same [`row_json`] shape, no file
+//! written.
 
 use super::who::{
     build_local_node, build_mesh_node, probe_nodes, NodeView, PullFn, SessionView,
@@ -260,20 +276,128 @@ fn row_json(r: &Row) -> Value {
     })
 }
 
+/// `state/stage/mesh.json` (P-14 M2) — core conducting state, the same
+/// `conducting_stage_dir()` roster `graph::pending_path`/`herald::herald_path`
+/// resolve through. `pub`, matching those two: a future non-`--mesh` reader
+/// (a widget-side test, another module) reaches this path rather than a
+/// second `conducting_stage_dir().join("mesh.json")` literal.
+pub fn mesh_path() -> std::path::PathBuf {
+    aoide_storage::fs::conducting_stage_dir().join("mesh.json")
+}
+
+/// True for a session presence a LIVE host reports (`online`/`stale`) —
+/// false for the cache-fallback vocabulary [`super::who::cached_presence`]
+/// hands back (`last-seen`/`unknown`). `done` never reaches here: both
+/// `node_list_with` and [`mesh_document`] retain-filter it out of every row
+/// first, same as bare `node list` always has.
+fn is_live(presence: &str) -> bool {
+    matches!(presence, "online" | "stale")
+}
+
+/// One session row within the `--mesh` document — [`row_json`]'s session
+/// shape plus a node-scoped `id` (`<rowName>/<sessionId>`, the exact
+/// `node/<rest>` grammar `storage::addr::resolve`'s tier 5 already inverts)
+/// so two hosts sharing a bare session id never collide in a flat
+/// per-refresh consumer; the bare `sessionId` still rides, for local action
+/// routing. `title`/`model`/`kind`/`parent` ride only when
+/// [`SessionView`]'s enrichment fields carry them — nothing invented for a
+/// session that never published one.
+fn mesh_session_json(row_name: &str, s: &SessionView) -> Value {
+    let mut v = json!({
+        "id": format!("{row_name}/{}", s.session_id),
+        "sessionId": s.session_id,
+        "label": s.label,
+        "petname": s.petname,
+        "agent": s.agent,
+        "state": s.state,
+        "presence": s.presence,
+        "cwd": s.cwd,
+    });
+    if let Some(t) = &s.title {
+        v["title"] = json!(t);
+    }
+    if let Some(m) = &s.model {
+        v["model"] = json!(m);
+    }
+    if let Some(k) = &s.kind {
+        v["kind"] = json!(k);
+    }
+    if let Some(parent) = &s.parent {
+        v["parent"] = json!(parent);
+    }
+    v
+}
+
+/// One row within the `--mesh` document — [`row_json`]'s row shape plus the
+/// row's own `liveSessions`/`cachedSessions` split (module doc's "the
+/// per-refresh widget document"). Remote-only action fields (`pid`,
+/// `windowAddress`, `workspace`) were never in [`row_json`]'s session shape
+/// to begin with, so there is nothing to additionally omit here.
+fn mesh_row_json(r: &Row) -> Value {
+    let live = r.sessions.iter().filter(|s| is_live(s.presence)).count();
+    let cached = r.sessions.len() - live;
+    json!({
+        "mark": mark(r),
+        "name": r.name,
+        "isLocal": r.is_local,
+        "paired": r.paired,
+        "verified": r.verified,
+        "advertising": r.advertising,
+        "presence": r.presence,
+        "addr": r.addr,
+        "lastSeen": r.last_seen,
+        "liveSessions": live,
+        "cachedSessions": cached,
+        "sessions": r.sessions.iter().map(|s| mesh_session_json(&r.name, s)).collect::<Vec<_>>(),
+    })
+}
+
+/// The `--mesh` document: the SAME `rows` bare `node list` renders (module
+/// doc's "the per-refresh widget document"), staged atomically to
+/// [`mesh_path`] rather than only returned. The message line counts LIVE
+/// sessions only — a cached row's session count would otherwise read like a
+/// live one to a human skimming the summary line.
+fn mesh_document(rows: &[Row], host: &str) -> Outcome {
+    let live_sessions: usize = rows.iter().flat_map(|r| &r.sessions).filter(|s| is_live(s.presence)).count();
+    let cached_sessions: usize = rows.iter().map(|r| r.sessions.len()).sum::<usize>() - live_sessions;
+    let message = format!(
+        "{} node(s), {} live session(s)\n{}",
+        rows.len(),
+        live_sessions,
+        render_roster(rows)
+    );
+    let data = json!({
+        "host": host,
+        "generatedAt": aoide_storage::time::now_iso_utc(),
+        "nodes": rows.iter().map(mesh_row_json).collect::<Vec<_>>(),
+        "liveSessions": live_sessions,
+        "cachedSessions": cached_sessions,
+    });
+    let path = mesh_path();
+    if let Err(e) = aoide_storage::stage::write_stage(&path, &data) {
+        return Outcome::error("node.list", format!("failed to stage {}: {e}", path.display()));
+    }
+    Outcome::ok("node.list", message).with_data(data)
+}
+
 /// The testable core, `who.rs::session_roster_with`'s exact shape one seam
 /// wider: real local stage + node-store I/O, but BOTH network-shaped steps —
 /// the per-node probes and the discovery sweep — arrive injected, so a test
 /// never opens a socket. The sweep runs on its own thread beside the probe
 /// fan-out (both are ~2s walls; serial would double the command's latency
-/// for nothing).
-pub(super) fn node_list_with(_inv: &Invocation, pull: PullFn, sweep: SweepFn) -> Outcome {
+/// for nothing) — UNLESS `--mesh` is present, which skips it entirely
+/// (module doc's "`--mesh`" section): the closure is simply never spawned,
+/// so `heard` reads empty by construction rather than by filtering a real
+/// sweep result afterward.
+pub(super) fn node_list_with(inv: &Invocation, pull: PullFn, sweep: SweepFn) -> Outcome {
     let cmd = "node.list";
     let (p, s, h) = match super::common::load_inputs(cmd) {
         Ok(v) => v,
         Err(e) => return e,
     };
     let host = aoide_storage::display::local_host_name();
-    let sweep_handle = std::thread::spawn(sweep);
+    let mesh = inv.flag_present("mesh");
+    let sweep_handle = if mesh { None } else { Some(std::thread::spawn(sweep)) };
 
     let local = build_local_node(&s.sessions, &h.hooks, &p.projects, &host);
     let nodes = aoide_storage::node_store::load_nodes();
@@ -287,11 +411,12 @@ pub(super) fn node_list_with(_inv: &Invocation, pull: PullFn, sweep: SweepFn) ->
         })
         .collect();
 
-    let sweep_result =
-        sweep_handle.join().unwrap_or_else(|_| Err("sweep thread panicked".to_string()));
-    let (heard, dropped, sweep_error) = match sweep_result {
-        Ok(r) => (r.heard, r.dropped, None),
-        Err(e) => (Vec::new(), 0, Some(e)),
+    let (heard, dropped, sweep_error) = match sweep_handle {
+        Some(handle) => match handle.join().unwrap_or_else(|_| Err("sweep thread panicked".to_string())) {
+            Ok(r) => (r.heard, r.dropped, None),
+            Err(e) => (Vec::new(), 0, Some(e)),
+        },
+        None => (Vec::new(), 0, None),
     };
 
     let mut rows = assemble_roster(local, mesh_nodes, &heard, &host);
@@ -299,6 +424,10 @@ pub(super) fn node_list_with(_inv: &Invocation, pull: PullFn, sweep: SweepFn) ->
     // default view, minus its `--all` escape: the deep view owns that).
     for r in &mut rows {
         r.sessions.retain(|sv| sv.presence != "done");
+    }
+
+    if mesh {
+        return mesh_document(&rows, &host);
     }
 
     let total_sessions: usize = rows.iter().map(|r| r.sessions.len()).sum();
@@ -390,6 +519,10 @@ mod tests {
             project: None,
             effective_project: None,
             exempt: false,
+            title: None,
+            model: None,
+            kind: None,
+            parent: None,
         }
     }
 
@@ -714,5 +847,139 @@ mod tests {
         let out = node_list_with(&invocation(&["node", "list"], &[]), no_pull(), empty_sweep());
         let data = out.data.unwrap();
         assert_eq!(data["nodes"][0]["sessions"].as_array().unwrap().len(), 1, "running only");
+    }
+
+    // ── --mesh: the per-refresh widget document (P-14 M2) ────────────────
+
+    fn mesh_invocation() -> Invocation {
+        flag_invocation(&["node", "list"], &[("mesh", "true")])
+    }
+
+    #[test]
+    fn mesh_rows_scope_duplicate_session_ids_by_node() {
+        let _env = Env::set_up("mesh-dup-ids");
+        let sf = super::super::model::SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![session("s1", "/x", "working", "1", None)],
+        };
+        super::super::model::write_stage(&super::super::model::sessions_path(), &sf).unwrap();
+        aoide_storage::node_store::save_nodes(&[mesh_node("chiyo")]).unwrap();
+        let pull: PullFn = Arc::new(|_| Ok(node_graph(&[("s1", "working", None)])));
+
+        let out = node_list_with(&mesh_invocation(), pull, empty_sweep());
+        let data = out.data.unwrap();
+        let nodes = data["nodes"].as_array().unwrap();
+        let local = nodes.iter().find(|n| n["isLocal"] == true).unwrap();
+        let local_name = local["name"].as_str().unwrap().to_string();
+        assert_eq!(local["sessions"][0]["id"], format!("{local_name}/s1"));
+        assert_eq!(local["sessions"][0]["sessionId"], "s1");
+        let remote = nodes.iter().find(|n| n["name"] == "chiyo").unwrap();
+        assert_eq!(remote["sessions"][0]["id"], "chiyo/s1", "same bare id, a different node — must not collide");
+        assert_eq!(remote["sessions"][0]["sessionId"], "s1", "bare sessionId still rides, for local action routing");
+    }
+
+    #[test]
+    fn an_offline_hosts_cached_working_session_is_excluded_from_the_live_count() {
+        let _env = Env::set_up("mesh-offline-live");
+        aoide_storage::node_store::save_nodes(&[mesh_node("chiyo")]).unwrap();
+        aoide_storage::node_store::save_node_cache(&cache(
+            "chiyo",
+            "2026-08-27T10:00:00Z",
+            node_graph(&[("r1", "working", None)]),
+        ))
+        .unwrap();
+        let pull: PullFn = Arc::new(|_| Err("down".to_string()));
+
+        let out = node_list_with(&mesh_invocation(), pull, empty_sweep());
+        let data = out.data.unwrap();
+        assert_eq!(data["liveSessions"], 0);
+        assert_eq!(data["cachedSessions"], 1);
+        let remote = data["nodes"].as_array().unwrap().iter().find(|n| n["name"] == "chiyo").unwrap();
+        assert_eq!(remote["liveSessions"], 0);
+        assert_eq!(remote["cachedSessions"], 1);
+        assert_eq!(remote["sessions"][0]["presence"], "last-seen");
+    }
+
+    #[test]
+    fn a_live_hosts_idle_session_stays_in_the_live_count() {
+        let _env = Env::set_up("mesh-live-idle");
+        aoide_storage::node_store::save_nodes(&[mesh_node("sakaki")]).unwrap();
+        let pull: PullFn = Arc::new(|_| Ok(node_graph(&[("r1", "idle", None)])));
+
+        let out = node_list_with(&mesh_invocation(), pull, empty_sweep());
+        let data = out.data.unwrap();
+        assert_eq!(data["liveSessions"], 1);
+        assert_eq!(data["cachedSessions"], 0);
+    }
+
+    #[test]
+    fn an_empty_disconnected_mesh_is_the_local_row_alone() {
+        let _env = Env::set_up("mesh-empty");
+        let out = node_list_with(&mesh_invocation(), no_pull(), empty_sweep());
+        let data = out.data.unwrap();
+        let nodes = data["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["isLocal"], true);
+        assert_eq!(data["liveSessions"], 0);
+        assert_eq!(data["cachedSessions"], 0);
+    }
+
+    #[test]
+    fn the_local_host_is_always_the_first_mesh_row() {
+        let _env = Env::set_up("mesh-local-first");
+        aoide_storage::node_store::save_nodes(&[mesh_node("alpha"), mesh_node("beta")]).unwrap();
+        let pull: PullFn = Arc::new(|_| Ok(node_graph(&[])));
+
+        let out = node_list_with(&mesh_invocation(), pull, empty_sweep());
+        let data = out.data.unwrap();
+        let nodes = data["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 3, "local + alpha + beta");
+        assert_eq!(nodes[0]["isLocal"], true);
+        assert_eq!(nodes[1]["name"], "alpha", "registry order after the local row");
+        assert_eq!(nodes[2]["name"], "beta");
+    }
+
+    #[test]
+    fn discovery_candidates_never_enter_the_mesh_document() {
+        let _env = Env::set_up("mesh-no-candidates");
+        // A sweep that WOULD surface a candidate if it ever ran — `--mesh`
+        // must never call it at all, not merely filter its result
+        // afterward (module doc's "`--mesh`" section).
+        let stranger = heard("stranger", "192.168.1.99");
+        let sweep: SweepFn = Box::new(move || Ok(SweepResult { heard: vec![stranger], dropped: 0 }));
+
+        let out = node_list_with(&mesh_invocation(), no_pull(), sweep);
+        let data = out.data.unwrap();
+        let nodes = data["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1, "no candidate row, local alone");
+        assert!(nodes.iter().all(|n| n["advertising"] == false), "advertising:false throughout");
+    }
+
+    #[test]
+    fn the_mesh_document_is_staged_atomically_at_mesh_path() {
+        let _env = Env::set_up("mesh-staged");
+        aoide_storage::node_store::save_nodes(&[mesh_node("sakaki")]).unwrap();
+        let pull: PullFn = Arc::new(|_| Ok(node_graph(&[("r1", "working", None)])));
+
+        let out = node_list_with(&mesh_invocation(), pull, empty_sweep());
+        let data = out.data.unwrap();
+        let on_disk: Value =
+            serde_json::from_str(&std::fs::read_to_string(mesh_path()).unwrap()).unwrap();
+        assert_eq!(on_disk, data, "the staged file is exactly the returned document");
+    }
+
+    #[test]
+    fn bare_node_list_still_sweeps_and_still_renders_candidates() {
+        let _env = Env::set_up("mesh-bare-unaffected");
+        let stranger = heard("stranger", "192.168.1.99");
+        let sweep: SweepFn = Box::new(move || Ok(SweepResult { heard: vec![stranger], dropped: 0 }));
+
+        let out = node_list_with(&invocation(&["node", "list"], &[]), no_pull(), sweep);
+        let data = out.data.unwrap();
+        let nodes = data["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2, "local + the unpaired candidate");
+        assert_eq!(nodes[1]["mark"], "◆");
+        assert!(data.get("liveSessions").is_none(), "the mesh-only tallies never ride on the bare document");
+        assert!(!mesh_path().exists(), "bare node list never writes the mesh document");
     }
 }

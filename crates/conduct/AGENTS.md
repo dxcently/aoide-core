@@ -1160,6 +1160,68 @@
   network seams (`PullFn`, `SweepFn`) stay injected so its tests never
   open a socket. Row/mark grammar and `--json` shape are CONTRACTS.md
   §7-pinned — a rendering change is a contract edit first.
+- **`--mesh` (P-14 M2) never spawns the sweep thread at all — it is not
+  merely filtered afterward.** `node_list_with` only calls
+  `std::thread::spawn(sweep)` when `--mesh` is absent; under `--mesh` the
+  injected `SweepFn` is dropped unexecuted. A test proving this MUST inject
+  a non-empty heard-set and assert it never reaches the document — an
+  empty-heard-set test would pass just as well on the wrong implementation
+  (filtering an always-run sweep's result down to nothing) and prove
+  nothing about which one is actually running. `assemble_roster` is called
+  with an empty heard slice regardless — the SAME roster-assembly seam
+  bare `node list` uses, not a second row builder — so `advertising` reads
+  `false` throughout and no candidate row ever appears.
+- **`who.rs::cached_presence(presence, fetched_at) -> &'static str` is the
+  ONE gate a cached session's presence passes through — don't rewrite a
+  cached `SessionView.presence` by hand anywhere else.** `build_mesh_node`'s
+  cache arm (the `Err` branch, `Some(entry)` case) is its only call site,
+  looping every session `sessions_from_graph` produced off the cache and
+  reassigning `presence` through it. The rule: `"done"` always survives
+  verbatim — both `node list` and `session`'s `presence != "done"` filter
+  depend on that exact string surviving the cache fallback unchanged, so
+  don't fold `done` into `last-seen`/`unknown` even when the cache carries
+  no `fetchedAt`. Everything else becomes `"last-seen"` when the cache
+  entry has a `fetched_at` and `"unknown"` when it doesn't. A node that
+  never had a successful pull (`load_node_cache` returns `None`) has no
+  cache to rewrite and surfaces no sessions at all — `never-pulled` stays a
+  node-level state with an empty session list, not a session-level
+  presence value. A LIVE host's own sessions (the `Ok(graph)` arm) never
+  pass through this gate — their presence is `session_presence`'s ordinary
+  online-host classification, verbatim.
+- **`SessionView`'s `title`/`model`/`kind`/`parent` are additive and
+  independently absent — never defaulted, inferred, or resolved across a
+  host boundary.** `build_local_node` fills them from `SessionRecord`'s own
+  `title`/`model`/`kind` plus `resolved_parent` (bare session id, matching
+  `session_id`, never node-scoped); `sessions_from_graph` fills them from a
+  remote node's own graph document — `title`/`model`/`role` (published back
+  under this struct's `kind` name) and the `spawned` edge whose `to` is
+  this session, `from` stripped of its `session:` prefix. A node that
+  didn't publish a given key leaves the matching field `None`; nothing
+  here fills a gap from another field, another session, or another host.
+  `effective_project` stays out of this list on purpose — remote rows
+  never carry one (S-D's territory), and `--mesh` does not change that.
+- **`mesh_path()` (`node_list.rs`) names ONE file, `state/stage/mesh.json`,
+  and only `--mesh` may write it.** It resolves through
+  `aoide_storage::fs::conducting_stage_dir()`, the same root
+  `graph::pending_path`/`herald::herald_path` resolve through — don't hang
+  a second path helper or a raw `state/stage/mesh.json` literal anywhere
+  else. `mesh_document`'s write is a single `aoide_storage::stage::
+  write_stage` call (atomic write-temp-then-rename), and it is the ONLY
+  write `node_list_with` performs — bare `node list` (no `--mesh`) returns
+  through the pre-existing `row_json`-built `Outcome` and touches no file
+  at all; don't let a future change to that branch start writing here "for
+  consistency," and don't let `--mesh` grow a second file. `mesh_row_json`/
+  `mesh_session_json` are `--mesh`-only projections built from the SAME
+  `Row`/`SessionView` bare `node list` already assembled — never a rendering
+  change to `row_json` itself, which stays byte-shape-identical to before
+  M2 (a golden/shape change to bare `node list` is a contract edit, same as
+  the bullet above). `liveSessions` counts `online`/`stale` sessions only
+  (`done` is already excluded upstream by the shared `presence != "done"`
+  retain); `cachedSessions` is every session that isn't live — with `done`
+  already gone, that's exactly `last-seen`/`unknown`. Wiring a periodic
+  refresh timer over this file is out of scope here (a later phase's job);
+  this command only ever writes it as a side effect of being invoked with
+  `--mesh`.
 - **`send::deliver_local`'s success path is ONE of exactly TWO mailbase-filing
   calls reached through `session_send` — never add a second one on that
   path.** Every consumer that delivers into an ALREADY-REGISTERED session's

@@ -40,9 +40,13 @@
 //! in `working`/`awaiting`/`idle`) | `stale` (`stopped`) | `done` — omitted
 //! from a normal listing, kept with `--all`. A remote session from a LIVE
 //! reply is classified exactly the same way a local one is — "as
-//! trustworthy as local" per the plan — and a remote session surfaced from
-//! the CACHE fallback is classified by its own last-known state too, simply
-//! under a node header already saying `unreachable`.
+//! trustworthy as local" per the plan. A remote session surfaced from the
+//! CACHE fallback instead is never trusted at that same face value:
+//! [`cached_presence`] lets `done` alone survive verbatim (`node list` and
+//! `session` both filter on that exact string) and rewrites everything else
+//! to `last-seen` (the cache carries a `fetchedAt`) or `unknown` (it
+//! doesn't) — a node header already saying `unreachable` never fronts a
+//! session still claiming to be live.
 //!
 //! ## The probe seam (why tests need no network)
 //!
@@ -128,6 +132,27 @@ pub(super) struct SessionView {
     /// cross-host exempt story yet (`grant.rs`'s module doc — out of scope,
     /// not a regression) and always reads `false`.
     pub(super) exempt: bool,
+    /// The auto-renamed one-line task title (`SessionRecord.title`) — a
+    /// local row reads the record directly, a remote row reads the node's
+    /// own published `title` key (`doc.rs`). `None` when neither side ever
+    /// set one; nothing here invents, defaults, or infers it (P-14 M2
+    /// enrichment — [`build_local_node`], [`sessions_from_graph`]).
+    pub(super) title: Option<String>,
+    /// The Claude model this session is running (`SessionRecord.model` /
+    /// the node's own `model` key). Same absent-stays-absent discipline as
+    /// `title`.
+    pub(super) model: Option<String>,
+    /// Session classification (`SessionRecord.kind`) — a node's own graph
+    /// document publishes it under the key `role` (`doc.rs`'s rename,
+    /// distinct from this module's local root/child `role` string), read
+    /// back here under the record's own noun.
+    pub(super) kind: Option<String>,
+    /// This session's parent session id, bare (matching `session_id`, never
+    /// node-scoped) — a local row reads [`resolved_parent`], a remote row
+    /// reads the SAME `spawned` edge [`sessions_from_graph`] already scans
+    /// for `role`, its `from` minus the `session:` prefix. `None` for a
+    /// root session on either side.
+    pub(super) parent: Option<String>,
 }
 
 /// One node (this box, or one registered node) as the host-grouped rendering
@@ -168,7 +193,8 @@ pub(super) fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord],
     let sessions = merged
         .iter()
         .map(|s| {
-            let role = if resolved_parent(s, &ids).is_some() { "child" } else { "root" };
+            let parent = resolved_parent(s, &ids);
+            let role = if parent.is_some() { "child" } else { "root" };
             let effective_project = super::model::effective_project_for(s, &merged, projects)
                 .map(|i| projects[i].name.clone());
             SessionView {
@@ -182,6 +208,10 @@ pub(super) fn build_local_node(sessions: &[SessionRecord], hooks: &[HookRecord],
                 project: s.project.clone(),
                 effective_project,
                 exempt: s.exempt,
+                title: s.title.clone(),
+                model: s.model.clone(),
+                kind: s.kind.clone(),
+                parent,
             }
         })
         .collect();
@@ -206,11 +236,11 @@ pub(super) fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView>
         .map(|n| {
             let full_id = n["id"].as_str().unwrap_or("");
             let session_id = full_id.strip_prefix("session:").unwrap_or(full_id).to_string();
-            let role = if edges.iter().any(|e| e["kind"] == "spawned" && e["to"] == full_id) {
-                "child"
-            } else {
-                "root"
-            };
+            let spawned_edge = edges.iter().find(|e| e["kind"] == "spawned" && e["to"] == full_id);
+            let role = if spawned_edge.is_some() { "child" } else { "root" };
+            let parent = spawned_edge
+                .and_then(|e| e["from"].as_str())
+                .map(|f| f.strip_prefix("session:").unwrap_or(f).to_string());
             let petname = n["petname"].as_str().map(String::from);
             let state = n["state"].as_str().unwrap_or("idle").to_string();
             let rec = aoide_storage::records::SessionRecord {
@@ -236,9 +266,32 @@ pub(super) fn sessions_from_graph(graph: &Value, host: &str) -> Vec<SessionView>
                 // never carries the field either, so this always reads
                 // `false`.
                 exempt: false,
+                title: n["title"].as_str().map(String::from),
+                model: n["model"].as_str().map(String::from),
+                kind: n["role"].as_str().map(String::from),
+                parent,
             }
         })
         .collect()
+}
+
+/// The gate every CACHED session's presence passes through once its host's
+/// live probe has failed (module doc's "Presence model") — pure, so the
+/// table is unit-testable with no probe or cache I/O. `done` alone survives
+/// verbatim (`node list` and `session` both filter `presence != "done"`);
+/// everything else reads `last-seen` when the cache carries a `fetchedAt`,
+/// `unknown` when it doesn't — a session's own raw state-derived presence
+/// (`session_presence`) is never trusted at face value once its host header
+/// already says `unreachable`.
+fn cached_presence(presence: &str, fetched_at: Option<&str>) -> &'static str {
+    if presence == "done" {
+        return "done";
+    }
+    if fetched_at.is_some() {
+        "last-seen"
+    } else {
+        "unknown"
+    }
 }
 
 /// Pure: classify one node's [`NodeView`] from its live-probe OUTCOME and
@@ -259,8 +312,11 @@ pub(super) fn build_mesh_node(node: &Node, probe: Result<Value, String>, cache: 
         },
         Err(e) => match cache {
             Some(entry) => {
-                let sessions =
+                let mut sessions =
                     entry.graph.as_ref().map(|g| sessions_from_graph(g, &node.name)).unwrap_or_default();
+                for sv in &mut sessions {
+                    sv.presence = cached_presence(sv.presence, entry.fetched_at.as_deref());
+                }
                 NodeView {
                     name: node.name.clone(),
                     is_local: false,
@@ -767,6 +823,108 @@ mod tests {
         assert!(node.sessions.is_empty());
     }
 
+    // ── cached_presence: the unreachable-host session gate (P-14 M2) ─────
+
+    #[test]
+    fn cached_sessions_of_an_unreachable_host_read_last_seen_not_online() {
+        let p = node("chiyo");
+        let graph = node_graph(&[("s1", "working", "/x", None)]);
+        let node = build_mesh_node(&p, Err("HTTP 000".to_string()), Some(cache("chiyo", "2026-08-14T00:05:00Z", graph)));
+        assert_eq!(node.presence, "unreachable");
+        assert_eq!(node.sessions[0].presence, "last-seen", "a cached session must never claim to be live under an unreachable header");
+    }
+
+    #[test]
+    fn a_cached_done_session_stays_done_under_an_unreachable_host() {
+        let p = node("chiyo");
+        let graph = node_graph(&[("s1", "done", "/x", None)]);
+        let node = build_mesh_node(&p, Err("HTTP 000".to_string()), Some(cache("chiyo", "2026-08-14T00:05:00Z", graph)));
+        assert_eq!(node.sessions[0].presence, "done", "both node list and session filter on this exact string");
+    }
+
+    #[test]
+    fn a_cache_without_a_fetched_at_reads_unknown() {
+        let p = node("chiyo");
+        let graph = node_graph(&[("s1", "idle", "/x", None)]);
+        let mut entry = cache("chiyo", "2026-08-14T00:05:00Z", graph);
+        entry.fetched_at = None;
+        let node = build_mesh_node(&p, Err("HTTP 000".to_string()), Some(entry));
+        assert_eq!(node.sessions[0].presence, "unknown");
+    }
+
+    #[test]
+    fn a_live_hosts_sessions_keep_their_own_presence() {
+        let p = node("chiyo");
+        let graph = node_graph(&[("s1", "working", "/x", None), ("s2", "done", "/x", None)]);
+        let node = build_mesh_node(&p, Ok(graph), None);
+        assert_eq!(node.presence, "online");
+        let s1 = node.sessions.iter().find(|s| s.session_id == "s1").unwrap();
+        let s2 = node.sessions.iter().find(|s| s.session_id == "s2").unwrap();
+        assert_eq!(s1.presence, "online");
+        assert_eq!(s2.presence, "done");
+    }
+
+    // ── enrichment: title/model/kind/parent ride only when published ─────
+
+    #[test]
+    fn enrichment_rides_only_when_the_node_published_it() {
+        // Local, absent: a bare record publishes nothing extra.
+        let bare = session("s1", "/x", "idle", "1", None);
+        let node = build_local_node(&[bare], &[], &[], "sakaki");
+        let s = &node.sessions[0];
+        assert!(s.title.is_none() && s.model.is_none() && s.kind.is_none() && s.parent.is_none());
+
+        // Local, present: the record's own fields ride through, and a
+        // resolved parent rides as the bare (not node-scoped) id.
+        let rich = SessionRecord {
+            title: Some("fix the thing".to_string()),
+            model: Some("claude-sonnet-5".to_string()),
+            kind: Some("agent".to_string()),
+            ..session("s2", "/x", "idle", "2", None)
+        };
+        let child = session("s3", "/x", "idle", "3", Some("s2"));
+        let node = build_local_node(&[rich, child], &[], &[], "sakaki");
+        let s2 = node.sessions.iter().find(|s| s.session_id == "s2").unwrap();
+        assert_eq!(s2.title.as_deref(), Some("fix the thing"));
+        assert_eq!(s2.model.as_deref(), Some("claude-sonnet-5"));
+        assert_eq!(s2.kind.as_deref(), Some("agent"));
+        assert!(s2.parent.is_none());
+        let s3 = node.sessions.iter().find(|s| s.session_id == "s3").unwrap();
+        assert_eq!(s3.parent.as_deref(), Some("s2"));
+
+        // Remote, absent: a node's own graph document with no title/model/
+        // role key and no spawned edge publishes nothing extra either.
+        let bare_graph = json!({
+            "schemaVersion": "0",
+            "nodes": [{ "id": "session:r1", "kind": "session", "state": "working", "cwd": "/x", "agent": "claude" }],
+            "edges": [],
+        });
+        let bare_remote = &sessions_from_graph(&bare_graph, "yomi-strix")[0];
+        assert!(bare_remote.title.is_none() && bare_remote.model.is_none() && bare_remote.kind.is_none() && bare_remote.parent.is_none());
+
+        // Remote, present: `title`/`model`/`role` (read back as `kind`) ride
+        // through, and the SAME `spawned` edge role derivation already scans
+        // supplies `parent` as the edge's `from` minus its `session:` prefix.
+        let rich_graph = json!({
+            "schemaVersion": "0",
+            "nodes": [
+                { "id": "session:root1", "kind": "session", "state": "working", "cwd": "/x", "agent": "claude", "title": "ship it", "model": "claude-opus-5", "role": "agent" },
+                { "id": "session:child1", "kind": "session", "state": "idle", "cwd": "/x", "agent": "claude" },
+            ],
+            "edges": [
+                { "from": "session:root1", "to": "session:child1", "kind": "spawned" },
+            ],
+        });
+        let rich_remote = sessions_from_graph(&rich_graph, "yomi-strix");
+        let root = rich_remote.iter().find(|s| s.session_id == "root1").unwrap();
+        assert_eq!(root.title.as_deref(), Some("ship it"));
+        assert_eq!(root.model.as_deref(), Some("claude-opus-5"));
+        assert_eq!(root.kind.as_deref(), Some("agent"));
+        assert!(root.parent.is_none());
+        let child = rich_remote.iter().find(|s| s.session_id == "child1").unwrap();
+        assert_eq!(child.parent.as_deref(), Some("root1"));
+    }
+
     // ── probe_nodes: parallel probe, results correctly paired by node ────
 
     #[test]
@@ -813,8 +971,8 @@ mod tests {
             fetched_at: None,
             error: None,
             sessions: vec![
-                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, effective_project: None, exempt: true },
-                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, effective_project: None, exempt: false },
+                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, effective_project: None, exempt: true, title: None, model: None, kind: None, parent: None },
+                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "idle".into(), presence: "online", cwd: "/x".into(), project: None, effective_project: None, exempt: false, title: None, model: None, kind: None, parent: None },
             ],
         }];
         let rendered = render_nodes(&nodes);
@@ -837,6 +995,7 @@ mod tests {
                 cwd: "/x".into(), project: None,
                 effective_project: None,
                 exempt: true,
+                title: None, model: None, kind: None, parent: None,
             }],
         }];
         let rendered = render_groups(&groups);
@@ -871,6 +1030,7 @@ mod tests {
                 cwd: "/y".to_string(), project: None,
                 effective_project: None,
                 exempt: false,
+                title: None, model: None, kind: None, parent: None,
             }],
         };
         (vec![local_node, mesh_node], locals)
@@ -961,9 +1121,9 @@ mod tests {
             fetched_at: None,
             error: None,
             sessions: vec![
-                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/z/nowhere".into(), project: None, effective_project: None, exempt: false },
-                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/zeta/x".into(), project: None, effective_project: None, exempt: false },
-                SessionView { session_id: "s3".into(), label: "l3".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/alpha/x".into(), project: None, effective_project: None, exempt: false },
+                SessionView { session_id: "s1".into(), label: "l1".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/z/nowhere".into(), project: None, effective_project: None, exempt: false, title: None, model: None, kind: None, parent: None },
+                SessionView { session_id: "s2".into(), label: "l2".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/zeta/x".into(), project: None, effective_project: None, exempt: false, title: None, model: None, kind: None, parent: None },
+                SessionView { session_id: "s3".into(), label: "l3".into(), petname: None, agent: "claude".into(), state: "working".into(), presence: "online", cwd: "/proj/alpha/x".into(), project: None, effective_project: None, exempt: false, title: None, model: None, kind: None, parent: None },
             ],
         }];
         let projects = vec![project("zeta", "/proj/zeta"), project("alpha", "/proj/alpha")];
@@ -996,6 +1156,7 @@ mod tests {
                 cwd: "/home/k/Aoide/pkgs/aoide".into(), project: None,
                 effective_project: None,
                 exempt: false,
+                title: None, model: None, kind: None, parent: None,
             }],
         }];
         let projects = vec![project("aoide", "/home/k/Aoide")];

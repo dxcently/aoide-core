@@ -650,6 +650,10 @@ mod tests {
             project: None,
             effective_project: None,
             exempt: false,
+            title: None,
+            model: None,
+            kind: None,
+            parent: None,
         }
     }
 

@@ -977,6 +977,36 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   `aoide-conduct`; `node status` (client) keeps the deep per-node
   registry view. CONTRACTS.md §7's CLI surface pins the row/mark grammar
   and the `--json` shape.
+  **`--mesh` (P-14 M2) is a flag on this same command, not a second
+  path.** It skips `run_sweep` entirely — a discovery candidate is absent
+  BY CONSTRUCTION, never filtered out after the fact, so `advertising`
+  reads `false` throughout — and calls `assemble_roster` with an empty
+  heard slice: the local row first, then every registered node in
+  registry order, the same one prober underneath. `who.rs::cached_presence`
+  is the one addition to that shared core: the gate every CACHED session's
+  presence passes through once its host's own live probe has failed —
+  `done` alone survives verbatim (`node list` and `session` both filter on
+  that exact string), everything else folds to `last-seen` (the cache
+  carries a `fetchedAt`) or `unknown` (it doesn't); a LIVE host's own
+  sessions are never rewritten. `SessionView` additionally carries
+  `title`/`model`/`kind`/`parent` — local from the record's own fields
+  plus `resolved_parent`, remote from the node's graph document (`title`/
+  `model`/`role`→`kind`, and the `spawned` edge's `from` minus its
+  `session:` prefix) — absent stays absent, nothing defaulted, inferred,
+  or cross-host-resolved; `effectiveProject` stays absent on every remote
+  row, unchanged. `node_list.rs::mesh_path` (beside `graph::pending_path`/
+  `herald::herald_path`) is where the result is atomically staged —
+  `state/stage/mesh.json`, one file both the dock and Sonata `FileView`
+  for this projection, the same `aoide usage` → `state/usage.json`
+  precedent; bare `node list` (no `--mesh`) never touches this file. Each
+  session's `id` is node-scoped (`<rowName>/<sessionId>`, inverting
+  `storage::addr::resolve` tier 5's `node/<rest>` grammar) beside its bare
+  `sessionId` (kept for local action routing); each row carries
+  `liveSessions`/`cachedSessions` (`online`/`stale` vs. `last-seen`/
+  `unknown` — `done` is already excluded upstream of this fold), and the
+  document totals the same two counts across every row — the message line
+  counts LIVE sessions only. A periodic refresh timer over this file is a
+  later phase's concern, not this one's.
 - `mail_bridge` (P-M2, architect's ruling 1: "spool in storage, wire lane
   in client, bridge through conduct") — a thin, two-function passthrough
   onto `aoide_client::mail_wire`'s outbox drain, with no logic of its own.
