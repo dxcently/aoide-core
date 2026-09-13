@@ -52,6 +52,7 @@ pub mod commands;
 pub mod context;
 pub mod daemon;
 pub mod discover;
+mod letter_send;
 pub mod mail_wire;
 pub mod mcp_client;
 pub mod mesh;

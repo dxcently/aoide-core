@@ -3734,6 +3734,10 @@ pub fn register_mail(r: &mut Registry) {
         flags: [
             flag!("to", "string", "Recipient address, self/<name> or <node>/<name> (required). <node> must already be a verified node for anything but self. <name> is free text — a role name, never a session petname."),
             flag!("from", "string", "Sender attribution override (default: AOIDE_SESSION_ID). Attribution only, not authentication."),
+            flag!("subject", "string", "Single-line subject; enables structured signed letter content."),
+            flag!("thread", "string", "Existing thread ID (64 lowercase hex); omitted starts a fresh thread."),
+            flag!("reply-to", "string", "Parent message ID (64 lowercase hex); requires --thread."),
+            flag!("cc", "string", "Comma-separated node/mailbox recipients; each receives a signed copy. To may also be comma-separated with subject or cc."),
         ],
         gated: false,
         implemented: true,
@@ -4020,6 +4024,9 @@ fn post_send_delivery(node: &str, msgid: &str) -> Value {
 /// unreachable," which [`crate::mail_wire::drain_node`] already treats as
 /// an ordinary recorded outcome) is the one case reported as `"failed"`.
 fn handle_mail_send(inv: &Invocation) -> Outcome {
+    if ["subject", "cc", "thread", "reply-to"].iter().any(|key| inv.flags.contains_key(*key)) {
+        return crate::letter_send::send(inv, handle_mail_send);
+    }
     let cmd = "mail.send";
     const USAGE: &str = "usage: aoide mail send --to (self|<node>)/<name> -- <text …>";
     let to = match inv.flags.get("to").map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -4043,7 +4050,7 @@ fn handle_mail_send(inv: &Invocation) -> Outcome {
     let text = inv.args.join(" ");
     let from = mail_sender_attribution(inv).unwrap_or_default();
 
-    if node == "self" {
+    if node == "self" || node == aoide_storage::display::local_host_name() {
         return match aoide_storage::mail::file_letter(&from, name, &text) {
             Ok(entry) => {
                 let mut data = serde_json::to_value(&entry).unwrap_or_default();
@@ -6799,6 +6806,41 @@ mod tests {
     }
 
     #[test]
+    fn structured_mail_send_files_signed_to_and_cc_once_with_local_aliases() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, root) = aoide_test_support::isolated_mail_root("structured-mail-real-send");
+        let local = aoide_storage::display::local_host_name();
+        let (key, _) = aoide_storage::identity::load_or_mint().unwrap();
+        let mut nodes = Vec::new();
+        aoide_storage::node_store::upsert_paired_node(&mut nodes, &local, "http://localhost", &key.info().pubkey_hex, "2026-09-13T00:00:00Z", &["message".into()]);
+        aoide_storage::node_store::save_nodes(&nodes).unwrap();
+        let recipient = format!("{local}/primary");
+        let copies = format!("self/copy,{local}/copy,self/primary");
+        let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["message\nbody"], &[("to", &recipient), ("cc", &copies), ("subject", "Signed subject"), ("from", "human")]));
+        assert_eq!(out.status, aoide_protocol::output::Status::Ok, "{}", out.message);
+        let data = out.data.unwrap();
+        assert_eq!(data["accepted"], 2);
+        assert_eq!(data["recipients"].as_array().unwrap().len(), 2);
+        for name in ["primary", "copy"] {
+            let entries = aoide_storage::mail::read_for(name, true, None).unwrap();
+            assert_eq!(entries.len(), 1, "one durable copy per endpoint");
+            let envelope = &entries[0].envelope;
+            assert_eq!(envelope.header.to.node, local);
+            assert_eq!(envelope.header.to.name, name);
+            assert!(aoide_storage::mail::verify_origin_signature(envelope));
+            let content = aoide_storage::letter::decode(&envelope.text).unwrap();
+            assert_eq!(content.subject, "Signed subject");
+            assert_eq!(content.body, "message\nbody");
+            assert_eq!(content.to.len(), 1);
+            assert_eq!(content.cc.len(), 1);
+            let mut tampered = envelope.clone();
+            tampered.text = tampered.text.replace("Signed subject", "Forged subject");
+            assert!(!aoide_storage::mail::verify_origin_signature(&tampered));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn mail_send_requires_to_and_text() {
         let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let (_env, root) = aoide_test_support::isolated_mail_root("mail-send-usage");
@@ -6913,12 +6955,14 @@ mod tests {
         let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
         let (_env, root) = aoide_test_support::isolated_mail_root("mail-send-unverified");
 
-        aoide_storage::node_store::save_nodes(&[fixture_node(None)]).unwrap(); // registered, `verified: false`
+        let mut peer = fixture_node(None);
+        peer.name = "unpaired-peer".into();
+        aoide_storage::node_store::save_nodes(&[peer]).unwrap(); // registered, `verified: false`
 
-        let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi"], &[("to", "yomi-strix/bob")]));
+        let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi"], &[("to", "unpaired-peer/bob")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Error, "registered but never paired — refused, not spooled");
         assert_eq!(out.data.unwrap()["reason"], "unpaired-node");
-        assert!(aoide_storage::outbox::list_entries("yomi-strix").unwrap().is_empty(), "nothing spooled before the refusal");
+        assert!(aoide_storage::outbox::list_entries("unpaired-peer").unwrap().is_empty(), "nothing spooled before the refusal");
 
         let out = handle_mail_send(&mail_inv_with_flags(&["mail", "send"], &["hi"], &[("to", "ghost/bob")]));
         assert_eq!(out.status, aoide_protocol::output::Status::Error, "never registered at all — same refuse-before-spool shape");

@@ -23,6 +23,9 @@
 
 ## Invariants
 
+- Structured thread/reply IDs are signed context, not membership or delivery authority. Legacy four-field content remains valid.
+- Structured letter content is optional signed text, never a new transport header. Invalid or legacy content remains raw; decoding must not write or alter envelope identity.
+
 - **Enduring identity is independent of knowledge configuration.** Bind an
   explicit `valid_node_name`-shaped key in `session::bind_enduring_agent`;
   do not infer it from a persona title, session name, or optional Mneme map.

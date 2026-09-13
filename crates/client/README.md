@@ -6,6 +6,20 @@ never the inbound/serve half (that's `aoide-server`).
 
 ## Named seams (what it exposes)
 
+- `letter_send` fans out optional `mail send --subject` / `--cc` content
+  through the existing scalar send handler. `--thread` selects an existing
+  conversation; `--reply-to` names its parent envelope and requires `--thread`.
+  Both IDs are 64 lowercase hex. New structured sends use one secure random
+  thread ID for all copies, returned as `threadId` in the outcome.
+  To and Cc accept comma-separated
+  node/mailbox addresses. All recipients validate before filing, self aliases
+  normalize before deduplication, and To takes precedence. Results contain
+  `complete`, an accepted count, and per-recipient address, role, msgid,
+  filing/spooling status, delivery details and error. Partial failure is nonzero;
+  accepted copies must not be resubmitted. A spooled copy is not proof of delivery.
+  There is no automatic retry of the fanout operation and no crash-atomic group
+  transaction; the existing outbox retries each durable envelope independently.
+
 - `context` implements `aoide context --id <session>`: local CLI requests
   daemon-owned, read-only persona/memory retrieval through the optional
   portable `context` config. The CLI requires aoided; MCP/A2A are refused.

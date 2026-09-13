@@ -126,6 +126,7 @@ pub mod fs;
 pub mod git;
 pub mod identity;
 pub mod ledger;
+pub mod letter;
 pub mod mail;
 pub mod manifest;
 pub mod mode;

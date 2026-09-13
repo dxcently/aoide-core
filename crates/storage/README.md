@@ -13,6 +13,13 @@ by decision — no embedded database yet
 
 ## Named seams (what it exposes)
 
+- `letter` defines optional `AOIDE-LETTER/1` content within the existing
+  signed envelope text: Subject, To, Cc, body, and optional threadId/replyTo.
+  Absent thread metadata preserves the four-field format. It performs no I/O
+  or delivery.
+  Exact-schema decoding preserves legacy or malformed bodies as raw text at
+  the caller; envelope headers and signatures keep their existing wire shape.
+
 - `config::Context` holds optional `context.agents` and `context.vaults` maps:
   an enduring key names persona/memory note paths and a logical vault; that
   vault resolves to an MCP endpoint, server-local vault name, and `tokenEnv`

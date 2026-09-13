@@ -2,6 +2,9 @@
 
 ## Invariants
 
+- A fresh structured letter mints one secure random thread ID before fanout; all copies share it. Replies explicitly retain the thread and name the parent; forwarding starts fresh.
+- Structured letter fanout reuses the scalar mail handler. Validate all recipients before effects, report every copy, and never retry accepted copies as a group. Metadata remains inside signed text, never unsigned envelope fields.
+
 - **`context` is daemon-owned and local-only.** The CLI must route to aoided
   and refuse if it is absent. Resolve `tokenEnv` only in that daemon's
   environment; never forward caller credential values in Invocation, argv,
