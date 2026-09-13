@@ -232,7 +232,7 @@ impl MailDraft {
 }
 
 /// The group name sessions fall under when no project anchors their cwd.
-pub const UNANCHORED: &str = "(unanchored)";
+pub const UNANCHORED: &str = "Active sessions";
 
 /// How many ticks (~500 ms each) a newly-appeared session stays marked fresh.
 pub const FRESH_TICKS: u8 = 4;
@@ -276,6 +276,9 @@ pub enum SidebarRow {
         folded: bool,
         count: usize,
     },
+    /// Ended sessions and ledger entries of one project. It hangs under its
+    /// project, except for the projectless group, whose node sits at the
+    /// root of the tree.
     Past {
         project: String,
         folded: bool,
@@ -1130,7 +1133,7 @@ impl App {
     /// Project navigation is a projection of the graph's effective ownership.
     /// Past rows contain only ended records still present in the stage snapshot.
     pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
-        fn append(rows: &mut Vec<SidebarRow>, group: &[&SessionRecord], past: bool) {
+        fn append(rows: &mut Vec<SidebarRow>, group: &[&SessionRecord], past: bool, root: usize) {
             fn visit(
                 rows: &mut Vec<SidebarRow>,
                 group: &[&SessionRecord],
@@ -1192,11 +1195,11 @@ impl App {
                     .iter()
                     .any(|p| Some(p.session_id.as_str()) == s.parent_session_id.as_deref())
             }) {
-                visit(rows, group, rec, past, 2, &mut seen);
+                visit(rows, group, rec, past, root, &mut seen);
             }
             // Malformed cycles remain inspectable rather than disappearing.
             for rec in group {
-                visit(rows, group, rec, past, 2, &mut seen);
+                visit(rows, group, rec, past, root, &mut seen);
             }
         }
         let merged = self.merged();
@@ -1236,79 +1239,103 @@ impl App {
         if groups.contains_key(UNANCHORED) && !names.iter().any(|n| n == UNANCHORED) {
             names.push(UNANCHORED.to_string());
         }
-        let mut rows = Vec::new();
-        for name in names {
-            let folded = self.sidebar_folded.contains(&name);
-            rows.push(SidebarRow::Project {
-                name: name.clone(),
+        // A past node hangs under the project it belongs to. Sessions that
+        // belong to no project keep theirs at the root of the tree, below
+        // every project, since their group holds only live sessions.
+        fn push_past(
+            rows: &mut Vec<SidebarRow>,
+            project: &str,
+            folded: bool,
+            past: &[&SessionRecord],
+            history: &[&aoide_storage::ledger::LedgerEntry],
+            depth: usize,
+        ) {
+            rows.push(SidebarRow::Past {
+                project: project.to_string(),
                 folded,
+                count: past.len() + history.len(),
             });
             if folded {
-                continue;
+                return;
             }
+            append(rows, past, true, depth);
+            for entry in history {
+                let title = entry
+                    .title
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&entry.agent);
+                let label = match entry.petname.as_deref().filter(|s| !s.is_empty()) {
+                    Some(petname) => format!("{petname} · {title}"),
+                    None => title.to_string(),
+                };
+                let label = format!(
+                    "{} · {label}",
+                    if entry.agent == "shell" {
+                        "terminal"
+                    } else {
+                        "agent"
+                    }
+                );
+                rows.push(SidebarRow::History {
+                    entry: (*entry).clone(),
+                    label,
+                    depth,
+                });
+            }
+        }
+        let mut rows = Vec::new();
+        let mut loose: (
+            Vec<&SessionRecord>,
+            Vec<&aoide_storage::ledger::LedgerEntry>,
+        ) = (Vec::new(), Vec::new());
+        for name in names {
             let (past, live): (Vec<_>, Vec<_>) = groups
                 .remove(&name)
                 .unwrap_or_default()
                 .into_iter()
                 .partition(|s| aoide_protocol::canonical_state(&s.state) == "done");
-            for terminal in [false, true] {
-                let group: Vec<_> = live
-                    .iter()
-                    .copied()
-                    .filter(|s| is_terminal(s) == terminal)
-                    .collect();
-                if group.is_empty() {
-                    continue;
-                }
-                let folded = self
-                    .sidebar_section_folded
-                    .contains(&(name.clone(), terminal));
-                rows.push(SidebarRow::Section {
-                    project: name.clone(),
-                    terminal,
-                    folded,
-                    count: group.len(),
-                });
-                if !folded {
-                    append(&mut rows, &group, false);
-                }
-            }
             let history = history_groups.remove(&name).unwrap_or_default();
-            if !past.is_empty() || !history.is_empty() {
-                let folded = !self.sidebar_past_open.contains(&name);
-                rows.push(SidebarRow::Past {
-                    project: name,
-                    folded,
-                    count: past.len() + history.len(),
-                });
-                if !folded {
-                    append(&mut rows, &past, true);
-                    for entry in history {
-                        let title = entry
-                            .title
-                            .as_deref()
-                            .filter(|s| !s.is_empty())
-                            .unwrap_or(&entry.agent);
-                        let label = match entry.petname.as_deref().filter(|s| !s.is_empty()) {
-                            Some(petname) => format!("{petname} · {title}"),
-                            None => title.to_string(),
-                        };
-                        let label = format!(
-                            "{} · {label}",
-                            if entry.agent == "shell" {
-                                "terminal"
-                            } else {
-                                "agent"
-                            }
-                        );
-                        rows.push(SidebarRow::History {
-                            entry: entry.clone(),
-                            label,
-                            depth: 2,
-                        });
+            let unanchored = name == UNANCHORED;
+            let folded = self.sidebar_folded.contains(&name);
+            rows.push(SidebarRow::Project {
+                name: name.clone(),
+                folded,
+            });
+            if !folded {
+                for terminal in [false, true] {
+                    let group: Vec<_> = live
+                        .iter()
+                        .copied()
+                        .filter(|s| is_terminal(s) == terminal)
+                        .collect();
+                    if group.is_empty() {
+                        continue;
+                    }
+                    let folded = self
+                        .sidebar_section_folded
+                        .contains(&(name.clone(), terminal));
+                    rows.push(SidebarRow::Section {
+                        project: name.clone(),
+                        terminal,
+                        folded,
+                        count: group.len(),
+                    });
+                    if !folded {
+                        append(&mut rows, &group, false, 2);
                     }
                 }
             }
+            if unanchored {
+                loose = (past, history);
+            } else if !folded && (!past.is_empty() || !history.is_empty()) {
+                let open = self.sidebar_past_open.contains(&name);
+                push_past(&mut rows, &name, !open, &past, &history, 2);
+            }
+        }
+        if !loose.0.is_empty() || !loose.1.is_empty() {
+            let open = self.sidebar_past_open.contains(UNANCHORED);
+            push_past(&mut rows, UNANCHORED, !open, &loose.0, &loose.1, 1);
         }
         rows
     }
@@ -3246,15 +3273,17 @@ mod tests {
         assert_eq!(app.panel, Panel::Session);
         assert!(app.last_outcome.is_none());
         assert!(app.tail.is_none());
+        // The Past node sits at the root, outside every project: folding the
+        // project it came from never hides it.
         app.sidebar_sel = 0;
         app.handle_sidebar_key(KeyEvent::from(KeyCode::Left));
-        assert_eq!(app.sidebar_rows().len(), 1);
+        assert_eq!(app.sidebar_rows().len(), 3);
         app.handle_sidebar_key(KeyEvent::from(KeyCode::Down));
-        assert_eq!(app.sidebar_sel, 0);
+        assert_eq!(app.sidebar_sel, 1);
+        app.handle_sidebar_key(KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(app.sidebar_rows().len(), 2);
         app.handle_sidebar_key(KeyEvent::from(KeyCode::Char('l')));
         assert_eq!(app.sidebar_rows().len(), 3);
-        app.handle_sidebar_key(KeyEvent::from(KeyCode::Char('h')));
-        assert_eq!(app.sidebar_rows().len(), 1);
     }
 
     #[test]
@@ -3433,7 +3462,7 @@ mod tests {
         rec.log_path = Some(log.to_string_lossy().into_owned());
         let mut app = App::for_test(Vec::new(), vec![rec], Vec::new());
         app.panel = Panel::Session;
-        app.dag_sel = 1; // row 0 is the `(unanchored)` group header
+        app.dag_sel = 1; // row 0 is the projectless group header
 
         app.handle_key(KeyEvent::from(KeyCode::Enter));
 
@@ -3490,7 +3519,7 @@ mod tests {
         rec.log_path = Some(log.to_string_lossy().into_owned());
         let mut app = App::for_test(Vec::new(), vec![rec], Vec::new());
         app.panel = Panel::Graph;
-        app.graph_sel = 1; // node 0 is the synthetic `(unanchored)` root
+        app.graph_sel = 1; // node 0 is the synthetic projectless root
 
         app.handle_key(KeyEvent::from(KeyCode::Enter));
 

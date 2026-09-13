@@ -41,7 +41,7 @@ pub enum NodeKind {
     Project,
     Session,
     /// The synthetic root gathering sessions anchored to no project (mirrors the
-    /// `(unanchored)` group the Unicode tree render uses).
+    /// projectless group the Unicode tree render uses).
     Unanchored,
 }
 
@@ -236,7 +236,7 @@ pub fn build_model(app: &App) -> Model {
         incoming.insert(to.to_string());
     }
 
-    // Roots: projects first, then a synthetic `(unanchored)` root gathering
+    // Roots: projects first, then a synthetic projectless root gathering
     // session nodes with no incoming edge.
     let mut roots: Vec<String> = project_ids;
     let mut unanchored: Vec<String> = Vec::new();
@@ -253,7 +253,7 @@ pub fn build_model(app: &App) -> Model {
             uid.clone(),
             Meta {
                 kind: NodeKind::Unanchored,
-                label: "(unanchored)".to_string(),
+                label: crate::app::UNANCHORED.to_string(),
                 title: "Sessions without a project".into(),
                 role: "group".into(),
                 harness: String::new(),
@@ -441,8 +441,16 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, sel: usize) {
     f.render_widget(Paragraph::new(lines).scroll((sy as u16, sx as u16)), area);
 }
 
+/// Empty canvas kept around the forest on every side, so the camera can pan
+/// and zoom PAST the outermost cards instead of clamping to their edges.
+const CANVAS_PAD: (usize, usize) = (40, 16);
 fn node_rect(n: &Node) -> (usize, usize, usize, usize) {
-    (n.depth * (n.width + GUTTER), n.world_y, n.width, n.height)
+    (
+        CANVAS_PAD.0 + n.depth * (n.width + GUTTER),
+        CANVAS_PAD.1 + n.world_y,
+        n.width,
+        n.height,
+    )
 }
 fn camera_scale(zoom: i8) -> usize {
     (100 + zoom.clamp(-2, 2) as i16 * 25) as usize
@@ -460,10 +468,15 @@ fn screen_rect(n: &Node, zoom: i8) -> (usize, usize, usize, usize) {
     )
 }
 fn extent(model: &Model) -> (usize, usize) {
-    model.nodes.iter().fold((0, 0), |(w, h), node| {
+    let scale = camera_scale(model.zoom);
+    let (w, h) = model.nodes.iter().fold((0, 0), |(w, h), node| {
         let (x, y, nw, nh) = screen_rect(node, model.zoom);
         (w.max(x + nw), h.max(y + nh))
-    })
+    });
+    (
+        w + CANVAS_PAD.0 * scale / 100,
+        h + CANVAS_PAD.1 * scale / 100,
+    )
 }
 
 pub fn zoom_label(app: &App) -> &'static str {
@@ -523,16 +536,27 @@ fn viewport(
             x.min(w.saturating_sub(area.width as usize)),
         );
     }
+    // The camera follows the selection: the selected card sits at the centre
+    // of the pane, and the canvas pad gives it room to get there.
+    let (ew, eh) = extent(model);
     model
         .nodes
         .get(sel)
         .map(|n| {
             let (x, y, w, h) = screen_rect(n, model.zoom);
+            // A card larger than the pane anchors its top-left instead.
+            let centre = |o: usize, len: usize, pane: usize| {
+                if len <= pane {
+                    (o + len / 2).saturating_sub(pane / 2)
+                } else {
+                    o
+                }
+            };
+            let cy = centre(y, h, area.height as usize);
+            let cx = centre(x, w, area.width as usize);
             (
-                y.saturating_add(h.min(area.height as usize))
-                    .saturating_sub(area.height as usize),
-                x.saturating_add(w.min(area.width as usize))
-                    .saturating_sub(area.width as usize),
+                cy.min(eh.saturating_sub(area.height as usize)),
+                cx.min(ew.saturating_sub(area.width as usize)),
             )
         })
         .unwrap_or((0, 0))
@@ -558,13 +582,19 @@ fn lay_out(model: &Model, sel: usize, pal: &crate::app::Palette) -> Vec<Vec<GCel
     let height = extent(model).1;
     let width = extent(model).0;
     let mut grid = vec![vec![GCell::default(); width]; height];
-    let conn = theme::accent_style(pal);
-    let pos: HashMap<&str, (usize, usize)> = model
+    // A wire wears the colour of the live session it leads to (its state hue),
+    // so an active agent lights its own connections; project trunks keep the
+    // accent.
+    let wire = |n: &Node| match n.state.as_deref() {
+        Some(s) if n.kind == NodeKind::Session => theme::state_style(s, pal),
+        _ => theme::accent_style(pal),
+    };
+    let pos: HashMap<&str, (usize, usize, Style)> = model
         .nodes
         .iter()
         .map(|n| {
             let (x, y, _, h) = screen_rect(n, model.zoom);
-            (n.id.as_str(), (x, y + h / 2))
+            (n.id.as_str(), (x, y + h / 2, wire(n)))
         })
         .collect();
     for n in &model.nodes {
@@ -575,21 +605,22 @@ fn lay_out(model: &Model, sel: usize, pal: &crate::app::Palette) -> Vec<Vec<GCel
         if kids.is_empty() {
             continue;
         }
-        let (px, py) = pos[n.id.as_str()];
+        let (px, py, conn) = pos[n.id.as_str()];
         let (_, _, w, _) = screen_rect(n, model.zoom);
-        let jx =
-            (n.depth * (n.width + GUTTER) + n.width + GUTTER / 2) * camera_scale(model.zoom) / 100;
-        let top = kids.iter().map(|(_, y)| *y).min().unwrap().min(py);
-        let bottom = kids.iter().map(|(_, y)| *y).max().unwrap().max(py);
+        let jx = (CANVAS_PAD.0 + n.depth * (n.width + GUTTER) + n.width + GUTTER / 2)
+            * camera_scale(model.zoom)
+            / 100;
+        let top = kids.iter().map(|(_, y, _)| *y).min().unwrap().min(py);
+        let bottom = kids.iter().map(|(_, y, _)| *y).max().unwrap().max(py);
         for x in px + w..=jx {
             set(&mut grid, x, py, '─', conn);
         }
         for y in top..=bottom {
             set(&mut grid, jx, y, '│', conn);
         }
-        for (cx, cy) in kids {
+        for (cx, cy, kc) in kids {
             for x in jx + 1..*cx {
-                set(&mut grid, x, *cy, '─', conn);
+                set(&mut grid, x, *cy, '─', *kc);
             }
             set(
                 &mut grid,
@@ -604,7 +635,7 @@ fn lay_out(model: &Model, sel: usize, pal: &crate::app::Palette) -> Vec<Vec<GCel
                 } else {
                     '├'
                 },
-                conn,
+                *kc,
             );
         }
         set(
@@ -629,20 +660,6 @@ fn lay_out(model: &Model, sel: usize, pal: &crate::app::Palette) -> Vec<Vec<GCel
             for (dx, cell) in row.iter().enumerate() {
                 set_cell(&mut grid, x + dx, y + dy, cell.clone());
             }
-        }
-    }
-    // Ports sit on the card boundary so links visibly belong to nodes.
-    for n in &model.nodes {
-        let (x, y, w, h) = screen_rect(n, model.zoom);
-        if n.depth > 0 {
-            set(&mut grid, x, y + h / 2, 'o', conn);
-        }
-        if model
-            .children
-            .get(&n.id)
-            .is_some_and(|kids| !kids.is_empty())
-        {
-            set(&mut grid, x + w - 1, y + h / 2, 'o', conn);
         }
     }
     grid
@@ -732,10 +749,16 @@ fn block_cells_at(
     } else {
         &n.role
     };
+    let mark = theme::mark(match role {
+        "project" | "root" => theme::Mark::Project,
+        "terminal" => theme::Mark::Terminal,
+        _ if n.kind != NodeKind::Session => theme::Mark::Project,
+        _ => theme::Mark::Agent,
+    });
     let heading = if state.is_empty() {
-        role.to_uppercase()
+        format!("{mark} {}", role.to_uppercase())
     } else {
-        format!("{} · {}", role.to_uppercase(), state)
+        format!("{mark} {} · {}", role.to_uppercase(), state)
     };
     let heading = if n.tags.is_empty() {
         heading
@@ -1130,7 +1153,7 @@ mod tests {
             Some(child)
         );
         let extent = graph_extent(&app);
-        assert_eq!(extent, (x + w, y + h));
+        assert_eq!(extent, (x + w + CANVAS_PAD.0, y + h + CANVAS_PAD.1));
         assert_eq!(
             viewport(&model, 0, area, Some((usize::MAX, usize::MAX))),
             (extent.1 - 7, extent.0 - 32)
@@ -1164,8 +1187,11 @@ mod tests {
             .find(|n| n.session_id.as_deref() == Some("child"))
             .unwrap();
         let grid = lay_out(&model, 1, &app.palette);
-        let junction = root.depth * (CHIP_MAX + GUTTER) + CHIP_MAX + GUTTER / 2;
-        assert_eq!(grid[root.world_y + NODE_H / 2][junction].ch, '─');
+        let junction = CANVAS_PAD.0 + root.depth * (CHIP_MAX + GUTTER) + CHIP_MAX + GUTTER / 2;
+        assert_eq!(
+            grid[CANVAS_PAD.1 + root.world_y + NODE_H / 2][junction].ch,
+            '─'
+        );
         assert_eq!(root.world_y, child.world_y);
         for (bg, fg) in [(0, 15), (15, 0)] {
             let pal = crate::app::Palette {
@@ -1490,12 +1516,9 @@ mod tests {
             let cells = lay_out(&model, 0, &app.palette);
             for n in &model.nodes {
                 let (x, y, w, h) = screen_rect(n, zoom);
-                if n.depth > 0 {
-                    assert_eq!(cells[y + h / 2][x].ch, 'o');
-                }
-                if model.children.contains_key(&n.id) {
-                    assert_eq!(cells[y + h / 2][x + w - 1].ch, 'o');
-                }
+                // no port circles: the card border stays whole where wires arrive
+                assert!(matches!(cells[y + h / 2][x].ch, '│' | '┃'));
+                assert!(matches!(cells[y + h / 2][x + w - 1].ch, '│' | '┃'));
             }
         }
     }

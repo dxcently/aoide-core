@@ -16,6 +16,9 @@ lines; bright selection highlights identify only the keyboard-focused region,
 while other selections retain subdued shading. Workspace views expose a project sidebar whose Agents,
 Terminals and Past groups fold independently. Past includes durable session
 ledger entries, not just ended records still retained in the current stage.
+Sessions belonging to no project gather in an `Active sessions` group holding
+only live ones; their ended sessions form the one Past node at the root of the
+tree, below every project.
 Opening a historical entry displays its recorded facts; it does not focus,
 kill or resurrect a process.
 
@@ -31,8 +34,16 @@ kill or resurrect a process.
 | `?` | Context help |
 | `q` / Ctrl-C | Quit outside text entry / quit globally |
 
-The single-line `𝄞 CONDUCTOR` header exposes project, agent and terminal count
-buttons. Semantic colors use the livery Base16 tokens as exact RGB: projects
+The single-line `𝄞 CONDUCTOR` header keeps the clef on the left and anchors the
+project, agent and terminal count buttons on the right. Every kind of thing has
+one identity mark, defined once in `theme::mark` and used wherever that kind
+appears (header buttons, tab labels, tree rows, roster rows, graph cards,
+legends): `⌂` home, `✉` mail, `♜` agent, `▣` terminal, `🖧` host, `⚑` review,
+`◆` project, `◇` folder, `∴` graph, `≡` log, `⚙` status, `◌` past session,
+`↻` resurrect, `⊚` model, `◉` cursor. Marks are one cell wide; `@` is reserved
+for addresses; a mark carries no colour of its own, its Role does, so the
+conductor stays themeable through livery alone. Layout measures labels in
+display cells, never bytes. Semantic colors use the livery Base16 tokens as exact RGB: projects
 use base0D, agents base0E, terminals base0C and mail base09. Focused tabs use
 their role color as a fill; inactive selections retain subdued livery shading.
 Missing tokens fall back to ANSI colors. A single border encloses the tabs;
@@ -48,6 +59,11 @@ text into the active field without interpreting it as commands.
 In Graph, Space + left drag or middle drag pans the canvas; the wheel pans
 vertically and Shift + wheel pans horizontally. Ctrl + wheel zooms the
 camera through 50%, 75%, 100%, 125% and 150%, anchored at the pointer.
+The forest sits on a padded canvas, so the camera pans and zooms past the
+outermost cards; the camera follows the selection by centring the selected
+card. Wires wear the state colour of the session they lead to, so a working
+agent lights its own connections; project trunks keep the accent. Cards carry
+their identity mark in the heading and no port glyphs.
 Project and session nodes keep their world positions and card dimensions;
 zoom transforms that same layout rather than choosing a different card
 preset. Terminal glyphs stay cell-sized, so labels clip within their visible

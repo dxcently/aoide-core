@@ -207,7 +207,7 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
 
     // Legend: the musical glyphs ARE the content here.
     let legend = Line::from(
-        " ♪ working  𝄐 awaiting  𝄁 stopped  𝄽 idle  𝄂 done  ◆ project (h/l fold)  ‣ fresh",
+        " ◆ project (h/l fold)  ♜ agent  ▣ terminal  ‣ fresh   ♪ working  𝄐 awaiting  𝄁 stopped  𝄽 idle  𝄂 done",
     )
     .style(theme::dim());
     f.render_widget(Paragraph::new(legend), parts[0]);
@@ -259,6 +259,17 @@ fn roster_item<'a>(row: &DagRow, app: &App) -> ListItem<'a> {
                 Span::styled(if fresh { "‣" } else { " " }.to_string(), cue_style),
                 Span::raw(prefix.clone()),
                 Span::styled(format!("{glyph} "), st),
+                Span::styled(
+                    format!(
+                        "{} ",
+                        theme::mark(if crate::app::is_terminal(rec) {
+                            theme::Mark::Terminal
+                        } else {
+                            theme::Mark::Agent
+                        })
+                    ),
+                    theme::dim(),
+                ),
                 Span::raw(format!(
                     "{}  ",
                     rec.petname
@@ -278,7 +289,10 @@ fn roster_item<'a>(row: &DagRow, app: &App) -> ListItem<'a> {
                 let ms = accent
                     .map(|c| Style::default().fg(c).add_modifier(Modifier::DIM))
                     .unwrap_or_else(theme::dim);
-                spans.push(Span::styled(format!("  ⟐{model}"), ms));
+                spans.push(Span::styled(
+                    format!("  {}{model}", theme::mark(theme::Mark::Model)),
+                    ms,
+                ));
             }
             for t in theme::session_tags(rec) {
                 let ts = accent
@@ -656,7 +670,7 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &App) {
     .split(area);
 
     let legend = Line::from(
-        " ● online  ◐ unreachable  ○ never-pulled    ♪ working  𝄐 awaiting  𝄁 stopped  𝄽 idle  𝄂 done",
+        " 🖧 host  ● online  ◐ unreachable  ○ never-pulled    ♪ working  𝄐 awaiting  𝄁 stopped  𝄽 idle  𝄂 done",
     )
     .style(theme::dim());
     f.render_widget(Paragraph::new(legend), parts[0]);
@@ -992,7 +1006,7 @@ mod tests {
             }],
             vec![root, kid],
         );
-        let out = render_panel(&app, Panel::Graph, 160, 40);
+        let out = render_panel(&app, Panel::Graph, 220, 40);
         assert!(out.contains("DAG"), "panel title rendered");
         assert!(
             out.contains("PROJECT") && out.contains("aoide"),
@@ -1137,11 +1151,11 @@ mod tests {
         app.dag_sel = 2;
         let out = render_panel(&app, Panel::Session, 100, 30);
         assert!(
-            out.contains("⟐claude-sonnet-5"),
+            out.contains("⊚claude-sonnet-5"),
             "root agent's model tag on its roster row: {out}"
         );
         assert!(
-            out.contains("⟐claude-fable-5"),
+            out.contains("⊚claude-fable-5"),
             "subagent's OWN model tag on its roster row: {out}"
         );
         assert!(
@@ -1170,7 +1184,7 @@ mod tests {
             }],
             vec![root, sub],
         );
-        let out = render_panel(&app, Panel::Graph, 160, 40);
+        let out = render_panel(&app, Panel::Graph, 220, 40);
         assert!(
             out.contains("claude · m"),
             "subagent chip carries its model tag: {out}"

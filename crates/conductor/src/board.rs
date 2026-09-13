@@ -9,18 +9,25 @@ use ratatui::{
     Frame,
 };
 
+// Tab labels: fixed digit (the key), the panel's identity mark, the name.
 pub const NAV: [(Panel, &str); 10] = [
-    (Panel::Home, "1 Home"),
-    (Panel::Mail, "2 Mail"),
-    (Panel::Session, "3 Agents"),
-    (Panel::Terminals, "4 Terminals"),
-    (Panel::Roster, "5 Mesh"),
-    (Panel::Pending, "6 Review"),
-    (Panel::Projects, "7 Projects"),
-    (Panel::Graph, "8 Graph"),
-    (Panel::Log, "9 Log"),
-    (Panel::Status, "0 Status"),
+    (Panel::Home, "1 ⌂ Home"),
+    (Panel::Mail, "2 ✉ Mail"),
+    (Panel::Session, "3 ♜ Agents"),
+    (Panel::Terminals, "4 ▣ Terminals"),
+    (Panel::Roster, "5 🖧 Mesh"),
+    (Panel::Pending, "6 ⚑ Review"),
+    (Panel::Projects, "7 ◆ Projects"),
+    (Panel::Graph, "8 ∴ Graph"),
+    (Panel::Log, "9 ≡ Log"),
+    (Panel::Status, "0 ⚙ Status"),
 ];
+
+/// Display width in cells — every hit region is sized by this, never by
+/// byte length (a mark is three bytes for one cell).
+pub fn cells(s: &str) -> u16 {
+    ratatui::text::Line::from(s).width() as u16
+}
 
 pub struct Geometry {
     pub header: Rect,
@@ -33,7 +40,7 @@ pub fn geometry(area: Rect, focused: bool) -> Geometry {
     let available = area.width.saturating_sub(2).max(1);
     let (mut used, mut nav_height) = (0, 1);
     for (_, label) in NAV {
-        let width = label.len() as u16 + 2;
+        let width = cells(label) + 2;
         if used > 0 && used + width > available {
             nav_height += 1;
             used = 0;
@@ -78,7 +85,7 @@ pub fn nav_regions(area: Rect) -> Vec<(Rect, Panel, &'static str)> {
     let mut y = area.y;
     NAV.iter()
         .filter_map(|&(panel, label)| {
-            let w = label.len() as u16 + 2;
+            let w = cells(label) + 2;
             if x.saturating_add(w) > area.right() {
                 x = area.x;
                 y = y.saturating_add(1);
@@ -124,7 +131,7 @@ pub fn action_regions(
     labels
         .iter()
         .filter_map(|&(key, label)| {
-            let w = label.len() as u16 + 4;
+            let w = cells(label) + 4;
             if x + w > area.right() {
                 return None;
             }
@@ -293,30 +300,61 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
         let y = content.y + (n - tree_offset(app, content.height)) as u16;
         let label = match row {
             SidebarRow::Project { name, folded, .. } => {
-                format!("{} {name}", if *folded { ">" } else { "v" })
+                format!(
+                    "{} {} {name}",
+                    if *folded { "▸" } else { "▾" },
+                    theme::mark(theme::Mark::Project)
+                )
             }
-            SidebarRow::Past { folded, count, .. } => format!(
-                "  {} Past sessions ({count})",
-                if *folded { ">" } else { "v" }
+            SidebarRow::Past {
+                project,
+                folded,
+                count,
+            } => format!(
+                "{}{} {} Past sessions ({count})",
+                if project == crate::app::UNANCHORED {
+                    ""
+                } else {
+                    "  "
+                },
+                if *folded { "▸" } else { "▾" },
+                theme::mark(theme::Mark::Past)
             ),
             SidebarRow::Session {
-                label, past, depth, ..
+                label,
+                past,
+                depth,
+                rec,
+                ..
             } => format!(
                 "{}{} {label}",
                 " ".repeat((*depth).min(8) * 2),
-                if *past { "-" } else { "@" }
+                theme::mark(if *past {
+                    theme::Mark::Past
+                } else if crate::app::is_terminal(rec) {
+                    theme::Mark::Terminal
+                } else {
+                    theme::Mark::Agent
+                })
             ),
-            SidebarRow::History { label, depth, .. } => {
-                format!("{}· {label}", " ".repeat((*depth).min(8) * 2))
-            }
+            SidebarRow::History { label, depth, .. } => format!(
+                "{}{} {label}",
+                " ".repeat((*depth).min(8) * 2),
+                theme::mark(theme::Mark::Past)
+            ),
             SidebarRow::Section {
                 terminal,
                 folded,
                 count,
                 ..
             } => format!(
-                "  {} {} ({count})",
-                if *folded { ">" } else { "v" },
+                "  {} {} {} ({count})",
+                if *folded { "▸" } else { "▾" },
+                theme::mark(if *terminal {
+                    theme::Mark::Terminal
+                } else {
+                    theme::Mark::Agent
+                }),
                 if *terminal { "Terminals" } else { "Agents" }
             ),
         };
@@ -359,14 +397,10 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
     }
 }
 
+/// The Home column is LEFT-anchored inside the padded surface (never centered).
 pub fn home_content(area: Rect) -> Rect {
     let width = area.width.saturating_sub(12).min(62);
-    Rect::new(
-        area.x + (area.width - width) / 2,
-        area.y + 1,
-        width,
-        area.height.saturating_sub(3),
-    )
+    Rect::new(area.x + 6, area.y + 1, width, area.height.saturating_sub(3))
 }
 
 pub fn recent_projects(app: &App) -> Vec<&aoide_conduct::graph::Project> {
@@ -398,13 +432,14 @@ pub fn recent_projects(app: &App) -> Vec<&aoide_conduct::graph::Project> {
 
 fn home_groups(area: Rect) -> Vec<(Rect, &'static str)> {
     let a = home_content(area);
-    let y = a.y + 8;
+    // logo (6 rows) + a three-row breath before the panels
+    let y = a.y + 9;
     if a.width >= 58 {
         let w = (a.width - 2) / 2;
         vec![
             (
                 Rect::new(a.x, y, w, a.bottom().saturating_sub(y).min(7)),
-                " PROJECTS ",
+                " ◆ PROJECTS ",
             ),
             (
                 Rect::new(
@@ -413,18 +448,18 @@ fn home_groups(area: Rect) -> Vec<(Rect, &'static str)> {
                     a.width - w - 2,
                     a.bottom().saturating_sub(y).min(7),
                 ),
-                " COMMUNICATION ",
+                " ✉ COMMUNICATION ",
             ),
         ]
     } else {
         vec![
             (
                 Rect::new(a.x, y, a.width, a.bottom().saturating_sub(y).min(4)),
-                " PROJECTS ",
+                " ◆ PROJECTS ",
             ),
             (
                 Rect::new(a.x, y + 4, a.width, a.bottom().saturating_sub(y + 4).min(5)),
-                " COMMUNICATION ",
+                " ✉ COMMUNICATION ",
             ),
         ]
     }
@@ -615,7 +650,7 @@ pub fn draw_home(f: &mut Frame, area: Rect, app: &App) {
     let start = recent_start(area);
     if start < a.bottom() {
         f.render_widget(
-            Paragraph::new("RECENT PROJECTS ──────────────────────────────────────────")
+            Paragraph::new("◌ RECENT PROJECTS ────────────────────────────────────────")
                 .style(theme::accent_style(&app.palette)),
             Rect::new(a.x, start, a.width, 1),
         );
@@ -1380,18 +1415,24 @@ pub fn panel_role(panel: Panel) -> theme::Role {
         Panel::Log | Panel::Status => theme::Role::Muted,
     }
 }
+/// The three count buttons sit on the RIGHT edge of the header, each led by
+/// its identity mark; `𝄞 CONDUCTOR` keeps the left.
 pub fn header_regions(area: Rect, app: &App) -> Vec<(Rect, Panel, String)> {
     let records = app.merged();
-    let mut x = area.x + 15;
-    [
+    let buttons = [
         (
             Panel::Projects,
-            format!("[{} Projects]", app.projects.len()),
+            format!(
+                "[{} {} Projects]",
+                theme::mark(theme::Mark::Project),
+                app.projects.len()
+            ),
         ),
         (
             Panel::Session,
             format!(
-                "[{} Agents]",
+                "[{} {} Agents]",
+                theme::mark(theme::Mark::Agent),
                 records
                     .iter()
                     .filter(|r| !crate::app::is_terminal(r) && !crate::app::is_done(&r.state))
@@ -1401,20 +1442,25 @@ pub fn header_regions(area: Rect, app: &App) -> Vec<(Rect, Panel, String)> {
         (
             Panel::Terminals,
             format!(
-                "[{} Terminals]",
+                "[{} {} Terminals]",
+                theme::mark(theme::Mark::Terminal),
                 records
                     .iter()
                     .filter(|r| crate::app::is_terminal(r) && !crate::app::is_done(&r.state))
                     .count()
             ),
         ),
-    ]
-    .into_iter()
-    .filter_map(|(p, label)| {
-        let width = label.len() as u16;
-        let r = Rect::new(x, area.y, width, 1);
-        x += width + 1;
-        (r.right() <= area.right()).then_some((r, p, label))
-    })
-    .collect()
+    ];
+    let total: u16 = buttons.iter().map(|(_, l)| cells(l) + 1).sum();
+    let left = area.x + 15;
+    let mut x = area.right().saturating_sub(total).max(left);
+    buttons
+        .into_iter()
+        .filter_map(|(p, label)| {
+            let width = cells(&label);
+            let r = Rect::new(x, area.y, width, 1);
+            x += width + 1;
+            (r.right() <= area.right()).then_some((r, p, label))
+        })
+        .collect()
 }

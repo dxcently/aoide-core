@@ -23,10 +23,61 @@ pub enum Role {
     Agent,
     Terminal,
     Mail,
+    /// Mesh hosts / nodes (base0F).
+    Host,
+    /// Past sessions and resurrection (base03).
+    History,
     Success,
     Warning,
     Error,
     Muted,
+}
+
+/// Identity marks — ONE table, used by the header counts, the tab row, the
+/// project tree, the roster legends, the graph cards and the action menus,
+/// so a thing wears the same mark everywhere. Every mark is a BMP code point
+/// that renders one cell wide in kitty/wezterm/foot and is covered by DejaVu
+/// Sans Mono, JetBrainsMono and Noto Sans Symbols (measured 2026-09-13); no
+/// SMP music glyphs (they fall back to specks) and no icon-font PUA. `@` is
+/// reserved for addresses (`name@node`). Colour never lives here — the
+/// partner hue is always a [`Role`] slot, so the livery stays in charge.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mark {
+    Home,
+    Mail,
+    Agent,
+    Terminal,
+    Host,
+    Review,
+    Project,
+    Folder,
+    Graph,
+    Log,
+    Status,
+    Past,
+    Resurrect,
+    Model,
+    Cursor,
+}
+
+pub fn mark(m: Mark) -> &'static str {
+    match m {
+        Mark::Home => "⌂",      // U+2302
+        Mark::Mail => "✉",      // U+2709
+        Mark::Agent => "♜",     // U+265C the rook, one piece the User moves
+        Mark::Terminal => "▣",  // U+25A3 a screen
+        Mark::Host => "🖧", // U+1F5A7 three networked computers (width 1; Noto Symbols 2 fallback)
+        Mark::Review => "⚑", // U+2691 held for a human
+        Mark::Project => "◆", // U+25C6
+        Mark::Folder => "◇", // U+25C7 a root under the project
+        Mark::Graph => "∴", // U+2234 three nodes
+        Mark::Log => "≡",  // U+2261
+        Mark::Status => "⚙", // U+2699
+        Mark::Past => "◌", // U+25CC a session that was
+        Mark::Resurrect => "↻", // U+21BB
+        Mark::Model => "⊚", // U+229A
+        Mark::Cursor => "◉", // U+25C9 the one selection mark
+    }
 }
 
 pub fn role_color(pal: &Palette, role: Role) -> Color {
@@ -35,6 +86,8 @@ pub fn role_color(pal: &Palette, role: Role) -> Color {
         Role::Agent => (14, Color::Magenta),
         Role::Terminal => (12, Color::Cyan),
         Role::Mail => (9, Color::Yellow),
+        Role::Host => (15, Color::LightRed),
+        Role::History => (3, Color::DarkGray),
         Role::Success => (11, Color::Green),
         Role::Warning => (10, Color::Yellow),
         Role::Error => (8, Color::Red),

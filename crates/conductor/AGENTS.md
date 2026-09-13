@@ -13,6 +13,10 @@
   Pointer-anchored zoom, pan limits, render and hit tests share geometry.
   Terminal glyphs stay fixed-size and clip inside cards; never relayout
   entities into alternative card presets when zoom changes.
+- One identity mark per kind, from `theme::mark`; never a second glyph for
+  the same kind, never a mark wider than one cell, never `@` (addresses).
+  Colour comes from a `Role`, not from the glyph. Measure labels with
+  `board::cells`, never `len()`.
 - Only the keyboard-focused pane gets a bright selection; other selected
   regions use subdued livery shading. Controls use ASCII markers and plain
   field labels, without editing badges or double borders.

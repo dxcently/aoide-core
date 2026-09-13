@@ -995,7 +995,7 @@ fn open_project_mail_menu(app: &mut App, name: String, x: u16, y: u16) {
         .filter(|r| {
             aoide_conduct::graph::effective_project_for(r, &records, &app.projects)
                 .map(|i| app.projects[i].name.as_str())
-                .unwrap_or("(unanchored)")
+                .unwrap_or(app::UNANCHORED)
                 == name
         })
         .filter_map(|r| {

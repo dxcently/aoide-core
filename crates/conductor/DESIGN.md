@@ -5,8 +5,11 @@ engine. Home provides an entry point; the project tree maintains context
 while the main area changes views. Even surface shading and single lines
 separate navigation, content and status. Only the keyboard-focused pane
 uses bright selection; remembered selections elsewhere remain subdued.
-The single-line `𝄞 CONDUCTOR` header provides semantic-colored project,
-agent and terminal count buttons. Home centers its logo as one preformatted block and pads the continuous
+The single-line `𝄞 CONDUCTOR` header keeps the clef left and right-anchors the
+semantic-colored project, agent and terminal count buttons, each led by its
+identity mark (`theme::mark`, one table for every surface; README lists it).
+Home anchors its logo and groups left as one preformatted block, a blank
+band between logo and groups, and pads the continuous
 light surface around shared action and project hit rectangles, retaining
 darker exterior margins. Home groups actions and recent projects
 on one continuous light surface, with the logo outside that region.
@@ -24,8 +27,11 @@ Workspace                ▼
 └────────────────────────┴────────────────────────────────────┘
 ```
 
-Tree selection is navigation. Historical entries display ledger facts and
-never masquerade as a live process. Current sessions and historical records
+Tree selection is navigation. A project holds its own live and ended
+sessions; sessions belonging to no project hold only their live ones, under
+`Active sessions`, and their ended sessions form the single Past node at the
+root of the tree. Historical entries display ledger facts and never
+masquerade as a live process. Current sessions and historical records
 remain separate even when they share a project or resumable harness ID.
 
 Project removal captures the project name in a confirmation prompt before any
@@ -68,7 +74,10 @@ The graph uses an interim fixed world layout of rectangular project and
 session nodes, recomputed on every refresh: it is not the retained scene
 graph (stable world nodes and edges, node dragging, positions preserved
 across refresh), which is designer-owned follow-up work. Its camera scales through 50%, 75%, 100%, 125% and 150%; Ctrl + wheel
-keeps the pointer's world location stable, bounded by canvas edges. Zoom
+keeps the pointer's world location stable, bounded by the padded canvas
+edges (the camera reaches past the outermost cards). Wires take the state
+colour of the session they lead to; cards carry an identity mark and no
+ports. Zoom
 transforms card rectangles and edges without switching layout presets.
 Terminal glyphs remain cell-sized and labels clip to the transformed card.
 Rendering, hit tests, extents, drag and wheel panning share that geometry.
