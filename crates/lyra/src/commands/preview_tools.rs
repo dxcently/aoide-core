@@ -3368,9 +3368,12 @@ exit 0
     /// never get a `"file"` match at all -- everything below it stayed
     /// "none" regardless of the SessionMenu fix. Skips (never fails) when
     /// this checkout doesn't have the song present.
+    /// The checkout is located from the crate's own manifest dir, never
+    /// `$AOIDE_FLAKE_ROOT`, which sibling tests repoint under a lock this
+    /// helper does not take.
     fn read_conductor_qml() -> Option<(PathBuf, String)> {
-        let path =
-            aoide_storage::fs::flake_root().join("song/songbook/sonata/widgets/conductor.qml");
+        let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../../song/songbook/sonata/widgets/conductor.qml");
         match std::fs::read_to_string(&path) {
             Ok(text) => Some((path, text)),
             Err(e) => {
