@@ -367,6 +367,7 @@ fn mesh_document(rows: &[Row], host: &str) -> Outcome {
         render_roster(rows)
     );
     let data = json!({
+        "schemaVersion": "0",
         "host": host,
         "generatedAt": aoide_storage::time::now_iso_utc(),
         "nodes": rows.iter().map(mesh_row_json).collect::<Vec<_>>(),
@@ -967,6 +968,7 @@ mod tests {
         let on_disk: Value =
             serde_json::from_str(&std::fs::read_to_string(mesh_path()).unwrap()).unwrap();
         assert_eq!(on_disk, data, "the staged file is exactly the returned document");
+        assert_eq!(data["schemaVersion"], "0", "the mesh document carries the stage-file schemaVersion");
     }
 
     #[test]

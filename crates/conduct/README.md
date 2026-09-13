@@ -1008,10 +1008,11 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   or cross-host-resolved; `effectiveProject` stays absent on every remote
   row, unchanged. `node_list.rs::mesh_path` (beside `graph::pending_path`/
   `herald::herald_path`) is where the result is atomically staged —
-  `state/stage/mesh.json`, one file both the dock and Sonata `FileView`
-  for this projection, the same `aoide usage` → `state/usage.json`
-  precedent; bare `node list` (no `--mesh`) never touches this file. Each
-  session's `id` is node-scoped (`<rowName>/<sessionId>`, inverting
+  `state/stage/mesh.json`, one file for a dock or Sonata widget to
+  `FileView` (the Mesh section wiring is a later phase; nothing reads it
+  yet), the same `aoide usage` → `state/usage.json` precedent; bare
+  `node list` (no `--mesh`) never touches this file. Each session's `id`
+  is node-scoped (`<rowName>/<sessionId>`, inverting
   `storage::addr::resolve` tier 5's `node/<rest>` grammar) beside its bare
   `sessionId` (kept for local action routing); each row carries
   `liveSessions`/`cachedSessions` (`online`/`stale` vs. `last-seen`/
