@@ -520,16 +520,27 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   struct's own snake_case field names, so `apply_codex_capture` remaps at
   the boundary (`MERGED_SOURCE_FIELDS`: `context_tokens` → `contextTokens`,
   `context_ceiling` → `contextCeiling`, the rest unchanged) and copies ONLY
-  the fields it actually applies — a `parentThreadId`/`nickname` pointer
-  `cap.sources` may carry is never copied, since this merge never sets
-  those VALUES. `state` moved at P-CX-5 S3: `apply_codex_capture` now sets
-  it too, from `cap.state` when `Some` and different, never blanked back
-  out by a `None` read (an unreadable, missing, or momentarily empty
+  the fields it actually applies — a `parentThreadId`/`thread_source`
+  pointer `cap.sources` may carry is never copied, since this merge never
+  sets those VALUES. `state` moved at P-CX-5 S3: `apply_codex_capture` now
+  sets it too, from `cap.state` when `Some` and different, never blanked
+  back out by a `None` read (an unreadable, missing, or momentarily empty
   rollout) — but its `sources` pointer stays out of `MERGED_SOURCE_FIELDS`
   on purpose, same as before S3: the VALUE moves, the provenance pointer
-  does not. `parentSessionId`, `title`, and `nickname` remain untouched by
-  this merge — later slices' own territory (S4 the subagent edge), never
-  this one's to set. See CONTRACTS.md §4 for the `sources` schema entry.
+  does not. `title` joined the merge at S4, FILL-ONCE: a captured
+  `nickname` lands on `rec.title` only while the record's own title is
+  empty, never overwriting one already set, with its `sources` pointer
+  stamped under the wire name `title` (outside `MERGED_SOURCE_FIELDS`,
+  since that list is unconditional and this fill is not). `parentSessionId`
+  is S4's other half, but never `apply_codex_capture`'s to set:
+  `apply_codex_lineage` folds a captured `parent_thread_id` into the edge
+  on its own, since it needs the FULL sessions roster (existence,
+  self-reference, and cycle checks via `doc.rs::would_cycle`) that this
+  merge never sees. The edge grants no authority — `kind`/`agent` stay
+  `"app"`/`"codex"` through it, so `send`'s `codex-app-unsupported` and
+  `kill_target`'s `APP_OWNS_PROCESS` refusals fire identically before
+  either ever reaches a parent walk. See CONTRACTS.md §4 for the `sources`
+  schema entry.
 - `graph/eidolon.rs` — eidolon presence reconciliation (P-EIDOLON, slice
   E1b; readiness E2 folded in). `reconcile_eidolon_sessions` mirrors
   `reconcile_codex_app_threads` rule for rule (upsert in place, remove what

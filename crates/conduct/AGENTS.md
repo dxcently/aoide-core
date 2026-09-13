@@ -173,11 +173,14 @@
   gap S3's removal of the per-tick idle reset opened: nothing else would
   have healed a stray write). A `None` read (unreadable, missing, or
   momentarily empty rollout) leaves the record's last-known `state` alone
-  rather than resetting it. `parentSessionId`, `title`, and `nickname`
-  remain deliberately untouched by that merge — the subagent edge
-  (`parent_thread_id`/`nickname`) is a later slice's own (R3's "one producer
-  per shape" also means `sources` itself never grows a second writer without
-  its own slice). `capture_for` memoises per thread (a process-static, no
+  rather than resetting it. `title` joined that merge at P-CX-5 S4,
+  FILL-ONCE: a captured `nickname` lands on `rec.title` only while the
+  record's own title is empty, never overwriting one already set.
+  `parentSessionId` is S4's other half but never `apply_codex_capture`'s to
+  set — `codex_app.rs::apply_codex_lineage` is its one writer, and holds
+  its own invariant below (R3's "one producer per shape" still means
+  `sources` never grows a second writer without its own function).
+  `capture_for` memoises per thread (a process-static, no
   signature change) so a live thread's ~1 Hz callers don't each re-scan a
   rollout's whole prefix just to count newlines: an unchanged `(len, mtime)`
   returns the prior capture with no I/O, and append-only growth reuses the
@@ -189,6 +192,28 @@
   never collides, and `sync_codex_app_threads` calls `retain_capture_memo`
   once per tick with that tick's own observed thread ids so a thread that
   stops being live has its entry evicted rather than held forever.
+
+- **A native `parent_thread_id` becomes `parentSessionId` only when the
+  parent exists locally, isn't the record itself, and wouldn't cycle — and
+  it grants NO authority (P-CX-5 S4).** `codex_app.rs::apply_codex_lineage`
+  is the one writer of a `kind:"app"` record's `parent_session_id`; it sets
+  the edge only when ALL of: `cap.parent_thread_id` is `Some(pt)`; `pt` is
+  not the record's own id (no self-loop); a record with `session_id == pt`
+  EXISTS in the sessions roster in ANY state — an exited/`"done"` parent
+  still anchors lineage, since it once genuinely spawned this thread, while
+  a native id naming no local record at all is dropped as unresolvable
+  provenance, never written as a promise; and the edge would not close a
+  cycle (`doc.rs::would_cycle`, the same guard `manage.rs::link` and
+  `session_store.rs`'s reparent already use — no third cycle-detection
+  shape in this crate). It is idempotent: a resumed thread's `session_meta`
+  re-read on every capture reapplies the identical edge as a no-op, never
+  re-setting or duplicating it. The edge changes nothing else about the
+  record — `rec.kind`/`rec.agent` stay exactly what
+  `reconcile_codex_app_threads` re-applies every upsert, so
+  `actions.rs::kill_target`'s `APP_OWNS_PROCESS` and
+  `send.rs::deliver_local_with`'s `codex-app-unsupported` refusals still
+  fire on the very first `kind:"app"` hop, before either ever reaches a
+  parent walk — an ancestry edge is not a transport or a kill grant.
 
 - **An eidolon presence record is keyed by its native id verbatim, exactly
   like a Codex thread (P-EIDOLON, slice E1b).** `graph/eidolon.rs::

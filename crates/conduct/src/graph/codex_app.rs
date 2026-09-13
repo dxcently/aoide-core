@@ -50,13 +50,27 @@
 //! camelCase (`context_tokens` → `contextTokens`, etc. —
 //! [`MERGED_SOURCE_FIELDS`]), and only ever carry an entry for a field this
 //! merge actually applies from a pointer: `state`'s own pointer is never one
-//! of them (its value moves without a `sources` entry, same as before S3),
-//! and `parentSessionId`/`title`/`nickname` stay untouched by this merge
-//! altogether (S4's own territory) — their pointers in `cap.sources` are
-//! never copied either. See [`apply_codex_capture`].
+//! of them (its value moves without a `sources` entry, same as before S3).
+//!
+//! `title` joins that same merge at S4, but FILL-ONCE rather than
+//! always-set: a captured `nickname` lands on `rec.title` only while the
+//! record's own title is empty/`None`, never overwriting one already set
+//! (by a real `session send` auto-rename or otherwise), with its `sources`
+//! entry stamped under the wire name `title` (never `nickname`, which is
+//! not a `SessionRecord` field) only the tick it actually fires —
+//! `thread_source` is parsed by [`super::codex_capture`] but never merged
+//! onto any field of this record. `parentSessionId` is S4's other half but
+//! never this same function's to set: [`apply_codex_lineage`] folds a
+//! captured `parent_thread_id` into the edge on its own, because the
+//! existence/self-reference/cycle checks it needs read the FULL sessions
+//! roster this merge never sees. The edge grants no authority — `kind`/
+//! `agent` stay `"app"`/`"codex"` through it, so `session kill`'s
+//! `APP_OWNS_PROCESS` and `send`'s `codex-app-unsupported` refusals fire
+//! identically before either ever reaches a parent walk. See
+//! [`apply_codex_capture`] and [`apply_codex_lineage`].
 
 use super::codex_capture::{capture_for, CodexCapture};
-use super::doc::restage_graph;
+use super::doc::{restage_graph, would_cycle};
 use super::model::{
     load_stage, sessions_path, write_stage, SessionRecord, SessionsFile, STAGE_GRAPH_VERSION,
 };
@@ -661,6 +675,12 @@ fn audit_scan_unknown_once(failure: &ScanFailure) {
 /// its internal map by Rust field name (`codex_capture.rs`'s own tests pin
 /// that); S2 remaps at this exact boundary, the one place a capture's
 /// internal shape crosses into the wire-facing record it lands on.
+/// `nickname` → `title` is deliberately NOT in this list even though S4
+/// does stamp that pointer: every entry here is copied unconditionally
+/// whenever `cap_sources` carries it, but `title`'s own pointer only ever
+/// moves the tick a `nickname` actually fills an empty title — a
+/// conditional rule this uniform list cannot express, so [`apply_codex_capture`]
+/// stamps it in its own small block instead.
 const MERGED_SOURCE_FIELDS: &[(&str, &str)] = &[
     ("say", "say"),
     ("tool", "tool"),
@@ -671,12 +691,12 @@ const MERGED_SOURCE_FIELDS: &[(&str, &str)] = &[
 ];
 
 /// Merge [`CodexCapture`]'s fields onto `rec` — `state`/`say`/`tool`/
-/// `activity`/`model`/`context_tokens`/`context_ceiling`/`sources`, each set
-/// only when `cap` produced `Some` AND the value actually differs: a quiet or
-/// partial tail read (every field `None`) changes nothing, and a value
-/// this merge already set is never blanked back out just because a LATER
-/// tick's tail window no longer covers the record that set it — the same
-/// "never clear, only set" discipline `session_store.rs`'s
+/// `activity`/`model`/`context_tokens`/`context_ceiling`/`sources`/`title`,
+/// each set only when `cap` produced `Some` AND the value actually differs: a
+/// quiet or partial tail read (every field `None`) changes nothing, and a
+/// value this merge already set is never blanked back out just because a
+/// LATER tick's tail window no longer covers the record that set it — the
+/// same "never clear, only set" discipline `session_store.rs`'s
 /// `refresh_transcript_fields` already holds for these very fields, `state`
 /// included (P-CX-5 S3): an unreadable, missing, or empty rollout reads
 /// `cap.state` as `None` and leaves the record's last state exactly where it
@@ -684,21 +704,30 @@ const MERGED_SOURCE_FIELDS: &[(&str, &str)] = &[
 /// `working`/`idle` (the fold's own vocabulary — see `codex_capture.rs`), so
 /// this merge can never write `"awaiting"` onto an app record either.
 /// `sources` is EXTENDED, never replaced, and restricted to
-/// [`MERGED_SOURCE_FIELDS`]: a `state`/`parent_thread_id`/`thread_source`/
-/// `nickname` pointer `cap.sources` may carry is never copied here — `state`
-/// stays out of that list even though its VALUE now moves (its pointer is
-/// not yet part of this scheme), and `parent_thread_id`/`thread_source`/
-/// `nickname` stay out because this merge never sets those values at all —
-/// a `sources` entry names a field THIS record actually carries a pointer
-/// FOR, never a promise about one a later slice (S4) has not landed yet. An
-/// entry already on `rec.sources` with no counterpart in `cap.sources` this
-/// tick is left standing — a shown datum's pointer must not vanish just
-/// because a later capture happened not to re-see the record that set it.
-/// Returns whether anything changed.
+/// [`MERGED_SOURCE_FIELDS`] plus `title`'s own conditional stamp below: a
+/// `state`/`parent_thread_id`/`thread_source` pointer `cap.sources` may
+/// carry is never copied here — `state` stays out of that list even though
+/// its VALUE now moves (its pointer is not yet part of this scheme), and
+/// `parent_thread_id`/`thread_source` stay out because this merge never
+/// sets those values at all — a `sources` entry names a field THIS record
+/// actually carries a pointer FOR, never a promise about a field a
+/// different function (or no function) sets. An entry already on
+/// `rec.sources` with no counterpart in `cap.sources` this tick is left
+/// standing — a shown datum's pointer must not vanish just because a later
+/// capture happened not to re-see the record that set it. Returns whether
+/// anything changed.
 ///
-/// Deliberately never touches `parent_session_id`, `title`, or `nickname`
-/// even though `cap` may carry values for the lineage ones — that's S4's
-/// (the subagent edge) own slice, never this merge's.
+/// `title` joins the merge at S4 (P-CX-5 S4), FILL-ONCE only: a captured
+/// `nickname` lands on `rec.title` while the record's own title is
+/// empty/`None`, and never overwrites one already set — by a real
+/// `session send` auto-rename, an operator edit, or an earlier tick's own
+/// fill. `thread_source` is parsed by `codex_capture.rs` but never merged
+/// onto any field here or anywhere else in this module.
+///
+/// Deliberately never touches `parent_session_id` even though `cap` may
+/// carry a value for it — [`apply_codex_lineage`] is that edge's one
+/// writer, called separately because it needs the full sessions roster
+/// this merge never sees (existence, self-reference, and cycle checks).
 fn apply_codex_capture(rec: &mut SessionRecord, cap: &CodexCapture) -> bool {
     let mut changed = false;
 
@@ -744,6 +773,22 @@ fn apply_codex_capture(rec: &mut SessionRecord, cap: &CodexCapture) -> bool {
             changed = true;
         }
     }
+    if let Some(nickname) = &cap.nickname {
+        let title_empty = rec.title.as_deref().is_none_or(str::is_empty);
+        if title_empty {
+            if rec.title.as_deref() != Some(nickname.as_str()) {
+                rec.title = Some(nickname.clone());
+                changed = true;
+            }
+            if let Some(ptr) = cap.sources.as_ref().and_then(|s| s.get("nickname")) {
+                let merged = rec.sources.get_or_insert_with(BTreeMap::new);
+                if merged.get("title") != Some(ptr) {
+                    merged.insert("title".to_string(), ptr.clone());
+                    changed = true;
+                }
+            }
+        }
+    }
     if let Some(cap_sources) = &cap.sources {
         for (snake, camel) in MERGED_SOURCE_FIELDS {
             let Some(ptr) = cap_sources.get(*snake) else {
@@ -758,6 +803,62 @@ fn apply_codex_capture(rec: &mut SessionRecord, cap: &CodexCapture) -> bool {
     }
 
     changed
+}
+
+/// Fold a captured `parent_thread_id` into `rec.parent_session_id` — the
+/// native lineage edge (P-CX-5 S4, `docs/architecture/CODEX-INTEGRATION.md`'s
+/// subagent-correlation phase). Sets the edge only when EVERY one of these
+/// holds, otherwise `rec` is left byte-identical:
+///
+///   * `cap.parent_thread_id` is `Some(pt)`;
+///   * `pt` is not `rec.session_id` itself (a self-referential id writes
+///     no edge, never a self-loop);
+///   * a record with `session_id == pt` EXISTS somewhere in `sessions` —
+///     in ANY state, an exited/`"done"` parent still anchors lineage,
+///     since it once genuinely spawned this thread; a dangling native id
+///     naming no local record at all is dropped as unresolvable provenance,
+///     never written as a promise; and
+///   * linking would not close a cycle ([`would_cycle`], the same guard
+///     `manage.rs`'s `link` and `session_store.rs`'s reparent already use —
+///     no third cycle-detection shape in this crate).
+///
+/// Idempotent: re-applying the same `pt` a resumed thread's `session_meta`
+/// re-reads on every capture is a no-op the second time, since the edge is
+/// already in place and nothing about it differs.
+///
+/// The edge grants no authority whatsoever — `rec.kind`/`rec.agent` are
+/// untouched by this function (still `Some("app")`/`"codex"`, re-applied
+/// every upsert by [`reconcile_codex_app_threads`] regardless of lineage),
+/// so `graph/actions.rs::kill_target`'s `APP_OWNS_PROCESS` refusal and
+/// `graph/send.rs::deliver_local_with`'s `codex-app-unsupported` refusal
+/// both still fire on the very first `kind:"app"` hop, before either ever
+/// reaches a parent walk. `sessions` is a snapshot taken BEFORE this tick's
+/// own merges (see the call site in [`sync_codex_app_threads`]) — a
+/// dangling or cyclic candidate is judged against the graph as it stood at
+/// the start of the tick, never against a sibling edge this same pass is
+/// still in the middle of writing.
+fn apply_codex_lineage(
+    rec: &mut SessionRecord,
+    cap: &CodexCapture,
+    sessions: &[SessionRecord],
+) -> bool {
+    let Some(pt) = cap.parent_thread_id.as_deref() else {
+        return false;
+    };
+    if pt == rec.session_id {
+        return false;
+    }
+    if !sessions.iter().any(|s| s.session_id == pt) {
+        return false;
+    }
+    if would_cycle(sessions, &rec.session_id, pt) {
+        return false;
+    }
+    if rec.parent_session_id.as_deref() == Some(pt) {
+        return false;
+    }
+    rec.parent_session_id = Some(pt.to_string());
+    true
 }
 
 /// The I/O wrapper over [`reconcile_codex_app_threads`] — gathers a
@@ -822,12 +923,20 @@ pub(crate) fn sync_codex_app_threads() -> bool {
         };
         let (mut sessions, mut changed) =
             reconcile_codex_app_threads(std::mem::take(&mut file.sessions), &scan);
+        // Snapshot BEFORE this tick's own merges — `apply_codex_lineage`'s
+        // existence/cycle checks judge a candidate parent against the graph
+        // as it stood at the start of the tick, never against a sibling
+        // edge this same pass is still in the middle of writing.
+        let lineage_snapshot = sessions.clone();
         for rec in sessions.iter_mut() {
             if rec.kind.as_deref() != Some("app") {
                 continue;
             }
             if let Some(cap) = captures.get(&rec.session_id) {
                 if apply_codex_capture(rec, cap) {
+                    changed = true;
+                }
+                if apply_codex_lineage(rec, cap, &lineage_snapshot) {
                     changed = true;
                 }
             }
@@ -850,7 +959,7 @@ pub(crate) fn sync_codex_app_threads() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::graph::testutil::{session, unique_stage, EnvVars};
+    use crate::graph::testutil::{send_invocation, session, unique_stage, EnvVars};
 
     fn thread(id: &str, cwd: &str, pid: u32) -> CodexThread {
         CodexThread {
@@ -1648,13 +1757,14 @@ mod tests {
     }
 
     #[test]
-    fn the_merge_still_never_touches_lineage_or_title() {
+    fn the_merge_still_never_sets_parent_session_id_and_never_overwrites_a_title() {
         // `cap` carries values for `parent_thread_id`/`nickname` (a real
-        // capture off a rollout with a `session_meta` header would), but
-        // this merge must never read them: the subagent edge is S4's own
-        // slice — R3 forbids touching it here. `state` moved OUT of this
-        // untouched set at S3; see `a_drifted_state_is_corrected_to_the_folded_one`
-        // and friends for its own coverage.
+        // capture off a rollout with a `session_meta` header would).
+        // `parent_session_id` is never this function's to set — that's
+        // `apply_codex_lineage`'s own slice, covered separately below.
+        // `title` DOES join this merge at S4, but fill-once only: a
+        // record whose title is already set (as this one's is) must never
+        // have it overwritten by a captured `nickname`.
         let mut rec = app_record("01a-lineage");
         rec.title = Some("original title".to_string());
         let before = rec.clone();
@@ -1667,7 +1777,7 @@ mod tests {
         let changed = apply_codex_capture(&mut rec, &cap);
         assert!(
             !changed,
-            "none of cap's set fields here are ones this merge reads"
+            "parent_thread_id is never this function's field, and an already-set title is never overwritten"
         );
         assert_eq!(rec.state, before.state);
         assert_eq!(rec.parent_session_id, before.parent_session_id);
@@ -1838,12 +1948,17 @@ mod tests {
     fn a_state_or_lineage_pointer_in_cap_sources_is_never_copied() {
         // A capture off a `session_meta`/turn-bracket header points `state`/
         // `parent_thread_id`/`thread_source`/`nickname`. `state`'s own VALUE
-        // now moves at S3 (so `changed` is `true` here), but none of these
-        // four keys is in `MERGED_SOURCE_FIELDS` — `state`'s pointer is not
-        // yet part of that scheme, and the lineage ones are S4's own slice —
-        // so `rec.sources` must stay `None`: a `sources` entry must never
-        // promise a field the record does not actually carry a pointer for.
+        // still moves (so `changed` is `true` here), but `state`/
+        // `parent_thread_id`/`thread_source` are never in `MERGED_SOURCE_FIELDS`
+        // and `parent_session_id` is never this function's field at all — so
+        // `rec.sources` must stay `None`. The title is pre-set here
+        // specifically so the `nickname` fill-once rule (its own coverage:
+        // `a_nickname_fills_an_empty_title_and_never_overwrites_one`) can
+        // never fire and confound this test's own question: a `sources`
+        // entry must never promise a field the record does not actually
+        // carry a pointer for.
         let mut rec = app_record("01a-no-lineage-pointer");
+        rec.title = Some("already set".to_string());
         let mut sources = BTreeMap::new();
         sources.insert("state".to_string(), "/rollout.jsonl#0".to_string());
         sources.insert(
@@ -1869,6 +1984,318 @@ mod tests {
         assert_eq!(
             rec.sources, None,
             "none of cap.sources's keys are ones this merge ever copies"
+        );
+    }
+
+    // ---- P-CX-5 S4: native lineage (`parent_thread_id` -> `parentSessionId`) ----
+
+    #[test]
+    fn a_native_parent_thread_id_becomes_a_parent_edge_on_the_app_record() {
+        let root = app_record("01a-root");
+        let mut child = app_record("01a-child");
+        let cap = CodexCapture {
+            parent_thread_id: Some("01a-root".to_string()),
+            ..Default::default()
+        };
+        let sessions = vec![root, child.clone()];
+        assert!(apply_codex_lineage(&mut child, &cap, &sessions));
+        assert_eq!(child.parent_session_id.as_deref(), Some("01a-root"));
+    }
+
+    #[test]
+    fn a_root_child_grandchild_chain_links_each_hop_to_its_own_parent() {
+        let root = app_record("01a-root");
+        let mut child = app_record("01a-child");
+        let mut grandchild = app_record("01a-grandchild");
+
+        let child_cap = CodexCapture {
+            parent_thread_id: Some("01a-root".to_string()),
+            ..Default::default()
+        };
+        let sessions_for_child = vec![root.clone(), child.clone(), grandchild.clone()];
+        assert!(apply_codex_lineage(
+            &mut child,
+            &child_cap,
+            &sessions_for_child
+        ));
+        assert_eq!(child.parent_session_id.as_deref(), Some("01a-root"));
+
+        let grandchild_cap = CodexCapture {
+            parent_thread_id: Some("01a-child".to_string()),
+            ..Default::default()
+        };
+        // The child's own edge above is already reflected here — each hop
+        // is judged against the graph as it stands when ITS OWN capture
+        // runs, never a stale pre-tick picture.
+        let sessions_for_grandchild = vec![root.clone(), child.clone(), grandchild.clone()];
+        assert!(apply_codex_lineage(
+            &mut grandchild,
+            &grandchild_cap,
+            &sessions_for_grandchild
+        ));
+        assert_eq!(grandchild.parent_session_id.as_deref(), Some("01a-child"));
+        assert_eq!(
+            root.parent_session_id, None,
+            "the root itself gains no parent"
+        );
+    }
+
+    #[test]
+    fn an_independent_app_root_keeps_no_parent() {
+        let mut root = app_record("01a-independent-root");
+        let sessions = vec![root.clone()];
+        assert!(!apply_codex_lineage(
+            &mut root,
+            &CodexCapture::default(),
+            &sessions
+        ));
+        assert_eq!(root.parent_session_id, None);
+    }
+
+    #[test]
+    fn an_unrelated_parent_thread_id_with_no_local_record_writes_no_edge() {
+        let mut child = app_record("01a-child");
+        let cap = CodexCapture {
+            parent_thread_id: Some("01a-nowhere".to_string()),
+            ..Default::default()
+        };
+        let sessions = vec![child.clone()];
+        assert!(!apply_codex_lineage(&mut child, &cap, &sessions));
+        assert_eq!(
+            child.parent_session_id, None,
+            "a native id naming no local record is dropped, never written as a promise"
+        );
+    }
+
+    #[test]
+    fn an_exited_parent_still_anchors_the_edge() {
+        // `canonical_state(&s.state) == "done"` — an exited thread — still
+        // EXISTS in the sessions vec; the rule only asks for existence, in
+        // ANY state, since a done parent once genuinely spawned this thread.
+        let mut exited_parent = app_record("01a-root");
+        exited_parent.state = "done".to_string();
+        let mut child = app_record("01a-child");
+        let cap = CodexCapture {
+            parent_thread_id: Some("01a-root".to_string()),
+            ..Default::default()
+        };
+        let sessions = vec![exited_parent, child.clone()];
+        assert!(apply_codex_lineage(&mut child, &cap, &sessions));
+        assert_eq!(child.parent_session_id.as_deref(), Some("01a-root"));
+    }
+
+    #[test]
+    fn a_self_referential_parent_thread_id_writes_no_edge() {
+        let mut rec = app_record("01a-self");
+        let cap = CodexCapture {
+            parent_thread_id: Some("01a-self".to_string()),
+            ..Default::default()
+        };
+        let sessions = vec![rec.clone()];
+        assert!(!apply_codex_lineage(&mut rec, &cap, &sessions));
+        assert_eq!(rec.parent_session_id, None);
+    }
+
+    #[test]
+    fn a_parent_thread_id_that_would_cycle_writes_no_edge() {
+        // `child` already points at `root` (a real edge some earlier tick
+        // wrote); `root`'s own fresh capture now claims ITS parent is
+        // `child` — closing a cycle, refused outright.
+        let mut root = app_record("01a-root");
+        let mut child = app_record("01a-child");
+        child.parent_session_id = Some("01a-root".to_string());
+        let sessions = vec![root.clone(), child.clone()];
+        let cap = CodexCapture {
+            parent_thread_id: Some("01a-child".to_string()),
+            ..Default::default()
+        };
+        assert!(!apply_codex_lineage(&mut root, &cap, &sessions));
+        assert_eq!(
+            root.parent_session_id, None,
+            "a cyclic candidate parent must never be written"
+        );
+    }
+
+    #[test]
+    fn a_capture_read_failure_leaves_lineage_and_title_untouched() {
+        let parent = app_record("01a-root");
+        let mut rec = app_record("01a-child");
+        rec.parent_session_id = Some("01a-root".to_string());
+        rec.title = Some("existing title".to_string());
+        let sessions = vec![parent, rec.clone()];
+        // `CodexCapture::default()` — every field `None` — is exactly what
+        // an unreadable, missing, or empty-tail rollout capture yields.
+        let cap = CodexCapture::default();
+        assert!(!apply_codex_lineage(&mut rec, &cap, &sessions));
+        assert!(!apply_codex_capture(&mut rec, &cap));
+        assert_eq!(rec.parent_session_id.as_deref(), Some("01a-root"));
+        assert_eq!(rec.title.as_deref(), Some("existing title"));
+    }
+
+    #[test]
+    fn a_resumed_thread_reapplies_the_same_edge_once() {
+        // A resumed thread's `session_meta` header is read fresh on every
+        // capture — re-applying the identical `parent_thread_id` a second
+        // tick must be a true no-op, never re-setting the same value or
+        // reporting a change that never happened.
+        let root = app_record("01a-root");
+        let mut child = app_record("01a-child");
+        let cap = CodexCapture {
+            parent_thread_id: Some("01a-root".to_string()),
+            ..Default::default()
+        };
+        let sessions_first = vec![root.clone(), child.clone()];
+        assert!(
+            apply_codex_lineage(&mut child, &cap, &sessions_first),
+            "the first application sets the edge"
+        );
+        let sessions_second = vec![root, child.clone()];
+        assert!(
+            !apply_codex_lineage(&mut child, &cap, &sessions_second),
+            "a resumed re-apply of the identical edge must report no change"
+        );
+        assert_eq!(child.parent_session_id.as_deref(), Some("01a-root"));
+    }
+
+    #[test]
+    fn a_nickname_fills_an_empty_title_and_never_overwrites_one() {
+        let mut sources = BTreeMap::new();
+        sources.insert("nickname".to_string(), "/rollout.jsonl#0".to_string());
+
+        let mut fresh = app_record("01a-fresh-title");
+        let cap = CodexCapture {
+            nickname: Some("Laplace".to_string()),
+            sources: Some(sources.clone()),
+            ..Default::default()
+        };
+        assert!(
+            apply_codex_capture(&mut fresh, &cap),
+            "an empty title must be filled from the nickname"
+        );
+        assert_eq!(fresh.title.as_deref(), Some("Laplace"));
+        assert_eq!(
+            fresh.sources.as_ref().and_then(|s| s.get("title")),
+            Some(&"/rollout.jsonl#0".to_string()),
+            "the fill's pointer lands under the wire name `title`, never `nickname`"
+        );
+
+        let mut already_named = app_record("01a-named-title");
+        already_named.title = Some("operator-set title".to_string());
+        let cap2 = CodexCapture {
+            nickname: Some("Different Name".to_string()),
+            sources: Some(sources),
+            ..Default::default()
+        };
+        assert!(
+            !apply_codex_capture(&mut already_named, &cap2),
+            "a non-empty title must never be overwritten by a captured nickname"
+        );
+        assert_eq!(already_named.title.as_deref(), Some("operator-set title"));
+    }
+
+    #[test]
+    fn an_app_child_with_a_parent_still_refuses_kill() {
+        let root = app_record("01a-root");
+        let mut child = app_record("01a-child");
+        child.pid = Some(999_999);
+        let cap = CodexCapture {
+            parent_thread_id: Some("01a-root".to_string()),
+            ..Default::default()
+        };
+        let sessions_before = vec![root.clone(), child.clone()];
+        assert!(apply_codex_lineage(&mut child, &cap, &sessions_before));
+        assert_eq!(child.parent_session_id.as_deref(), Some("01a-root"));
+
+        let sessions = vec![root, child.clone()];
+        let err = crate::graph::actions::kill_target(&child.session_id, &sessions).unwrap_err();
+        // `APP_OWNS_PROCESS` is private to `actions.rs`; asserted verbatim
+        // here since it cannot be imported across the module boundary.
+        assert_eq!(
+            err, "the desktop app owns this thread's process; close the thread in the app instead",
+            "the lineage edge must never defeat actions.rs's own kind:\"app\" refusal"
+        );
+    }
+
+    #[test]
+    fn an_app_child_with_a_parent_still_refuses_send() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["AOIDE_STAGE_DIR", "AOIDE_AUDIT_LOG"]);
+        let root_dir = unique_stage("codex-lineage-refuses-send");
+        let stage = root_dir.join("stage");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_AUDIT_LOG", root_dir.join("log"));
+
+        let root = app_record("01a-root");
+        let mut child = app_record("01a-child");
+        let cap = CodexCapture {
+            parent_thread_id: Some("01a-root".to_string()),
+            ..Default::default()
+        };
+        let sessions_before = vec![root.clone(), child.clone()];
+        assert!(apply_codex_lineage(&mut child, &cap, &sessions_before));
+
+        let sf = SessionsFile {
+            schema_version: "0".to_string(),
+            sessions: vec![root, child.clone()],
+        };
+        write_stage(&sessions_path(), &sf).unwrap();
+
+        let out = crate::graph::session_send(&send_invocation(
+            &["hi"],
+            &[("id", &child.session_id), ("yes", "true")],
+        ));
+        assert_eq!(out.status, aoide_protocol::output::Status::Error);
+        assert_eq!(
+            out.data.as_ref().unwrap()["reason"],
+            "codex-app-unsupported",
+            "the lineage edge must never defeat send.rs's own kind:\"app\" refusal"
+        );
+
+        let _ = std::fs::remove_dir_all(&root_dir);
+    }
+
+    #[test]
+    fn the_app_records_kind_and_agent_survive_the_lineage_merge() {
+        let root = app_record("01a-root");
+        let mut child = app_record("01a-child");
+        child.agent = "codex".to_string();
+        let cap = CodexCapture {
+            parent_thread_id: Some("01a-root".to_string()),
+            ..Default::default()
+        };
+        let sessions = vec![root, child.clone()];
+        assert!(apply_codex_lineage(&mut child, &cap, &sessions));
+        assert_eq!(child.kind.as_deref(), Some("app"));
+        assert_eq!(child.agent, "codex");
+    }
+
+    #[test]
+    fn an_app_child_inherits_its_parents_effective_project() {
+        let projects = vec![crate::graph::model::Project {
+            name: "aoide".to_string(),
+            path: "/home/khoa/Aoide".to_string(),
+            ..Default::default()
+        }];
+        let mut root = app_record("01a-root");
+        root.project = Some("aoide".to_string());
+        let mut child = app_record("01a-child");
+        // No cwd anchor of its own — the ONLY way this resolves to "aoide"
+        // is by walking the `parentSessionId` edge this slice writes.
+        child.cwd = "/home/khoa/Elsewhere".to_string();
+        let cap = CodexCapture {
+            parent_thread_id: Some("01a-root".to_string()),
+            ..Default::default()
+        };
+        let sessions_before = vec![root.clone(), child.clone()];
+        assert!(apply_codex_lineage(&mut child, &cap, &sessions_before));
+
+        let sessions = vec![root, child.clone()];
+        let resolved = crate::graph::model::effective_project_for(&child, &sessions, &projects);
+        assert_eq!(
+            resolved.map(|i| projects[i].name.as_str()),
+            Some("aoide"),
+            "the child must inherit its parent's effective project through this slice's own edge"
         );
     }
 }
