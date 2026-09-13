@@ -12,7 +12,7 @@
 //! `state/stage/graph.json` — so the picture on screen is the document on disk.
 //! We parse that document into a forest (each session has at most one incoming
 //! edge — spawned-by wins over anchors — so the layout is a tree walk), assign
-//! `column = depth` and `row = preorder index`, and paint chips + connectors.
+//! `column = depth` and center parents over their descendant leaves, and paint rectangular nodes + connectors.
 //!
 //! Tags: read-only. The schema has no tag surface (see the module note in
 //! [`crate::theme::session_tags`]); tags found on a session record's
@@ -22,19 +22,18 @@ use crate::app::App;
 use crate::theme;
 use aoide_conduct::graph;
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use ratatui::Frame;
 use std::collections::{HashMap, HashSet};
 
-/// Per-depth band width in cells. Wide enough to read as columns (distinct from
-/// the roster's tight indentation) and to give edges a gutter to route through.
-/// Widened 28->36 for the display grammar's `<host>/<role>/<petname>
-/// (…<tail4>)` label (petnames plan P3) — `CHIP_MAX` (below) follows.
-const COL_W: usize = 36;
-/// Max chip width (label + state + tag chips), leaving a gutter for connectors.
-const CHIP_MAX: usize = COL_W - 4;
+/// Generous wire gutter separates fixed world cards.
+const GUTTER: usize = 12;
+/// Fixed node width; title, identity, and state each have their own line.
+const CHIP_MAX: usize = 32;
+const NODE_H: usize = 7;
+const LEAF_PITCH: usize = NODE_H + 4;
 
 /// What a node is — drives marker, colour, and whether Enter can cue it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,6 +51,11 @@ pub struct Node {
     pub id: String,
     pub kind: NodeKind,
     pub label: String,
+    pub title: String,
+    pub activity: String,
+    pub petname: Option<String>,
+    pub role: String,
+    pub harness: String,
     /// The bare session id (for the focus jump on Enter); `None` for anchors.
     pub session_id: Option<String>,
     pub state: Option<String>,
@@ -63,12 +67,18 @@ pub struct Node {
     pub model: Option<String>,
     pub depth: usize,
     pub row: usize,
+    world_y: usize,
+    width: usize,
+    height: usize,
 }
 
 /// Node metadata carried from the parsed document into the DFS.
 struct Meta {
     kind: NodeKind,
     label: String,
+    title: String,
+    role: String,
+    harness: String,
     session_id: Option<String>,
     state: Option<String>,
     tags: Vec<String>,
@@ -78,6 +88,7 @@ struct Meta {
 /// The parsed + laid-out forest: nodes in preorder (the selection order) and the
 /// child adjacency needed to draw connectors.
 pub struct Model {
+    zoom: i8,
     pub nodes: Vec<Node>,
     /// node id → child node ids, in draw order.
     children: HashMap<String, Vec<String>>,
@@ -88,6 +99,19 @@ pub struct Model {
 /// land on a node the screen isn't showing.
 pub fn node_order(app: &App) -> Vec<Node> {
     build_model(app).nodes
+}
+
+pub fn selected_session_id(app: &App) -> Option<String> {
+    node_order(app)
+        .get(app.graph_sel)
+        .and_then(|node| node.session_id.clone())
+}
+
+pub fn session_id_at(area: Rect, app: &App, x: u16, y: u16) -> Option<String> {
+    let index = hit_node(area, app, x, y)?;
+    node_order(app)
+        .get(index)
+        .and_then(|node| node.session_id.clone())
 }
 
 /// Build the layout model from the canonical graph document.
@@ -139,6 +163,9 @@ pub fn build_model(app: &App) -> Model {
                     Meta {
                         kind: NodeKind::Project,
                         label: name,
+                        title: str_field(n, "path"),
+                        role: "project".into(),
+                        harness: String::new(),
                         session_id: None,
                         state: None,
                         tags: Vec::new(),
@@ -159,8 +186,15 @@ pub fn build_model(app: &App) -> Model {
                 // <sessionId>` for a legacy/petname-less node. `session_id`
                 // (below) stays the bare canonical id — this is the LABEL
                 // only, never what Enter's focus jump reads.
-                let role = if spawned_targets.contains(id.as_str()) { "child" } else { "root" };
-                let petname = n.get("petname").and_then(|v| v.as_str()).map(str::to_string);
+                let role = if spawned_targets.contains(id.as_str()) {
+                    "child"
+                } else {
+                    "root"
+                };
+                let petname = n
+                    .get("petname")
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
                 let rec = aoide_storage::records::SessionRecord {
                     session_id: sid.clone(),
                     petname,
@@ -172,6 +206,9 @@ pub fn build_model(app: &App) -> Model {
                     Meta {
                         kind: NodeKind::Session,
                         label,
+                        title: str_field(n, "title"),
+                        role: str_field(n, "role"),
+                        harness: str_field(n, "agent"),
                         session_id: Some(sid),
                         state: Some(state),
                         tags,
@@ -217,6 +254,9 @@ pub fn build_model(app: &App) -> Model {
             Meta {
                 kind: NodeKind::Unanchored,
                 label: "(unanchored)".to_string(),
+                title: "Sessions without a project".into(),
+                role: "group".into(),
+                harness: String::new(),
                 session_id: None,
                 state: None,
                 tags: Vec::new(),
@@ -234,7 +274,39 @@ pub fn build_model(app: &App) -> Model {
         walk(r, 0, &meta, &children, &mut visited, &mut nodes);
     }
 
-    Model { nodes, children }
+    let mut leaf_y = 0;
+    for root in &roots {
+        place_subtree(root, &children, &mut nodes, &mut leaf_y);
+        leaf_y += LEAF_PITCH;
+    }
+
+    for node in &mut nodes {
+        if let Some(record) = node
+            .session_id
+            .as_ref()
+            .and_then(|id| merged.iter().find(|s| &s.session_id == id))
+        {
+            node.petname = record.petname.clone();
+            node.activity = match (
+                record.tool.as_deref().filter(|s| !s.is_empty()),
+                record
+                    .activity
+                    .as_deref()
+                    .or(record.say.as_deref())
+                    .filter(|s| !s.is_empty()),
+            ) {
+                (Some(tool), Some(activity)) if tool != activity => format!("{tool} · {activity}"),
+                (Some(tool), _) => tool.into(),
+                (_, Some(activity)) => activity.into(),
+                _ => String::new(),
+            };
+        }
+    }
+    Model {
+        nodes,
+        children,
+        zoom: app.graph_zoom,
+    }
 }
 
 fn str_field(v: &serde_json::Value, key: &str) -> String {
@@ -260,12 +332,20 @@ fn walk(
             id: id.to_string(),
             kind: m.kind,
             label: m.label.clone(),
+            title: m.title.clone(),
+            activity: String::new(),
+            petname: None,
+            role: m.role.clone(),
+            harness: m.harness.clone(),
             session_id: m.session_id.clone(),
             state: m.state.clone(),
             tags: m.tags.clone(),
             model: m.model.clone(),
             depth,
             row: out.len(),
+            world_y: 0,
+            width: CHIP_MAX,
+            height: NODE_H,
         });
     }
     if let Some(kids) = children.get(id) {
@@ -275,6 +355,43 @@ fn walk(
     }
 }
 
+/// Selection remains preorder; spatial placement uses leaf lanes instead.
+fn place_subtree(
+    id: &str,
+    children: &HashMap<String, Vec<String>>,
+    nodes: &mut [Node],
+    next_y: &mut usize,
+) -> usize {
+    let Some(index) = nodes.iter().position(|n| n.id == id) else {
+        return *next_y;
+    };
+    let depth = nodes[index].depth;
+    let kids: Vec<String> = children
+        .get(id)
+        .into_iter()
+        .flatten()
+        .filter(|child| {
+            nodes
+                .iter()
+                .any(|n| &n.id == *child && n.depth == depth + 1)
+        })
+        .cloned()
+        .collect();
+    let y = if kids.is_empty() {
+        let y = *next_y;
+        *next_y += LEAF_PITCH;
+        y
+    } else {
+        let positions: Vec<usize> = kids
+            .iter()
+            .map(|child| place_subtree(child, children, nodes, next_y))
+            .collect();
+        (positions[0] + positions[positions.len() - 1]) / 2
+    };
+    nodes[index].world_y = y;
+    y
+}
+
 // ── Rendering: model → cell grid → ratatui Lines ────────────────────────────
 
 /// One painted cell: a symbol and its style.
@@ -282,6 +399,7 @@ fn walk(
 struct GCell {
     ch: char,
     style: Style,
+    continuation: bool,
 }
 
 impl Default for GCell {
@@ -289,6 +407,7 @@ impl Default for GCell {
         GCell {
             ch: ' ',
             style: Style::default(),
+            continuation: false,
         }
     }
 }
@@ -311,195 +430,428 @@ pub fn render(f: &mut Frame, area: Rect, app: &App, sel: usize) {
         return;
     }
 
-    let grid = lay_out(&model, sel, &app.palette);
+    let grid = lay_out(
+        &model,
+        if app.sidebar_focused { usize::MAX } else { sel },
+        &app.palette,
+    );
     let lines = grid_to_lines(&grid);
 
-    // Scroll to keep the selected node in view (vertical and horizontal).
-    let vh = area.height as usize;
-    let vw = area.width as usize;
-    let (sy, sx) = model
+    let (sy, sx) = viewport(&model, sel, area, app.graph_pan);
+    f.render_widget(Paragraph::new(lines).scroll((sy as u16, sx as u16)), area);
+}
+
+fn node_rect(n: &Node) -> (usize, usize, usize, usize) {
+    (n.depth * (n.width + GUTTER), n.world_y, n.width, n.height)
+}
+fn camera_scale(zoom: i8) -> usize {
+    (100 + zoom.clamp(-2, 2) as i16 * 25) as usize
+}
+fn screen_rect(n: &Node, zoom: i8) -> (usize, usize, usize, usize) {
+    let (x, y, w, h) = node_rect(n);
+    let scale = camera_scale(zoom);
+    let sx = x * scale / 100;
+    let sy = y * scale / 100;
+    (
+        sx,
+        sy,
+        (x + w) * scale / 100 - sx,
+        (y + h) * scale / 100 - sy,
+    )
+}
+fn extent(model: &Model) -> (usize, usize) {
+    model.nodes.iter().fold((0, 0), |(w, h), node| {
+        let (x, y, nw, nh) = screen_rect(node, model.zoom);
+        (w.max(x + nw), h.max(y + nh))
+    })
+}
+
+pub fn zoom_label(app: &App) -> &'static str {
+    match app.graph_zoom.clamp(-2, 2) {
+        -2 => "50%",
+        -1 => "75%",
+        1 => "125%",
+        2 => "150%",
+        _ => "100%",
+    }
+}
+
+/// Zoom the camera over a fixed world layout. Terminal glyphs remain cell-sized.
+pub fn zoom_at(app: &mut App, area: Rect, pointer: (u16, u16), delta: i8) {
+    if delta == 0 || !area.contains(ratatui::layout::Position::new(pointer.0, pointer.1)) {
+        return;
+    }
+    let next = app.graph_zoom.saturating_add(delta.signum()).clamp(-2, 2);
+    if next == app.graph_zoom {
+        return;
+    }
+    let old = camera_scale(app.graph_zoom);
+    let new = camera_scale(next);
+    let origin = graph_origin(app, area);
+    let px = (pointer.0 - area.x) as usize;
+    let py = (pointer.1 - area.y) as usize;
+    let x = ((origin.0 + px) * new / old).saturating_sub(px);
+    let y = ((origin.1 + py) * new / old).saturating_sub(py);
+    app.graph_zoom = next;
+    let (w, h) = graph_extent(app);
+    app.graph_pan = Some((
+        x.min(w.saturating_sub(area.width as usize)),
+        y.min(h.saturating_sub(area.height as usize)),
+    ));
+    app.graph_drag = None;
+}
+
+/// Graph canvas size in cells, for bounded drag and wheel panning.
+pub fn graph_extent(app: &App) -> (usize, usize) {
+    extent(&build_model(app))
+}
+pub fn graph_origin(app: &App, area: Rect) -> (usize, usize) {
+    let (y, x) = viewport(&build_model(app), app.graph_sel, area, app.graph_pan);
+    (x, y)
+}
+
+fn viewport(
+    model: &Model,
+    sel: usize,
+    area: Rect,
+    manual: Option<(usize, usize)>,
+) -> (usize, usize) {
+    if let Some((x, y)) = manual {
+        let (w, h) = extent(model);
+        return (
+            y.min(h.saturating_sub(area.height as usize)),
+            x.min(w.saturating_sub(area.width as usize)),
+        );
+    }
+    model
         .nodes
         .get(sel)
         .map(|n| {
-            let y = if n.row >= vh { n.row - vh + 1 } else { 0 };
-            let node_x = n.depth * COL_W;
-            let x = if node_x + CHIP_MAX > vw {
-                (node_x + CHIP_MAX).saturating_sub(vw)
-            } else {
-                0
-            };
-            (y as u16, x as u16)
+            let (x, y, w, h) = screen_rect(n, model.zoom);
+            (
+                y.saturating_add(h.min(area.height as usize))
+                    .saturating_sub(area.height as usize),
+                x.saturating_add(w.min(area.width as usize))
+                    .saturating_sub(area.width as usize),
+            )
         })
-        .unwrap_or((0, 0));
-
-    f.render_widget(Paragraph::new(lines).scroll((sy, sx)), area);
+        .unwrap_or((0, 0))
+}
+/// Hit testing uses exactly the painted rectangles and viewport.
+pub fn hit_node(area: Rect, app: &App, x: u16, y: u16) -> Option<usize> {
+    if !area.contains(ratatui::layout::Position::new(x, y)) {
+        return None;
+    }
+    let model = build_model(app);
+    let (sy, sx) = viewport(&model, app.graph_sel, area, app.graph_pan);
+    let gx = (x - area.x) as usize + sx;
+    let gy = (y - area.y) as usize + sy;
+    model.nodes.iter().position(|n| {
+        let (nx, ny, w, h) = screen_rect(n, model.zoom);
+        gx >= nx && gx < nx + w && gy >= ny && gy < ny + h
+    })
 }
 
 /// Compose the styled cell grid: connectors first (box-drawing edges routed in
-/// the gutter left of each child column), then node chips on top.
+/// the gutter left of each child column), then node blocks on top.
 fn lay_out(model: &Model, sel: usize, pal: &crate::app::Palette) -> Vec<Vec<GCell>> {
-    // Pre-compose each node's chip cells so we know its on-screen width.
-    let chips: Vec<Vec<GCell>> = model
+    let height = extent(model).1;
+    let width = extent(model).0;
+    let mut grid = vec![vec![GCell::default(); width]; height];
+    let conn = theme::accent_style(pal);
+    let pos: HashMap<&str, (usize, usize)> = model
         .nodes
         .iter()
-        .enumerate()
-        .map(|(i, n)| chip_cells(n, i == sel, pal))
+        .map(|n| {
+            let (x, y, _, h) = screen_rect(n, model.zoom);
+            (n.id.as_str(), (x, y + h / 2))
+        })
         .collect();
-
-    let height = model.nodes.len();
-    let width = model
-        .nodes
-        .iter()
-        .zip(&chips)
-        .map(|(n, c)| n.depth * COL_W + c.len() + 1)
-        .max()
-        .unwrap_or(1)
-        .max(1);
-
-    let mut grid: Vec<Vec<GCell>> = vec![vec![GCell::default(); width]; height];
-    let conn = theme::dim();
-
-    // Row + depth lookup by node id (for connector endpoints).
-    let pos: HashMap<&str, (usize, usize, usize)> = model
-        .nodes
-        .iter()
-        .enumerate()
-        .map(|(i, n)| (n.id.as_str(), (n.row, n.depth, chips[i].len())))
-        .collect();
-
-    // Connectors: for every parent with children, a bus in the gutter.
     for n in &model.nodes {
         let Some(kids) = model.children.get(&n.id) else {
             continue;
         };
-        let kids: Vec<&str> = kids
-            .iter()
-            .filter(|k| pos.contains_key(k.as_str()))
-            .map(String::as_str)
-            .collect();
+        let kids: Vec<_> = kids.iter().filter_map(|k| pos.get(k.as_str())).collect();
         if kids.is_empty() {
             continue;
         }
-        let (prow, pdepth, plen) = pos[n.id.as_str()];
-        let ccol = (pdepth + 1) * COL_W;
-        let jx = ccol.saturating_sub(2);
-        let p_right = pdepth * COL_W + plen;
-        let last_row = kids.iter().map(|k| pos[k].0).max().unwrap_or(prow);
-
-        // Horizontal from the parent chip to the bus, then the corner.
-        for x in p_right..jx {
-            set(&mut grid, x, prow, '─', conn);
+        let (px, py) = pos[n.id.as_str()];
+        let (_, _, w, _) = screen_rect(n, model.zoom);
+        let jx =
+            (n.depth * (n.width + GUTTER) + n.width + GUTTER / 2) * camera_scale(model.zoom) / 100;
+        let top = kids.iter().map(|(_, y)| *y).min().unwrap().min(py);
+        let bottom = kids.iter().map(|(_, y)| *y).max().unwrap().max(py);
+        for x in px + w..=jx {
+            set(&mut grid, x, py, '─', conn);
         }
-        set(&mut grid, jx, prow, '┐', conn);
-        // The vertical bus down to the last child.
-        for y in (prow + 1)..=last_row {
+        for y in top..=bottom {
             set(&mut grid, jx, y, '│', conn);
         }
-        // A tee/elbow into each child, then a lead-in to the chip.
-        for k in &kids {
-            let (crow, _, _) = pos[*k];
-            let corner = if crow == last_row { '└' } else { '├' };
-            set(&mut grid, jx, crow, corner, conn);
-            for x in (jx + 1)..ccol {
-                set(&mut grid, x, crow, '─', conn);
+        for (cx, cy) in kids {
+            for x in jx + 1..*cx {
+                set(&mut grid, x, *cy, '─', conn);
+            }
+            set(
+                &mut grid,
+                jx,
+                *cy,
+                if top == bottom {
+                    '─'
+                } else if *cy == top {
+                    '┌'
+                } else if *cy == bottom {
+                    '└'
+                } else {
+                    '├'
+                },
+                conn,
+            );
+        }
+        set(
+            &mut grid,
+            jx,
+            py,
+            if top == bottom {
+                '─'
+            } else if py == top {
+                '┬'
+            } else if py == bottom {
+                '┴'
+            } else {
+                '┼'
+            },
+            conn,
+        );
+    }
+    for (i, n) in model.nodes.iter().enumerate() {
+        let (x, y, w, h) = screen_rect(n, model.zoom);
+        for (dy, row) in block_cells_at(n, i == sel, pal, w, h).iter().enumerate() {
+            for (dx, cell) in row.iter().enumerate() {
+                set_cell(&mut grid, x + dx, y + dy, cell.clone());
             }
         }
     }
-
-    // Chips on top.
-    for (i, n) in model.nodes.iter().enumerate() {
-        let x0 = n.depth * COL_W;
-        for (dx, cell) in chips[i].iter().enumerate() {
-            set_cell(&mut grid, x0 + dx, n.row, cell.clone());
+    // Ports sit on the card boundary so links visibly belong to nodes.
+    for n in &model.nodes {
+        let (x, y, w, h) = screen_rect(n, model.zoom);
+        if n.depth > 0 {
+            set(&mut grid, x, y + h / 2, 'o', conn);
+        }
+        if model
+            .children
+            .get(&n.id)
+            .is_some_and(|kids| !kids.is_empty())
+        {
+            set(&mut grid, x + w - 1, y + h / 2, 'o', conn);
         }
     }
-
     grid
 }
 
-fn push_cells(buf: &mut Vec<GCell>, s: &str, style: Style) {
-    for ch in s.chars() {
-        buf.push(GCell { ch, style });
-    }
+#[cfg(test)]
+fn block_cells(n: &Node, selected: bool, pal: &crate::app::Palette) -> Vec<Vec<GCell>> {
+    block_cells_at(n, selected, pal, n.width, n.height)
 }
-
-/// Build a node's chip as styled cells: marker, label, a short state word, and
-/// read-only tag chips — fit to [`CHIP_MAX`].
-///
-/// Send-back fix (P3 review): post-P2 every session carries a minted
-/// petname, so the display-grammar label (`<host>/<role>/<petname>
-/// (…<tail4>)`) routinely runs 30+ chars on its own — wider than the whole
-/// old bare-id chip. The SUFFIX (state, model, tag chips) is sized first and
-/// the label gets whatever budget is left, never the other way — state must
-/// survive on every row, the label is what yields. [`fit_label`] degrades
-/// the label gracefully into that budget rather than being blind-truncated
-/// by the final backstop below.
-fn chip_cells(n: &Node, selected: bool, pal: &crate::app::Palette) -> Vec<GCell> {
-    let accent = theme::accent(pal).unwrap_or(Color::Cyan);
-    let (marker, marker_style, label_style) = match n.kind {
-        NodeKind::Project | NodeKind::Unanchored => (
-            '◆',
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-            Style::default().fg(accent).add_modifier(Modifier::BOLD),
-        ),
-        NodeKind::Session => {
-            let st = theme::state_style(n.state.as_deref().unwrap_or(""), pal);
-            ('●', st, Style::default())
-        }
+fn block_cells_at(
+    n: &Node,
+    selected: bool,
+    pal: &crate::app::Palette,
+    width: usize,
+    height: usize,
+) -> Vec<Vec<GCell>> {
+    let surface = theme::surface(
+        pal,
+        if n.kind != NodeKind::Session {
+            10
+        } else if n.role == "shell" || n.harness == "shell" {
+            3
+        } else {
+            6
+        },
+    );
+    let accent = theme::role_color(
+        pal,
+        if n.kind != NodeKind::Session {
+            theme::Role::Project
+        } else if n.harness == "shell" || n.role == "terminal" {
+            theme::Role::Terminal
+        } else {
+            theme::Role::Agent
+        },
+    );
+    let border = if selected {
+        surface.fg(accent).add_modifier(Modifier::BOLD)
+    } else if n.kind != NodeKind::Session {
+        surface.fg(accent)
+    } else {
+        surface.patch(theme::state_style(n.state.as_deref().unwrap_or(""), pal))
     };
-
-    // The suffix — state, then model, then tag chips — in the SAME order
-    // and styling as always; only the sizing is new (computed before the
-    // label, so the label knows what's left).
-    let mut suffix: Vec<GCell> = Vec::new();
-    if let Some(state) = &n.state {
-        if !state.is_empty() {
-            push_cells(&mut suffix, &format!(" {state}"), theme::dim());
+    let mut block = vec![
+        vec![
+            GCell {
+                ch: ' ',
+                style: surface,
+                continuation: false
+            };
+            width
+        ];
+        height
+    ];
+    let (tl, tr, bl, br, h, v) = if selected {
+        ('┏', '┓', '┗', '┛', '━', '┃')
+    } else {
+        ('┌', '┐', '└', '┘', '─', '│')
+    };
+    for x in 1..width - 1 {
+        set(&mut block, x, 0, h, border);
+        set(&mut block, x, height - 1, h, border);
+    }
+    for y in 1..height - 1 {
+        set(&mut block, 0, y, v, border);
+        set(&mut block, width - 1, y, v, border);
+    }
+    for (x, y, ch) in [
+        (0, 0, tl),
+        (width - 1, 0, tr),
+        (0, height - 1, bl),
+        (width - 1, height - 1, br),
+    ] {
+        set(&mut block, x, y, ch, border);
+    }
+    let state = n.state.as_deref().unwrap_or("");
+    let role = if n.role.is_empty() {
+        if n.harness == "shell" {
+            "terminal"
+        } else if !n.harness.is_empty() {
+            "agent"
+        } else {
+            "session"
+        }
+    } else if n.role == "shell" {
+        "terminal"
+    } else {
+        &n.role
+    };
+    let heading = if state.is_empty() {
+        role.to_uppercase()
+    } else {
+        format!("{} · {}", role.to_uppercase(), state)
+    };
+    let heading = if n.tags.is_empty() {
+        heading
+    } else {
+        format!(
+            "{} {}",
+            heading,
+            n.tags
+                .iter()
+                .map(|t| format!("[{t}]"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        )
+    };
+    let main = if n.kind == NodeKind::Session && !n.title.is_empty() {
+        &n.title
+    } else {
+        &n.label
+    };
+    let identity = if n.kind == NodeKind::Session {
+        if n.title.is_empty() {
+            String::new()
+        } else {
+            fit_label(&n.label, width - 4)
+        }
+    } else {
+        truncate_end(&n.title, width - 4)
+    };
+    let detail = match (&n.harness, n.model.as_deref()) {
+        (h, Some(m)) if !h.is_empty() => format!("{h} · {m}"),
+        (_, Some(m)) => m.into(),
+        (h, None) => h.clone(),
+    };
+    let card_identity = n
+        .petname
+        .as_ref()
+        .map(|name| {
+            let tail: String = n
+                .session_id
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .rev()
+                .take(4)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            format!("{name} (…{tail})")
+        })
+        .unwrap_or_else(|| n.label.clone());
+    let rows = if n.kind == NodeKind::Session {
+        vec![
+            (
+                1,
+                truncate_end(
+                    if n.title.is_empty() {
+                        &n.harness
+                    } else {
+                        &n.title
+                    },
+                    width - 4,
+                ),
+                surface.add_modifier(Modifier::BOLD),
+            ),
+            (2, fit_label(&card_identity, width - 4), surface),
+            (3, truncate_end(&detail, width - 4), surface.fg(accent)),
+            (4, heading, surface.patch(theme::state_style(state, pal))),
+            (5, truncate_end(&n.activity, width - 4), surface),
+        ]
+    } else {
+        vec![
+            (1, heading, surface.fg(accent).add_modifier(Modifier::BOLD)),
+            (
+                2,
+                if n.kind == NodeKind::Session && n.title.is_empty() {
+                    fit_label(main, width - 4)
+                } else {
+                    truncate_end(main, width - 4)
+                },
+                surface.add_modifier(Modifier::BOLD),
+            ),
+            (3, identity, surface),
+            (4, detail, surface),
+            (
+                5,
+                n.tags
+                    .iter()
+                    .map(|tag| format!("[{tag}]"))
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                surface.fg(accent),
+            ),
+        ]
+    };
+    for (y, text, style) in rows {
+        if y >= height - 1 {
+            continue;
+        }
+        let mut dx = 0;
+        for ch in text.chars() {
+            let cells = Span::raw(ch.to_string()).width();
+            if cells == 0 {
+                continue;
+            }
+            if dx + cells > width - 4 {
+                break;
+            }
+            set(&mut block, 2 + dx, y, ch, style);
+            for i in 1..cells {
+                block[y][2 + dx + i].continuation = true;
+            }
+            dx += cells;
         }
     }
-    // The running Claude model, when known — same `⟐` glyph the gadget dock
-    // uses for a subagent's model text, rendered uniformly on agent AND
-    // subagent chips alike; absent for projects, unanchored, and shells.
-    if let Some(model) = &n.model {
-        if !model.is_empty() {
-            push_cells(
-                &mut suffix,
-                &format!(" ⟐{model}"),
-                Style::default().fg(accent).add_modifier(Modifier::DIM),
-            );
-        }
-    }
-    for t in &n.tags {
-        push_cells(
-            &mut suffix,
-            &format!(" ⟨{t}⟩"),
-            Style::default().fg(accent).add_modifier(Modifier::DIM),
-        );
-    }
-
-    // marker + space = 2 fixed cells; the label gets whatever's left after
-    // that and the suffix above.
-    let label_budget = CHIP_MAX.saturating_sub(2).saturating_sub(suffix.len());
-    let label = fit_label(&n.label, label_budget);
-
-    let mut cells: Vec<GCell> = Vec::new();
-    push_cells(&mut cells, &marker.to_string(), marker_style);
-    push_cells(&mut cells, " ", label_style);
-    push_cells(&mut cells, &label, label_style);
-    cells.extend(suffix);
-
-    // Backstop only now — sizing above already fits the budget in the
-    // overwhelming common case; this only bites the pathological one where
-    // the suffix ALONE exceeds CHIP_MAX-2 (label_budget saturated to 0),
-    // and even then it cuts from the END (tags, then model), never from the
-    // front where marker+state live.
-    cells.truncate(CHIP_MAX);
-    if selected {
-        for c in &mut cells {
-            c.style = c.style.add_modifier(Modifier::REVERSED);
-        }
-    }
-    cells
+    block
 }
 
 /// Fit a display-grammar label (`<host>/<role>/<petname> (…<tail4>)`, or the
@@ -608,7 +960,16 @@ fn truncate_end(s: &str, budget: usize) -> String {
 }
 
 fn set(grid: &mut [Vec<GCell>], x: usize, y: usize, ch: char, style: Style) {
-    set_cell(grid, x, y, GCell { ch, style });
+    set_cell(
+        grid,
+        x,
+        y,
+        GCell {
+            ch,
+            style,
+            continuation: false,
+        },
+    );
 }
 
 fn set_cell(grid: &mut [Vec<GCell>], x: usize, y: usize, cell: GCell) {
@@ -627,6 +988,9 @@ fn grid_to_lines(grid: &[Vec<GCell>]) -> Vec<Line<'static>> {
             let mut buf = String::new();
             let mut cur: Option<Style> = None;
             for cell in row {
+                if cell.continuation {
+                    continue;
+                }
                 match cur {
                     Some(s) if s == cell.style => buf.push(cell.ch),
                     _ => {
@@ -696,6 +1060,139 @@ mod tests {
     }
 
     #[test]
+    fn block_viewport_and_hit_testing_share_every_selected_rectangle() {
+        let mut app = App::for_test(
+            vec![],
+            vec![
+                session("root", "/x", "working", None),
+                session("child", "/x", "idle", Some("root")),
+            ],
+            vec![],
+        );
+        let area = Rect::new(3, 2, 44, 12);
+        let model = build_model(&app);
+        for sel in 0..model.nodes.len() {
+            app.graph_sel = sel;
+            let (sy, sx) = viewport(&model, sel, area, app.graph_pan);
+            let (x, y, w, h) = node_rect(&model.nodes[sel]);
+            assert!(x >= sx && x + w <= sx + area.width as usize);
+            assert!(y >= sy && y + h <= sy + area.height as usize);
+            for dy in 0..h {
+                for dx in 0..w {
+                    assert_eq!(
+                        hit_node(
+                            area,
+                            &app,
+                            (area.x as usize + x - sx + dx) as u16,
+                            (area.y as usize + y - sy + dy) as u16
+                        ),
+                        Some(sel)
+                    );
+                }
+            }
+        }
+        app.graph_sel = 0;
+        assert_eq!(
+            hit_node(area, &app, area.x, area.y + NODE_H as u16),
+            None,
+            "row gutter is not a node"
+        );
+        let tiny = Rect::new(0, 0, 8, 3);
+        let (sy, sx) = viewport(&model, 2, tiny, None);
+        let (x, y, _, _) = node_rect(&model.nodes[2]);
+        assert_eq!((sx, sy), (x, y));
+    }
+
+    #[test]
+    fn manual_pan_overrides_selection_and_hit_tests_the_visible_block() {
+        let mut app = App::for_test(
+            vec![],
+            vec![
+                session("root", "/x", "working", None),
+                session("child", "/x", "idle", Some("root")),
+            ],
+            vec![],
+        );
+        let area = Rect::new(3, 4, 32, 7);
+        let model = build_model(&app);
+        let child = model
+            .nodes
+            .iter()
+            .position(|n| n.session_id.as_deref() == Some("child"))
+            .unwrap();
+        let (x, y, w, h) = node_rect(&model.nodes[child]);
+        app.graph_sel = 0;
+        app.graph_pan = Some((x, y));
+        assert_eq!(viewport(&model, 0, area, app.graph_pan), (y, x));
+        assert_eq!(hit_node(area, &app, area.x, area.y), Some(child));
+        assert_eq!(
+            hit_node(area, &app, area.x + w as u16 - 1, area.y + h as u16 - 1),
+            Some(child)
+        );
+        let extent = graph_extent(&app);
+        assert_eq!(extent, (x + w, y + h));
+        assert_eq!(
+            viewport(&model, 0, area, Some((usize::MAX, usize::MAX))),
+            (extent.1 - 7, extent.0 - 32)
+        );
+        app.graph_pan = None;
+        assert_eq!(hit_node(area, &app, area.x, area.y), Some(0));
+        let cells = block_cells(&model.nodes[0], false, &app.palette);
+        assert_eq!(cells[0][0].ch, '┌');
+    }
+
+    #[test]
+    fn blocks_preserve_metadata_edges_and_palette_contrast() {
+        let mut parent = session("root", "/x", "working", None);
+        parent.title = Some("Distinct task title".into());
+        parent.petname = Some("brave-otter".into());
+        parent.model = Some("model-one".into());
+        let app = App::for_test(
+            vec![],
+            vec![parent, session("child", "/x", "idle", Some("root"))],
+            vec![],
+        );
+        let model = build_model(&app);
+        let root = model
+            .nodes
+            .iter()
+            .find(|n| n.session_id.as_deref() == Some("root"))
+            .unwrap();
+        let child = model
+            .nodes
+            .iter()
+            .find(|n| n.session_id.as_deref() == Some("child"))
+            .unwrap();
+        let grid = lay_out(&model, 1, &app.palette);
+        let junction = root.depth * (CHIP_MAX + GUTTER) + CHIP_MAX + GUTTER / 2;
+        assert_eq!(grid[root.world_y + NODE_H / 2][junction].ch, '─');
+        assert_eq!(root.world_y, child.world_y);
+        for (bg, fg) in [(0, 15), (15, 0)] {
+            let pal = crate::app::Palette {
+                bg: Some(bg),
+                fg: Some(fg),
+                accent: Some(3),
+                urgent: Some(1),
+                ..Default::default()
+            };
+            let cells = block_cells(root, true, &pal);
+            let text: String = cells.iter().flatten().map(|c| c.ch).collect();
+            assert!(
+                text.contains("Distinct task title")
+                    && text.contains(" (…root)")
+                    && text.contains("claude · model-one")
+            );
+            assert_eq!(cells[0][0].ch, '┏');
+            assert_eq!(cells[2][2].style.fg, theme::surface(&pal, 0).fg);
+            assert!(cells[2][2].style.bg.is_some());
+        }
+        let mut wide = root.clone();
+        wide.title = "界".repeat(50);
+        let lines = grid_to_lines(&block_cells(&wide, false, &app.palette));
+        assert!(lines.iter().all(|l| l.width() == CHIP_MAX));
+    }
+
+    #[test]
     fn model_lays_out_projects_then_spawned_children_in_columns() {
         let app = App::for_test(
             vec![Project {
@@ -716,8 +1213,16 @@ mod tests {
         // field that stays the bare canonical id (Enter's focus jump
         // unaffected by the label change).
         let proj = m.nodes.iter().find(|n| n.label == "aoide").unwrap();
-        let root = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("root")).unwrap();
-        let kid = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("kid")).unwrap();
+        let root = m
+            .nodes
+            .iter()
+            .find(|n| n.session_id.as_deref() == Some("root"))
+            .unwrap();
+        let kid = m
+            .nodes
+            .iter()
+            .find(|n| n.session_id.as_deref() == Some("kid"))
+            .unwrap();
         assert_eq!(proj.depth, 0);
         assert_eq!(root.depth, 1);
         assert_eq!(kid.depth, 2);
@@ -735,7 +1240,10 @@ mod tests {
         );
         let m = build_model(&app);
         assert!(m.nodes.iter().any(|n| n.kind == NodeKind::Unanchored));
-        assert!(m.nodes.iter().any(|n| n.session_id.as_deref() == Some("loose")));
+        assert!(m
+            .nodes
+            .iter()
+            .any(|n| n.session_id.as_deref() == Some("loose")));
     }
 
     #[test]
@@ -758,9 +1266,21 @@ mod tests {
             Vec::new(),
         );
         let m = build_model(&app);
-        let root_n = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("root")).unwrap();
-        let kid_n = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("kid")).unwrap();
-        let term_n = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("term")).unwrap();
+        let root_n = m
+            .nodes
+            .iter()
+            .find(|n| n.session_id.as_deref() == Some("root"))
+            .unwrap();
+        let kid_n = m
+            .nodes
+            .iter()
+            .find(|n| n.session_id.as_deref() == Some("kid"))
+            .unwrap();
+        let term_n = m
+            .nodes
+            .iter()
+            .find(|n| n.session_id.as_deref() == Some("term"))
+            .unwrap();
         assert_eq!(root_n.model.as_deref(), Some("claude-sonnet-5"));
         assert_eq!(kid_n.model.as_deref(), Some("claude-fable-5"));
         assert_eq!(term_n.model, None);
@@ -781,7 +1301,11 @@ mod tests {
             Vec::new(),
         );
         let m = build_model(&app);
-        let node = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("t")).unwrap();
+        let node = m
+            .nodes
+            .iter()
+            .find(|n| n.session_id.as_deref() == Some("t"))
+            .unwrap();
         assert_eq!(node.tags, vec!["backend".to_string(), "wip".to_string()]);
     }
 
@@ -810,11 +1334,23 @@ mod tests {
         let m = build_model(&app);
         let host = aoide_storage::display::local_host_name();
 
-        let root_n = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("root")).unwrap();
+        let root_n = m
+            .nodes
+            .iter()
+            .find(|n| n.session_id.as_deref() == Some("root"))
+            .unwrap();
         assert_eq!(root_n.label, format!("{host}/root/brave-otter (…root)"));
-        assert_eq!(root_n.session_id.as_deref(), Some("root"), "session_id stays the bare canonical id");
+        assert_eq!(
+            root_n.session_id.as_deref(),
+            Some("root"),
+            "session_id stays the bare canonical id"
+        );
 
-        let kid_n = m.nodes.iter().find(|n| n.session_id.as_deref() == Some("kid")).unwrap();
+        let kid_n = m
+            .nodes
+            .iter()
+            .find(|n| n.session_id.as_deref() == Some("kid"))
+            .unwrap();
         assert_eq!(kid_n.label, format!("{host}/child/calm-thorn (…kid)"));
         assert_eq!(kid_n.session_id.as_deref(), Some("kid"));
 
@@ -832,7 +1368,7 @@ mod tests {
     }
 
     #[test]
-    fn chip_cells_keeps_state_and_the_tail_visible_on_a_realistic_petnamed_row() {
+    fn block_keeps_state_and_identity_on_separate_bounded_lines() {
         // Send-back regression (P3 review): post-P2 every session carries a
         // minted petname, so a REAL row's label is `<host>/<role>/<petname>
         // (…<tail4>)` — routinely 30+ chars on a real box, wider than the
@@ -847,7 +1383,8 @@ mod tests {
             None,
         );
         root.petname = Some("hardy-harbor".into()); // wordlist-shaped (petname.rs).
-        root.extra.insert("tags".into(), serde_json::json!(["backend"]));
+        root.extra
+            .insert("tags".into(), serde_json::json!(["backend"]));
         let app = App::for_test(
             vec![Project {
                 name: "aoide".into(),
@@ -871,13 +1408,20 @@ mod tests {
             node.label.chars().count()
         );
 
-        let cells = chip_cells(node, false, &app.palette);
-        let rendered: String = cells.iter().map(|c| c.ch).collect();
+        let block = block_cells(node, false, &app.palette);
+        let cells = &block[3];
+        let rendered: String = block.iter().flatten().map(|c| c.ch).collect();
 
         // (a) the acceptance bar: state survives.
-        assert!(rendered.contains("working"), "state chip survives: {rendered:?}");
+        assert!(
+            rendered.contains("working"),
+            "state chip survives: {rendered:?}"
+        );
         // (b) the tail4 grep-back handle survives — the last thing to die.
-        assert!(rendered.contains(" (…"), "tail4 handle survives: {rendered:?}");
+        assert!(
+            rendered.contains(" (…"),
+            "tail4 handle survives: {rendered:?}"
+        );
         // (c) the row never overflows the chip's budget.
         assert!(
             cells.len() <= CHIP_MAX,
@@ -893,7 +1437,10 @@ mod tests {
         assert_eq!(fit_label(label, 100), label);
         // Rung 1: host/role/ + middle-elided name + tail all present.
         let r1 = fit_label(label, 30);
-        assert!(r1.starts_with("yomi-strix/child/"), "rung 1 keeps host/role/: {r1}");
+        assert!(
+            r1.starts_with("yomi-strix/child/"),
+            "rung 1 keeps host/role/: {r1}"
+        );
         assert!(r1.ends_with(" (…ab12)"), "rung 1 keeps the tail: {r1}");
         // Rung 2: budget too small for host — role/name/tail only.
         let r2 = fit_label(label, 18);
@@ -902,12 +1449,150 @@ mod tests {
         assert!(r2.ends_with(" (…ab12)"), "rung 2 keeps the tail: {r2}");
         // Even at a brutal budget, the tail bracket is the last thing cut.
         let tiny = fit_label(label, 8);
-        assert!(tiny.ends_with(" (…ab12)"), "tail survives an 8-cell budget: {tiny}");
+        assert!(
+            tiny.ends_with(" (…ab12)"),
+            "tail survives an 8-cell budget: {tiny}"
+        );
         let tinier = fit_label(label, 5);
         assert_eq!(tinier.chars().count(), 5);
         assert!(
             tinier.contains("ab12") || tinier.contains('…'),
             "even a 5-cell budget keeps SOME fragment of the tail or an ellipsis: {tinier}"
         );
+    }
+    #[test]
+    fn branches_have_centered_parents_separate_lanes_and_connected_ports() {
+        let app = App::for_test(
+            vec![],
+            vec![
+                session("root", "/x", "working", None),
+                session("left", "/x", "working", Some("root")),
+                session("right", "/x", "idle", Some("root")),
+                session("leaf", "/x", "idle", Some("left")),
+            ],
+            vec![],
+        );
+        let model = build_model(&app);
+        let node = |id: &str| {
+            model
+                .nodes
+                .iter()
+                .find(|n| n.session_id.as_deref() == Some(id))
+                .unwrap()
+        };
+        let (root, left, right, leaf) = (node("root"), node("left"), node("right"), node("leaf"));
+        assert_eq!(left.world_y, leaf.world_y);
+        assert!(right.world_y >= left.world_y + LEAF_PITCH);
+        assert_eq!(root.world_y, (left.world_y + right.world_y) / 2);
+        for zoom in -2..=2 {
+            let mut model = build_model(&app);
+            model.zoom = zoom;
+            let cells = lay_out(&model, 0, &app.palette);
+            for n in &model.nodes {
+                let (x, y, w, h) = screen_rect(n, zoom);
+                if n.depth > 0 {
+                    assert_eq!(cells[y + h / 2][x].ch, 'o');
+                }
+                if model.children.contains_key(&n.id) {
+                    assert_eq!(cells[y + h / 2][x + w - 1].ch, 'o');
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn camera_zoom_preserves_pointer_and_fixed_world_layout() {
+        let mut app = App::for_test(
+            vec![],
+            vec![
+                session("root", "/x", "working", None),
+                session("child", "/x", "idle", Some("root")),
+            ],
+            vec![],
+        );
+        let area = Rect::new(3, 4, 12, 4);
+        app.graph_pan = Some((44, 1));
+        let pointer = (area.x + 4, area.y + 2);
+        let before = hit_node(area, &app, pointer.0, pointer.1);
+        let world: Vec<_> = build_model(&app).nodes.iter().map(node_rect).collect();
+        zoom_at(&mut app, area, pointer, 1);
+        assert_eq!(graph_origin(&app, area), (56, 1));
+        assert_eq!(hit_node(area, &app, pointer.0, pointer.1), before);
+        assert_eq!(
+            build_model(&app)
+                .nodes
+                .iter()
+                .map(node_rect)
+                .collect::<Vec<_>>(),
+            world
+        );
+        zoom_at(&mut app, area, pointer, 1);
+        assert_eq!(app.graph_zoom, 2);
+        let pan = app.graph_pan;
+        zoom_at(&mut app, area, pointer, 1);
+        assert_eq!(app.graph_pan, pan);
+        assert_eq!(zoom_label(&app), "150%");
+        let zoom = app.graph_zoom;
+        zoom_at(&mut app, area, (0, 0), -1);
+        assert_eq!(app.graph_zoom, zoom);
+    }
+
+    #[test]
+    fn camera_rectangles_match_render_and_hit_at_every_scale() {
+        let mut app = App::for_test(vec![], vec![session("root", "/x", "working", None)], vec![]);
+        let area = Rect::new(2, 3, 60, 20);
+        for zoom in [-2, -1, 0, 1, 2] {
+            app.graph_zoom = zoom;
+            app.graph_sel = 1;
+            let model = build_model(&app);
+            let node = &model.nodes[1];
+            assert_eq!((node.width, node.height), (CHIP_MAX, NODE_H));
+            let (x, y, w, h) = screen_rect(node, zoom);
+            let cells = block_cells_at(node, true, &app.palette, w, h);
+            assert_eq!((cells[0].len(), cells.len()), (w, h));
+            assert!(grid_to_lines(&cells).iter().all(|line| line.width() == w));
+            let (sy, sx) = viewport(&model, 1, area, None);
+            for dy in 0..h {
+                for dx in 0..w {
+                    assert_eq!(
+                        hit_node(
+                            area,
+                            &app,
+                            (area.x as usize + x - sx + dx) as u16,
+                            (area.y as usize + y - sy + dy) as u16
+                        ),
+                        Some(1)
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn normal_session_card_has_widget_fields_and_resolves_action_target() {
+        let mut rec = session("canonical-id", "/x", "working", None);
+        rec.title = Some("Review conductor".into());
+        rec.petname = Some("calm-rook".into());
+        rec.model = Some("fable".into());
+        rec.tool = Some("Read".into());
+        rec.activity = Some("Inspect graph".into());
+        let mut app = App::for_test(vec![], vec![rec], vec![]);
+        app.graph_sel = 1;
+        let model = build_model(&app);
+        let cells = block_cells(&model.nodes[1], true, &app.palette);
+        let line = |y: usize| cells[y].iter().map(|c| c.ch).collect::<String>();
+        assert!(line(1).contains("Review conductor"));
+        assert!(line(2).contains("calm-rook"));
+        assert!(line(3).contains("claude · fable"));
+        assert!(line(4).contains("working"));
+        assert!(line(5).contains("Read · Inspect graph"));
+        assert_eq!(selected_session_id(&app).as_deref(), Some("canonical-id"));
+        let area = Rect::new(0, 0, 32, 7);
+        assert_eq!(
+            session_id_at(area, &app, 1, 1).as_deref(),
+            Some("canonical-id")
+        );
+        app.graph_sel = 0;
+        assert!(selected_session_id(&app).is_none());
     }
 }

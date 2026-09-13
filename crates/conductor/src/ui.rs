@@ -26,7 +26,7 @@
 
 use crate::app::{App, DagRow, Panel};
 use crate::graphview;
-use crate::theme::{self, DIVIDER, END_CAP};
+use crate::theme;
 use aoide_conduct::graph;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -38,62 +38,49 @@ use ratatui::Frame;
 /// the body, and the status line — then the help or log-tail overlay when
 /// either is open (mutually exclusive by construction — see [`crate::app`]).
 pub fn draw(f: &mut Frame, app: &App) {
+    crate::board::draw(f, app);
+}
+
+pub(crate) fn draw_overlays(f: &mut Frame, app: &App) {
     let area = f.area();
-    let rows = Layout::vertical([
-        Constraint::Length(1), // brand header
-        Constraint::Length(1), // tab strip
-        Constraint::Min(3),    // body
-        Constraint::Length(1), // status bar
-    ])
-    .split(area);
-
-    draw_header(f, rows[0], app);
-    draw_tabs(f, rows[1], app);
-    draw_body(f, rows[2], app);
-    draw_status(f, rows[3], app);
-
     if app.help_open {
         draw_help(f, area, app);
     }
     if app.tail.is_some() {
         draw_log_tail(f, area, app);
     }
+    if let Some(input) = &app.input {
+        if let crate::app::InputKind::ProjectRemove { name } = &input.kind {
+            let width = area.width.min(68);
+            let height = area.height.min(10);
+            let popup = Rect::new(
+                area.x + (area.width - width) / 2,
+                area.y + (area.height - height) / 2,
+                width,
+                height,
+            );
+            f.render_widget(Clear, popup);
+            f.render_widget(
+                Paragraph::new(format!("Unregister project `{name}`?\nProject files are kept.\n\nType the exact project name: {}▏\n\nEnter confirms matching name; Esc cancels", input.buffer))
+                    .wrap(ratatui::widgets::Wrap { trim: false })
+                    .style(theme::accent_style(&app.palette))
+                    .block(Block::default().title(" Confirm project removal ").borders(Borders::ALL)),
+                popup,
+            );
+        }
+    }
 }
 
 // ── Chrome: header, tabs, status bar ────────────────────────────────────────
 
-fn draw_header(f: &mut Frame, area: Rect, app: &App) {
-    let brand = format!("{END_CAP} aoide · conductor {DIVIDER}  conduct the agent sessions");
-    let p = Paragraph::new(Line::from(brand)).style(theme::accent_style(&app.palette));
-    f.render_widget(p, area);
-}
-
-fn draw_tabs(f: &mut Frame, area: Rect, app: &App) {
-    let mut spans: Vec<Span> = Vec::new();
-    let accent = theme::accent(&app.palette);
-    for (i, p) in Panel::ALL.iter().enumerate() {
-        let label = format!(" {} {} ", i + 1, p.title());
-        if *p == app.panel {
-            let mut st = Style::default().add_modifier(Modifier::REVERSED | Modifier::BOLD);
-            if let Some(c) = accent {
-                st = st.fg(c);
-            }
-            spans.push(Span::styled(label, st));
-        } else {
-            spans.push(Span::styled(label, theme::dim()));
-        }
-    }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
-}
-
-fn draw_status(f: &mut Frame, area: Rect, app: &App) {
+pub(crate) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     let hint = keymap_hint(app.panel);
     let msg = if let Some(input) = &app.input {
         format!("{}: {}▏", input.label, input.buffer)
     } else {
         app.status_message()
     };
-    let left = format!(" {DIVIDER} {msg}");
+    let left = format!(" {msg}");
 
     let hint_w = (hint.len() as u16 + 1).min(area.width.saturating_sub(4));
     let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(hint_w)]).split(area);
@@ -111,10 +98,12 @@ fn draw_status(f: &mut Frame, area: Rect, app: &App) {
 /// frontend owns.
 fn keymap_hint(panel: Panel) -> &'static str {
     match panel {
+        Panel::Home => "click to open · Ctrl-P projects · ? help · q quit",
+        Panel::Mail => "↑/↓ letters · PgUp/PgDn read · r refresh · ? help",
         Panel::Graph => {
-            "j/k walk · g/G ends · Enter jump · p prune · Tab panel · ? help · q quit"
+            "j/k select · Space+drag pan · wheel scroll · Enter open"
         }
-        Panel::Session => {
+        Panel::Session|Panel::Terminals => {
             "j/k select · Enter jump/fold · h/l fold · L link · a add root · d rm · p prune · ? help · q quit"
         }
         Panel::Projects => "j/k select · a add root · d remove · Tab panel · ? help · q quit",
@@ -127,38 +116,64 @@ fn keymap_hint(panel: Panel) -> &'static str {
     }
 }
 
-/// A framed panel block: the double box, an accent border, a reverse-video
-/// title, and the clef-tail end-cap tucked on the bottom-right seam (the same
-/// ornament placement the QML uses).
+/// Single-line pane borders; the focused body receives the accent.
 fn panel_block(title: &str, app: &App) -> Block<'static> {
     let accent = theme::accent(&app.palette);
-    let mut title_style = Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED);
-    if let Some(c) = accent {
-        title_style = title_style.fg(c);
+    let mut title_style = Style::default().add_modifier(Modifier::BOLD);
+    if !app.sidebar_focused {
+        if let Some(c) = accent {
+            title_style = title_style.fg(c);
+        }
     }
     let mut border_style = Style::default();
-    if let Some(c) = accent {
-        border_style = border_style.fg(c);
+    if !app.sidebar_focused {
+        if let Some(c) = accent {
+            border_style = border_style.fg(c).add_modifier(Modifier::BOLD);
+        }
     }
     Block::new()
         .borders(Borders::ALL)
-        .border_type(BorderType::Double)
+        .border_type(BorderType::Plain)
         .border_style(border_style)
         .title(Span::styled(format!(" {title} "), title_style))
-        .title_bottom(Line::from(Span::styled(END_CAP, theme::dim())).right_aligned())
+}
+
+/// Ratatui applies this across the complete selected row, including trailing cells.
+fn selection_style(app: &App) -> Style {
+    if app.sidebar_focused {
+        return theme::surface(&app.palette, 14).add_modifier(Modifier::BOLD);
+    }
+    Style::default()
+        .bg(theme::accent(&app.palette).unwrap_or(Color::Cyan))
+        .fg(theme::opt_color(app.palette.bg).unwrap_or(Color::Black))
+        .add_modifier(Modifier::BOLD)
+}
+
+fn pad_column(text: &str, width: usize) -> String {
+    format!(
+        "{text}{}",
+        " ".repeat(width.saturating_sub(Span::raw(text).width()))
+    )
 }
 
 // ── Body dispatch ───────────────────────────────────────────────────────────
 
-fn draw_body(f: &mut Frame, area: Rect, app: &App) {
+pub(crate) fn draw_body(f: &mut Frame, area: Rect, app: &App) {
     let block = panel_block(app.panel.title(), app);
     let inner = block.inner(area);
     f.render_widget(block, area);
+    let (inner, actions) = crate::board::body_content(inner);
+    crate::board::draw_actions(f, actions, app);
     match app.panel {
+        Panel::Home => crate::board::draw_home(f, inner, app),
+        Panel::Mail => crate::board::draw_mail(f, inner, app),
         Panel::Graph => graphview::render(f, inner, app, app.graph_sel),
-        Panel::Session => draw_sessions(f, inner, app),
+        Panel::Session | Panel::Terminals if app.history_selected.is_some() => {
+            crate::board::draw_history(f, inner, app)
+        }
+        Panel::Session | Panel::Terminals => draw_sessions(f, inner, app),
         Panel::Projects => draw_projects(f, inner, app),
-        Panel::Log => draw_log(f, inner, app),
+        Panel::Log => crate::eventview::draw(f, inner, app),
         Panel::Status => draw_status_panel(f, inner, app),
         Panel::Roster => draw_roster(f, inner, app),
         Panel::Pending => draw_pending(f, inner, app),
@@ -198,13 +213,8 @@ fn draw_sessions(f: &mut Frame, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(legend), parts[0]);
 
     // Roster: a stateful list so selection auto-scrolls.
-    let accent = theme::accent(&app.palette);
     let items: Vec<ListItem> = rows.iter().map(|r| roster_item(r, app)).collect();
-    let mut hl = Style::default().add_modifier(Modifier::REVERSED);
-    if let Some(c) = accent {
-        hl = hl.fg(c);
-    }
-    let list = List::new(items).highlight_style(hl);
+    let list = List::new(items).highlight_style(selection_style(app));
     let mut state = ListState::default();
     state.select(Some(app.dag_sel.min(rows.len().saturating_sub(1))));
     f.render_stateful_widget(list, parts[1], &mut state);
@@ -249,7 +259,13 @@ fn roster_item<'a>(row: &DagRow, app: &App) -> ListItem<'a> {
                 Span::styled(if fresh { "‣" } else { " " }.to_string(), cue_style),
                 Span::raw(prefix.clone()),
                 Span::styled(format!("{glyph} "), st),
-                Span::raw(format!("{}  ", rec.session_id)),
+                Span::raw(format!(
+                    "{}  ",
+                    rec.petname
+                        .as_deref()
+                        .or(rec.title.as_deref())
+                        .unwrap_or(&rec.agent)
+                )),
                 Span::styled(format!("{}  ", rec.agent), theme::dim()),
                 Span::styled(format!("{}  ", rec.state), st),
                 Span::styled(format!("{}  ", elapsed), theme::dim()),
@@ -432,9 +448,21 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
+    let name_width = projects
+        .iter()
+        .map(|p| Span::raw(&p.name).width())
+        .max()
+        .unwrap_or(0)
+        .max(12);
     let parts = Layout::vertical([Constraint::Length(1), Constraint::Min(0)]).split(area);
     f.render_widget(
-        Paragraph::new(Line::from(" project        sessions  path").style(theme::dim())),
+        Paragraph::new(
+            Line::from(format!(
+                "  {} sessions  path",
+                pad_column("project", name_width)
+            ))
+            .style(theme::dim()),
+        ),
         parts[0],
     );
 
@@ -452,14 +480,16 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
                 .count();
             let bar = theme::ascii_bar(anchored, 6);
             let mut lines = vec![Line::from(format!(
-                "◆ {:<12} {bar} {:>2}  {}",
-                p.name, anchored, p.path
+                "◆ {} {bar} {:>2}  {}",
+                pad_column(&p.name, name_width),
+                anchored,
+                p.path
             ))];
             for r in p.roots().into_iter().skip(1) {
                 lines.push(
                     Line::from(format!(
-                        "  {:<12} {} {:>2}  {}",
-                        "",
+                        "  {} {} {:>2}  {}",
+                        " ".repeat(name_width),
                         " ".repeat(bar.chars().count()),
                         "",
                         r
@@ -471,12 +501,7 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    let accent = theme::accent(&app.palette);
-    let mut hl = Style::default().add_modifier(Modifier::REVERSED);
-    if let Some(c) = accent {
-        hl = hl.fg(c);
-    }
-    let list = List::new(items).highlight_style(hl);
+    let list = List::new(items).highlight_style(selection_style(app));
     let mut state = ListState::default();
     if app.input.is_none() {
         state.select(Some(app.proj_sel.min(projects.len().saturating_sub(1))));
@@ -485,50 +510,6 @@ fn draw_projects(f: &mut Frame, area: Rect, app: &App) {
 }
 
 // ── [3] LOG — the audit tail ────────────────────────────────────────────────
-
-fn draw_log(f: &mut Frame, area: Rect, app: &App) {
-    if app.log.is_empty() {
-        f.render_widget(
-            Paragraph::new(Line::from("   The audit log is empty.").style(theme::dim())),
-            area,
-        );
-        return;
-    }
-    let lines: Vec<Line> = app
-        .log
-        .iter()
-        .map(|l| {
-            let mut class_style = Style::default();
-            if let Some(c) = theme::class_color(&l.class) {
-                class_style = class_style.fg(c);
-            }
-            Line::from(vec![
-                Span::styled(format!("{:<12}", trunc(&l.class, 12)), class_style),
-                Span::styled(format!(" {:<6}", trunc(&l.door, 6)), theme::dim()),
-                Span::styled(
-                    format!(" {:<15}", trunc(&l.status, 15)),
-                    Style::default().fg(theme::status_color(&l.status)),
-                ),
-                Span::raw(format!(" {}: {}", l.command, l.message)),
-            ])
-        })
-        .collect();
-
-    // Scroll so the newest lines (the tail) are on screen.
-    let h = area.height as usize;
-    let scroll = lines.len().saturating_sub(h) as u16;
-    f.render_widget(Paragraph::new(lines).scroll((scroll, 0)), area);
-}
-
-fn trunc(s: &str, max: usize) -> String {
-    if s.chars().count() <= max {
-        s.to_string()
-    } else {
-        s.chars().take(max).collect()
-    }
-}
-
-// ── [4] STATUS — stage-tree health ──────────────────────────────────────────
 
 fn draw_status_panel(f: &mut Frame, area: Rect, app: &App) {
     // Two roots since command-defrag S1 (2026-08-27): conducting state
@@ -695,13 +676,8 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &App) {
     // A stateful list (P-C5 adds selection to C4's read-only pane) — same
     // shape [`draw_sessions`] uses over the DAG's flattened rows.
     let pal = &app.palette;
-    let accent = theme::accent(pal);
     let items: Vec<ListItem> = rows.iter().map(|r| roster_row_item(r, pal)).collect();
-    let mut hl = Style::default().add_modifier(Modifier::REVERSED);
-    if let Some(c) = accent {
-        hl = hl.fg(c);
-    }
-    let list = List::new(items).highlight_style(hl);
+    let list = List::new(items).highlight_style(selection_style(app));
     let mut state = ListState::default();
     state.select(Some(app.roster_sel.min(rows.len().saturating_sub(1))));
     f.render_stateful_widget(list, parts[2], &mut state);
@@ -709,7 +685,12 @@ fn draw_roster(f: &mut Frame, area: Rect, app: &App) {
 
 fn roster_row_item<'a>(row: &crate::app::RosterRow, pal: &crate::app::Palette) -> ListItem<'a> {
     match row {
-        crate::app::RosterRow::NodeHeader { name, is_local, presence, fetched_at } => {
+        crate::app::RosterRow::NodeHeader {
+            name,
+            is_local,
+            presence,
+            fetched_at,
+        } => {
             let glyph = graph::glyph(presence);
             let head = match presence.as_str() {
                 "unreachable" => format!(
@@ -726,7 +707,10 @@ fn roster_row_item<'a>(row: &crate::app::RosterRow, pal: &crate::app::Palette) -
                 Style::default().add_modifier(Modifier::BOLD),
             )))
         }
-        crate::app::RosterRow::Session { session: s, is_last } => {
+        crate::app::RosterRow::Session {
+            session: s,
+            is_last,
+        } => {
             let branch = if *is_last { "└─ " } else { "├─ " };
             let st = theme::state_style(&s.state, pal);
             let sg = theme::state_glyph(&s.state);
@@ -772,13 +756,8 @@ fn draw_pending(f: &mut Frame, area: Rect, app: &App) {
         return;
     }
 
-    let accent = theme::accent(&app.palette);
     let items: Vec<ListItem> = rows.iter().map(pending_row_item).collect();
-    let mut hl = Style::default().add_modifier(Modifier::REVERSED);
-    if let Some(c) = accent {
-        hl = hl.fg(c);
-    }
-    let list = List::new(items).highlight_style(hl);
+    let list = List::new(items).highlight_style(selection_style(app));
     let mut state = ListState::default();
     state.select(Some(app.pending_sel.min(rows.len().saturating_sub(1))));
     f.render_stateful_widget(list, parts[1], &mut state);
@@ -862,41 +841,25 @@ fn draw_log_tail(f: &mut Frame, area: Rect, app: &App) {
 
 fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     let help: &[&str] = &[
-        "",
-        "  Tab / Shift-Tab   cycle panels",
-        "  1 2 3 4 5 6 7     DAG / SESSION / PROJECTS / LOG / STATUS / ROSTER / PENDING",
-        "  j / k  ↓ / ↑      move selection",
-        "",
-        "  DAG (the visual graph)",
-        "    j / k            walk nodes (preorder)",
-        "    g / G            jump to first / last node",
-        "    Enter            cue window · tail the log if headless",
-        "    Esc / q          close the log tail (Enter also closes it)",
-        "    p                prune done sessions (also restages graph.json)",
-        "    ◆ project  ● session   ⟨tag⟩ read-only tag",
-        "",
-        "  SESSION",
-        "    Enter            cue window · tail the log if headless",
-        "    Esc / q          close the log tail (Enter also closes it)",
-        "    h / l            fold / unfold the group",
-        "    L                link the session under a parent",
-        "    a / d            add a root / remove a project",
-        "    p                prune done sessions (restages the DAG)",
-        "    ♪ 𝄐 𝄁 𝄽 𝄂        working · awaiting · stopped · idle · done   ‣ fresh",
-        "",
-        "  PROJECTS: a add root · d remove",
-        "",
-        "  ROSTER: j/k select · s compose (send to the selected session)",
-        "    r forces a refresh; auto-probes every ~15s while the pane is",
-        "    open. ● online  ◐ unreachable  ○ never-pulled",
-        "",
-        "  PENDING: j/k select · a approve · d deny — held send/A2A",
-        "    entries; resolving always re-lists (ids are positions, not",
-        "    stable — they shift the moment any entry resolves)",
-        "",
-        "  ?                 toggle this help      q / Ctrl-C  quit",
-        "  Every cue runs through the one door; the audit log records it.",
-        "",
+        "  Tab / Shift-Tab   cycle views · Ctrl-P project tree",
+        "  1 Home · 2 Mail · 3 Agents · 4 Terminals · 5 Mesh",
+        "  6 Review · 7 Projects · 8 Graph · 9 Log · 0 Status",
+        "  Mouse             click tabs, rows and actions; wheel scrolls",
+        "  Arrows / j,k      select in the focused pane",
+        "  Tree: h/l         fold/unfold · Enter open · Past is history",
+        "  Home: n           create a project",
+        "  Projects: a/r     add folder / resurrect project",
+        "  Agents/Terminals: Enter cue window or tail the log if headless",
+        "  Esc / q           close the log tail (Enter also closes it)",
+        "  Graph: j/k        select blocks · Enter focus · read-only tags",
+        "  Mail: h/l         conversations / letters; j/k select",
+        "  Mail: n/s/r       new letter / reply / refresh",
+        "  Compose: Enter    newline after recipient · Ctrl-S send",
+        "  Compose: Esc      discard draft; shortcuts become text",
+        "  Mail / Log        PgUp/PgDn or wheel scrolls detail",
+        "  Mesh: s/r         terminal input / refresh",
+        "  Approvals: a/d    approve / deny conductor input (not mail)",
+        "  ? / Esc           close help · q / Ctrl-C quit",
     ];
     let title = " aoide conductor — keys ";
     let box_w = help
@@ -1029,22 +992,25 @@ mod tests {
             }],
             vec![root, kid],
         );
-        let out = render_panel(&app, Panel::Graph, 120, 30);
+        let out = render_panel(&app, Panel::Graph, 160, 40);
         assert!(out.contains("DAG"), "panel title rendered");
-        assert!(out.contains("◆ aoide"), "project node drawn");
+        assert!(
+            out.contains("PROJECT") && out.contains("aoide"),
+            "project node drawn"
+        );
         // Session chips render the display grammar (petnames plan P3), not
         // the bare id — neither fixture session has a minted petname, so
         // each degrades to `<host>/<role>/<sessionId>`.
         let host = aoide_storage::display::local_host_name();
         assert!(
-            out.contains(&format!("● {host}/root/r")) && out.contains(&format!("{host}/child/k")),
+            out.contains(&format!("{host}/root/r")) && out.contains(&format!("{host}/child/k")),
             "session nodes drawn: {out}"
         );
         assert!(
             out.contains('├') || out.contains('└') || out.contains('─'),
             "box-drawing edges present"
         );
-        assert!(out.contains("⟨x⟩"), "read-only tag chip drawn: {out}");
+        assert!(out.contains("[x]"), "read-only tag chip drawn: {out}");
     }
 
     #[test]
@@ -1058,8 +1024,11 @@ mod tests {
             vec![session("s1", "/home/k/Aoide", "running", None)],
         );
         let out = render_panel(&app, Panel::Session, 100, 30);
-        assert!(out.contains("SESSION"), "panel title");
-        assert!(out.contains("◆ aoide"), "group header");
+        assert!(out.contains("AGENTS"), "panel title");
+        assert!(
+            out.contains("PROJECT") && out.contains("aoide"),
+            "group header"
+        );
         assert!(out.contains("[1/1]"), "live/total badge");
         assert!(out.contains("s1") && out.contains("claude"), "session row");
         assert!(out.contains('♪'), "working glyph in legend/row");
@@ -1201,8 +1170,65 @@ mod tests {
             }],
             vec![root, sub],
         );
-        let out = render_panel(&app, Panel::Graph, 120, 30);
-        assert!(out.contains("⟐m"), "subagent chip carries its model tag: {out}");
+        let out = render_panel(&app, Panel::Graph, 160, 40);
+        assert!(
+            out.contains("claude · m"),
+            "subagent chip carries its model tag: {out}"
+        );
+    }
+
+    #[test]
+    fn selected_project_highlight_fills_each_root_row_and_columns_align() {
+        let mut app = app_with(
+            vec![Project {
+                name: "界wide-project-name".into(),
+                path: "/primary".into(),
+                roots: vec!["/extra".into()],
+                ..Default::default()
+            }],
+            vec![],
+        );
+        app.sidebar_focused = false;
+        app.palette.bg = Some(0);
+        app.palette.accent = Some(6);
+        let mut terminal = Terminal::new(TestBackend::new(80, 10)).unwrap();
+        terminal
+            .draw(|f| draw_projects(f, Rect::new(0, 0, 80, 10), &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        for y in [1, 2] {
+            for x in [0, 40, 79] {
+                assert_eq!(buffer[(x, y)].bg, Color::Indexed(6));
+                assert_eq!(buffer[(x, y)].fg, Color::Indexed(0));
+            }
+        }
+        let cell_column = |row: u16, symbol: &str| {
+            (0..80)
+                .find(|x| buffer[(*x, row)].symbol() == symbol)
+                .unwrap()
+        };
+        assert_eq!(cell_column(1, "/"), cell_column(2, "/"));
+        assert_eq!(cell_column(0, "p"), 2); // project heading
+        assert_eq!(pad_column("界", 4), "界  ");
+    }
+
+    #[test]
+    fn focused_pane_border_is_single_accent_and_inactive_selection_is_subdued() {
+        let mut app = app_with(vec![], vec![]);
+        app.sidebar_focused = false;
+        app.palette.bg = Some(15);
+        app.palette.fg = Some(0);
+        app.palette.accent = Some(4);
+        let mut terminal = Terminal::new(TestBackend::new(30, 5)).unwrap();
+        terminal
+            .draw(|f| f.render_widget(panel_block("Projects", &app), Rect::new(0, 0, 30, 5)))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "┌");
+        assert_eq!(buffer[(0, 0)].fg, Color::Indexed(4));
+        assert_eq!(buffer[(28, 4)].symbol(), "─");
+        app.sidebar_focused = true;
+        assert_ne!(selection_style(&app).bg, Some(Color::Indexed(4)));
     }
 
     #[test]
@@ -1250,7 +1276,10 @@ mod tests {
         );
         let out = render_panel(&app, Panel::Projects, 90, 20);
         assert!(out.contains("/a"), "the primary root still renders: {out}");
-        assert!(out.contains("/second-root"), "the extra root renders too: {out}");
+        assert!(
+            out.contains("/second-root"),
+            "the extra root renders too: {out}"
+        );
         let ai = out.find("aoide").unwrap();
         let zi = out.find("zeta").unwrap();
         assert!(ai < zi, "sort/meter for the neighbour still holds");
@@ -1262,6 +1291,7 @@ mod tests {
         let mut app = app_with(vec![], vec![]);
         app.log = vec![
             crate::app::LogLine {
+                raw: serde_json::json!({}),
                 ts: 1,
                 door: "cli".into(),
                 class: "audit".into(),
@@ -1270,6 +1300,7 @@ mod tests {
                 message: "staged".into(),
             },
             crate::app::LogLine {
+                raw: serde_json::json!({}),
                 ts: 2,
                 door: "cli".into(),
                 class: "audit".into(),
@@ -1293,8 +1324,11 @@ mod tests {
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &a)).unwrap();
         let out = dump(term.backend().buffer());
-        assert!(out.contains("aoide conductor — keys"), "overlay title present");
-        assert!(out.contains("cycle panels"));
+        assert!(
+            out.contains("aoide conductor — keys"),
+            "overlay title present"
+        );
+        assert!(out.contains("cycle views"));
         assert!(out.contains("read-only tag"), "DAG tag legend documented");
         assert!(
             out.contains("tail the log if headless"),
@@ -1319,7 +1353,12 @@ mod tests {
     /// log file nests under — lets a test pin a DETERMINISTIC path depth
     /// (task #59's regression test, below) rather than relying on however
     /// deep the ambient `$TMPDIR` happens to be on whatever machine runs it.
-    fn app_with_tail_under(base: std::path::PathBuf, session_id: &str, lines: Vec<String>, tag: &str) -> App {
+    fn app_with_tail_under(
+        base: std::path::PathBuf,
+        session_id: &str,
+        lines: Vec<String>,
+        tag: &str,
+    ) -> App {
         let dir = base.join(format!(
             "aoide-ui-tail-test-{tag}-{}-{}",
             std::process::id(),
@@ -1400,7 +1439,9 @@ mod tests {
         // 60-character directory names — so the deep-tree case is
         // exercised every run, not only on whichever machine happens to
         // hand out a long temp path.
-        let deep_base = std::env::temp_dir().join("a".repeat(60)).join("b".repeat(60));
+        let deep_base = std::env::temp_dir()
+            .join("a".repeat(60))
+            .join("b".repeat(60));
         let app = app_with_tail_under(deep_base.clone(), "s1", vec!["hi".into()], "deep");
         let backend = TestBackend::new(90, 34);
         let mut term = Terminal::new(backend).unwrap();
@@ -1511,7 +1552,10 @@ mod tests {
         // re-sorted here.
         let local_pos = out.find("sakaki (this host)").unwrap();
         let node_pos = out.find("yomi-strix").unwrap();
-        assert!(local_pos < node_pos, "local box renders before nodes: {out}");
+        assert!(
+            local_pos < node_pos,
+            "local box renders before nodes: {out}"
+        );
     }
 
     #[test]

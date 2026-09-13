@@ -31,14 +31,7 @@ use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Instant, SystemTime};
 
-/// The seven panels, in Tab / 1-7 order. `Graph` is the visual DAG (the new hero
-/// view — nodes/edges laid out and drawn); `Session` is the collapsible roster
-/// (the terminal-sessions view, keyed off [`App::dag_rows`]). The two are
-/// deliberately distinct lenses on the same data: `Graph` shows the *shape* of
-/// the DAG, `Session` the *state* of each terminal. `Roster` (messaging/
-/// presence plan, P-C4) and `Pending` (P-C5) are later additions — each
-/// appended last so no earlier key ever shifts (registry append-only
-/// discipline, `pkgs/aoide/crates/AGENTS.md`).
+/// Navigation follows the visible tab order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Panel {
     Graph,
@@ -48,27 +41,36 @@ pub enum Panel {
     Status,
     Roster,
     Pending,
+    Home,
+    Mail,
+    Terminals,
 }
 
 impl Panel {
-    pub const ALL: [Panel; 7] = [
-        Panel::Graph,
+    pub const ALL: [Panel; 10] = [
+        Panel::Home,
+        Panel::Mail,
         Panel::Session,
-        Panel::Projects,
-        Panel::Log,
-        Panel::Status,
+        Panel::Terminals,
         Panel::Roster,
         Panel::Pending,
+        Panel::Projects,
+        Panel::Graph,
+        Panel::Log,
+        Panel::Status,
     ];
     pub fn title(self) -> &'static str {
         match self {
             Panel::Graph => "DAG",
-            Panel::Session => "SESSION",
+            Panel::Session => "AGENTS",
             Panel::Projects => "PROJECTS",
             Panel::Log => "LOG",
             Panel::Status => "STATUS",
             Panel::Roster => "ROSTER",
             Panel::Pending => "PENDING",
+            Panel::Home => "HOME",
+            Panel::Mail => "MAIL",
+            Panel::Terminals => "TERMINALS",
         }
     }
     pub fn index(self) -> usize {
@@ -76,10 +78,15 @@ impl Panel {
     }
 }
 
-/// The palette pulled from `stage/livery.json`, each hex mapped to nearest
-/// ANSI-256. `None` fields mean "no colour — inherit the terminal".
+/// Exact RGB palette and Base16 tokens from stage livery, with ANSI-256
+/// compatibility fields. Missing colors retain terminal fallbacks.
 #[derive(Debug, Clone, Default)]
 pub struct Palette {
+    pub base16: [Option<(u8, u8, u8)>; 16],
+    pub urgent_rgb: Option<(u8, u8, u8)>,
+    pub bg_rgb: Option<(u8, u8, u8)>,
+    pub fg_rgb: Option<(u8, u8, u8)>,
+    pub accent_rgb: Option<(u8, u8, u8)>,
     pub bg: Option<u8>,
     pub fg: Option<u8>,
     pub accent: Option<u8>,
@@ -89,6 +96,7 @@ pub struct Palette {
 /// One decoded audit-log line (the flat event feed the LOG panel tails).
 #[derive(Debug, Clone)]
 pub struct LogLine {
+    pub raw: serde_json::Value,
     pub ts: u64,
     pub door: String,
     pub class: String,
@@ -113,7 +121,16 @@ pub struct Input {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InputKind {
+    SessionProject {
+        id: String,
+    },
+    ProjectRoot {
+        name: String,
+    },
     ProjectAdd,
+    ProjectRemove {
+        name: String,
+    },
     /// Link the named child session under the parent the prompt collects.
     Link {
         child: String,
@@ -125,6 +142,93 @@ pub enum InputKind {
     Compose {
         target: String,
     },
+}
+
+#[derive(Debug, Clone)]
+pub enum ContextTarget {
+    Session(SessionRecord),
+    Project(String),
+    History(aoide_storage::ledger::LedgerEntry),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextAction {
+    Details,
+    WriteLetter,
+    Open,
+    AssignProject,
+    Resurrect,
+    AddFolder,
+}
+impl ContextAction {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Details => "Details",
+            Self::WriteLetter => "Write letter",
+            Self::Open => "Open / focus",
+            Self::AssignProject => "Set project",
+            Self::Resurrect => "Resurrect",
+            Self::AddFolder => "Add folder",
+        }
+    }
+}
+#[derive(Debug, Clone)]
+pub struct ContextMenu {
+    pub x: u16,
+    pub y: u16,
+    pub title: String,
+    pub target: ContextTarget,
+    pub actions: Vec<ContextAction>,
+    pub selected: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailMode {
+    New,
+    Reply,
+    ReplyAll,
+    Forward,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailField {
+    To,
+    Cc,
+    Subject,
+    Body,
+}
+#[derive(Debug, Clone)]
+pub struct MailDraft {
+    pub mode: MailMode,
+    pub from: String,
+    pub to: String,
+    pub cc: String,
+    pub subject: String,
+    pub body: String,
+    pub original: Option<crate::mailview::MailLetter>,
+    pub focus: MailField,
+    pub recipient_field: MailField,
+    /// UTF-8 byte boundary in the focused field.
+    pub cursor: usize,
+    pub error: Option<String>,
+    /// A partial/uncertain submission cannot be blindly submitted again.
+    pub submitted: bool,
+}
+impl MailDraft {
+    pub fn field(&self, field: MailField) -> &str {
+        match field {
+            MailField::To => &self.to,
+            MailField::Cc => &self.cc,
+            MailField::Subject => &self.subject,
+            MailField::Body => &self.body,
+        }
+    }
+    fn field_mut(&mut self) -> &mut String {
+        match self.focus {
+            MailField::To => &mut self.to,
+            MailField::Cc => &mut self.cc,
+            MailField::Subject => &mut self.subject,
+            MailField::Body => &mut self.body,
+        }
+    }
 }
 
 /// The group name sessions fall under when no project anchors their cwd.
@@ -154,6 +258,37 @@ pub enum DagRow {
     },
 }
 
+/// Sidebar navigation retains complete records; labels are presentation only.
+#[derive(Debug, Clone)]
+pub enum SidebarRow {
+    History {
+        entry: aoide_storage::ledger::LedgerEntry,
+        label: String,
+        depth: usize,
+    },
+    Project {
+        name: String,
+        folded: bool,
+    },
+    Section {
+        project: String,
+        terminal: bool,
+        folded: bool,
+        count: usize,
+    },
+    Past {
+        project: String,
+        folded: bool,
+        count: usize,
+    },
+    Session {
+        rec: SessionRecord,
+        label: String,
+        past: bool,
+        depth: usize,
+    },
+}
+
 /// mtimes of the stage files we poll, so a tick reloads only what changed.
 /// Stage-files-only: the log tail's own mtime lives on [`LogTail`] itself,
 /// gated separately in [`App::poll_refresh`] — a tail is a file read, not a
@@ -161,6 +296,7 @@ pub enum DagRow {
 /// closed).
 #[derive(Debug, Clone, Default)]
 struct StageMtimes {
+    history: Option<SystemTime>,
     sessions: Option<SystemTime>,
     hooks: Option<SystemTime>,
     projects: Option<SystemTime>,
@@ -269,6 +405,20 @@ pub struct PendingRow {
 /// The whole conductor state.
 pub struct App {
     pub panel: Panel,
+    pub home_sel: usize,
+    pub sidebar_focused: bool,
+    pub sidebar_sel: usize,
+    pub sidebar_scroll: usize,
+    sidebar_folded: HashSet<String>,
+    sidebar_past_open: HashSet<String>,
+    sidebar_section_folded: HashSet<(String, bool)>,
+    pub mail: crate::mailview::MailBoard,
+    pub mail_room_sel: usize,
+    pub mail_room_id: Option<String>,
+    pub mail_room_focus: bool,
+    pub mail_sel: usize,
+    pub mail_scroll: u16,
+    mail_refreshed: Option<Instant>,
     pub help_open: bool,
     /// The open headless-log-tail overlay, or `None` (closed) — the same
     /// modal role [`help_open`](Self::help_open) plays, richer payload. Enter
@@ -280,6 +430,10 @@ pub struct App {
     /// Selected node in the DAG (Graph) panel (indexes the preorder node list
     /// [`crate::graphview::node_order`] the layout walks).
     pub graph_sel: usize,
+    pub graph_pan: Option<(usize, usize)>,
+    pub graph_zoom: i8,
+    pub graph_pan_mode: bool,
+    pub graph_drag: Option<(u16, u16, usize, usize)>,
     /// Selected row in the SESSION panel (indexes [`App::dag_rows`]).
     pub dag_sel: usize,
     /// Selected row in the PROJECTS panel.
@@ -287,14 +441,23 @@ pub struct App {
     /// Live data from the stage tree.
     pub projects: Vec<graph::Project>,
     pub sessions: Vec<SessionRecord>,
+    pub history: Vec<aoide_storage::ledger::LedgerEntry>,
+    pub history_error: Option<String>,
+    pub history_selected: Option<aoide_storage::ledger::LedgerEntry>,
     pub hooks: Vec<graph::HookRecord>,
     /// The audit tail (newest last), capped to [`LOG_CAP`].
     pub log: Vec<LogLine>,
+    pub log_sel: usize,
+    pub log_scroll: u16,
+    pub log_error: Option<String>,
     pub palette: Palette,
     /// The last dispatched action's outcome — drives the status line.
     pub last_outcome: Option<Outcome>,
     /// Any active inline prompt.
     pub input: Option<Input>,
+    pub context_menu: Option<ContextMenu>,
+    pub mail_draft: Option<MailDraft>,
+    pub mail_target_menu: Option<(u16, u16, Vec<(String, String)>, usize)>,
     /// Group names currently folded shut in the SESSION panel.
     pub folded: HashSet<String>,
     /// Terminal-watcher: session id → remaining fresh ticks. A session lands
@@ -364,19 +527,46 @@ fn status_tag(status: Status) -> &'static str {
 impl App {
     fn empty() -> Self {
         App {
-            panel: Panel::Graph,
+            panel: Panel::Home,
+            home_sel: 0,
+            sidebar_focused: true,
+            sidebar_sel: 0,
+            sidebar_scroll: 0,
+            sidebar_folded: HashSet::new(),
+            sidebar_past_open: HashSet::new(),
+            sidebar_section_folded: HashSet::new(),
+            mail: crate::mailview::MailBoard::default(),
+            mail_room_sel: 0,
+            mail_room_id: None,
+            mail_room_focus: true,
+            mail_sel: 0,
+            mail_scroll: 0,
+            mail_refreshed: None,
             help_open: false,
             tail: None,
             graph_sel: 0,
+            graph_pan: None,
+            graph_zoom: 0,
+            graph_pan_mode: false,
+            graph_drag: None,
             dag_sel: 0,
             proj_sel: 0,
             projects: Vec::new(),
             sessions: Vec::new(),
+            history: Vec::new(),
+            history_error: None,
+            history_selected: None,
             hooks: Vec::new(),
             log: Vec::new(),
+            log_sel: 0,
+            log_scroll: 0,
+            log_error: None,
             palette: Palette::default(),
             last_outcome: None,
             input: None,
+            context_menu: None,
+            mail_draft: None,
+            mail_target_menu: None,
             folded: HashSet::new(),
             fresh: BTreeMap::new(),
             known: HashSet::new(),
@@ -424,6 +614,7 @@ impl App {
         let mut app = App::empty();
         app.dispatch_fn = dispatch;
         app.reload_all();
+        app.refresh_mail();
         app
     }
 
@@ -456,6 +647,27 @@ impl App {
         aoide_protocol::default_audit_log()
     }
 
+    fn history_mtime() -> Option<SystemTime> {
+        if cfg!(test) {
+            return None;
+        }
+        Self::mtime(&aoide_storage::ledger::session_ledger_path())
+    }
+
+    fn reload_history(&mut self) {
+        // Unit fixtures inject history directly, never the operator's ambient ledger.
+        if cfg!(test) {
+            return;
+        }
+        match aoide_storage::ledger::read_ledger() {
+            Ok(entries) => {
+                self.history = entries;
+                self.history_error = None;
+            }
+            Err(error) => self.history_error = Some(format!("Cannot read past sessions: {error}")),
+        }
+    }
+
     /// Reload every stage file + the audit tail and refresh recorded mtimes.
     pub fn reload_all(&mut self) {
         let dir = Self::stage();
@@ -467,6 +679,7 @@ impl App {
         self.hooks = h.hooks;
         self.palette = load_palette(&stage_notes_path(&Self::rice_stage()));
         self.reload_log();
+        self.reload_history();
         // A local read through the dispatcher (P-C5) — `reload_all` runs
         // synchronously right after every mutating `App::dispatch`, so this
         // is what makes "re-list after every pending resolve" true: by the
@@ -475,6 +688,7 @@ impl App {
         self.refresh_pending();
 
         self.mtimes = StageMtimes {
+            history: Self::history_mtime(),
             sessions: Self::mtime(&dir.join("sessions.json")),
             hooks: Self::mtime(&dir.join("hooks.json")),
             projects: Self::mtime(&dir.join("projects.json")),
@@ -502,36 +716,22 @@ impl App {
         self.initialized = true;
     }
 
-    /// Re-read the audit log tail (last [`LOG_CAP`] JSONL records).
+    /// Refresh the bounded audit snapshot without discarding it on read failure.
     fn reload_log(&mut self) {
-        let path = Self::audit_path();
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            self.log.clear();
-            return;
-        };
-        let mut lines: Vec<LogLine> = Vec::new();
-        for raw in content.lines() {
-            if raw.trim().is_empty() {
-                continue;
+        match crate::eventview::read_history(&Self::audit_path()) {
+            Ok(lines) => {
+                let selected = self.log.get(self.log_sel).map(|r| &r.raw);
+                let next = selected.and_then(|raw| lines.iter().position(|r| &r.raw == raw));
+                if next.is_none() {
+                    self.log_scroll = 0;
+                }
+                self.log_sel =
+                    next.unwrap_or_else(|| self.log_sel.min(lines.len().saturating_sub(1)));
+                self.log = lines;
+                self.log_error = None;
             }
-            if let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) {
-                let field = |k: &str| -> String {
-                    v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string()
-                };
-                lines.push(LogLine {
-                    ts: v.get("ts").and_then(|x| x.as_u64()).unwrap_or(0),
-                    door: field("door"),
-                    class: field("class"),
-                    command: field("command"),
-                    status: field("status"),
-                    message: field("message"),
-                });
-            }
+            Err(error) => self.log_error = Some(error),
         }
-        if lines.len() > LOG_CAP {
-            lines.drain(0..lines.len() - LOG_CAP);
-        }
-        self.log = lines;
     }
 
     /// A tick: reload any stage file / the audit log whose mtime advanced, age
@@ -541,8 +741,17 @@ impl App {
         let dir = Self::stage();
         let rice_dir = Self::rice_stage();
         let mut changed = false;
+        if self.panel == Panel::Mail
+            && self
+                .mail_refreshed
+                .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(5))
+        {
+            self.refresh_mail();
+            changed = true;
+        }
 
         let cur = StageMtimes {
+            history: Self::history_mtime(),
             sessions: Self::mtime(&dir.join("sessions.json")),
             hooks: Self::mtime(&dir.join("hooks.json")),
             projects: Self::mtime(&dir.join("projects.json")),
@@ -553,6 +762,10 @@ impl App {
         if cur.projects != self.mtimes.projects {
             let p: ProjectsFile = Self::load_json(&dir.join("projects.json"));
             self.projects = p.projects;
+            changed = true;
+        }
+        if cur.history != self.mtimes.history {
+            self.reload_history();
             changed = true;
         }
         if cur.sessions != self.mtimes.sessions {
@@ -786,7 +999,10 @@ impl App {
                 rows.push(RosterRow::Empty);
             }
             for (i, s) in n.sessions.into_iter().enumerate() {
-                rows.push(RosterRow::Session { session: s, is_last: i + 1 == len });
+                rows.push(RosterRow::Session {
+                    session: s,
+                    is_last: i + 1 == len,
+                });
             }
         }
         rows
@@ -802,7 +1018,12 @@ impl App {
     /// sessions."
     pub fn roster_status(&self) -> String {
         let probing = self.roster_rx.is_some();
-        if let Some(o) = self.roster.outcome.as_ref().filter(|o| o.status != Status::Ok) {
+        if let Some(o) = self
+            .roster
+            .outcome
+            .as_ref()
+            .filter(|o| o.status != Status::Ok)
+        {
             let first = o.message.lines().next().unwrap_or("");
             let suffix = if probing { " · probing…" } else { "" };
             return format!("[{}] {}: {first}{suffix}", status_tag(o.status), o.command);
@@ -831,7 +1052,11 @@ impl App {
     /// copying"); this only reshapes the JSON it already computed.
     fn refresh_pending(&mut self) {
         let inv = Invocation {
-            path: vec!["session".to_string(), "pending".to_string(), "list".to_string()],
+            path: vec![
+                "session".to_string(),
+                "pending".to_string(),
+                "list".to_string(),
+            ],
             args: Vec::new(),
             flags: BTreeMap::from([("json".to_string(), "true".to_string())]),
             door: Door::Cli,
@@ -902,6 +1127,314 @@ impl App {
         graph::merged_sessions(&self.sessions, &self.hooks)
     }
 
+    /// Project navigation is a projection of the graph's effective ownership.
+    /// Past rows contain only ended records still present in the stage snapshot.
+    pub fn sidebar_rows(&self) -> Vec<SidebarRow> {
+        fn append(rows: &mut Vec<SidebarRow>, group: &[&SessionRecord], past: bool) {
+            fn visit(
+                rows: &mut Vec<SidebarRow>,
+                group: &[&SessionRecord],
+                rec: &SessionRecord,
+                past: bool,
+                depth: usize,
+                seen: &mut HashSet<String>,
+            ) {
+                if !seen.insert(rec.session_id.clone()) {
+                    return;
+                }
+                let title = rec
+                    .title
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(&rec.agent);
+                let pet = rec.petname.as_deref().filter(|s| !s.is_empty());
+                let short: String = rec
+                    .session_id
+                    .chars()
+                    .rev()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                    .collect();
+                let label = match pet {
+                    Some(p) => format!("{p} · {title} (…{short})"),
+                    None => format!("{title} (…{short})"),
+                };
+                let label = if past {
+                    format!(
+                        "{} · {label}",
+                        if is_terminal(rec) {
+                            "terminal"
+                        } else {
+                            "agent"
+                        }
+                    )
+                } else {
+                    label
+                };
+                rows.push(SidebarRow::Session {
+                    rec: rec.clone(),
+                    label,
+                    past,
+                    depth,
+                });
+                for child in group
+                    .iter()
+                    .filter(|s| s.parent_session_id.as_deref() == Some(rec.session_id.as_str()))
+                {
+                    visit(rows, group, child, past, depth + 1, seen);
+                }
+            }
+            let mut seen = HashSet::new();
+            for rec in group.iter().filter(|s| {
+                !group
+                    .iter()
+                    .any(|p| Some(p.session_id.as_str()) == s.parent_session_id.as_deref())
+            }) {
+                visit(rows, group, rec, past, 2, &mut seen);
+            }
+            // Malformed cycles remain inspectable rather than disappearing.
+            for rec in group {
+                visit(rows, group, rec, past, 2, &mut seen);
+            }
+        }
+        let merged = self.merged();
+        let mut names = sorted_project_names(&self.projects);
+        let mut groups: BTreeMap<String, Vec<&SessionRecord>> = BTreeMap::new();
+        let mut history_groups: BTreeMap<String, Vec<&aoide_storage::ledger::LedgerEntry>> =
+            BTreeMap::new();
+        let mut seen: HashSet<String> = merged.iter().map(|s| s.session_id.clone()).collect();
+        for entry in self.history.iter().rev() {
+            if !seen.insert(entry.session_id.clone()) {
+                continue;
+            }
+            let name = entry
+                .project
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| {
+                    let projection = SessionRecord {
+                        cwd: entry.cwd.clone(),
+                        ..Default::default()
+                    };
+                    graph::project_for(&projection, &self.projects)
+                        .map(|i| self.projects[i].name.clone())
+                        .unwrap_or_else(|| UNANCHORED.to_string())
+                });
+            if !names.contains(&name) {
+                names.push(name.clone());
+            }
+            history_groups.entry(name).or_default().push(entry);
+        }
+        for rec in &merged {
+            let name = graph::effective_project_for(rec, &merged, &self.projects)
+                .map(|i| self.projects[i].name.clone())
+                .unwrap_or_else(|| UNANCHORED.to_string());
+            groups.entry(name).or_default().push(rec);
+        }
+        if groups.contains_key(UNANCHORED) && !names.iter().any(|n| n == UNANCHORED) {
+            names.push(UNANCHORED.to_string());
+        }
+        let mut rows = Vec::new();
+        for name in names {
+            let folded = self.sidebar_folded.contains(&name);
+            rows.push(SidebarRow::Project {
+                name: name.clone(),
+                folded,
+            });
+            if folded {
+                continue;
+            }
+            let (past, live): (Vec<_>, Vec<_>) = groups
+                .remove(&name)
+                .unwrap_or_default()
+                .into_iter()
+                .partition(|s| aoide_protocol::canonical_state(&s.state) == "done");
+            for terminal in [false, true] {
+                let group: Vec<_> = live
+                    .iter()
+                    .copied()
+                    .filter(|s| is_terminal(s) == terminal)
+                    .collect();
+                if group.is_empty() {
+                    continue;
+                }
+                let folded = self
+                    .sidebar_section_folded
+                    .contains(&(name.clone(), terminal));
+                rows.push(SidebarRow::Section {
+                    project: name.clone(),
+                    terminal,
+                    folded,
+                    count: group.len(),
+                });
+                if !folded {
+                    append(&mut rows, &group, false);
+                }
+            }
+            let history = history_groups.remove(&name).unwrap_or_default();
+            if !past.is_empty() || !history.is_empty() {
+                let folded = !self.sidebar_past_open.contains(&name);
+                rows.push(SidebarRow::Past {
+                    project: name,
+                    folded,
+                    count: past.len() + history.len(),
+                });
+                if !folded {
+                    append(&mut rows, &past, true);
+                    for entry in history {
+                        let title = entry
+                            .title
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .unwrap_or(&entry.agent);
+                        let label = match entry.petname.as_deref().filter(|s| !s.is_empty()) {
+                            Some(petname) => format!("{petname} · {title}"),
+                            None => title.to_string(),
+                        };
+                        let label = format!(
+                            "{} · {label}",
+                            if entry.agent == "shell" {
+                                "terminal"
+                            } else {
+                                "agent"
+                            }
+                        );
+                        rows.push(SidebarRow::History {
+                            entry: entry.clone(),
+                            label,
+                            depth: 2,
+                        });
+                    }
+                }
+            }
+        }
+        rows
+    }
+
+    /// Navigate only: selecting an ended record never resurrects or focuses it.
+    pub fn sidebar_activate(&mut self, index: usize) {
+        let Some(row) = self.sidebar_rows().get(index).cloned() else {
+            return;
+        };
+        self.sidebar_sel = index;
+        match row {
+            SidebarRow::History { entry, .. } => {
+                self.select_panel(if entry.agent == "shell" {
+                    Panel::Terminals
+                } else {
+                    Panel::Session
+                });
+                self.history_selected = Some(entry);
+                self.sidebar_focused = false;
+            }
+            SidebarRow::Project { name, .. } => {
+                if let Some(i) = sorted_project_names(&self.projects)
+                    .iter()
+                    .position(|n| *n == name)
+                {
+                    self.proj_sel = i;
+                    self.select_panel(Panel::Projects);
+                    self.sidebar_focused = false;
+                }
+            }
+            SidebarRow::Section {
+                project, terminal, ..
+            } => {
+                let key = (project, terminal);
+                if !self.sidebar_section_folded.remove(&key) {
+                    self.sidebar_section_folded.insert(key);
+                }
+            }
+            SidebarRow::Past { project, .. } => {
+                if !self.sidebar_past_open.remove(&project) {
+                    self.sidebar_past_open.insert(project);
+                }
+            }
+            SidebarRow::Session { rec, .. } => {
+                self.history_selected = None;
+                self.folded.clear();
+                self.select_panel(if is_terminal(&rec) {
+                    Panel::Terminals
+                } else {
+                    Panel::Session
+                });
+                if let Some(i) = self.dag_rows().iter().position(|r| matches!(r, DagRow::Session { rec: s, .. } if s.session_id == rec.session_id)) {
+                    self.dag_sel = i;
+                    self.sidebar_focused = false;
+                }
+            }
+        }
+    }
+
+    pub fn handle_sidebar_key(&mut self, key: KeyEvent) {
+        let rows = self.sidebar_rows();
+        self.sidebar_sel = self.sidebar_sel.min(rows.len().saturating_sub(1));
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.sidebar_sel = self.sidebar_sel.saturating_sub(1)
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.sidebar_sel = (self.sidebar_sel + 1).min(rows.len().saturating_sub(1))
+            }
+            KeyCode::Enter => self.sidebar_activate(self.sidebar_sel),
+            KeyCode::Left | KeyCode::Right | KeyCode::Char('h' | 'l') => {
+                let close = matches!(key.code, KeyCode::Left | KeyCode::Char('h'));
+                match rows.get(self.sidebar_sel) {
+                    Some(SidebarRow::Project { name, .. }) => {
+                        if close {
+                            self.sidebar_folded.insert(name.clone());
+                        } else {
+                            self.sidebar_folded.remove(name);
+                        }
+                    }
+                    Some(SidebarRow::Section {
+                        project, terminal, ..
+                    }) => {
+                        let key = (project.clone(), *terminal);
+                        if close {
+                            self.sidebar_section_folded.insert(key);
+                        } else {
+                            self.sidebar_section_folded.remove(&key);
+                        }
+                    }
+                    Some(SidebarRow::Past { project, .. }) => {
+                        if close {
+                            self.sidebar_past_open.remove(project);
+                        } else {
+                            self.sidebar_past_open.insert(project.clone());
+                        }
+                    }
+                    Some(SidebarRow::Session { past, .. }) if close => {
+                        let past = *past;
+                        if let Some(i) = rows[..self.sidebar_sel].iter().rposition(|r| {
+                            matches!(r, SidebarRow::Project { .. })
+                                || (past && matches!(r, SidebarRow::Past { .. }))
+                                || (!past && matches!(r, SidebarRow::Section { .. }))
+                        }) {
+                            self.sidebar_sel = i;
+                        }
+                    }
+                    Some(SidebarRow::History { .. }) if close => {
+                        if let Some(i) = rows[..self.sidebar_sel]
+                            .iter()
+                            .rposition(|r| matches!(r, SidebarRow::Past { .. }))
+                        {
+                            self.sidebar_sel = i;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+        self.sidebar_sel = self
+            .sidebar_sel
+            .min(self.sidebar_rows().len().saturating_sub(1));
+        self.sidebar_scroll = self.sidebar_scroll.min(self.sidebar_sel);
+    }
+
     /// Flatten the DAG into selectable rows: every project (sorted by name) as
     /// a group header carrying `[live/total]`, then — unless folded — its root
     /// sessions with spawned subtrees nested beneath, tree prefixes pre-walked;
@@ -913,10 +1446,18 @@ impl App {
         let mut projects = self.projects.clone();
         projects.sort_by(|a, b| a.name.cmp(&b.name));
 
-        let ids: HashSet<&str> = merged.iter().map(|s| s.session_id.as_str()).collect();
+        let visible: Vec<_> = merged
+            .iter()
+            .filter(|s| match self.panel {
+                Panel::Session => !is_terminal(s),
+                Panel::Terminals => is_terminal(s),
+                _ => true,
+            })
+            .collect();
+        let ids: HashSet<&str> = visible.iter().map(|s| s.session_id.as_str()).collect();
         let mut children: BTreeMap<&str, Vec<&SessionRecord>> = BTreeMap::new();
         let mut roots: Vec<&SessionRecord> = Vec::new();
-        for s in &merged {
+        for s in visible {
             match s.parent_session_id.as_deref().filter(|p| ids.contains(p)) {
                 Some(p) => children.entry(p).or_default().push(s),
                 None => roots.push(s),
@@ -926,7 +1467,7 @@ impl App {
         let mut per_project: Vec<Vec<&SessionRecord>> = vec![Vec::new(); projects.len()];
         let mut loose: Vec<&SessionRecord> = Vec::new();
         for r in &roots {
-            match graph::project_for(r, &projects) {
+            match graph::effective_project_for(r, &merged, &projects) {
                 Some(i) => per_project[i].push(r),
                 None => loose.push(r),
             }
@@ -996,6 +1537,10 @@ impl App {
     }
 
     fn clamp_selection(&mut self) {
+        self.sidebar_sel = self
+            .sidebar_sel
+            .min(self.sidebar_rows().len().saturating_sub(1));
+        self.sidebar_scroll = self.sidebar_scroll.min(self.sidebar_sel);
         let n_rows = self.dag_rows().len();
         if self.dag_sel >= n_rows.max(1) {
             self.dag_sel = n_rows.saturating_sub(1);
@@ -1027,6 +1572,10 @@ impl App {
     /// an immediate SYNCHRONOUS refresh instead (it's a local read, no
     /// background thread needed — see the "PENDING" section).
     pub fn select_panel(&mut self, p: Panel) {
+        self.history_selected = None;
+        if p == Panel::Mail {
+            self.refresh_mail();
+        }
         self.panel = p;
         if p == Panel::Roster && self.roster_stale() {
             self.spawn_roster_fetch();
@@ -1045,7 +1594,7 @@ impl App {
     }
 
     pub fn input_active(&self) -> bool {
-        self.input.is_some()
+        self.input.is_some() || self.mail_draft.is_some()
     }
 
     // ── The single dispatch seam (audit for free) ───────────────────────────
@@ -1064,7 +1613,12 @@ impl App {
     /// `--to`/`--yes` on `send`, which plain positional args can't
     /// carry. Kept as a separate method rather than widening `dispatch`'s
     /// signature so the six existing flag-less call sites stay untouched.
-    pub fn dispatch_with_flags(&mut self, path: &[&str], args: &[String], flags: BTreeMap<String, String>) {
+    pub fn dispatch_with_flags(
+        &mut self,
+        path: &[&str],
+        args: &[String],
+        flags: BTreeMap<String, String>,
+    ) {
         let inv = Invocation {
             path: path.iter().map(|s| s.to_string()).collect(),
             args: args.to_vec(),
@@ -1165,17 +1719,720 @@ impl App {
     // ── Key handling for the active panel / inline input ────────────────────
 
     pub fn handle_key(&mut self, key: KeyEvent) {
+        if self.mail_draft.is_some() {
+            self.handle_mail_draft_key(key);
+            return;
+        }
         if self.input.is_some() {
             self.handle_input_key(key);
             return;
         }
+        if matches!(self.panel, Panel::Session | Panel::Terminals)
+            && self.history_selected.is_some()
+        {
+            if key.code == KeyCode::Esc {
+                self.sidebar_focused = true;
+            }
+            return;
+        }
         match self.panel {
             Panel::Graph => self.handle_graph_key(key),
-            Panel::Session => self.handle_dag_key(key),
+            Panel::Session | Panel::Terminals => self.handle_dag_key(key),
             Panel::Projects => self.handle_projects_key(key),
             Panel::Roster => self.handle_roster_key(key),
             Panel::Pending => self.handle_pending_key(key),
-            Panel::Log | Panel::Status => {} // read-only panels
+            Panel::Mail => self.handle_mail_key(key),
+            Panel::Log => self.handle_log_key(key),
+            Panel::Home | Panel::Status => {} // read-only panels
+        }
+    }
+
+    pub fn mail_letters(&self) -> Vec<crate::mailview::MailLetter> {
+        let rooms = self.mail.conversations();
+        let room = self
+            .mail_room_id
+            .as_ref()
+            .and_then(|id| rooms.iter().find(|r| &r.id == id))
+            .or_else(|| rooms.first());
+        room.map(|r| r.letters.clone()).unwrap_or_default()
+    }
+
+    pub fn select_mail_room(&mut self, index: usize) {
+        let rooms = self.mail.conversations();
+        self.mail_room_sel = index.min(rooms.len().saturating_sub(1));
+        self.mail_room_id = rooms.get(self.mail_room_sel).map(|r| r.id.clone());
+        self.mail_sel = rooms
+            .get(self.mail_room_sel)
+            .map(|r| r.letters.len().saturating_sub(1))
+            .unwrap_or(0);
+        self.mail_scroll = 0;
+    }
+
+    pub fn refresh_mail(&mut self) {
+        let selected = self
+            .mail_letters()
+            .get(self.mail_sel)
+            .map(|m| m.msgid.clone());
+        let room = self
+            .mail_room_id
+            .clone()
+            .or_else(|| self.mail.conversations().first().map(|r| r.id.clone()));
+        self.mail.refresh();
+        self.mail_refreshed = Some(Instant::now());
+        let rooms = self.mail.conversations();
+        if let Some(index) = room.and_then(|id| rooms.iter().position(|r| r.id == id)) {
+            self.mail_room_sel = index;
+            self.mail_room_id = Some(rooms[index].id.clone());
+            if let Some(index) =
+                selected.and_then(|id| rooms[index].letters.iter().position(|m| m.msgid == id))
+            {
+                self.mail_sel = index;
+            } else {
+                self.mail_sel = rooms[index].letters.len().saturating_sub(1);
+                self.mail_scroll = 0;
+            }
+        } else {
+            self.select_mail_room(0);
+        }
+    }
+
+    fn handle_log_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.log_sel = self.log_sel.saturating_sub(1);
+                self.log_scroll = 0;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                self.log_sel = (self.log_sel + 1).min(self.log.len().saturating_sub(1));
+                self.log_scroll = 0;
+            }
+            KeyCode::PageUp => self.log_scroll = self.log_scroll.saturating_sub(10),
+            KeyCode::PageDown => self.log_scroll = self.log_scroll.saturating_add(10),
+            KeyCode::Char('r') => self.reload_log(),
+            _ => {}
+        }
+    }
+
+    pub fn open_context_for_session(&mut self, rec: SessionRecord, x: u16, y: u16) {
+        let mut actions = vec![ContextAction::Details];
+        if !is_done(&rec.state) && self.merged().iter().any(|s| s.session_id == rec.session_id) {
+            if rec.petname.as_ref().is_some_and(|name| !name.is_empty()) && !is_terminal(&rec) {
+                actions.push(ContextAction::WriteLetter);
+            }
+            if self.sessions.iter().any(|s| s.session_id == rec.session_id) {
+                actions.push(ContextAction::Open);
+                actions.push(ContextAction::AssignProject);
+            }
+        }
+        self.context_menu = Some(ContextMenu {
+            x,
+            y,
+            title: rec.title.clone().unwrap_or_else(|| rec.agent.clone()),
+            target: ContextTarget::Session(rec),
+            actions,
+            selected: 0,
+        });
+    }
+
+    pub fn open_context_for_project(&mut self, name: String, x: u16, y: u16) {
+        if !self.projects.iter().any(|p| p.name == name) {
+            return;
+        }
+        self.context_menu = Some(ContextMenu {
+            x,
+            y,
+            title: name.clone(),
+            target: ContextTarget::Project(name),
+            actions: vec![
+                ContextAction::Details,
+                ContextAction::WriteLetter,
+                ContextAction::AddFolder,
+                ContextAction::Resurrect,
+            ],
+            selected: 0,
+        });
+    }
+
+    pub fn open_context_for_history(
+        &mut self,
+        entry: aoide_storage::ledger::LedgerEntry,
+        x: u16,
+        y: u16,
+    ) {
+        let mut actions = vec![ContextAction::Details];
+        if self.history_project(&entry).is_some()
+            && (entry.harness_session_id.is_some() || entry.restore.is_some())
+        {
+            actions.push(ContextAction::Resurrect);
+        }
+        self.context_menu = Some(ContextMenu {
+            x,
+            y,
+            title: entry.title.clone().unwrap_or_else(|| entry.agent.clone()),
+            target: ContextTarget::History(entry),
+            actions,
+            selected: 0,
+        });
+    }
+
+    fn history_project(&self, entry: &aoide_storage::ledger::LedgerEntry) -> Option<String> {
+        if let Some(name) = &entry.project {
+            return self
+                .projects
+                .iter()
+                .find(|p| &p.name == name)
+                .map(|p| p.name.clone());
+        }
+        graph::anchor_for(&entry.cwd, &self.projects).map(|i| self.projects[i].name.clone())
+    }
+
+    pub fn run_context_action(&mut self, index: usize) {
+        let Some(menu) = self.context_menu.take() else {
+            return;
+        };
+        let Some(action) = menu.actions.get(index).copied() else {
+            return;
+        };
+        match (menu.target, action) {
+            (ContextTarget::Session(rec), ContextAction::Details) => {
+                if !self.merged().iter().any(|s| s.session_id == rec.session_id) {
+                    self.last_outcome = Some(Outcome::usage(
+                        "session",
+                        "Session is no longer in the current roster; open its historical entry.",
+                    ));
+                    return;
+                }
+                self.select_panel(if is_terminal(&rec) {
+                    Panel::Terminals
+                } else {
+                    Panel::Session
+                });
+                self.folded.clear();
+                if let Some(i) = self.dag_rows().iter().position(
+                    |r| matches!(r,DagRow::Session{rec:r,..} if r.session_id==rec.session_id),
+                ) {
+                    self.dag_sel = i;
+                    self.sidebar_focused = false;
+                }
+            }
+            (ContextTarget::History(entry), ContextAction::Details) => {
+                self.select_panel(if entry.agent == "shell" {
+                    Panel::Terminals
+                } else {
+                    Panel::Session
+                });
+                self.history_selected = Some(entry);
+                self.sidebar_focused = false;
+            }
+            (ContextTarget::Project(name), ContextAction::Details) => {
+                self.select_panel(Panel::Projects);
+                if let Some(i) = sorted_project_names(&self.projects)
+                    .iter()
+                    .position(|p| p == &name)
+                {
+                    self.proj_sel = i;
+                    self.sidebar_focused = false;
+                }
+            }
+            (ContextTarget::Session(rec), ContextAction::WriteLetter) => {
+                if let Some(name) = rec.petname {
+                    self.open_mail_to(format!(
+                        "{}/{}",
+                        aoide_storage::display::local_host_name(),
+                        name
+                    ));
+                }
+            }
+            (ContextTarget::Project(name), ContextAction::WriteLetter) => {
+                let merged = self.merged();
+                let choices = merged
+                    .iter()
+                    .filter(|rec| {
+                        !is_done(&rec.state)
+                            && !is_terminal(rec)
+                            && graph::effective_project_for(rec, &merged, &self.projects)
+                                .is_some_and(|i| self.projects[i].name == name)
+                    })
+                    .filter_map(|rec| {
+                        rec.petname.as_ref().map(|petname| {
+                            (
+                                format!(
+                                    "{} · {petname}",
+                                    rec.title.as_deref().unwrap_or(&rec.agent)
+                                ),
+                                format!("{}/{petname}", aoide_storage::display::local_host_name()),
+                            )
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                if choices.is_empty() {
+                    self.last_outcome = Some(Outcome::usage(
+                        "mail.send",
+                        "This project has no live agent mailbox.",
+                    ));
+                } else {
+                    self.mail_target_menu = Some((menu.x, menu.y, choices, 0));
+                }
+            }
+            (ContextTarget::Session(rec), ContextAction::Open) => {
+                if let Some(current) = self
+                    .sessions
+                    .iter()
+                    .find(|s| s.session_id == rec.session_id && !is_done(&s.state))
+                    .cloned()
+                {
+                    self.cue_session(&current);
+                } else {
+                    self.last_outcome =
+                        Some(Outcome::usage("session", "Session is no longer live."));
+                }
+            }
+            (ContextTarget::Session(rec), ContextAction::AssignProject) => {
+                self.input = Some(Input {
+                    label: format!(
+                        "Project for {} (blank = automatic)",
+                        rec.petname.as_deref().unwrap_or(&rec.session_id)
+                    ),
+                    buffer: rec.project.unwrap_or_default(),
+                    step: 0,
+                    collected: vec![],
+                    kind: InputKind::SessionProject { id: rec.session_id },
+                });
+            }
+            (ContextTarget::Project(name), ContextAction::AddFolder) => {
+                self.input = Some(Input {
+                    label: format!("Folder to add to {name}"),
+                    buffer: String::new(),
+                    step: 0,
+                    collected: vec![],
+                    kind: InputKind::ProjectRoot { name },
+                });
+            }
+            (ContextTarget::Project(name), ContextAction::Resurrect) => self.dispatch_with_flags(
+                &["resurrect"],
+                &[],
+                BTreeMap::from([("project".into(), name)]),
+            ),
+            (ContextTarget::History(entry), ContextAction::Resurrect) => {
+                if let Some(project) = self.history_project(&entry) {
+                    self.dispatch_with_flags(
+                        &["resurrect"],
+                        &[],
+                        BTreeMap::from([
+                            ("project".into(), project),
+                            ("id".into(), entry.session_id),
+                        ]),
+                    );
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn open_mail_to(&mut self, recipient: String) {
+        if self.mail_draft.is_some() {
+            return;
+        }
+        self.open_mail(MailMode::New);
+        if let Some(draft) = &mut self.mail_draft {
+            draft.to = recipient;
+            draft.focus = MailField::Subject;
+            draft.cursor = 0;
+        }
+    }
+
+    pub fn open_mail(&mut self, mode: MailMode) {
+        if self.mail_draft.is_some() {
+            return;
+        }
+        let original = if mode == MailMode::New {
+            None
+        } else {
+            self.mail_letters().get(self.mail_sel).cloned()
+        };
+        if mode != MailMode::New && original.is_none() {
+            return;
+        }
+        let local = aoide_storage::display::local_host_name();
+        let from = format!("{local}/conductor-human");
+        let mut draft = MailDraft {
+            mode,
+            from,
+            to: String::new(),
+            cc: String::new(),
+            subject: String::new(),
+            body: String::new(),
+            original,
+            focus: MailField::To,
+            recipient_field: MailField::To,
+            cursor: 0,
+            error: None,
+            submitted: false,
+        };
+        if let Some(letter) = &draft.original {
+            let content = aoide_storage::letter::decode(&letter.text);
+            let subject = content.as_ref().map(|c| c.subject.as_str()).unwrap_or("");
+            let body = content
+                .as_ref()
+                .map(|c| c.body.as_str())
+                .unwrap_or(&letter.text);
+            let prefix = if mode == MailMode::Forward {
+                "Fwd:"
+            } else {
+                "Re:"
+            };
+            draft.subject = if subject.to_lowercase().starts_with(&prefix.to_lowercase()) {
+                subject.into()
+            } else {
+                format!("{prefix} {subject}").trim_end().into()
+            };
+            draft.body = format!(
+                "\n\nOn {}, {} wrote:\n{}",
+                letter.received_at,
+                letter.from,
+                body.lines()
+                    .map(|line| format!("> {line}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            );
+            if mode != MailMode::Forward {
+                let target = if letter.from_address.name == "conductor-human"
+                    && letter.from_address.node == local
+                {
+                    &letter.to_address
+                } else {
+                    &letter.from_address
+                };
+                draft.to = format!("{}/{}", target.node, target.name);
+                if mode == MailMode::ReplyAll {
+                    let addresses = content
+                        .map(|c| c.to.into_iter().chain(c.cc).collect::<Vec<_>>())
+                        .unwrap_or_else(|| vec![letter.to_address.clone()]);
+                    let mut seen = HashSet::from([
+                        draft.to.clone(),
+                        draft.from.clone(),
+                        "self/conductor-human".into(),
+                    ]);
+                    draft.cc = addresses
+                        .into_iter()
+                        .map(|a| format!("{}/{}", a.node, a.name))
+                        .filter(|a| seen.insert(a.clone()))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                }
+                draft.focus = MailField::Body;
+            }
+        }
+        self.mail_draft = Some(draft);
+        self.sidebar_focused = false;
+    }
+
+    pub fn focus_mail_field(&mut self, field: MailField) {
+        self.sidebar_focused = false;
+        if let Some(draft) = &mut self.mail_draft {
+            draft.focus = field;
+            if matches!(field, MailField::To | MailField::Cc) {
+                draft.recipient_field = field;
+            }
+            draft.cursor = draft.field(field).len();
+        }
+    }
+
+    pub fn add_mail_recipient(&mut self, address: &str) {
+        self.sidebar_focused = false;
+        let Some(draft) = &mut self.mail_draft else {
+            return;
+        };
+        if draft.submitted {
+            return;
+        }
+        let local = aoide_storage::display::local_host_name();
+        let canonical = |value: &str| {
+            value
+                .trim()
+                .strip_prefix("self/")
+                .map(|name| format!("{local}/{name}"))
+                .unwrap_or_else(|| value.trim().into())
+        };
+        let address = canonical(address);
+        if draft
+            .to
+            .split(',')
+            .chain(draft.cc.split(','))
+            .any(|old| canonical(old) == address)
+        {
+            return;
+        }
+        let target = if draft.recipient_field == MailField::Cc {
+            &mut draft.cc
+        } else {
+            &mut draft.to
+        };
+        if !target.trim().is_empty() {
+            target.push_str(", ");
+        }
+        target.push_str(&address);
+        draft.focus = draft.recipient_field;
+        draft.cursor = target.len();
+        draft.error = None;
+    }
+
+    pub fn send_mail_draft(&mut self) {
+        let Some(mut draft) = self.mail_draft.take() else {
+            return;
+        };
+        if draft.submitted {
+            draft.error = Some(
+                "Already submitted: inspect recipient results before creating another letter."
+                    .into(),
+            );
+            self.mail_draft = Some(draft);
+            return;
+        }
+        if draft.to.trim().is_empty() || draft.body.trim().is_empty() {
+            draft.error = Some("To and Message are required.".into());
+            self.mail_draft = Some(draft);
+            return;
+        }
+        let local = aoide_storage::display::local_host_name();
+        let route = |text: &str| {
+            text.split(',')
+                .map(str::trim)
+                .map(|a| {
+                    a.strip_prefix(&format!("{local}/"))
+                        .map(|name| format!("self/{name}"))
+                        .unwrap_or_else(|| a.into())
+                })
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        let mut flags = BTreeMap::from([
+            ("to".into(), route(&draft.to)),
+            ("from".into(), "conductor-human".into()),
+        ]);
+        flags.insert("subject".into(), draft.subject.clone());
+        if matches!(draft.mode, MailMode::Reply | MailMode::ReplyAll) {
+            if let Some(original) = &draft.original {
+                flags.insert(
+                    "thread".into(),
+                    original
+                        .thread_id()
+                        .unwrap_or_else(|| original.msgid.clone()),
+                );
+                flags.insert("reply-to".into(), original.msgid.clone());
+            }
+        }
+        if !draft.cc.trim().is_empty() {
+            flags.insert("cc".into(), route(&draft.cc));
+        }
+        self.dispatch_with_flags(&["mail", "send"], &[draft.body.clone()], flags);
+        if let Some(outcome) = &self.last_outcome {
+            if outcome.status == Status::Ok {
+                self.refresh_mail();
+                return;
+            }
+            let mut message = outcome.message.clone();
+            if let Some(recipients) = outcome
+                .data
+                .as_ref()
+                .and_then(|data| data.get("recipients"))
+                .and_then(|rows| rows.as_array())
+            {
+                for recipient in recipients {
+                    let node = recipient
+                        .pointer("/address/node")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let name = recipient
+                        .pointer("/address/name")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("?");
+                    let status = recipient
+                        .get("status")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("unknown");
+                    let error = recipient
+                        .get("error")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("");
+                    message.push_str(&format!("\n{node}/{name}: {status} {error}"));
+                }
+            }
+            draft.error = Some(message);
+            draft.submitted = outcome.data.as_ref().is_some_and(|d| {
+                d.get("accepted")
+                    .and_then(|n| n.as_u64())
+                    .is_some_and(|n| n > 0)
+                    || d.get("msgid").is_some()
+            }) || !outcome.changed.is_empty();
+        }
+        self.mail_draft = Some(draft);
+    }
+
+    pub fn handle_mail_draft_key(&mut self, key: KeyEvent) {
+        use crossterm::event::KeyModifiers;
+        if key.code == KeyCode::Char('s') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            self.send_mail_draft();
+            return;
+        }
+        if key.code == KeyCode::Esc {
+            self.mail_draft = None;
+            return;
+        }
+        let Some(draft) = &mut self.mail_draft else {
+            return;
+        };
+        if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
+            let fields = [
+                MailField::To,
+                MailField::Cc,
+                MailField::Subject,
+                MailField::Body,
+            ];
+            let i = fields.iter().position(|f| *f == draft.focus).unwrap_or(0);
+            let back = key.code == KeyCode::BackTab || key.modifiers.contains(KeyModifiers::SHIFT);
+            draft.focus = fields[(i + if back { 3 } else { 1 }) % 4];
+            if matches!(draft.focus, MailField::To | MailField::Cc) {
+                draft.recipient_field = draft.focus;
+            }
+            draft.cursor = draft.field(draft.focus).len();
+            return;
+        }
+        let cursor = draft.cursor.min(draft.field(draft.focus).len());
+        if matches!(key.code, KeyCode::Up | KeyCode::Down) && draft.focus == MailField::Body {
+            let text = &draft.body;
+            let start = text[..cursor].rfind('\n').map(|i| i + 1).unwrap_or(0);
+            let column = text[start..cursor].chars().count();
+            let target = if key.code == KeyCode::Up {
+                if start == 0 {
+                    return;
+                }
+                let end = start - 1;
+                let prev = text[..end].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                (prev, end)
+            } else {
+                let Some(end) = text[cursor..].find('\n').map(|i| cursor + i) else {
+                    return;
+                };
+                let next = end + 1;
+                (
+                    next,
+                    text[next..]
+                        .find('\n')
+                        .map(|i| next + i)
+                        .unwrap_or(text.len()),
+                )
+            };
+            draft.cursor = target.0
+                + text[target.0..target.1]
+                    .char_indices()
+                    .nth(column)
+                    .map(|(i, _)| i)
+                    .unwrap_or(target.1 - target.0);
+            return;
+        }
+
+        match key.code {
+            KeyCode::Left => {
+                draft.cursor = draft.field(draft.focus)[..cursor]
+                    .char_indices()
+                    .next_back()
+                    .map(|(i, _)| i)
+                    .unwrap_or(0)
+            }
+            KeyCode::Right => {
+                draft.cursor = draft.field(draft.focus)[cursor..]
+                    .chars()
+                    .next()
+                    .map(|c| cursor + c.len_utf8())
+                    .unwrap_or(cursor)
+            }
+            KeyCode::Home => {
+                draft.cursor = draft.field(draft.focus)[..cursor]
+                    .rfind('\n')
+                    .map(|i| i + 1)
+                    .unwrap_or(0)
+            }
+            KeyCode::End => {
+                draft.cursor = draft.field(draft.focus)[cursor..]
+                    .find('\n')
+                    .map(|i| cursor + i)
+                    .unwrap_or(draft.field(draft.focus).len())
+            }
+            KeyCode::Backspace if cursor > 0 => {
+                let start = draft.field(draft.focus)[..cursor]
+                    .char_indices()
+                    .next_back()
+                    .unwrap()
+                    .0;
+                draft.field_mut().drain(start..cursor);
+                draft.cursor = start;
+            }
+            KeyCode::Delete => {
+                if let Some(c) = draft.field(draft.focus)[cursor..].chars().next() {
+                    draft.field_mut().drain(cursor..cursor + c.len_utf8());
+                }
+            }
+            KeyCode::Enter if draft.focus == MailField::Body => {
+                draft.field_mut().insert(cursor, '\n');
+                draft.cursor = cursor + 1;
+            }
+            KeyCode::Enter => {
+                let fields = [
+                    MailField::To,
+                    MailField::Cc,
+                    MailField::Subject,
+                    MailField::Body,
+                ];
+                let i = fields.iter().position(|f| *f == draft.focus).unwrap();
+                draft.focus = fields[(i + 1) % 4];
+                if matches!(draft.focus, MailField::To | MailField::Cc) {
+                    draft.recipient_field = draft.focus;
+                }
+                draft.cursor = draft.field(draft.focus).len();
+            }
+            KeyCode::Char(c)
+                if !key
+                    .modifiers
+                    .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                    && (draft.focus == MailField::Body || !c.is_control()) =>
+            {
+                draft.field_mut().insert(cursor, c);
+                draft.cursor = cursor + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_mail_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('n') => self.open_mail(MailMode::New),
+            KeyCode::Char('s') => self.open_mail(MailMode::Reply),
+            KeyCode::Char('a') => self.open_mail(MailMode::ReplyAll),
+            KeyCode::Char('f') => self.open_mail(MailMode::Forward),
+            KeyCode::Left | KeyCode::Char('h') => self.mail_room_focus = true,
+            KeyCode::Right | KeyCode::Char('l') | KeyCode::Enter => self.mail_room_focus = false,
+            KeyCode::Up | KeyCode::Char('k') => {
+                if self.mail_room_focus {
+                    self.select_mail_room(self.mail_room_sel.saturating_sub(1));
+                } else {
+                    self.mail_sel = self.mail_sel.saturating_sub(1);
+                    self.mail_scroll = 0;
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.mail_room_focus {
+                    self.select_mail_room(self.mail_room_sel.saturating_add(1));
+                } else {
+                    self.mail_sel =
+                        (self.mail_sel + 1).min(self.mail_letters().len().saturating_sub(1));
+                    self.mail_scroll = 0;
+                }
+            }
+            KeyCode::PageUp => self.mail_scroll = self.mail_scroll.saturating_sub(10),
+            KeyCode::PageDown => self.mail_scroll = self.mail_scroll.saturating_add(10),
+            KeyCode::Char('r') => self.refresh_mail(),
+            _ => {}
         }
     }
 
@@ -1275,6 +2532,7 @@ impl App {
     /// [`App::cue_session`] focus jump the roster uses); `p` prunes — the one
     /// graph-wide command — so the visual view is not read-only.
     fn handle_graph_key(&mut self, key: KeyEvent) {
+        let previous_selection = self.graph_sel;
         let nodes = crate::graphview::node_order(self);
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
@@ -1304,6 +2562,9 @@ impl App {
             }
             KeyCode::Char('p') => self.dispatch(&["session", "prune"], &[]),
             _ => {}
+        }
+        if self.graph_sel != previous_selection {
+            self.graph_pan = None;
         }
     }
 
@@ -1350,7 +2611,7 @@ impl App {
                 if let Some(DagRow::Group { name, .. }) = rows.get(self.dag_sel) {
                     if name != UNANCHORED {
                         let name = name.clone();
-                        self.dispatch(&["project", "remove"], &[name]);
+                        self.open_project_remove(name);
                     }
                 }
             }
@@ -1395,6 +2656,16 @@ impl App {
         }
     }
 
+    fn open_project_remove(&mut self, name: String) {
+        self.input = Some(Input {
+            label: format!("Unregister project `{name}`; type its name to confirm"),
+            buffer: String::new(),
+            step: 0,
+            collected: Vec::new(),
+            kind: InputKind::ProjectRemove { name },
+        });
+    }
+
     fn open_project_add(&mut self) {
         self.input = Some(Input {
             label: "project name (an existing name adds a root)".to_string(),
@@ -1420,7 +2691,7 @@ impl App {
             KeyCode::Char('d') => {
                 let sorted = sorted_project_names(&self.projects);
                 if let Some(name) = sorted.get(self.proj_sel).cloned() {
-                    self.dispatch(&["project", "remove"], &[name]);
+                    self.open_project_remove(name);
                 }
             }
             // r: resurrect the focused project's most recent resumable
@@ -1460,6 +2731,29 @@ impl App {
                 self.input = Some(input);
             }
             KeyCode::Enter => match input.kind.clone() {
+                InputKind::SessionProject { id } => {
+                    let mut flags = BTreeMap::from([("id".into(), id)]);
+                    if input.buffer.trim().is_empty() {
+                        flags.insert("clear".into(), "true".into());
+                    } else {
+                        flags.insert("project".into(), input.buffer.trim().into());
+                    }
+                    self.dispatch_with_flags(&["session", "project"], &[], flags);
+                }
+                InputKind::ProjectRoot { name } => {
+                    if input.buffer.trim().is_empty() {
+                        self.input = Some(input);
+                    } else {
+                        self.dispatch(&["project", "add"], &[name, input.buffer.trim().into()]);
+                    }
+                }
+                InputKind::ProjectRemove { name } => {
+                    if input.buffer == name {
+                        self.dispatch(&["project", "remove"], &[name]);
+                    } else {
+                        self.input = Some(input);
+                    }
+                }
                 InputKind::ProjectAdd => {
                     if input.step == 0 {
                         // Collected the name; advance to the path (defaults cwd).
@@ -1537,6 +2831,10 @@ impl App {
 /// matters since the `stop`/`stopped` vocabulary was split off `done`: a
 /// `stopped` session finished its TURN and is still very much alive, so it must
 /// stay in the `live` count.
+pub fn is_terminal(rec: &SessionRecord) -> bool {
+    rec.agent == "shell" || rec.kind.as_deref() == Some("shell")
+}
+
 pub fn is_done(state: &str) -> bool {
     graph::canonical_state(state) == "done"
 }
@@ -1604,7 +2902,7 @@ fn stage_notes_path(dir: &std::path::Path) -> std::path::PathBuf {
     dir.join("livery.json")
 }
 
-/// Load `stage/livery.json`'s palette, mapping each hex to nearest ANSI-256.
+/// Load exact palette/Base16 RGB and compatibility ANSI-256 indices.
 pub fn load_palette(path: &std::path::Path) -> Palette {
     let Ok(s) = std::fs::read_to_string(path) else {
         return Palette::default();
@@ -1619,6 +2917,28 @@ pub fn load_palette(path: &std::path::Path) -> Palette {
             .and_then(hex_to_ansi256)
     };
     Palette {
+        base16: std::array::from_fn(|i| {
+            v.get("base16")
+                .and_then(|p| p.get(format!("base{i:02X}")))
+                .and_then(|v| v.as_str())
+                .and_then(parse_hex)
+        }),
+        urgent_rgb: pal
+            .and_then(|p| p.get("urgent"))
+            .and_then(|v| v.as_str())
+            .and_then(parse_hex),
+        bg_rgb: pal
+            .and_then(|p| p.get("bg"))
+            .and_then(|v| v.as_str())
+            .and_then(parse_hex),
+        fg_rgb: pal
+            .and_then(|p| p.get("fg"))
+            .and_then(|v| v.as_str())
+            .and_then(parse_hex),
+        accent_rgb: pal
+            .and_then(|p| p.get("accent"))
+            .and_then(|v| v.as_str())
+            .and_then(parse_hex),
         bg: pick("bg"),
         fg: pick("fg"),
         accent: pick("accent"),
@@ -1628,7 +2948,15 @@ pub fn load_palette(path: &std::path::Path) -> Palette {
 
 /// Parse `#rrggbb` (or `#rgb`) and map to the nearest ANSI-256 colour index.
 pub fn hex_to_ansi256(hex: &str) -> Option<u8> {
+    let (r, g, b) = parse_hex(hex)?;
+    Some(rgb_to_ansi256(r, g, b))
+}
+
+fn parse_hex(hex: &str) -> Option<(u8, u8, u8)> {
     let h = hex.trim().trim_start_matches('#');
+    if !h.is_ascii() {
+        return None;
+    }
     let (r, g, b) = match h.len() {
         6 => (
             u8::from_str_radix(&h[0..2], 16).ok()?,
@@ -1643,7 +2971,7 @@ pub fn hex_to_ansi256(hex: &str) -> Option<u8> {
         }
         _ => return None,
     };
-    Some(rgb_to_ansi256(r, g, b))
+    Some((r, g, b))
 }
 
 /// Nearest xterm-256 index for an RGB triple. Considers both the 6×6×6 colour
@@ -1699,7 +3027,260 @@ fn dist2(r: u8, g: u8, b: u8, r2: u8, g2: u8, b2: u8) -> u32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ledger_only_session_appears_under_past_without_entering_live_graph() {
+        let project = graph::Project {
+            name: "work".into(),
+            path: "/work".into(),
+            ..Default::default()
+        };
+        let mut app = App::for_test(vec![project], vec![], vec![]);
+        app.history = vec![aoide_storage::ledger::LedgerEntry {
+            session_id: "past-only".into(),
+            cwd: "/work/src".into(),
+            agent: "codex".into(),
+            title: Some("Previous task".into()),
+            ..Default::default()
+        }];
+        assert!(matches!(
+            &app.sidebar_rows()[1],
+            SidebarRow::Past {
+                count: 1,
+                folded: true,
+                ..
+            }
+        ));
+        app.sidebar_activate(1);
+        assert!(
+            matches!(&app.sidebar_rows()[2], SidebarRow::History { entry, depth: 2, .. } if entry.session_id == "past-only")
+        );
+        app.sidebar_activate(2);
+        assert_eq!(
+            app.history_selected.as_ref().unwrap().session_id,
+            "past-only"
+        );
+        assert!(app.merged().is_empty());
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(app.last_outcome.is_none());
+    }
+
+    #[test]
+    fn history_deduplicates_stage_ids_and_preserves_recorded_project() {
+        let current = SessionRecord {
+            session_id: "current".into(),
+            state: "idle".into(),
+            ..Default::default()
+        };
+        let mut app = App::for_test(vec![], vec![current], vec![]);
+        app.history = vec![
+            aoide_storage::ledger::LedgerEntry {
+                session_id: "current".into(),
+                ..Default::default()
+            },
+            aoide_storage::ledger::LedgerEntry {
+                session_id: "old".into(),
+                project: Some("retired-project".into()),
+                ..Default::default()
+            },
+        ];
+        app.sidebar_past_open.insert("retired-project".into());
+        let rows = app.sidebar_rows();
+        assert_eq!(
+            rows.iter()
+                .filter(|r| matches!(r, SidebarRow::History { .. }))
+                .count(),
+            1
+        );
+        assert!(rows
+            .iter()
+            .any(|r| matches!(r, SidebarRow::Project { name, .. } if name == "retired-project")));
+    }
     use super::*;
+
+    #[test]
+    fn sidebar_keeps_empty_projects_and_inherits_owner_outside_root() {
+        let project = graph::Project {
+            name: "aoide".into(),
+            path: "/project".into(),
+            ..Default::default()
+        };
+        let empty = graph::Project {
+            name: "empty".into(),
+            path: "/empty".into(),
+            ..Default::default()
+        };
+        let owner = SessionRecord {
+            session_id: "owner".into(),
+            cwd: "/project".into(),
+            agent: "claude".into(),
+            state: "working".into(),
+            ..Default::default()
+        };
+        let child = SessionRecord {
+            session_id: "child-1234".into(),
+            cwd: "/tmp".into(),
+            parent_session_id: Some("owner".into()),
+            agent: "claude".into(),
+            petname: Some("small-fern".into()),
+            state: "idle".into(),
+            ..Default::default()
+        };
+        let app = App::for_test(vec![project, empty], vec![owner, child], vec![]);
+        let rows = app.sidebar_rows();
+        assert!(matches!(&rows[0], SidebarRow::Project { name, .. } if name == "aoide"));
+        assert!(
+            matches!(&rows[3], SidebarRow::Session { rec, label, depth: 3, past: false } if rec.session_id == "child-1234" && label == "small-fern · claude (…1234)")
+        );
+        assert!(matches!(&rows[4], SidebarRow::Project { name, .. } if name == "empty"));
+        assert_eq!(Panel::Graph.index(), 7);
+        assert_eq!(Panel::Pending.index(), 5);
+        assert_eq!(app.panel, Panel::Home);
+    }
+
+    #[test]
+    fn agent_and_terminal_sections_preserve_full_roster_inheritance() {
+        let shell = SessionRecord {
+            session_id: "wrapper".into(),
+            agent: "shell".into(),
+            cwd: "/project".into(),
+            state: "idle".into(),
+            ..Default::default()
+        };
+        let agent = SessionRecord {
+            session_id: "native".into(),
+            agent: "claude".into(),
+            cwd: "/tmp".into(),
+            parent_session_id: Some("wrapper".into()),
+            state: "working".into(),
+            ..Default::default()
+        };
+        let mut app = App::for_test(
+            vec![graph::Project {
+                name: "aoide".into(),
+                path: "/project".into(),
+                ..Default::default()
+            }],
+            vec![shell, agent],
+            vec![],
+        );
+        let rows = app.sidebar_rows();
+        assert!(matches!(
+            &rows[1],
+            SidebarRow::Section {
+                terminal: false,
+                count: 1,
+                ..
+            }
+        ));
+        assert!(
+            matches!(&rows[2], SidebarRow::Session { rec, depth: 2, .. } if rec.session_id == "native")
+        );
+        assert!(matches!(
+            &rows[3],
+            SidebarRow::Section {
+                terminal: true,
+                count: 1,
+                ..
+            }
+        ));
+        app.sidebar_activate(2);
+        assert_eq!(app.panel, Panel::Session);
+        assert!(
+            matches!(&app.dag_rows()[0], DagRow::Group { name, total: 1, .. } if name == "aoide")
+        );
+        assert!(
+            matches!(&app.dag_rows()[1], DagRow::Session { rec, .. } if rec.session_id == "native")
+        );
+        app.sidebar_activate(4);
+        assert_eq!(app.panel, Panel::Terminals);
+        assert!(
+            matches!(&app.dag_rows()[1], DagRow::Session { rec, .. } if rec.session_id == "wrapper")
+        );
+        assert_eq!(app.dag_rows().len(), 2);
+        app.panel = Panel::Graph;
+        assert_eq!(app.dag_rows().len(), 3);
+        app.sidebar_activate(1);
+        assert!(matches!(
+            &app.sidebar_rows()[1],
+            SidebarRow::Section { folded: true, .. }
+        ));
+        assert!(!app
+            .sidebar_rows()
+            .iter()
+            .any(|r| matches!(r, SidebarRow::Session { rec, .. } if rec.session_id == "native")));
+        assert!(app.last_outcome.is_none());
+        assert!(is_terminal(&SessionRecord {
+            agent: "bash".into(),
+            kind: Some("shell".into()),
+            ..Default::default()
+        }));
+        assert_eq!(Panel::Mail.index(), 1);
+        assert_eq!(Panel::Terminals.index(), 3);
+    }
+
+    #[test]
+    fn sidebar_past_is_collapsed_and_activation_only_navigates() {
+        let rec = SessionRecord {
+            session_id: "ended-5678".into(),
+            agent: "claude".into(),
+            state: "done".into(),
+            ..Default::default()
+        };
+        let mut app = App::for_test(vec![], vec![rec], vec![]);
+        assert_eq!(app.sidebar_rows().len(), 2);
+        assert!(matches!(
+            &app.sidebar_rows()[1],
+            SidebarRow::Past {
+                folded: true,
+                count: 1,
+                ..
+            }
+        ));
+        app.sidebar_sel = 1;
+        app.handle_sidebar_key(KeyEvent::from(KeyCode::Right));
+        assert!(matches!(
+            &app.sidebar_rows()[2],
+            SidebarRow::Session { past: true, .. }
+        ));
+        app.sidebar_activate(2);
+        assert_eq!(app.panel, Panel::Session);
+        assert!(app.last_outcome.is_none());
+        assert!(app.tail.is_none());
+        app.sidebar_sel = 0;
+        app.handle_sidebar_key(KeyEvent::from(KeyCode::Left));
+        assert_eq!(app.sidebar_rows().len(), 1);
+        app.handle_sidebar_key(KeyEvent::from(KeyCode::Down));
+        assert_eq!(app.sidebar_sel, 0);
+        app.handle_sidebar_key(KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(app.sidebar_rows().len(), 3);
+        app.handle_sidebar_key(KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(app.sidebar_rows().len(), 1);
+    }
+
+    #[test]
+    fn audit_refresh_preserves_identity_and_keeps_snapshot_on_error() {
+        with_isolated_stage(|| {
+            let path = App::audit_path();
+            std::fs::write(&path, "{\"ts\":2,\"message\":\"selected\"}\n").unwrap();
+            let mut app = App::for_test(vec![], vec![], vec![]);
+            app.reload_log();
+            app.log_scroll = 10;
+            std::fs::write(&path, "{\"ts\":1}\n{\"ts\":2,\"message\":\"selected\"}\n").unwrap();
+            app.reload_log();
+            assert_eq!(app.log_sel, 1);
+            assert_eq!(app.log_scroll, 10);
+            std::fs::write(&path, "malformed\n").unwrap();
+            app.reload_log();
+            assert!(app.log_error.is_some());
+            assert_eq!(app.log.len(), 2);
+            assert_eq!(app.log_sel, 1);
+            std::fs::write(&path, "{\"ts\":3}\n").unwrap();
+            app.reload_log();
+            assert!(app.log_error.is_none());
+            assert_eq!(app.log_sel, 0);
+            assert_eq!(app.log_scroll, 0);
+        });
+    }
 
     #[test]
     fn stage_notes_path_is_unconditionally_livery_json() {
@@ -1946,7 +3527,10 @@ mod tests {
 
         app.open_tail(&rec); // must not panic
 
-        let tail = app.tail.as_ref().expect("tail still opens on a missing file");
+        let tail = app
+            .tail
+            .as_ref()
+            .expect("tail still opens on a missing file");
         assert!(
             tail.lines.is_empty(),
             "P1's tail_file returns empty on a missing file"
@@ -1974,7 +3558,10 @@ mod tests {
             // `changed` either: `false` here is proof the gate held.
             let changed = app.poll_refresh();
 
-            assert!(!changed, "an unchanged tail mtime must not report a repaint");
+            assert!(
+                !changed,
+                "an unchanged tail mtime must not report a repaint"
+            );
             assert_eq!(app.tail.as_ref().unwrap().mtime, after_open);
             assert_eq!(
                 app.tail.as_ref().unwrap().lines,
@@ -2022,7 +3609,10 @@ mod tests {
 
             app.poll_refresh();
 
-            assert!(app.roster_rx.is_none(), "a fresh cache must not spawn a fetch");
+            assert!(
+                app.roster_rx.is_none(),
+                "a fresh cache must not spawn a fetch"
+            );
             assert_eq!(ROSTER_CALLS.load(Ordering::SeqCst), 0);
         });
     }
@@ -2038,7 +3628,10 @@ mod tests {
 
             app.poll_refresh();
 
-            let rx = app.roster_rx.take().expect("a stale, visible pane spawns a fetch");
+            let rx = app
+                .roster_rx
+                .take()
+                .expect("a stale, visible pane spawns a fetch");
             let outcome = rx
                 .recv_timeout(Duration::from_secs(2))
                 .expect("the background dispatch completes");
@@ -2058,7 +3651,10 @@ mod tests {
 
             app.poll_refresh();
 
-            assert!(app.roster_rx.is_none(), "a hidden pane must never spawn a fetch");
+            assert!(
+                app.roster_rx.is_none(),
+                "a hidden pane must never spawn a fetch"
+            );
             assert_eq!(ROSTER_CALLS.load(Ordering::SeqCst), 0);
         });
     }
@@ -2069,7 +3665,7 @@ mod tests {
         ROSTER_CALLS.store(0, Ordering::SeqCst);
 
         let mut app = App::for_test_with_dispatch(counting_roster_dispatch);
-        assert_eq!(app.panel, Panel::Graph, "starts elsewhere");
+        assert_eq!(app.panel, Panel::Home, "starts elsewhere");
 
         app.select_panel(Panel::Roster); // no tick involved at all
 
@@ -2077,7 +3673,8 @@ mod tests {
             .roster_rx
             .take()
             .expect("landing on a stale ROSTER must fetch immediately, not wait for a tick");
-        rx.recv_timeout(Duration::from_secs(2)).expect("dispatch completes");
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("dispatch completes");
         assert_eq!(ROSTER_CALLS.load(Ordering::SeqCst), 1);
     }
 
@@ -2091,7 +3688,10 @@ mod tests {
 
         app.select_panel(Panel::Roster);
 
-        assert!(app.roster_rx.is_none(), "a fresh cache needs no immediate fetch");
+        assert!(
+            app.roster_rx.is_none(),
+            "a fresh cache needs no immediate fetch"
+        );
         assert_eq!(ROSTER_CALLS.load(Ordering::SeqCst), 0);
     }
 
@@ -2110,7 +3710,8 @@ mod tests {
             .roster_rx
             .take()
             .expect("`r` forces a fetch regardless of the throttle window");
-        rx.recv_timeout(Duration::from_secs(2)).expect("dispatch completes");
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("dispatch completes");
         assert_eq!(ROSTER_CALLS.load(Ordering::SeqCst), 1);
     }
 
@@ -2131,7 +3732,8 @@ mod tests {
         app.spawn_roster_fetch();
 
         let rx = app.roster_rx.take().unwrap();
-        rx.recv_timeout(Duration::from_secs(2)).expect("dispatch completes");
+        rx.recv_timeout(Duration::from_secs(2))
+            .expect("dispatch completes");
         assert_eq!(
             ROSTER_CALLS.load(Ordering::SeqCst),
             1,
@@ -2170,25 +3772,40 @@ mod tests {
                 },
             ],
         });
-        app.roster.outcome = Some(Outcome::ok("session", "2 node(s), 1 session(s)").with_data(data));
+        app.roster.outcome =
+            Some(Outcome::ok("session", "2 node(s), 1 session(s)").with_data(data));
         app.roster.fetched_at = Some(Instant::now());
 
         let nodes = app.roster_nodes();
-        assert_eq!(nodes.len(), 2, "local + one node, in the roster's own order");
-        assert!(nodes[0].is_local && nodes[0].name == "sakaki", "local box first");
+        assert_eq!(
+            nodes.len(),
+            2,
+            "local + one node, in the roster's own order"
+        );
+        assert!(
+            nodes[0].is_local && nodes[0].name == "sakaki",
+            "local box first"
+        );
         assert_eq!(nodes[0].sessions[0].label, "sakaki/root/s1");
         assert_eq!(nodes[0].sessions[0].state, "working");
         assert_eq!(nodes[1].name, "yomi-strix");
         assert_eq!(nodes[1].presence, "unreachable");
         assert_eq!(nodes[1].fetched_at.as_deref(), Some("2026-08-20T23:00:00Z"));
 
-        assert!(app.roster_status().starts_with("fetched "), "{}", app.roster_status());
+        assert!(
+            app.roster_status().starts_with("fetched "),
+            "{}",
+            app.roster_status()
+        );
     }
 
     #[test]
     fn roster_status_surfaces_a_non_ok_outcome_instead_of_hiding_it() {
         let mut app = App::for_test(Vec::new(), Vec::new(), Vec::new());
-        app.roster.outcome = Some(Outcome::error("session", "stage read failed: permission denied"));
+        app.roster.outcome = Some(Outcome::error(
+            "session",
+            "stage read failed: permission denied",
+        ));
         app.roster.fetched_at = Some(Instant::now());
 
         let status = app.roster_status();
@@ -2266,11 +3883,21 @@ mod tests {
         let changed = app.poll_roster();
 
         assert!(changed, "a landed fetch is a repaint");
-        assert_eq!(app.roster_flat_rows().len(), 2, "header + the one remaining session");
-        assert_eq!(app.roster_sel, 1, "clamped onto the new last row, not left at the stale index 3");
+        assert_eq!(
+            app.roster_flat_rows().len(),
+            2,
+            "header + the one remaining session"
+        );
+        assert_eq!(
+            app.roster_sel, 1,
+            "clamped onto the new last row, not left at the stale index 3"
+        );
 
         app.handle_key(KeyEvent::from(KeyCode::Char('s')));
-        let input = app.input.as_ref().expect("`s` composes against the row actually on screen");
+        let input = app
+            .input
+            .as_ref()
+            .expect("`s` composes against the row actually on screen");
         assert_eq!(input.label, "send to sakaki/root/brave-otter (…s1)");
     }
 
@@ -2326,11 +3953,16 @@ mod tests {
             app.roster_sel = 1; // the s1 session row (index 1: header, session, header, session)
 
             app.handle_key(KeyEvent::from(KeyCode::Char('s')));
-            let input = app.input.as_ref().expect("`s` on a session row opens compose");
+            let input = app
+                .input
+                .as_ref()
+                .expect("`s` on a session row opens compose");
             assert_eq!(input.label, "send to sakaki/root/brave-otter (…s1)");
             assert_eq!(
                 input.kind,
-                InputKind::Compose { target: "sakaki/root/brave-otter (…s1)".to_string() }
+                InputKind::Compose {
+                    target: "sakaki/root/brave-otter (…s1)".to_string()
+                }
             );
 
             for c in "hi".chars() {
@@ -2344,9 +3976,16 @@ mod tests {
                 .iter()
                 .find(|(path, ..)| path == &vec!["send".to_string()])
                 .expect("a send dispatch was recorded");
-            assert_eq!(send_call.1, vec!["hi".to_string()], "text rides as a single positional arg");
+            assert_eq!(
+                send_call.1,
+                vec!["hi".to_string()],
+                "text rides as a single positional arg"
+            );
             let mut expected_flags = BTreeMap::new();
-            expected_flags.insert("to".to_string(), "sakaki/root/brave-otter (…s1)".to_string());
+            expected_flags.insert(
+                "to".to_string(),
+                "sakaki/root/brave-otter (…s1)".to_string(),
+            );
             expected_flags.insert("yes".to_string(), "true".to_string());
             assert_eq!(send_call.2, expected_flags);
         });
@@ -2361,7 +4000,10 @@ mod tests {
 
         app.handle_key(KeyEvent::from(KeyCode::Char('s')));
 
-        assert!(app.input.is_none(), "no session under the cursor — nothing to compose to");
+        assert!(
+            app.input.is_none(),
+            "no session under the cursor — nothing to compose to"
+        );
     }
 
     // ── Projects panel: `r` resurrects the focused project (P-D8) ────────
@@ -2371,11 +4013,72 @@ mod tests {
         Mutex::new(Vec::new());
 
     fn recording_resurrect_dispatch(inv: &Invocation) -> Outcome {
-        RESURRECT_CALLS
-            .lock()
-            .unwrap()
-            .push((inv.path.clone(), inv.args.clone(), inv.flags.clone()));
+        RESURRECT_CALLS.lock().unwrap().push((
+            inv.path.clone(),
+            inv.args.clone(),
+            inv.flags.clone(),
+        ));
         Outcome::ok("resurrect", "resurrected 1 session")
+    }
+
+    #[test]
+    fn project_removal_requires_exact_confirmation_and_keeps_original_target() {
+        let _g = PROJECTS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        RESURRECT_CALLS.lock().unwrap().clear();
+        let mut app = App::for_test_with_dispatch(recording_resurrect_dispatch);
+        app.panel = Panel::Projects;
+        app.projects = vec![
+            graph::Project {
+                name: "first".into(),
+                ..Default::default()
+            },
+            graph::Project {
+                name: "second".into(),
+                ..Default::default()
+            },
+        ];
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        app.handle_key(KeyEvent::from(KeyCode::Delete));
+        assert!(RESURRECT_CALLS.lock().unwrap().is_empty());
+        app.input.as_mut().unwrap().buffer = "wrong".into();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert!(RESURRECT_CALLS.lock().unwrap().is_empty());
+        app.proj_sel = 1;
+        app.input.as_mut().unwrap().buffer = "first".into();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        let calls = RESURRECT_CALLS.lock().unwrap();
+        let removes: Vec<_> = calls
+            .iter()
+            .filter(|(p, ..)| p == &["project", "remove"])
+            .collect();
+        assert_eq!(removes.len(), 1);
+        assert_eq!(removes[0].1, vec!["first"]);
+        assert!(app.input.is_none());
+    }
+
+    #[test]
+    fn project_group_removal_can_be_cancelled_without_dispatch() {
+        let _g = PROJECTS_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        RESURRECT_CALLS.lock().unwrap().clear();
+        let mut app = App::for_test_with_dispatch(recording_resurrect_dispatch);
+        app.panel = Panel::Session;
+        app.projects = vec![graph::Project {
+            name: "first".into(),
+            ..Default::default()
+        }];
+        app.dag_sel = app
+            .dag_rows()
+            .iter()
+            .position(|row| matches!(row, DagRow::Group { name, .. } if name == "first"))
+            .unwrap();
+        app.handle_key(KeyEvent::from(KeyCode::Char('d')));
+        assert!(
+            matches!(app.input.as_ref().map(|i| &i.kind), Some(InputKind::ProjectRemove { name }) if name == "first")
+        );
+        app.handle_key(KeyEvent::from(KeyCode::Esc));
+        assert!(app.input.is_none());
+        assert!(RESURRECT_CALLS.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -2386,8 +4089,16 @@ mod tests {
         let mut app = App::for_test_with_dispatch(recording_resurrect_dispatch);
         app.panel = Panel::Projects;
         app.projects = vec![
-            graph::Project { name: "aoide".to_string(), path: "/home/x/Aoide".to_string(), ..Default::default() },
-            graph::Project { name: "melete".to_string(), path: "/home/x/Melete".to_string(), ..Default::default() },
+            graph::Project {
+                name: "aoide".to_string(),
+                path: "/home/x/Aoide".to_string(),
+                ..Default::default()
+            },
+            graph::Project {
+                name: "melete".to_string(),
+                path: "/home/x/Melete".to_string(),
+                ..Default::default()
+            },
         ];
         // `sorted_project_names` sorts by name: ["aoide", "melete"].
         app.proj_sel = 1; // "melete"
@@ -2403,10 +4114,17 @@ mod tests {
             .iter()
             .filter(|(path, ..)| path == &vec!["resurrect".to_string()])
             .collect();
-        assert_eq!(resurrect_calls.len(), 1, "exactly one resurrect dispatch fired");
+        assert_eq!(
+            resurrect_calls.len(),
+            1,
+            "exactly one resurrect dispatch fired"
+        );
         let (path, args, flags) = resurrect_calls[0];
         assert_eq!(path, &vec!["resurrect".to_string()]);
-        assert!(args.is_empty(), "the project rides as a flag, not a positional arg");
+        assert!(
+            args.is_empty(),
+            "the project rides as a flag, not a positional arg"
+        );
         let mut expected_flags = BTreeMap::new();
         expected_flags.insert("project".to_string(), "melete".to_string());
         assert_eq!(flags, &expected_flags);
@@ -2443,7 +4161,10 @@ mod tests {
     /// positions and all — mirroring the real door's behaviour exactly).
     fn recording_pending_dispatch(inv: &Invocation) -> Outcome {
         let path = inv.path.join(".");
-        PENDING_CALLS.lock().unwrap().push((path.clone(), inv.args.clone()));
+        PENDING_CALLS
+            .lock()
+            .unwrap()
+            .push((path.clone(), inv.args.clone()));
         match path.as_str() {
             "session.pending.list" => {
                 let q = PENDING_QUEUE.lock().unwrap();
@@ -2479,8 +4200,11 @@ mod tests {
     fn approve_dispatches_pending_approve_then_relists_and_positions_shift() {
         let _g = PENDING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         PENDING_CALLS.lock().unwrap().clear();
-        *PENDING_QUEUE.lock().unwrap() =
-            vec![("s0".into(), "a".into()), ("s1".into(), "b".into()), ("s2".into(), "c".into())];
+        *PENDING_QUEUE.lock().unwrap() = vec![
+            ("s0".into(), "a".into()),
+            ("s1".into(), "b".into()),
+            ("s2".into(), "c".into()),
+        ];
 
         with_isolated_stage(|| {
             let mut app = App::for_test_with_dispatch(recording_pending_dispatch);
@@ -2492,8 +4216,14 @@ mod tests {
 
             let calls = PENDING_CALLS.lock().unwrap();
             let last_two = &calls[calls.len() - 2..];
-            assert_eq!(last_two[0], ("session.pending.approve".to_string(), vec!["0".to_string()]));
-            assert_eq!(last_two[1], ("session.pending.list".to_string(), Vec::<String>::new()));
+            assert_eq!(
+                last_two[0],
+                ("session.pending.approve".to_string(), vec!["0".to_string()])
+            );
+            assert_eq!(
+                last_two[1],
+                ("session.pending.list".to_string(), Vec::<String>::new())
+            );
             drop(calls);
 
             // Positions shifted: s1 (was index 1) is now at index 0.
@@ -2519,8 +4249,14 @@ mod tests {
 
             let calls = PENDING_CALLS.lock().unwrap();
             let last_two = &calls[calls.len() - 2..];
-            assert_eq!(last_two[0], ("session.pending.deny".to_string(), vec!["0".to_string()]));
-            assert_eq!(last_two[1], ("session.pending.list".to_string(), Vec::<String>::new()));
+            assert_eq!(
+                last_two[0],
+                ("session.pending.deny".to_string(), vec!["0".to_string()])
+            );
+            assert_eq!(
+                last_two[1],
+                ("session.pending.list".to_string(), Vec::<String>::new())
+            );
             drop(calls);
 
             let rows = app.pending_rows();
@@ -2538,8 +4274,11 @@ mod tests {
         // then s1 (never s0 twice, never skip to s2).
         let _g = PENDING_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         PENDING_CALLS.lock().unwrap().clear();
-        *PENDING_QUEUE.lock().unwrap() =
-            vec![("s0".into(), "a".into()), ("s1".into(), "b".into()), ("s2".into(), "c".into())];
+        *PENDING_QUEUE.lock().unwrap() = vec![
+            ("s0".into(), "a".into()),
+            ("s1".into(), "b".into()),
+            ("s2".into(), "c".into()),
+        ];
 
         with_isolated_stage(|| {
             let mut app = App::for_test_with_dispatch(recording_pending_dispatch);
@@ -2551,7 +4290,10 @@ mod tests {
 
             let rows = app.pending_rows();
             assert_eq!(rows.len(), 1);
-            assert_eq!(rows[0].session_id, "s2", "s0 then s1 were taken — never a stale re-resolve");
+            assert_eq!(
+                rows[0].session_id, "s2",
+                "s0 then s1 were taken — never a stale re-resolve"
+            );
         });
     }
 
@@ -2592,5 +4334,208 @@ mod tests {
         assert_eq!(app.pending_sel, 0);
         app.handle_key(KeyEvent::from(KeyCode::Char('k')));
         assert_eq!(app.pending_sel, 0, "k never walks before the first row");
+    }
+    #[test]
+    fn mail_draft_navigation_and_unicode_edits_do_not_send() {
+        let mut app = App::for_test(vec![], vec![], vec![]);
+        app.open_mail_to("osaka/fable".into());
+        app.handle_key(KeyEvent::from(KeyCode::Char('界')));
+        app.handle_key(KeyEvent::from(KeyCode::Left));
+        app.handle_key(KeyEvent::from(KeyCode::Char('A')));
+        assert_eq!(app.mail_draft.as_ref().unwrap().subject, "A界");
+        app.handle_key(KeyEvent::from(KeyCode::Tab));
+        app.handle_key(KeyEvent::from(KeyCode::Char('x')));
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(app.mail_draft.as_ref().unwrap().body, "x\n");
+        assert!(app.last_outcome.is_none());
+        app.handle_key(KeyEvent::from(KeyCode::BackTab));
+        assert_eq!(app.mail_draft.as_ref().unwrap().focus, MailField::Subject);
+    }
+
+    #[test]
+    fn mail_draft_local_route_and_partial_submission_cannot_repeat() {
+        fn partial(inv: &Invocation) -> Outcome {
+            if !inv.flags.contains_key("to") {
+                return Outcome::usage("test", "read ignored");
+            }
+            assert_eq!(inv.flags.get("to").map(String::as_str), Some("self/fable"));
+            assert_eq!(inv.flags.get("subject").map(String::as_str), Some("Review"));
+            let mut out = Outcome::usage("mail.send", "One recipient failed; others filed");
+            out.data =
+                Some(serde_json::json!({"accepted":1,"recipients":[{"msgid":"already-filed"}]}));
+            out
+        }
+        let mut app = App::for_test_with_dispatch(partial);
+        app.open_mail_to(format!(
+            "{}/fable",
+            aoide_storage::display::local_host_name()
+        ));
+        let draft = app.mail_draft.as_mut().unwrap();
+        draft.subject = "Review".into();
+        draft.body = "Please check".into();
+        app.send_mail_draft();
+        assert!(app.mail_draft.as_ref().unwrap().submitted);
+        app.send_mail_draft();
+        assert!(app
+            .mail_draft
+            .as_ref()
+            .unwrap()
+            .error
+            .as_ref()
+            .unwrap()
+            .starts_with("Already submitted"));
+    }
+
+    #[test]
+    fn reply_all_and_forward_keep_original_and_explicit_destinations() {
+        use aoide_storage::mail::Address;
+        let local = aoide_storage::display::local_host_name();
+        let content = aoide_storage::letter::LetterContent {
+            subject: "Architecture".into(),
+            to: vec![Address {
+                node: local.clone(),
+                name: "conductor-human".into(),
+            }],
+            cc: vec![Address {
+                node: "osaka".into(),
+                name: "reviewer".into(),
+            }],
+            body: "Original text".into(),
+            thread_id: None,
+            reply_to: None,
+        }
+        .encode()
+        .unwrap();
+        let mut app = App::for_test(vec![], vec![], vec![]);
+        app.mail.letters.push(crate::mailview::MailLetter {
+            seq: 1,
+            msgid: "original-id".into(),
+            from: "osaka/fable".into(),
+            to: format!("{local}/conductor-human"),
+            from_address: Address {
+                node: "osaka".into(),
+                name: "fable".into(),
+            },
+            to_address: Address {
+                node: local,
+                name: "conductor-human".into(),
+            },
+            text: content,
+            received_at: "today".into(),
+            minted_at: "today".into(),
+        });
+        app.open_mail(MailMode::ReplyAll);
+        let draft = app.mail_draft.as_ref().unwrap();
+        assert_eq!(draft.to, "osaka/fable");
+        assert_eq!(draft.cc, "osaka/reviewer");
+        assert_eq!(draft.subject, "Re: Architecture");
+        assert!(draft.body.contains("> Original text"));
+        assert_eq!(draft.original.as_ref().unwrap().msgid, "original-id");
+        app.mail_draft = None;
+        app.open_mail(MailMode::Forward);
+        let draft = app.mail_draft.as_ref().unwrap();
+        assert!(draft.to.is_empty());
+        assert!(draft.cc.is_empty());
+        assert_eq!(draft.subject, "Fwd: Architecture");
+    }
+    #[test]
+    fn session_context_opens_without_dispatch_and_preserves_exact_assignment_id() {
+        fn assignment(inv: &Invocation) -> Outcome {
+            if inv.path == ["session", "project"] {
+                assert_eq!(inv.flags.get("id").map(String::as_str), Some("wanted"));
+                assert_eq!(
+                    inv.flags.get("project").map(String::as_str),
+                    Some("destination")
+                );
+                return Outcome::ok("session.project", "assigned exact target");
+            }
+            Outcome::usage("read", "ignored")
+        }
+        let mut app = App::for_test_with_dispatch(assignment);
+        let mut rec = session("wanted", "/x", "working", None);
+        rec.petname = Some("calm-rook".into());
+        app.sessions = vec![rec.clone(), session("other", "/y", "working", None)];
+        app.open_context_for_session(rec, 3, 4);
+        assert!(app.last_outcome.is_none());
+        let menu = app.context_menu.as_ref().unwrap();
+        let index = menu
+            .actions
+            .iter()
+            .position(|a| *a == ContextAction::AssignProject)
+            .unwrap();
+        app.dag_sel = 999;
+        app.run_context_action(index);
+        assert!(app.last_outcome.is_none());
+        app.input.as_mut().unwrap().buffer = "destination".into();
+        app.handle_key(KeyEvent::from(KeyCode::Enter));
+        assert_eq!(
+            app.last_outcome.as_ref().unwrap().command,
+            "session.project"
+        );
+    }
+
+    #[test]
+    fn historical_context_resurrects_exact_entry_and_never_offers_live_actions() {
+        fn resurrect(inv: &Invocation) -> Outcome {
+            if inv.path == ["resurrect"] {
+                assert_eq!(inv.flags.get("id").map(String::as_str), Some("ended-exact"));
+                assert_eq!(
+                    inv.flags.get("project").map(String::as_str),
+                    Some("archive")
+                );
+                return Outcome::ok("resurrect", "exact history");
+            }
+            Outcome::usage("read", "ignored")
+        }
+        let mut app = App::for_test_with_dispatch(resurrect);
+        app.projects = vec![graph::Project {
+            name: "archive".into(),
+            path: "/archive".into(),
+            ..Default::default()
+        }];
+        let entry = aoide_storage::ledger::LedgerEntry {
+            session_id: "ended-exact".into(),
+            project: Some("archive".into()),
+            harness_session_id: Some("native".into()),
+            ..Default::default()
+        };
+        app.open_context_for_history(entry.clone(), 0, 0);
+        assert_eq!(
+            app.context_menu.as_ref().unwrap().actions,
+            vec![ContextAction::Details, ContextAction::Resurrect]
+        );
+        app.run_context_action(1);
+        assert_eq!(app.last_outcome.as_ref().unwrap().command, "resurrect");
+        app.open_context_for_history(entry, 0, 0);
+        app.run_context_action(0);
+        assert_eq!(
+            app.history_selected.as_ref().unwrap().session_id,
+            "ended-exact"
+        );
+    }
+
+    #[test]
+    fn historical_context_does_not_guess_a_retired_explicit_project() {
+        let mut app = App::for_test(
+            vec![graph::Project {
+                name: "new".into(),
+                path: "/archive".into(),
+                ..Default::default()
+            }],
+            vec![],
+            vec![],
+        );
+        let entry = aoide_storage::ledger::LedgerEntry {
+            session_id: "ended".into(),
+            project: Some("retired".into()),
+            cwd: "/archive".into(),
+            harness_session_id: Some("native".into()),
+            ..Default::default()
+        };
+        app.open_context_for_history(entry, 0, 0);
+        assert_eq!(
+            app.context_menu.as_ref().unwrap().actions,
+            vec![ContextAction::Details]
+        );
     }
 }

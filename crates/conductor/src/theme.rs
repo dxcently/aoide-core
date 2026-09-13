@@ -8,15 +8,136 @@
 //! roster reads in musical notation (♪ working, 𝄐 awaiting, 𝄁 stopped, 𝄽 idle,
 //! 𝄂 done).
 //!
-//! Colour comes from `stage/livery.json`'s palette `{bg,fg,accent,urgent}`
-//! when present, each hex already mapped to the nearest ANSI-256 index in
-//! [`crate::app`]; here we wrap those indices as `Color::Indexed`. Absent
-//! a palette key we fall back to a named ANSI colour so the TUI still reads,
-//! exactly as the hand-rolled renderer did.
+//! Colour comes from stage livery palette and Base16 tokens as exact RGB.
+//! Missing semantic tokens retain ANSI fallbacks; focused tabs use role fills,
+//! while inactive selections keep subdued foreground/background-derived shades.
 
 use crate::app::{is_done, Palette};
 use aoide_conduct::graph::SessionRecord;
 use ratatui::style::{Color, Modifier, Style};
+
+/// Semantic hues use the livery's Base16 slots, with ANSI fallback.
+#[derive(Debug, Clone, Copy)]
+pub enum Role {
+    Project,
+    Agent,
+    Terminal,
+    Mail,
+    Success,
+    Warning,
+    Error,
+    Muted,
+}
+
+pub fn role_color(pal: &Palette, role: Role) -> Color {
+    let (slot, fallback) = match role {
+        Role::Project => (13, Color::Blue),
+        Role::Agent => (14, Color::Magenta),
+        Role::Terminal => (12, Color::Cyan),
+        Role::Mail => (9, Color::Yellow),
+        Role::Success => (11, Color::Green),
+        Role::Warning => (10, Color::Yellow),
+        Role::Error => (8, Color::Red),
+        Role::Muted => (4, Color::DarkGray),
+    };
+    pal.base16[slot]
+        .map(|(r, g, b)| Color::Rgb(r, g, b))
+        .or_else(|| {
+            if matches!(role, Role::Error) {
+                pal.urgent_rgb
+                    .map(|(r, g, b)| Color::Rgb(r, g, b))
+                    .or_else(|| opt_color(pal.urgent))
+            } else {
+                None
+            }
+        })
+        .unwrap_or(fallback)
+}
+
+/// Only the keyboard-focused selection receives a bright semantic fill.
+pub fn tab_style(pal: &Palette, role: Role, selected: bool, focused: bool) -> Style {
+    let hue = role_color(pal, role);
+    if selected && focused {
+        let (r, g, b) = match hue {
+            Color::Rgb(r, g, b) => (r, g, b),
+            Color::Indexed(i) => rgb(i),
+            _ => {
+                return Style::default()
+                    .fg(Color::Black)
+                    .bg(hue)
+                    .add_modifier(Modifier::BOLD)
+            }
+        };
+        let luminance = u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114;
+        let candidates = [pal.bg_rgb.or(pal.base16[0]), pal.fg_rgb.or(pal.base16[5])];
+        let ink = candidates
+            .into_iter()
+            .flatten()
+            .max_by_key(|&(r, g, b)| {
+                luminance.abs_diff(u32::from(r) * 299 + u32::from(g) * 587 + u32::from(b) * 114)
+            })
+            .map(|(r, g, b)| Color::Rgb(r, g, b))
+            .unwrap_or(if luminance >= 128000 {
+                Color::Black
+            } else {
+                Color::White
+            });
+        Style::default()
+            .fg(ink)
+            .bg(hue)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        surface(pal, if selected { 12 } else { 4 }).fg(hue)
+    }
+}
+
+fn rgb(index: u8) -> (u8, u8, u8) {
+    const BASIC: [(u8, u8, u8); 16] = [
+        (0, 0, 0),
+        (128, 0, 0),
+        (0, 128, 0),
+        (128, 128, 0),
+        (0, 0, 128),
+        (128, 0, 128),
+        (0, 128, 128),
+        (192, 192, 192),
+        (128, 128, 128),
+        (255, 0, 0),
+        (0, 255, 0),
+        (255, 255, 0),
+        (0, 0, 255),
+        (255, 0, 255),
+        (0, 255, 255),
+        (255, 255, 255),
+    ];
+    if index < 16 {
+        return BASIC[index as usize];
+    }
+    if index >= 232 {
+        let c = 8 + (index - 232) * 10;
+        return (c, c, c);
+    }
+    let n = index - 16;
+    let v = |x: u8| if x == 0 { 0 } else { 55 + x * 40 };
+    (v(n / 36), v((n / 6) % 6), v(n % 6))
+}
+/// Surface shades derive from the same foreground/background, in either light or dark livery.
+pub fn surface(pal: &Palette, amount: u16) -> Style {
+    let mut style = Style::default();
+    if let Some((r, g, b)) = pal.fg_rgb.or_else(|| pal.fg.map(rgb)) {
+        style = style.fg(Color::Rgb(r, g, b));
+    }
+    if let (Some((a, b, c)), Some((x, y, z))) = (
+        pal.bg_rgb.or_else(|| pal.bg.map(rgb)),
+        pal.fg_rgb.or_else(|| pal.fg.map(rgb)),
+    ) {
+        let mix = |a: u8, b: u8| {
+            ((u16::from(a) * (100 - amount.min(100)) + u16::from(b) * amount.min(100)) / 100) as u8
+        };
+        style = style.bg(Color::Rgb(mix(a, x), mix(b, y), mix(c, z)));
+    }
+    style
+}
 
 /// Clef-tail end-cap ornament — verbatim from `GadgetFrame.qml` / `AoideBar.qml`.
 pub const END_CAP: &str = "ৎ𝄢";
@@ -31,7 +152,9 @@ pub fn opt_color(idx: Option<u8>) -> Option<Color> {
 /// The accent colour: the palette's, or `None` to inherit (the brand header /
 /// frame borders use this and simply stay uncoloured on a paletteless rig).
 pub fn accent(pal: &Palette) -> Option<Color> {
-    opt_color(pal.accent)
+    pal.accent_rgb
+        .map(|(r, g, b)| Color::Rgb(r, g, b))
+        .or_else(|| opt_color(pal.accent))
 }
 
 /// A `Style` foreground-tinted with the accent when present (else unchanged).
@@ -42,10 +165,9 @@ pub fn accent_style(pal: &Palette) -> Style {
     }
 }
 
-/// Dim modifier — the "inherit, but quieter" style the chrome uses for paths,
-/// footers, and settled detail.
+/// Secondary text keeps terminal contrast; terminal DIM can erase light-palette text.
 pub fn dim() -> Style {
-    Style::default().add_modifier(Modifier::DIM)
+    Style::default()
 }
 
 // ── Session state → glyph + colour ──────────────────────────────────────────
@@ -73,6 +195,7 @@ pub fn classify(state: &str) -> StateClass {
     } else if l.contains("await") || l.contains("block") || l == "notification" {
         StateClass::Awaiting
     } else if l.contains("running")
+        || l == "working"
         || l.contains("pretooluse")
         || l.contains("posttooluse")
         || l.contains("active")
@@ -110,11 +233,11 @@ pub fn state_glyph(state: &str) -> &'static str {
 /// stopped (warm, just finished), cyan idle, dim done, inherit for the unknown.
 pub fn state_style(state: &str, pal: &Palette) -> Style {
     match classify(state) {
-        StateClass::Working => Style::default().fg(Color::Green),
-        StateClass::Awaiting => Style::default().fg(opt_color(pal.urgent).unwrap_or(Color::Yellow)),
-        StateClass::Stopped => Style::default().fg(Color::Blue),
-        StateClass::Idle => Style::default().fg(Color::Cyan),
-        StateClass::Done => dim(),
+        StateClass::Working => Style::default().fg(role_color(pal, Role::Success)),
+        StateClass::Awaiting => Style::default().fg(role_color(pal, Role::Warning)),
+        StateClass::Stopped => Style::default().fg(role_color(pal, Role::Project)),
+        StateClass::Idle => Style::default().fg(role_color(pal, Role::Terminal)),
+        StateClass::Done => Style::default().fg(role_color(pal, Role::Muted)),
         StateClass::Unknown => Style::default(),
     }
 }
@@ -233,6 +356,44 @@ pub fn disp(s: &str) -> &str {
 mod tests {
     use super::*;
     use serde_json::Map;
+
+    #[test]
+    fn semantic_tokens_and_focus_preserve_livery() {
+        let mut pal = Palette::default();
+        pal.base16[13] = Some((31, 62, 93));
+        pal.base16[11] = Some((41, 82, 123));
+        pal.bg_rgb = Some((240, 230, 220));
+        pal.fg_rgb = Some((20, 30, 40));
+        assert_eq!(role_color(&pal, Role::Project), Color::Rgb(31, 62, 93));
+        assert_eq!(
+            state_style("working", &pal).fg,
+            Some(Color::Rgb(41, 82, 123))
+        );
+        let active = tab_style(&pal, Role::Project, true, true);
+        assert_eq!(active.bg, Some(Color::Rgb(31, 62, 93)));
+        assert_eq!(active.fg, Some(Color::Rgb(240, 230, 220)));
+        assert_ne!(tab_style(&pal, Role::Project, true, false).bg, active.bg);
+        assert_eq!(role_color(&Palette::default(), Role::Agent), Color::Magenta);
+    }
+
+    #[test]
+    fn loader_reads_actual_base16_keys_and_ignores_invalid_tokens() {
+        let path = std::env::temp_dir().join(format!(
+            "conductor-livery-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, r##"{"palette":{"bg":"#f2ebde","fg":"#2f2a33","urgent":"#b0472f"},"base16":{"base0D":"#345f81","base0E":"bad-token","base0B":"#4e8b45"}}"##).unwrap();
+        let pal = crate::app::load_palette(&path);
+        std::fs::remove_file(path).unwrap();
+        assert_eq!(pal.base16[13], Some((52, 95, 129)));
+        assert_eq!(pal.base16[14], None);
+        assert_eq!(pal.base16[0], None);
+        assert_eq!(pal.urgent_rgb, Some((176, 71, 47)));
+    }
 
     fn rec_with_tags(tags: serde_json::Value) -> SessionRecord {
         let mut extra = Map::new();

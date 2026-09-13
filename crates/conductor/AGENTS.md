@@ -2,64 +2,95 @@
 
 ## Invariants
 
-- **Frontend only — never a second implementation.** Every action the TUI
-  performs is `dispatch::dispatch(Invocation { door: Door::Cli, .. })`
-  through the injected `DispatchFn`. Adding logic here that computes an
-  outcome instead of dispatching for one breaks the "three doors, one
-  schema" contract — the conductor would drift from what the CLI/MCP/A2A
-  doors do.
-- **The DI seam is one-way.** `App` takes a `DispatchFn` fn-pointer
-  parameter rather than calling a trunk's assembled registry directly — this
-  crate must never depend on `cli` (or `lyra`) to get one; the app crate
-  supplies it at construction.
-- **`ui` stays pure.** `draw(frame, area, &App)` functions take `&App` and
-  paint; they never mutate state or dispatch — that discipline is what
-  makes every panel `TestBackend`-testable.
-- **Terminal restoration is belt-and-braces.** Any new exit path (a new
-  keybind, a new panic site) must still route through `TermGuard`'s `Drop`
-  or the panic hook — never leave the tty in raw/alternate-screen mode.
-- **Core, never lyra.** No dependency here may pull in wayland/image/song —
-  that would contradict "conducting is core identity, painting is lyra's."
-- **Two stage roots, never merged (command-defrag S1, 2026-08-27).**
-  `App::stage` (`aoide_storage::fs::conducting_stage_dir`, `state/stage/`)
-  is for projects/sessions/hooks/graph; `App::rice_stage`
-  (`aoide_storage::fs::stage_dir`, `song/stage/`) is for `livery.json` only
-  (the STATUS panel's palette). A new panel that reads a CONDUCTING file
-  uses `App::stage`; one that reads rice/paint state uses `App::rice_stage`.
-  They resolve to the SAME directory only under an `$AOIDE_STAGE_DIR`
-  override (every test here sets one) — don't collapse them back to one
-  `dir` variable "for simplicity," that reintroduces the coupling the
-  storage-crate split exists to remove.
-- **A keybind is scoped to its own panel's `handle_*_key` handler — a
-  letter used on one panel is free to mean something else on another
-  (P-D8: `r` = resurrect on PROJECTS, `r` = force-refresh on ROSTER, two
-  different handlers, never a collision).** Don't chase "one global keymap"
-  consistency across panels; check only the ONE handler a new binding
-  lands in for a clash, and note in the handler's own comment which other
-  panel reuses the same letter and why that's still safe.
+- Frontend only: every mutation uses the injected `DispatchFn` with a normal
+  invocation. Reuse existing command outcomes and storage types; do not
+  create another project registry, mail store, policy engine or dispatcher.
+- Rendering stays pure. `ui`, `board` and graph views draw from state;
+  input handling owns state changes and dispatch. Mouse hit testing and
+  drawing share geometry and row ordering, including scrolling and narrow
+  layouts. An action must mean the same thing by mouse and keyboard.
+- Graph zoom is a camera transform of fixed world rectangles at 50/75/100/125/150%.
+  Pointer-anchored zoom, pan limits, render and hit tests share geometry.
+  Terminal glyphs stay fixed-size and clip inside cards; never relayout
+  entities into alternative card presets when zoom changes.
+- Only the keyboard-focused pane gets a bright selection; other selected
+  regions use subdued livery shading. Controls use ASCII markers and plain
+  field labels, without editing badges or double borders.
+- Project removal snapshots its target and requires an exact-name confirmation;
+  initial keys, empty input and Escape never unregister a project.
+- Context menus snapshot their exact target. Historical actions may resurrect
+  only through the existing registered-project/native-ID or restore-snapshot
+  path; never route them to a stale live focus or project mutation. Project
+  resurrection retains the backend's undying semantics. Do not advertise
+  unsupported Rename or Kill actions.
+- Semantic colors read exact RGB Base16 tokens from rice-stage livery;
+  ANSI colors are fallbacks for absent tokens, not a competing theme.
+- History is separate from live state. Ledger entries never enter
+  `App::merged()` or the live graph. Opening one only selects historical
+  detail; stale live selection must not receive Enter, kill or focus while
+  history is displayed. Preserve explicit recorded project attribution;
+  use the existing root matcher only when attribution is absent.
+- Human mail browsing is non-consuming. Read the existing immutable base
+  through storage's `Entry` shape without recipient read/mark, receipts,
+  repair or migration writes. Keep original message IDs, canonical
+  addresses and text. Structured conversation identity is the signed
+  `threadId`, never the current participant set or subject. Aggregate
+  canonical sender, envelope target, To and Cc endpoints without changing
+  routing identity. Legacy pair correspondence stays labeled; a legacy
+  reply thread includes only the exact original whose msgid anchors it.
+  Preserve `replyTo`; new letters and forwards receive new thread IDs.
+- The mail form owns input before global navigation. Its selected field and
+  UTF-8 cursor stay consistent with mouse hit testing. Opening a tree
+  recipient action only edits a draft; it never dispatches implicitly.
+  The visible recipient tree obeys the selected To/Cc target and never
+  treats a project group as an implicit broadcast destination. To/Cc targeting
+  persists across additions. Ctrl-P changes tree/form focus; Escape leaves
+  the tree before cancelling the form. Text entry owns printable keys.
+  Reply and Forward retain the immutable original as context. Partial
+  accepted submissions cannot repeat the whole fanout; surface recipient
+  results and keep the draft locked against duplicate sends.
+- A human-composed letter is attributed to `conductor-human` and sent only
+  by explicit dispatch. Enter in the body inserts a newline. Do not
+  silently rewrite or re-sign agent-authored/delivered mail as that agent.
+- Mail interception needs a real daemon proposal gate. Neither transport
+  hold nor Pending input approvals is an editable-mail policy. Preserve
+  originals, actor attribution and exact revision decisions if that seam
+  is implemented. Do not claim outgoing archive completeness or remote sync.
+- Bounded mail/audit reads ignore incomplete final records without
+  modifying files. Failed refreshes expose the error and retain prior
+  data. Raw audit fields remain inspectable; absent facts stay unknown.
+- Conducting stage and rice stage are distinct. Project/session/hook reads
+  use `App::stage`; palette notes use `App::rice_stage`. Historical ledger,
+  mail and audit paths use their existing owning APIs.
+- Roster probes remain bounded and asynchronous; refresh throttling must
+  not freeze input. Offline cached sessions retain their last-seen status.
+- Pending IDs are array positions. Relist after every approve/deny before
+  using another selection; never recycle those indices as durable mail
+  proposal identifiers.
+- All exit paths preserve `TermGuard` restoration and panic-hook cleanup.
+  Keep terminal/mouse state correct after normal exit, errors and panics.
+- No Wayland, image, Qt, Nix or song runtime dependency enters this core
+  frontend. The bundled logo is plain text branding, sourced from the
+  Fastfetch art, not a runtime call to the desktop module.
 
 ## Extension points
 
-- **A new panel** adds a `ui` draw function + a `graphview`/`theme` helper
-  as needed, wired into `app::App`'s panel enum.
-- **A new dispatched action** is a normal `Invocation` built and passed to
-  the injected `DispatchFn` — never a bespoke code path.
-- **A new project-scoped action** (PROJECTS panel: `a`/`d`/`r` today) reads
-  the focused row via `sorted_project_names(&self.projects).get(self.
-  proj_sel)`, the same resolution every existing binding in
-  `handle_projects_key` uses — never a second way to find "the project
-  under the cursor."
-- **A project spans several roots** (`Project::roots()`, path first). A
-  PROJECTS row stays ONE selectable multi-line `ListItem` per project no
-  matter how many roots it has — `proj_sel` indexes projects, so a new root
-  is a new line inside the existing item, never a new row. The SESSION
-  panel's DAG group header deliberately shows only a project's first root
-  (D6 of the multi-root-projects lane) — extra roots are the PROJECTS
-  panel's job alone; do not duplicate them into the DAG header, which has
-  no row for them in `dag_rows`.
+A panel adds an App selection/state seam and pure renderer, then joins the
+shared navigation, keyboard and mouse geometry. Number keys 1–9 then 0 and Tab cycling follow the visible tab order. Panel-specific keys
+are scoped to their handlers; text input and overlays take priority.
 
-## Docs update required in the same commit
+Project rows represent projects, not individual roots. Use `Project::roots`
+and existing attribution/grouping helpers. Tree row models are the common
+source for rendering, focus, collapse and activation.
 
-- This `README.md` when a panel, seam, or the DI contract changes.
-- `pkgs/aoide/crates/AGENTS.md` for cross-crate invariants — not restated
-  here.
+Tests use isolated paths or injected fixtures. Never read or mutate the
+operator's ambient mail cursors, ledger, registry or terminal during unit
+checks. Add meaningful state-transition and narrow-layout tests for changed
+input/view seams; run this crate's tests, not an unrelated workspace sweep.
+
+## Documentation updates
+
+Update README.md for user-visible behavior and named seams, and DESIGN.md
+for state flow or integrity boundaries in the same commit as the change.
+Keep documents integral and current; implementation history belongs in the
+commit/log. Cross-crate invariants belong in the parent AGENTS.md.

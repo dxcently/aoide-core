@@ -1,126 +1,169 @@
 # aoide-conductor
 
-`aoide conductor` — the interactive terminal frontend over the trunk: a
-ratatui/crossterm TUI with seven panels (DAG, SESSION, PROJECTS, LOG,
-STATUS, ROSTER, PENDING). Core, never `lyra` — pure Rust, no system-closure
-weight, and conducting orchestration is Aoide's core identity (root
-`AGENTS.md`).
+`aoide conductor` is Aoide's terminal workspace for projects, agents,
+terminals and correspondence. It is a ratatui/crossterm frontend over the
+existing dispatcher and stores, usable without a desktop session.
 
-## Named seams (what it exposes)
+## Working in the conductor
 
-- `app::App` — live state (projects/sessions/hooks from the CONDUCTING stage
-  tree, `state/stage/`), audit tail, panel/node selection, the last
-  dispatched `Outcome`, the ROSTER panel's throttled `session --hosts`
-  cache, the PENDING panel's `session pending list` cache. Draws nothing.
-  `App::stage`
-  (`state/stage/`, core) and `App::rice_stage` (`song/stage/`, `livery.json`
-  only, for the STATUS panel's palette) are two DIFFERENT roots
-  (command-defrag lane S1, 2026-08-27) — they coincide only under an
-  `$AOIDE_STAGE_DIR` override (every test here sets one), diverging on the
-  default production layout.
-- `ui` — pure `draw(frame, area, &App)` view functions per panel, testable
-  with a `TestBackend`.
-- `graphview` — DAG layout + drawing.
-- `theme` — palette → `Style`, glyph vocabulary, small pure formatters.
-- `logtail` — the log-tail overlay for headless-session detail.
-- `commands` — this crate's one CLI command, `conductor`.
+Home opens as a full page with Aoide's logo outside a continuous light
+livery surface containing the central actions and recent projects, including
+the gaps between them. The surface has three columns of side padding and
+vertical padding around its controls, with darker outer margins. The logo
+is centered as one preformatted block, preserving its internal alignment. Arrows or `h` / `j` / `k` / `l` select an action or
+recent project; Enter opens it. `H` opens connected hosts and `L` opens Activity. Shared surfaces use even shading and single separator
+lines; bright selection highlights identify only the keyboard-focused region,
+while other selections retain subdued shading. Workspace views expose a project sidebar whose Agents,
+Terminals and Past groups fold independently. Past includes durable session
+ledger entries, not just ended records still retained in the current stage.
+Opening a historical entry displays its recorded facts; it does not focus,
+kill or resurrect a process.
 
-## ROSTER: presence over this box + every registered node (P-C4; selection + compose P-C5)
+| Key | View or action |
+|---|---|
+| `1` / `2` / `3` / `4` / `5` | Home / Mail / Agents / Terminals / Mesh |
+| `6` / `7` / `8` / `9` / `0` | Review / Projects / Graph / Log / Status |
+| Tab / Shift-Tab | Next / previous view |
+| Ctrl-P | Switch focus to or from the project tree; Home opens Projects |
+| Arrows or `j` / `k` | Select rows in the focused region |
+| `h` / `l`, Left / Right | Fold or unfold tree groups |
+| `e` / right-click | Actions for a tree, graph, project or session target |
+| `?` | Context help |
+| `q` / Ctrl-C | Quit outside text entry / quit globally |
 
-Rows are `session --hosts --json`'s `Outcome.data` (the standalone `who`
-command this used to dispatch is retired — session-surface redesign,
-command-defrag lane X, 2026-08-28 — folded into bare `session`'s `--hosts`
-grouping; same `Outcome` shape, only the dispatched path/flags changed),
-dispatched through the same injected `DispatchFn` as every other action —
-never re-derived — parsed into `App::roster_nodes()` (local box first, then
-nodes, exactly the roster's own order), then flattened into
-`App::roster_flat_rows()` for selection (one `Vec` is the single source of
-truth for both render and key handling, the same shape `App::dag_rows()`
-uses over the DAG). Node glyphs (`●`/`◐`/`○` —
-online/unreachable/never-pulled) call `aoide_conduct::graph::glyph`
-directly (`conduct/src/graph/who.rs`'s `pub` roster-presence helper — no
-forked copy here); session glyphs reuse the conductor's existing
-musical-note set (`theme::state_glyph`) since the roster classifies
-sessions off the identical state vocabulary the SESSION panel already
-reads.
+The single-line `𝄞 CONDUCTOR` header exposes project, agent and terminal count
+buttons. Semantic colors use the livery Base16 tokens as exact RGB: projects
+use base0D, agents base0E, terminals base0C and mail base09. Focused tabs use
+their role color as a fill; inactive selections retain subdued livery shading.
+Missing tokens fall back to ANSI colors. A single border encloses the tabs;
+the hint bar and status bar use distinct livery shades without ornaments.
+Controls use ASCII marks such as `[+]`, `[-]`, `[+ To]` and `[+ Cc]`;
+field labels remain plain, with focus shown by shading and the cursor.
 
-`session --hosts` performs a LIVE network probe of every registered node
-(~2s/node, parallel) on every invocation, so this pane throttles: it
-re-dispatches at most every ~15s while VISIBLE, never on every ~500ms tick.
-Switching into the pane with a stale cache fires one immediate fetch; `r`
-forces one regardless of the throttle window. The dispatch itself runs on
-its own `std::thread` (mirroring the roster core's own internal
-`probe_nodes` pattern) and reports back over an `mpsc` channel the tick
-loop polls without blocking — the one dispatch in this crate that does not
-go through the synchronous `App::dispatch` (which every mutating action
-uses), because the roster never mutates anything and its live probes would
-otherwise freeze the tick loop for the probe's duration.
+Mouse navigation selects the same tabs, tree rows, content rows and actions
+as keyboard navigation. Visible action labels explain panel-specific keys.
+Text entry takes precedence over navigation shortcuts. Bracketed paste inserts
+text into the active field without interpreting it as commands.
 
-`j`/`k` walk the flattened rows; `s` on a selected SESSION row (P-C5) opens
-the existing inline `Input` line editor, pre-labeled with that row's own
-display-grammar label, and on submit dispatches `send --to <target>
---yes -- <text>` through `App::dispatch_with_flags` — the same single
-dispatch seam, just with flags. `--yes` is a documented no-op for a REMOTE
-target (`conduct/src/graph/send.rs::deliver_remote` folds that note
-straight into the `Outcome` message, so `App::status_message` surfaces it
-same as any other dispatch, no special-casing needed here).
+In Graph, Space + left drag or middle drag pans the canvas; the wheel pans
+vertically and Shift + wheel pans horizontally. Ctrl + wheel zooms the
+camera through 50%, 75%, 100%, 125% and 150%, anchored at the pointer.
+Project and session nodes keep their world positions and card dimensions;
+zoom transforms that same layout rather than choosing a different card
+preset. Terminal glyphs stay cell-sized, so labels clip within their visible
+boxes. Rendering, selection and mouse hits share the transformed rectangles.
 
-## PENDING: held `send` / A2A entries, approve/deny (P-C5)
+Actions open a target-specific menu. Arrows or `j` / `k` select an entry,
+Enter applies it and Escape closes the menu.
 
-Rows are `session pending list --json`'s `Outcome.data`, dispatched through
-the same injected `DispatchFn`, parsed into `App::pending_rows()` — never
-re-derived: the malformed-entry detection and display-grammar rendering
-stay in `conduct::graph::pending`. Unlike ROSTER's `session --hosts`,
-`session pending list` is a local file read (no network), so there is no throttle and no
-background thread: `App::refresh_pending` runs synchronously, called from
-`reload_all` (which fires after every dispatch) and from the tick loop
-while the pane is visible.
+| Target | Available actions |
+|---|---|
+| Every target | Details |
+| Live local session | Open / focus; Set project (blank restores automatic attribution) |
+| Live local agent with a mailbox petname | Write letter |
+| Project | Write letter recipient chooser; Add folder; Resurrect its existing undying set |
+| Historical session with a registered project and native session ID or restore snapshot | Resurrect that exact session |
 
-`j`/`k` walk the rows; `a`/`d` approve/deny the selected one. **The
-invariant**: `session pending list`'s `id` is the entry's ARRAY POSITION, not
-a stable id (`conduct/src/graph/pending.rs`'s module doc) — resolving one
-entry shifts every id after it. `App::dispatch` already re-lists via
-`reload_all` -> `refresh_pending` synchronously before the next paint, so a
-second a/d keypress in the same visit always resolves the row actually on
-screen, never a stale index.
+Historical actions never focus a stale process. The menu retains the exact
+selected target through dispatch. Rename and Kill are not context actions.
 
-## PROJECTS: register/remove/resurrect (P-D8 adds `r`)
+Projects use the existing project registry and its multiple-root model.
+Removing a project from Projects or a session group opens a confirmation.
+Type the exact project name and press Enter to unregister it; Escape cancels.
+This removes the registration, not project files.
+Mesh reuses bounded asynchronous `session --hosts` probes with cached
+fallback; a last-seen remote session is not asserted to be currently live.
+Session steering dispatches `send`; Mail dispatches signed correspondence.
+Pending remains the conductor-input/A2A approval queue, not mail editing.
 
-Rows are `App::projects` (the live-loaded `projects.json`, already read for
-the DAG panel's own anchoring), sorted by name (`sorted_project_names`) for
-a stable, deterministic row order independent of file-write order. A row is
-ONE selectable item per project regardless of how many roots it has —
-`proj_sel` indexes projects, never roots — rendered as its head line (name,
-meter, first root) plus one dim line per extra root. `j`/`k` walk the rows;
-`a` opens the same inline `Input` line editor ROSTER's compose flow uses to
-`project add <path>` — naming a project that already exists ADDS that path
-as a root rather than creating a second project; `d` dispatches `project
-remove <name>` (the whole project, every root) for the row under the
-cursor. Growing a project past its first root this way is the only path
-the TUI offers; replacing a root list outright is `project edit`, CLI-only
-this slice — no key binding claims it here. `r` (P-D8,
-`docs/architecture/AOIDED.md`'s "L5") dispatches `resurrect --project
-<name>` through `App::dispatch_with_flags` — the SAME single dispatch seam
-every other action uses, just with the project name riding as a flag
-rather than a positional arg (`resurrect` takes no positional args
-at all). `r` is unclaimed on this panel (it binds only `j`/`k`/`a`/`d`
-otherwise); the ROSTER panel's own `r` = force-refresh is a different
-handler, different panel, so the two never collide. All three actions are
-no-ops with the cursor on an empty list.
+## Correspondence and activity
 
-## What it consumes
+Mail groups structured letters by their signed `threadId`, independent of
+who joins later. Letters appear in local received-sequence order; the
+participant roster includes observed senders, envelope targets, To and Cc.
+Separate thread IDs stay separate even between the same people. Thread
+labels use the earliest available nonempty subject.
 
-`aoide-protocol`, `aoide-conduct` (`build_graph`/`merged_sessions`/
-`anchor_for` — reused, never re-derived), `aoide-storage`. Reads stage files
-directly for live state (`aoide_storage::fs::conducting_stage_dir` for
-projects/sessions/hooks/graph, `stage_dir` for `livery.json` — see
-`app::App`'s own seam note above); does not depend on `aoide-server`.
+Letters without a thread ID appear as explicitly labeled legacy pair
+correspondence. Replying to one uses that original message ID as the thread
+ID and attaches only that original letter, not unrelated pair history.
+Replies retain the thread ID and record the original message ID in
+`replyTo`; a new letter or forward begins a new thread. These are local
+archive views, not room membership or complete cross-host outgoing history.
+Browsing performs no remote synchronization.
 
-## How it composes
+`n` creates a letter; `s`, `a` and `f` open Reply, Reply all and Forward.
+The form keeps From, To, Cc, Subject and Message visible together with the
+selected original letter. To and Cc accept comma-separated `node/mailbox`
+addresses. The visible recipient tree lets you add individual agents while
+composing: choose `[+ To]` or `[+ Cc]`, then a recipient. Project groups
+organize those choices; selecting a project never broadcasts to all its agents.
+Adding a recipient changes the draft only, without sending. The selected
+To/Cc target remains active across recipient additions. Ctrl-P switches focus
+between the recipient tree and the form. Escape from the tree returns to the
+form before a further Escape can cancel the draft.
 
-Only `cli` depends on it — `conductor` never ships in `lyra`. **The one
-rule**: it is a FRONTEND, never a second implementation. Every action
-dispatches through `dispatch::dispatch(Invocation { door: Door::Cli, .. })`
-via a dependency-injected `DispatchFn` (Phase 6a's DI seam) so the single
-audit log records conductor actions exactly like a typed command — nothing
-here parses or re-derives a command.
+Click a field to edit it, or use Tab / Shift-Tab to move between fields.
+The active field and text cursor are visible. Enter inserts a newline in
+Message; elsewhere it advances to the next field. Arrow keys, Home/End,
+Backspace and Delete edit text. Ctrl-S or the Send control dispatches the
+letter; Escape in the form or Cancel discards the draft. Field labels stay
+plain, with the cursor and shading indicating focus. Text input takes
+priority over navigation and quit shortcuts, so typing `q` enters a letter.
+
+Sending uses `mail send` with the explicit sender `conductor-human`.
+Subject, To, Cc, thread ID and reply reference are structured content inside
+the signed body; the backend files or queues an envelope for each distinct
+recipient. A listed Cc address
+alone is not proof of delivery. Local canonical addresses route through the
+local delivery path. A partial failure keeps recipient results visible and
+locks the submitted draft against resending successful recipients. An
+entirely rejected submission remains editable. Browsing never advances an
+agent's cursor, emits a receipt or rewrites a signed message.
+
+Mail retains at most 200 letters from the last 2 MiB of the existing base.
+Activity likewise reads at most 200 complete events from the last 2 MiB of
+the audit JSONL. Selecting an event shows recorded time, door, class,
+command, status, message and full raw JSON, including additional fields.
+Missing facts are labeled rather than invented. Page Up/Down scrolls event
+detail. Incomplete trailing writes wait for another refresh; errors remain
+visible alongside the previous successful snapshot.
+
+## Named seams
+
+| Module | Owns |
+|---|---|
+| `app::App` | Loaded state, selections, folding, history, asynchronous roster refresh and dispatched actions |
+| `board` | Home/workspace composition, navigation, sidebar and shared drawing/hit-test geometry |
+| `ui` | Pure panel/detail/overlay rendering |
+| `graphview` | Graph layout, blocks and connections |
+| `mailview` | Non-consuming local letters, signed thread grouping and legacy pair correspondence |
+| `eventview` | Bounded audit reader and full-record event rendering |
+| `logtail` | Read-only headless-session log overlay |
+| `theme` | Styles, glyphs and shared formatters |
+| `commands` | Registration of `conductor` |
+
+The CLI supplies an injected `DispatchFn`; this crate does not assemble a
+second command registry or depend on the CLI/daemon implementation. Mutations
+use that dispatch seam. Pure views read state without performing actions.
+
+Projects, sessions and hooks come from the conducting stage (`state/stage`).
+Past sessions come from `state/session-ledger.jsonl`. Mail uses the existing
+mail base; Activity uses the existing audit path. The rice stage
+(`song/stage`) supplies palette notes only and is not the conducting store.
+
+`assets/logo.txt` bundles the plain text art from
+`modules/dendrites/fastfetch/ascii-fetch`. Its inclusion adds no runtime Nix,
+Fastfetch or Qt dependency. Conductor belongs to the core binary, not Lyra.
+
+## Mail review boundary
+
+Editing/intercepting agent mail before dispatch is not implemented. It needs
+a daemon-enforced proposal gate with stable IDs, exact-revision approval,
+preserved original text and operator attribution. Transport outbox hold and
+the existing Pending panel do not provide that guarantee. Delivered signed
+letters remain immutable; corrections are new messages.
+
+See [DESIGN.md](DESIGN.md) for state flow and the remaining review seam.
+Run `cargo test -p aoide-conductor` from the package workspace for this
+crate's model, input and rendering checks.
