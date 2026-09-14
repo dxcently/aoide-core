@@ -1017,7 +1017,14 @@ mod tests {
             }],
             vec![root, kid],
         );
-        let out = render_panel(&app, Panel::Graph, 220, 40);
+        // Three ranks (project → root → kid) stand 3×CARD_H + 2×RANK_GAP =
+        // 27 world rows tall, and the camera centres the default selection
+        // (the topmost card) rather than top-aligning — so the pane itself
+        // must be tall enough to pull the origin to 0 and still clear the
+        // bottom-most card. 50 rows of graph content does that with room to
+        // spare; the other 10 are this panel's header/nav/border/action
+        // row/status-bar chrome.
+        let out = render_panel(&app, Panel::Graph, 220, 60);
         assert!(out.contains("GRAPH"), "panel title rendered");
         assert!(
             out.contains("PROJECT") && out.contains("aoide"),
@@ -1214,7 +1221,10 @@ mod tests {
             }],
             vec![root, sub],
         );
-        let out = render_panel(&app, Panel::Graph, 220, 40);
+        // Same 3-rank project → root → subagent chain as
+        // `graph_panel_draws_nodes_edges_and_tags`; see that test's comment
+        // for the viewport arithmetic.
+        let out = render_panel(&app, Panel::Graph, 220, 60);
         assert!(
             out.contains("claude · m"),
             "subagent chip carries its model tag: {out}"
