@@ -245,12 +245,12 @@ impl<'a> Painter<'a> {
             return;
         }
         let (cx, cy) = (self.area.x + x as u16, self.area.y + y as u16);
-        self.buf[(cx, cy)].set_symbol(symbol).set_style(style);
-        // ratatui's own convention for a wide glyph: the cells it covers carry
-        // an empty symbol so the buffer's width bookkeeping stays right.
-        for i in 1..width as u16 {
-            self.buf[(cx + i, cy)].set_symbol("").set_style(style);
-        }
+        // `set_stringn` already resets every cell a wide glyph covers to
+        // `Cell::EMPTY` -- whose `symbol()` reads back as `" "`, not `""` --
+        // and already refuses to write a glyph past `max_width`, so the
+        // signed-coordinate precheck above and this one call are the whole
+        // method.
+        self.buf.set_stringn(cx, cy, symbol, width as usize, style);
     }
 }
 
@@ -439,7 +439,10 @@ mod tests {
         let mut buf = Buffer::empty(area);
         Painter::new(&mut buf, area).set(1, 0, "界", 2, Style::default());
         assert_eq!(buf[(1, 0)].symbol(), "界");
-        assert_eq!(buf[(2, 0)].symbol(), "");
+        // A reset cell's symbol is `" "` (`Cell::EMPTY.symbol()`), never
+        // `""` -- not a regression for a real draw, since `Buffer::diff_iter`
+        // skips the trailing cell of a wide glyph rather than inspecting it.
+        assert_eq!(buf[(2, 0)].symbol(), " ");
     }
 
     #[test]
