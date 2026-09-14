@@ -115,11 +115,28 @@ the same retained world, so they agree by construction rather than by one
 frame leaving notes for the next event.
 
 Connectors paint straight into the frame buffer through the clipping
-`Painter`, never through `ratatui`'s `Canvas` widget: `Canvas` draws with
-sub-cell braille and half-block marks, which cannot carry this graph's
-box-drawing junction grammar (`┌ ┐ ┬ ┼` and their mirrors) at cell resolution,
-nor a distinct state colour per edge on a specific cell. Terminal glyphs stay
-fixed-size here, and a `Canvas` has no cell to hold one in.
+`Painter`, never through `ratatui`'s `Canvas` widget. Every grid a `Canvas`
+`Marker` can select -- Braille, the block/dot/bar `CharGrid`, the
+octant/quadrant/sextant pattern grids, `HalfBlock` -- shares one
+`Grid::paint(x, y, color)` method that takes a colour and nothing else, and
+`CharGrid::save()`, the marker closest to cell resolution, emits a single
+fixed glyph for every painted cell in the whole grid rather than one chosen
+per cell. No `Marker` lets a caller pick a different glyph per dot, so none
+can carry a mixed box-drawing grammar where a junction, a horizontal run and
+a vertical run (`┌ ┐ ┬ ┼` and their mirrors) are three different characters
+at three different cells. `Canvas`'s only path for arbitrary text,
+`Context::print`, does not help either: it accepts a label only when its
+anchor point falls inside the world bounds, then separately clips the
+rendered string against the buffer's right edge in screen space -- two
+partial checks in two coordinate systems, not the one whole-glyph precheck
+this crate's own `Painter` already does before it writes anything. Terminal
+glyphs stay fixed-size here, and neither a `Canvas` grid nor its label path
+has a cell that can hold one.
+
+Ratatui ships no node/edge/tree/DAG widget to reach for instead: `GraphType`
+belongs to `Chart`/`Dataset` and names a Cartesian series style (`Scatter`,
+`Line`, `Bar`, `Area`), a plotting-axis concept with nothing to do with graph
+topology.
 
 Focus walks the graph undirected from the selected node and draws that
 component alone; All draws every node. The synthetic root gathering sessions
