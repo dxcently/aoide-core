@@ -86,16 +86,27 @@ pub(crate) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     // so the message gets its own width first and the hint takes what's left
     // -- measured in display cells, never bytes (the hints carry `·`, two
     // bytes for one cell, which used to starve the message down to a stub).
+    // A one-column gap is reserved between them so a hint that fills its
+    // whole share of the width can never abut the message; the hint is what
+    // gets clipped (or dropped entirely) when that gap can't fit.
     let msg_w = crate::board::cells(&left).min(area.width);
-    let hint_w = (crate::board::cells(hint) + 1).min(area.width.saturating_sub(msg_w));
-    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(hint_w)]).split(area);
+    let gap: u16 = 1;
+    let hint_room = area.width.saturating_sub(msg_w).saturating_sub(gap);
+    let hint_w = (crate::board::cells(hint) + 1).min(hint_room);
+    let gap_w = area.width - msg_w - hint_w;
+    let cols = Layout::horizontal([
+        Constraint::Length(msg_w),
+        Constraint::Length(gap_w),
+        Constraint::Length(hint_w),
+    ])
+    .split(area);
     f.render_widget(
         Paragraph::new(Line::from(left)).style(theme::accent_style(&app.palette)),
         cols[0],
     );
     f.render_widget(
         Paragraph::new(Line::from(hint).style(theme::dim()).right_aligned()),
-        cols[1],
+        cols[2],
     );
 }
 
@@ -1744,6 +1755,51 @@ mod tests {
         assert!(
             out.contains(" ready"),
             "the message still renders whole at a narrow width: {out:?}"
+        );
+    }
+
+    /// The exact live repro, one step further: the prior fix stopped the
+    /// hint from truncating the message but left zero columns between the
+    /// two, so at 118 columns they rendered as the glued nonsense
+    /// "readyj/k...". The message must survive AND a gap must separate it
+    /// from the hint.
+    #[test]
+    fn status_bar_never_glues_the_message_to_the_hint_at_118_columns() {
+        let mut a = App::for_test(vec![], vec![], vec![]);
+        a.panel = Panel::Graph;
+        let backend = TestBackend::new(118, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_status(f, f.area(), &a)).unwrap();
+        let out = dump(term.backend().buffer());
+        assert!(
+            out.contains(" ready"),
+            "the message must render intact: {out:?}"
+        );
+        assert!(
+            !out.contains("readyj"),
+            "the message and the hint's first word must not abut: {out:?}"
+        );
+        let after_message = out.find(" ready").unwrap() + " ready".len();
+        assert_eq!(
+            out.as_bytes().get(after_message),
+            Some(&b' '),
+            "a blank column separates the message from the hint: {out:?}"
+        );
+    }
+
+    /// A width too narrow for the hint at all: the message still renders
+    /// whole and nothing panics -- the hint is what disappears entirely.
+    #[test]
+    fn status_bar_keeps_the_message_at_a_very_narrow_width() {
+        let mut a = App::for_test(vec![], vec![], vec![]);
+        a.panel = Panel::Graph;
+        let backend = TestBackend::new(30, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_status(f, f.area(), &a)).unwrap();
+        let out = dump(term.backend().buffer());
+        assert!(
+            out.contains(" ready"),
+            "the message still renders whole at a very narrow width: {out:?}"
         );
     }
 }
