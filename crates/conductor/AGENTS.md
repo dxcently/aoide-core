@@ -8,7 +8,10 @@
 - Rendering stays pure. `ui`, `board` and graph views draw from state;
   input handling owns state changes and dispatch. Mouse hit testing and
   drawing share geometry and row ordering, including scrolling and narrow
-  layouts. An action must mean the same thing by mouse and keyboard.
+  layouts. A popup is sized from its own measured content, and the draw
+  path and the hit test call the same sizing function so the click target
+  is always the drawn rectangle. An action must mean the same thing by
+  mouse and keyboard.
 - The graph is a retained scene. World positions, camera, view and the selected
   node's identity live in `App::graph`; a frame reads them and never rebuilds
   the world. Placement keeps a surviving node's rectangle, re-places a node
