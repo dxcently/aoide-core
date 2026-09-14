@@ -2,7 +2,7 @@
 
 use crate::app::{App, LogLine};
 use ratatui::{
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame,
@@ -90,21 +90,15 @@ fn detail(row: &LogLine) -> String {
 
 pub fn parts(area: Rect) -> (Rect, Rect) {
     let wide = area.width >= 85;
-    let p = Layout::default()
-        .direction(if wide {
-            Direction::Horizontal
-        } else {
-            Direction::Vertical
-        })
-        .constraints(if wide {
-            vec![Constraint::Percentage(40), Constraint::Percentage(60)]
-        } else {
-            vec![
-                Constraint::Length((area.height / 3).max(6).min(area.height)),
-                Constraint::Min(0),
-            ]
-        })
-        .split(area);
+    let p = if wide {
+        Layout::horizontal([Constraint::Percentage(40), Constraint::Percentage(60)]).split(area)
+    } else {
+        Layout::vertical([
+            Constraint::Length((area.height / 3).max(6).min(area.height)),
+            Constraint::Min(0),
+        ])
+        .split(area)
+    };
     (p[0], p[1])
 }
 pub fn draw(f: &mut Frame, area: Rect, app: &App) {
@@ -189,5 +183,18 @@ mod tests {
         assert_eq!(rows[0].ts, 5);
         assert_eq!(rows.last().unwrap().ts, 204);
         assert!(decode_tail(b"bad\n", false).is_err());
+    }
+
+    #[test]
+    fn parts_splits_horizontally_when_wide_and_vertically_when_narrow() {
+        let wide = Rect::new(0, 0, 100, 40);
+        let (list, detail) = parts(wide);
+        assert_eq!(list, Rect::new(0, 0, 40, 40));
+        assert_eq!(detail, Rect::new(40, 0, 60, 40));
+
+        let narrow = Rect::new(0, 0, 60, 30);
+        let (list, detail) = parts(narrow);
+        assert_eq!(list, Rect::new(0, 0, 60, 10));
+        assert_eq!(detail, Rect::new(0, 10, 60, 20));
     }
 }
