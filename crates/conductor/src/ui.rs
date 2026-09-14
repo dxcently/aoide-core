@@ -1070,6 +1070,17 @@ mod tests {
             out.contains("prune"),
             "status bar keymap hint carries prune: {out}"
         );
+        // Both fixture sessions are titleless with no model, so each card's
+        // detail row alone carries its harness ("claude"); the tree also
+        // names each session's harness once. Four total, not six -- a card
+        // with an empty title must not ALSO echo the harness on its own
+        // title-fallback row above the detail row that already has it.
+        assert_eq!(
+            out.matches("claude").count(),
+            4,
+            "harness printed once per card, not doubled by an empty-title \
+             fallback: {out}"
+        );
     }
 
     #[test]
@@ -1247,6 +1258,18 @@ mod tests {
         assert!(
             out.contains("claude · m"),
             "subagent chip carries its model tag: {out}"
+        );
+        // Both sessions are titleless, so each card's harness lives only in
+        // its detail row ("claude" alone for the root, "claude · m" for the
+        // subagent); the tree names each session's harness once more. Four
+        // total, not six -- an empty title must not also echo the harness
+        // on its own title-fallback row above a detail row that already
+        // carries it.
+        assert_eq!(
+            out.matches("claude").count(),
+            4,
+            "harness printed once per card, not doubled by an empty-title \
+             fallback: {out}"
         );
     }
 

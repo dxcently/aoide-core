@@ -1013,20 +1013,6 @@ fn block_cells_at(
                 .join(" ")
         )
     };
-    let main = if n.kind == NodeKind::Session && !n.title.is_empty() {
-        &n.title
-    } else {
-        &n.label
-    };
-    let identity = if n.kind == NodeKind::Session {
-        if n.title.is_empty() {
-            String::new()
-        } else {
-            fit_label(&n.label, budget)
-        }
-    } else {
-        truncate_end(&n.title, budget)
-    };
     let detail = match (&n.harness, n.model.as_deref()) {
         (h, Some(m)) if !h.is_empty() => format!("{h} · {m}"),
         (_, Some(m)) => m.into(),
@@ -1050,41 +1036,32 @@ fn block_cells_at(
             format!("{name} (…{tail})")
         })
         .unwrap_or_else(|| n.label.clone());
-    let rows = if n.kind == NodeKind::Session {
+    // An ordered (text, style) sequence, one entry per would-be row, with
+    // empty entries dropped and the survivors renumbered by `enumerate` --
+    // so a titleless card never leaves a blank row where the title would
+    // have gone, and never repeats the harness name the detail row
+    // (`harness · model`) already carries.
+    let rows: Vec<(String, Style)> = if n.kind == NodeKind::Session {
         vec![
             (
-                1,
-                truncate_end(
-                    if n.title.is_empty() {
-                        &n.harness
-                    } else {
-                        &n.title
-                    },
-                    budget,
-                ),
+                truncate_end(&n.title, budget),
                 surface.add_modifier(Modifier::BOLD),
             ),
-            (2, fit_label(&card_identity, budget), surface),
-            (3, truncate_end(&detail, budget), surface.fg(accent)),
-            (4, heading, surface.patch(theme::state_style(state, pal))),
-            (5, truncate_end(&n.activity, budget), surface),
+            (fit_label(&card_identity, budget), surface),
+            (truncate_end(&detail, budget), surface.fg(accent)),
+            (heading, surface.patch(theme::state_style(state, pal))),
+            (truncate_end(&n.activity, budget), surface),
         ]
     } else {
         vec![
-            (1, heading, surface.fg(accent).add_modifier(Modifier::BOLD)),
+            (heading, surface.fg(accent).add_modifier(Modifier::BOLD)),
             (
-                2,
-                if n.kind == NodeKind::Session && n.title.is_empty() {
-                    fit_label(main, budget)
-                } else {
-                    truncate_end(main, budget)
-                },
+                truncate_end(&n.label, budget),
                 surface.add_modifier(Modifier::BOLD),
             ),
-            (3, identity, surface),
-            (4, detail, surface),
+            (truncate_end(&n.title, budget), surface),
+            (detail, surface),
             (
-                5,
                 n.tags
                     .iter()
                     .map(|tag| format!("[{tag}]"))
@@ -1094,7 +1071,12 @@ fn block_cells_at(
             ),
         ]
     };
-    for (y, text, style) in rows {
+    for (idx, (text, style)) in rows
+        .into_iter()
+        .filter(|(text, _)| !text.is_empty())
+        .enumerate()
+    {
+        let y = idx + 1;
         if y >= height - 1 {
             continue;
         }
@@ -2180,5 +2162,25 @@ mod tests {
         );
         select_index(&mut app, 0);
         assert!(selected_session_id(&app).is_none());
+    }
+
+    #[test]
+    fn a_titleless_card_prints_its_harness_only_once() {
+        // Regression: an empty title used to fall back to printing the
+        // harness on its own row, which the detail row ("harness · model",
+        // or the bare harness with no model) already carried -- so a
+        // titleless card showed its harness twice. Dropping empty rows and
+        // compacting the rest means the harness now appears on exactly one
+        // row: the detail row.
+        let rec = session("r", "/x", "working", None); // title stays None
+        let app = App::for_test(vec![], vec![rec], vec![]);
+        let model = build_model(&app);
+        let cells = block_cells(node(&model, "r"), false, &app.palette);
+        let text: String = cells.iter().flatten().map(|c| c.ch).collect();
+        assert_eq!(
+            text.matches("claude").count(),
+            1,
+            "harness appears exactly once on a titleless card: {text:?}"
+        );
     }
 }
