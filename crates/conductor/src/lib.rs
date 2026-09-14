@@ -61,6 +61,7 @@ pub mod eventview;
 pub mod graphview;
 pub mod logtail;
 pub mod mailview;
+pub mod scene;
 pub mod theme;
 pub mod ui;
 
@@ -169,8 +170,8 @@ fn event_loop(terminal: &mut Terminal<CrosstermBackend<Stdout>>, app: &mut App) 
                 Event::Key(key)
                     if key.kind == KeyEventKind::Release && key.code == KeyCode::Char(' ') =>
                 {
-                    app.graph_pan_mode = false;
-                    app.graph_drag = None;
+                    app.graph.pan_mode = false;
+                    app.graph.drag = None;
                 }
                 // A press/repeat that `handle_key` reports as a quit ends the
                 // loop. The guard short-circuits, so `handle_key` (which mutates
@@ -302,8 +303,8 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if key.code == KeyCode::Esc {
         app.sidebar_focused = false;
         app.mail_room_focus = false;
-        app.graph_pan_mode = false;
-        app.graph_drag = None;
+        app.graph.pan_mode = false;
+        app.graph.drag = None;
         return false;
     }
     if app.panel == Panel::Home {
@@ -360,7 +361,7 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
             board::Hit::Tree(app.sidebar_sel)
         } else {
             board::Hit::Row(match app.panel {
-                Panel::Graph => app.graph_sel,
+                Panel::Graph => graphview::selected_index(app),
                 Panel::Projects => app.proj_sel,
                 _ => app.dag_sel,
             })
@@ -376,21 +377,17 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         )
     {
         let nodes = graphview::node_order(app);
-        if let Some(node) = nodes.get(app.graph_sel) {
+        let selected = graphview::selected_index(app);
+        if let Some(node) = nodes.get(selected) {
             if matches!(key.code, KeyCode::Left | KeyCode::Char('h')) {
-                if let Some(i) = nodes[..app.graph_sel]
-                    .iter()
-                    .rposition(|n| n.depth < node.depth)
-                {
-                    app.graph_sel = i;
-                    app.graph_pan = None;
+                if let Some(i) = nodes[..selected].iter().rposition(|n| n.depth < node.depth) {
+                    graphview::select_index(app, i);
                 }
             } else if nodes
-                .get(app.graph_sel + 1)
+                .get(selected + 1)
                 .is_some_and(|n| n.depth > node.depth)
             {
-                app.graph_sel += 1;
-                app.graph_pan = None;
+                graphview::select_index(app, selected + 1);
             }
         }
         return false;
@@ -407,13 +404,13 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
     if app.panel == Panel::Graph && !app.sidebar_focused {
         if key.code == KeyCode::Char(' ') {
             if key.kind != KeyEventKind::Repeat {
-                app.graph_pan_mode = !app.graph_pan_mode;
+                app.graph.pan_mode = !app.graph.pan_mode;
             }
             return false;
         }
         if key.code == KeyCode::Esc {
-            app.graph_pan_mode = false;
-            app.graph_drag = None;
+            app.graph.pan_mode = false;
+            app.graph.drag = None;
             return false;
         }
     }
@@ -698,26 +695,26 @@ fn handle_mouse(app: &mut App, area: ratatui::layout::Rect, mouse: MouseEvent) {
             MouseEventKind::Down(button)
                 if canvas.contains(point)
                     && (button == MouseButton::Middle
-                        || (button == MouseButton::Left && app.graph_pan_mode)) =>
+                        || (button == MouseButton::Left && app.graph.pan_mode)) =>
             {
                 let (x, y) = graphview::graph_origin(app, canvas);
-                app.graph_drag = Some((mouse.column, mouse.row, x, y));
+                app.graph.drag = Some((mouse.column, mouse.row, x, y));
                 app.sidebar_focused = false;
                 return;
             }
-            MouseEventKind::Drag(_) if app.graph_drag.is_some() => {
-                let (sx, sy, ox, oy) = app.graph_drag.unwrap();
+            MouseEventKind::Drag(_) if app.graph.drag.is_some() => {
+                let (sx, sy, ox, oy) = app.graph.drag.unwrap();
                 let (w, h) = graphview::graph_extent(app);
-                let x = (ox as i64 + sx as i64 - mouse.column as i64).max(0) as usize;
-                let y = (oy as i64 + sy as i64 - mouse.row as i64).max(0) as usize;
-                app.graph_pan = Some((
-                    x.min(w.saturating_sub(canvas.width as usize)),
-                    y.min(h.saturating_sub(canvas.height as usize)),
+                let x = (ox + sx as i32 - mouse.column as i32).max(0);
+                let y = (oy + sy as i32 - mouse.row as i32).max(0);
+                app.graph.camera.pan = Some((
+                    x.min((w - canvas.width as i32).max(0)),
+                    y.min((h - canvas.height as i32).max(0)),
                 ));
                 return;
             }
             MouseEventKind::Up(_) => {
-                app.graph_drag = None;
+                app.graph.drag = None;
                 return;
             }
             MouseEventKind::ScrollUp
@@ -738,14 +735,10 @@ fn handle_mouse(app: &mut App, area: ratatui::layout::Rect, mouse: MouseEvent) {
                     MouseEventKind::ScrollDown | MouseEventKind::ScrollRight
                 );
                 let n = if horizontal { &mut x } else { &mut y };
-                *n = if forward {
-                    n.saturating_add(3)
-                } else {
-                    n.saturating_sub(3)
-                };
-                app.graph_pan = Some((
-                    x.min(w.saturating_sub(canvas.width as usize)),
-                    y.min(h.saturating_sub(canvas.height as usize)),
+                *n = if forward { *n + 3 } else { *n - 3 };
+                app.graph.camera.pan = Some((
+                    x.clamp(0, (w - canvas.width as i32).max(0)),
+                    y.clamp(0, (h - canvas.height as i32).max(0)),
                 ));
                 return;
             }
@@ -812,7 +805,7 @@ fn handle_mouse(app: &mut App, area: ratatui::layout::Rect, mouse: MouseEvent) {
                             app.log_sel = i;
                             app.log_scroll = 0;
                         }
-                        Panel::Graph => app.graph_sel = i,
+                        Panel::Graph => graphview::select_index(app, i),
                         _ => {}
                     }
                 }
@@ -923,7 +916,7 @@ fn open_context_hit(app: &mut App, hit: board::Hit, x: u16, y: u16) {
             }
         }
         board::Hit::Row(i) if app.panel == Panel::Graph => {
-            app.graph_sel = i;
+            graphview::select_index(app, i);
             app.sidebar_focused = false;
             if let Some(node) = graphview::node_order(app).get(i) {
                 if let Some(id) = &node.session_id {
@@ -1218,7 +1211,7 @@ mod tests {
             modifiers: KeyModifiers::CONTROL,
         };
         handle_mouse(&mut app, area, event);
-        assert_eq!(app.graph_zoom, 1);
+        assert_eq!(app.graph.camera.zoom, 1);
         handle_mouse(
             &mut app,
             area,
@@ -1229,7 +1222,7 @@ mod tests {
                 ..event
             },
         );
-        assert_eq!(app.graph_zoom, 0);
+        assert_eq!(app.graph.camera.zoom, 0);
         handle_mouse(
             &mut app,
             area,
@@ -1239,7 +1232,132 @@ mod tests {
                 ..event
             },
         );
-        assert_eq!(app.graph_zoom, 0);
+        assert_eq!(app.graph.camera.zoom, 0);
+        assert!(app.last_outcome.is_none());
+    }
+
+    /// The all/focus switch means the same thing by key and by click, and the
+    /// scene's own state — not a render — is what either one moves.
+    #[test]
+    fn all_and_focus_toggle_the_same_way_by_key_and_by_click() {
+        let session = |id: &str, cwd: &str| SessionRecord {
+            session_id: id.into(),
+            agent: "claude".into(),
+            cwd: cwd.into(),
+            state: "working".into(),
+            ..Default::default()
+        };
+        let project = |name: &str, path: &str| aoide_conduct::graph::Project {
+            name: name.into(),
+            path: path.into(),
+            ..Default::default()
+        };
+        let mut app = App::for_test(
+            vec![project("one", "/one"), project("two", "/two")],
+            vec![session("a", "/one"), session("b", "/two")],
+            vec![],
+        );
+        app.panel = Panel::Graph;
+        app.sidebar_focused = false;
+        app.sync_graph_scene();
+
+        // Focus is the default and draws only the picked project's own forest.
+        assert_eq!(app.graph.view, crate::scene::View::Focus);
+        let focused = graphview::node_order(&app).len();
+        let whole = graphview::build_model(&app).nodes.len();
+        assert!(focused < whole, "{focused} of {whole} nodes in focus");
+
+        handle_key(&mut app, KeyEvent::from(KeyCode::Char('a')));
+        assert_eq!(app.graph.view, crate::scene::View::All);
+        assert_eq!(graphview::node_order(&app).len(), whole);
+
+        // The action control carries the same key, so the click routes through
+        // the identical handler rather than a parallel path.
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        let g = board::page_geometry(area, &app);
+        let (_, actions) = board::body_content(board::inner(g.body));
+        let (rect, key, label) = board::action_regions(actions, Panel::Graph)
+            .into_iter()
+            .next()
+            .expect("the graph panel exposes its view control");
+        assert_eq!((key, label), (KeyCode::Char('a'), "All / focus"));
+        handle_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: rect.x + 1,
+                row: rect.y,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        assert_eq!(app.graph.view, crate::scene::View::Focus);
+        assert_eq!(graphview::node_order(&app).len(), focused);
+        assert!(
+            app.last_outcome.is_none(),
+            "a view choice dispatches nothing"
+        );
+    }
+
+    /// A click on a card selects exactly the card the camera painted there —
+    /// the scene's selection is an id, so the keyboard agrees immediately.
+    #[test]
+    fn a_click_on_a_card_selects_the_same_node_the_keyboard_would() {
+        let mut app = App::for_test(
+            vec![],
+            vec![
+                SessionRecord {
+                    session_id: "parent".into(),
+                    agent: "claude".into(),
+                    cwd: "/x".into(),
+                    state: "working".into(),
+                    ..Default::default()
+                },
+                SessionRecord {
+                    session_id: "child".into(),
+                    agent: "claude".into(),
+                    cwd: "/x".into(),
+                    state: "idle".into(),
+                    parent_session_id: Some("parent".into()),
+                    ..Default::default()
+                },
+            ],
+            vec![],
+        );
+        app.panel = Panel::Graph;
+        app.sidebar_focused = false;
+        app.sync_graph_scene();
+        graphview::select_index(&mut app, 0);
+
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        let g = board::page_geometry(area, &app);
+        let (canvas, _) = board::body_content(board::inner(g.body));
+        // Walk the canvas for the first cell that hits a card other than the
+        // selected one, then click it.
+        let target = (canvas.y..canvas.bottom())
+            .flat_map(|y| (canvas.x..canvas.right()).map(move |x| (x, y)))
+            .find(|&(x, y)| graphview::hit_node(canvas, &app, x, y).is_some_and(|i| i != 0))
+            .expect("a second card is on screen");
+        let expected = graphview::hit_node(canvas, &app, target.0, target.1).unwrap();
+        let expected_id = graphview::node_order(&app)[expected].id.clone();
+        handle_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Left),
+                column: target.0,
+                row: target.1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+        // The id is what moved — under Focus the visible list re-forms around
+        // the newly picked card, so an index would name a different node.
+        assert_eq!(app.graph.selected, expected_id);
+        assert_eq!(
+            graphview::node_order(&app)[graphview::selected_index(&app)].id,
+            expected_id
+        );
+        assert!(!app.sidebar_focused);
         assert!(app.last_outcome.is_none());
     }
 

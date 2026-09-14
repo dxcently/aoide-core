@@ -113,7 +113,11 @@ pub fn action_regions(
 ) -> Vec<(Rect, crossterm::event::KeyCode, &'static str)> {
     use crossterm::event::KeyCode;
     let labels: &[(char, &str)] = match panel {
-        Panel::Graph => &[('s', "Write letter"), ('e', "Actions")],
+        Panel::Graph => &[
+            ('a', "All / focus"),
+            ('s', "Write letter"),
+            ('e', "Actions"),
+        ],
         Panel::Projects => &[('a', "Add folder"), ('r', "Resurrect")],
         Panel::Session | Panel::Terminals => &[('\n', "Open / focus")],
         Panel::Roster => &[('s', "Terminal input"), ('r', "Refresh")],
@@ -161,8 +165,9 @@ pub fn draw_actions(f: &mut Frame, area: Rect, app: &App) {
         }
         f.render_widget(
             Paragraph::new(format!(
-                "Canvas {} | Ctrl-wheel zoom | Space+drag pan",
-                crate::graphview::zoom_label(app)
+                "Canvas {} · {} | a all/focus | Ctrl-wheel zoom | Space+drag pan",
+                crate::graphview::zoom_label(app),
+                crate::graphview::view_label(app)
             ))
             .style(Style::default().fg(theme::role_color(&app.palette, theme::Role::Terminal))),
             columns[1],

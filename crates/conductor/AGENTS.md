@@ -9,10 +9,20 @@
   input handling owns state changes and dispatch. Mouse hit testing and
   drawing share geometry and row ordering, including scrolling and narrow
   layouts. An action must mean the same thing by mouse and keyboard.
-- Graph zoom is a camera transform of fixed world rectangles at 50/75/100/125/150%.
-  Pointer-anchored zoom, pan limits, render and hit tests share geometry.
+- The graph is a retained scene. World positions, camera, view and the selected
+  node's identity live in `App::graph`; a frame reads them and never rebuilds
+  the world. Placement keeps a surviving node's rectangle, re-places a node
+  whose depth changed, and drops a departed one. Selection is a node identity,
+  never a row index, so a refresh cannot move it.
+- Graph zoom is a camera transform of those fixed world rectangles at
+  50/75/100/125/150%. Pointer-anchored zoom, pan limits, render and hit tests
+  share one transform; never let render record rectangles for a later hit test.
   Terminal glyphs stay fixed-size and clip inside cards; never relayout
   entities into alternative card presets when zoom changes.
+- The painter clips; the world outside the camera is never drawn. Edges paint
+  before cards. Focus draws the selected node's connected component and All
+  draws every node, and the synthetic root gathering unattached sessions is not
+  an edge Focus may traverse.
 - One identity mark per kind, from `theme::mark`; never a second glyph for
   the same kind, never a mark wider than one cell, never `@` (addresses).
   Colour comes from a `Role`, not from the glyph. Measure labels with

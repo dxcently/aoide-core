@@ -430,13 +430,10 @@ pub struct App {
     /// `handle_key` swallows keys while it is `Some` the same way it does for
     /// the help overlay.
     pub tail: Option<LogTail>,
-    /// Selected node in the DAG (Graph) panel (indexes the preorder node list
-    /// [`crate::graphview::node_order`] the layout walks).
-    pub graph_sel: usize,
-    pub graph_pan: Option<(usize, usize)>,
-    pub graph_zoom: i8,
-    pub graph_pan_mode: bool,
-    pub graph_drag: Option<(u16, u16, usize, usize)>,
+    /// The retained graph scene: camera, view choice, the selected node`s ID
+    /// and the world coordinates cards keep across refreshes. It lives here,
+    /// outside render, so a frame never reconstructs what the last one decided.
+    pub graph: crate::scene::SceneState,
     /// Selected row in the SESSION panel (indexes [`App::dag_rows`]).
     pub dag_sel: usize,
     /// Selected row in the PROJECTS panel.
@@ -547,11 +544,7 @@ impl App {
             mail_refreshed: None,
             help_open: false,
             tail: None,
-            graph_sel: 0,
-            graph_pan: None,
-            graph_zoom: 0,
-            graph_pan_mode: false,
-            graph_drag: None,
+            graph: crate::scene::SceneState::default(),
             dag_sel: 0,
             proj_sel: 0,
             projects: Vec::new(),
@@ -700,6 +693,30 @@ impl App {
         };
         self.note_new_sessions();
         self.clamp_selection();
+        self.sync_graph_scene();
+    }
+
+    /// Fold the freshly loaded forest into the retained graph scene: cards that
+    /// are still here keep the world coordinates the operator last saw, arrivals
+    /// take a slot colliding with none of them, and departures leave the store.
+    /// The selection is an ID, so it names the same card across the refresh —
+    /// or, once that card is gone, falls back to the first one.
+    pub fn sync_graph_scene(&mut self) {
+        let model = crate::graphview::build_model(self);
+        let placed: Vec<crate::scene::Placed> = model
+            .nodes
+            .iter()
+            .map(|n| crate::scene::Placed {
+                x: n.world.x,
+                y: n.world.y,
+                depth: n.depth,
+            })
+            .collect();
+        let ids: Vec<String> = model.nodes.iter().map(|n| n.id.clone()).collect();
+        self.graph.positions.commit(ids.iter().cloned(), &placed);
+        if !ids.contains(&self.graph.selected) {
+            self.graph.selected = ids.first().cloned().unwrap_or_default();
+        }
     }
 
     /// Terminal-watcher bookkeeping: any session id we have never seen becomes
@@ -1575,10 +1592,6 @@ impl App {
         let n_proj = self.projects.len();
         if self.proj_sel >= n_proj.max(1) {
             self.proj_sel = n_proj.saturating_sub(1);
-        }
-        let n_nodes = crate::graphview::node_order(self).len();
-        if self.graph_sel >= n_nodes.max(1) {
-            self.graph_sel = n_nodes.saturating_sub(1);
         }
         let n_roster = self.roster_flat_rows().len();
         if self.roster_sel >= n_roster.max(1) {
@@ -2553,45 +2566,40 @@ impl App {
         }
     }
 
-    /// Keys for the DAG (Graph) panel. Navigation walks the same preorder node
-    /// list the layout draws, so `j`/`k` can never point at a node that isn't on
+    /// Keys for the Graph panel. Navigation walks the same visible node list
+    /// the scene draws, so `j`/`k` can never point at a node that isn't on
     /// screen. Enter cues the selected session's window (the same
-    /// [`App::cue_session`] focus jump the roster uses); `p` prunes — the one
+    /// [`App::cue_session`] focus jump the roster uses); `a` swaps between the
+    /// focused component and the whole forest; `p` prunes — the one
     /// graph-wide command — so the visual view is not read-only.
     fn handle_graph_key(&mut self, key: KeyEvent) {
-        let previous_selection = self.graph_sel;
         let nodes = crate::graphview::node_order(self);
+        let selected = crate::graphview::selected_index(self);
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if !nodes.is_empty() && self.graph_sel + 1 < nodes.len() {
-                    self.graph_sel += 1;
-                }
+                crate::graphview::select_index(self, selected + 1)
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                self.graph_sel = self.graph_sel.saturating_sub(1);
+                crate::graphview::select_index(self, selected.saturating_sub(1))
             }
-            KeyCode::Home | KeyCode::Char('g') => self.graph_sel = 0,
+            KeyCode::Home | KeyCode::Char('g') => crate::graphview::select_index(self, 0),
             KeyCode::End | KeyCode::Char('G') => {
-                self.graph_sel = nodes.len().saturating_sub(1);
+                crate::graphview::select_index(self, nodes.len().saturating_sub(1))
             }
+            KeyCode::Char('a') => crate::graphview::toggle_view(self),
             KeyCode::Enter => {
-                if let Some(node) = nodes.get(self.graph_sel) {
-                    if let Some(id) = node.session_id.clone() {
-                        // Node → record via `merged()` (the same lookup the
-                        // roster's rows are built from) — no graphview
-                        // change, `cue_session` is the one branch.
-                        let rec = self.merged().into_iter().find(|m| m.session_id == id);
-                        if let Some(rec) = rec {
-                            self.cue_session(&rec);
-                        }
+                if let Some(id) = nodes.get(selected).and_then(|n| n.session_id.clone()) {
+                    // Node → record via `merged()` (the same lookup the
+                    // roster's rows are built from) — no graphview
+                    // change, `cue_session` is the one branch.
+                    let rec = self.merged().into_iter().find(|m| m.session_id == id);
+                    if let Some(rec) = rec {
+                        self.cue_session(&rec);
                     }
                 }
             }
             KeyCode::Char('p') => self.dispatch(&["session", "prune"], &[]),
             _ => {}
-        }
-        if self.graph_sel != previous_selection {
-            self.graph_pan = None;
         }
     }
 
@@ -3519,7 +3527,7 @@ mod tests {
         rec.log_path = Some(log.to_string_lossy().into_owned());
         let mut app = App::for_test(Vec::new(), vec![rec], Vec::new());
         app.panel = Panel::Graph;
-        app.graph_sel = 1; // node 0 is the synthetic projectless root
+        crate::graphview::select_index(&mut app, 1); // node 0 is the synthetic projectless root
 
         app.handle_key(KeyEvent::from(KeyCode::Enter));
 

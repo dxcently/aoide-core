@@ -101,7 +101,7 @@ fn keymap_hint(panel: Panel) -> &'static str {
         Panel::Home => "click to open · Ctrl-P projects · ? help · q quit",
         Panel::Mail => "↑/↓ letters · PgUp/PgDn read · r refresh · ? help",
         Panel::Graph => {
-            "j/k select · Space+drag pan · wheel scroll · Enter open"
+            "j/k select · a all/focus · Space+drag pan · Ctrl-wheel zoom · Enter open"
         }
         Panel::Session|Panel::Terminals => {
             "j/k select · Enter jump/fold · h/l fold · L link · a add root · d rm · p prune · ? help · q quit"
@@ -167,7 +167,7 @@ pub(crate) fn draw_body(f: &mut Frame, area: Rect, app: &App) {
     match app.panel {
         Panel::Home => crate::board::draw_home(f, inner, app),
         Panel::Mail => crate::board::draw_mail(f, inner, app),
-        Panel::Graph => graphview::render(f, inner, app, app.graph_sel),
+        Panel::Graph => graphview::render(f, inner, app),
         Panel::Session | Panel::Terminals if app.history_selected.is_some() => {
             crate::board::draw_history(f, inner, app)
         }
@@ -865,7 +865,8 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "  Projects: a/r     add folder / resurrect project",
         "  Agents/Terminals: Enter cue window or tail the log if headless",
         "  Esc / q           close the log tail (Enter also closes it)",
-        "  Graph: j/k        select blocks · Enter focus · read-only tags",
+        "  Graph: j/k        select cards · Enter focus · read-only tags",
+        "  Graph: a          whole forest / the picked card's own graph",
         "  Mail: h/l         conversations / letters; j/k select",
         "  Mail: n/s/r       new letter / reply / refresh",
         "  Compose: Enter    newline after recipient · Ctrl-S send",
@@ -976,7 +977,7 @@ mod tests {
         );
         a.panel = panel;
         a.dag_sel = app.dag_sel;
-        a.graph_sel = app.graph_sel;
+        a.graph.selected = app.graph.selected.clone();
         a.log = app.log.clone();
         let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
