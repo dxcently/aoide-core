@@ -35,6 +35,7 @@ kill or resurrect a process.
 | `h` / `l`, Left / Right in Graph | Move the selection by depth, toward the parent or the child |
 | Enter in Graph | Open or focus the selected session |
 | `s` in Graph | Write a letter to the selected agent |
+| `p` in Graph | Prune ended sessions |
 | `?` | Context help |
 | `q` / Ctrl-C | Quit outside text entry / quit globally |
 
@@ -70,8 +71,9 @@ row, so the same card stays selected across a refresh.
 
 `j` / `k` or the arrows step the selection through the visible cards; `h` / `l`
 or Left / Right step it by depth, toward the parent or the child. Enter opens
-or focuses the selected session, and `s` writes a letter to the selected agent
-directly, without opening the actions menu.
+or focuses the selected session, `s` writes a letter to the selected agent
+directly without opening the actions menu, and `p` prunes ended sessions —
+the one mutation the panel dispatches on its own.
 
 `a` switches the two views. Focus, the default, draws only the connected graph
 the selected card belongs to; All draws the whole forest. Sessions belonging to

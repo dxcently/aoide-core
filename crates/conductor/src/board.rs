@@ -165,7 +165,7 @@ pub fn draw_actions(f: &mut Frame, area: Rect, app: &App) {
         }
         f.render_widget(
             Paragraph::new(format!(
-                "Canvas {} · {} | a all/focus | Space/middle-drag or wheel pan | Ctrl-wheel zoom",
+                "Canvas {} · {} | a all/focus | Space/middle-drag or wheel pan | Ctrl-wheel zoom | p prune",
                 crate::graphview::zoom_label(app),
                 crate::graphview::view_label(app)
             ))

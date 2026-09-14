@@ -101,7 +101,7 @@ fn keymap_hint(panel: Panel) -> &'static str {
         Panel::Home => "click to open · Ctrl-P projects · ? help · q quit",
         Panel::Mail => "↑/↓ letters · PgUp/PgDn read · r refresh · ? help",
         Panel::Graph => {
-            "j/k select · a all/focus · Space+drag pan · Ctrl-wheel zoom · Enter open"
+            "j/k select · h/l depth · a all/focus · Enter open · s letter · e menu · drag/wheel pan · Ctrl-wheel zoom · p prune"
         }
         Panel::Session|Panel::Terminals => {
             "j/k select · Enter jump/fold · h/l fold · L link · a add root · d rm · p prune · ? help · q quit"
@@ -871,6 +871,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "  Graph: e/s        actions menu / write a letter",
         "  Graph: pan        Space or middle drag; wheel/Shift-wheel",
         "  Graph: zoom       Ctrl+wheel steps 50-150%, at the pointer",
+        "  Graph: p          prune ended sessions",
         "  Mail: h/l         conversations / letters; j/k select",
         "  Mail: n/s/r       new letter / reply / refresh",
         "  Compose: Enter    newline after recipient · Ctrl-S send",
@@ -1030,6 +1031,14 @@ mod tests {
             "box-drawing edges present"
         );
         assert!(out.contains("[x]"), "read-only tag chip drawn: {out}");
+        assert!(
+            out.contains("all/focus"),
+            "status bar keymap hint carries the view toggle: {out}"
+        );
+        assert!(
+            out.contains("prune"),
+            "status bar keymap hint carries prune: {out}"
+        );
     }
 
     #[test]
