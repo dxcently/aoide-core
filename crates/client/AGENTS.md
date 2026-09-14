@@ -618,6 +618,16 @@
   meaningful for a link that has been dead a long time — don't move the
   `back_off` call ahead of the entry write, and don't drop the cap without
   re-checking `a_drain_never_attempts_more_than_the_batch_cap_per_call`.
+  **The entry write's own success is never a precondition for the
+  back-off, either.** `write_entry`'s `Result` is captured, not `?`-ed
+  away, so a local write failure — a full or read-only disk, the exact
+  condition under which the link is also likely failing — still lets
+  `back_off` run before that write's own error propagates to the caller;
+  an early `?` here used to skip `back_off` outright on that failure,
+  leaving the link un-backed-off and re-dialed every following tick
+  precisely when the box is already sick
+  (`a_link_backs_off_even_when_the_entrys_own_record_cannot_be_written`
+  pins it).
   `drain_all`'s per-node loop is unaffected by any of them: one node's
   `TransportFailed` break stays scoped to that node's own iteration, never
   short-circuiting the loop over other nodes (see

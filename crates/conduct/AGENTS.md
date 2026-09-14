@@ -1305,6 +1305,19 @@
   caught by the next trigger. Do not reorder the stamp ahead of the
   write, and do not stamp inside a `Result`-discarding path that can't
   tell success from failure.
+- **Every ring socket write is bounded by `RING_WRITE_TIMEOUT` (2s,
+  P-M5c-4) — a wedged peer must never hold `.ring.lock` forever.** Both
+  transports connect through `connect_for_ring`, which arms the timeout
+  on the stream before either transport's first write, so it covers
+  `write_delivery`'s SECOND write (the submit keystroke) as well as the
+  first — never re-derive a per-call timeout instead. A timed-out write
+  is an ordinary `Err`, so it lands in the SAME `write-failed` skip the
+  stamp-ordering bullet above already covers: no new outcome string, the
+  latch left untouched, the reader still armed for the next trigger. A
+  new ring transport connects through `connect_for_ring`, never a bare
+  `UnixStream::connect`, so it can never regress back to an unbounded
+  write under this lock — pinned by
+  `a_ring_write_to_a_peer_that_never_reads_gives_up_instead_of_holding_the_ring_lock`.
 - **A ring never PTY-injects into a non-headless (interactive) wrap, full
   stop — there is no override flag, no `--force`.** Transport selection
   runs first: a live Claude Code channel socket (`channel_socket_path`) is

@@ -164,7 +164,12 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   no-daemon local fallback, both go through `aoide_client::daemon::
   daemon_dispatch` (or replay nothing) rather than calling `ring`
   directly; `aoide-server`'s A2A deposit arm does not ring at all
-  (P-M5b-2 gives it its own forward path).
+  (P-M5b-2 gives it its own forward path). Both transports connect
+  through `connect_for_ring` (P-M5c-4), which arms a `RING_WRITE_TIMEOUT`
+  (2s) on the stream before any write — a peer that accepts the
+  connection but never reads can no longer hold `.ring.lock` open
+  forever; a timed-out write is an ordinary `write-failed` skip, latch
+  untouched, same as any other write failure.
 - **The undying mark (P-C2/P-C3, durable-sessions plan; renamed from "carry"
   at command-defrag lane U1, 2026-08-27; relocated under `session grant` at
   the session-surface redesign, command-defrag lane X, 2026-08-28):**

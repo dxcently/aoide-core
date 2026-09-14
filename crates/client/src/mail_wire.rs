@@ -203,13 +203,20 @@ pub fn drain_node(node_name: &str) -> Result<(), String> {
                 // failure BEFORE backing off the link — otherwise `tries`/
                 // `lastOutcome` for the whole batch stay exactly where they
                 // were on a dead link, which is indistinguishable from a
-                // drain that never even tried.
+                // drain that never even tried. The back-off itself is NOT
+                // conditional on that record write succeeding: a local
+                // spool write can fail for the same reason the link is
+                // failing (a full or read-only disk), and an early `?` here
+                // used to skip `back_off` entirely on that write's error —
+                // leaving the link un-backed-off and re-dialed on every
+                // following tick, exactly when the box is already sick.
                 let mut updated = entry;
                 updated.tries += 1;
                 updated.last_try_at = aoide_storage::time::now_iso_utc();
                 updated.last_outcome = format!("transport: {reason}");
-                aoide_storage::outbox::write_entry(node_name, &updated)?;
+                let recorded = aoide_storage::outbox::write_entry(node_name, &updated);
                 aoide_storage::outbox::back_off(node_name, now_epoch, &reason)?;
+                recorded?;
                 break;
             }
             DepositAttempt::Refused(reason) => {
@@ -291,6 +298,45 @@ mod tests {
 
         let link = aoide_storage::outbox::read_link_state("elsewhere").unwrap();
         assert!(link.is_some(), "the link backs off after an unreachable attempt");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `TransportFailed` must back the link off even when the entry's own
+    /// record write fails — the exact condition (a full or read-only disk)
+    /// under which the link is most likely failing too. Made deterministic,
+    /// without chmod and without root: `atomic_write`
+    /// (`aoide_storage::fs::atomic_write_bytes_impl`) writes an entry
+    /// through a temp path shaped `<msgid>.tmp.<our own pid>` beside the
+    /// entry file; planting a DIRECTORY at that exact path makes the next
+    /// write to this entry fail with EISDIR, while `back_off`'s own
+    /// `link.json` (same directory, a different name) is untouched and
+    /// still writes fine, and `list_entries` never trips over the directory
+    /// (it filters on `extension == "json"`).
+    #[test]
+    fn a_link_backs_off_even_when_the_entrys_own_record_cannot_be_written() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("backoff-despite-write-failure");
+
+        aoide_storage::node_store::save_nodes(&[unpaired_node("elsewhere")]).unwrap();
+
+        let env = aoide_storage::mail::mint_outbound_letter("alice", "elsewhere", "bob", "hi").unwrap();
+        let msgid = env.msgid.clone();
+        aoide_storage::outbox::write_entry("elsewhere", &OutboxEntry::fresh(env)).unwrap();
+
+        // Block the entry's own record write before the drain ever runs, so
+        // the FIRST attempt on this entry (not a later retry) already hits
+        // the failure this test pins.
+        let blocked_tmp =
+            dir.join("state").join("outbox").join("elsewhere").join(format!("{msgid}.tmp.{}", std::process::id()));
+        std::fs::create_dir_all(&blocked_tmp).unwrap();
+        std::fs::write(blocked_tmp.join("occupied"), b"").unwrap();
+
+        let result = drain_node("elsewhere");
+        assert!(result.is_err(), "the entry write's own error must still propagate: {result:?}");
+
+        let link = aoide_storage::outbox::read_link_state("elsewhere").unwrap();
+        assert!(link.is_some(), "the link must back off even though the entry's own record write failed");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

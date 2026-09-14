@@ -106,6 +106,35 @@ fn write_channel(mut stream: impl std::io::Write, payload: &[u8]) -> std::io::Re
     stream.flush()
 }
 
+/// How long one of `ring_locked`'s socket writes may block before this
+/// module gives up on it (P-M5c-4). `ring_locked` runs its whole
+/// select → inject → stamp sequence for a mailbox name under
+/// [`aoide_storage::mail::with_ring_lock`]'s `.ring.lock` — held, uniquely
+/// in this crate, across real socket I/O, inside the resident daemon — so a
+/// peer that accepts the connection but never reads (a wedged agent child, a
+/// stopped process, a socket whose owner has hung) fills the kernel buffer
+/// and blocks the write forever with no bound in place, parking the
+/// daemon's ring against every OTHER mailbox for as long as that one peer
+/// stays wedged. A timed-out write returns `Err`, which `ring_locked`'s own
+/// `match wrote` already treats as an ordinary transport failure: reported
+/// `write-failed`, the latch left untouched, so the reader stays armed for
+/// the next trigger — no new outcome, no new arm. Set on the STREAM (via
+/// [`connect_for_ring`]), not per-call, so it also covers
+/// [`super::send::write_delivery`]'s SECOND write — the submit keystroke —
+/// not just the first.
+const RING_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// The one place `ring_locked` ever opens a socket — both the channel and
+/// the PTY transport connect through here (see [`RING_WRITE_TIMEOUT`]'s own
+/// doc for why the bound exists) so neither can regress back to a plain,
+/// unbounded `UnixStream::connect`. A future third ring transport connects
+/// through this too, never a fresh `UnixStream::connect` call of its own.
+fn connect_for_ring(path: impl AsRef<std::path::Path>) -> std::io::Result<UnixStream> {
+    let stream = UnixStream::connect(path)?;
+    stream.set_write_timeout(Some(RING_WRITE_TIMEOUT))?;
+    Ok(stream)
+}
+
 /// Self-check-then-walk-up (the shape `window.rs`'s `windowless_by_lineage`/
 /// `windowless_by_lineage_from_parent` pair walks, generalized to a
 /// different question): is `id` itself a conducted wrap
@@ -236,7 +265,7 @@ fn ring_locked(name: &str, exclude: Option<&str>) -> RingReport {
         // refuses the connect and falls through to the PTY/skip below —
         // never a stat-only check.
         let channel_write =
-            UnixStream::connect(channel_socket_path(wrap_id)).ok().map(|stream| write_channel(stream, payload.as_bytes()));
+            connect_for_ring(channel_socket_path(wrap_id)).ok().map(|stream| write_channel(stream, payload.as_bytes()));
 
         let wrote = match channel_write {
             Some(result) => result,
@@ -246,7 +275,7 @@ fn ring_locked(name: &str, exclude: Option<&str>) -> RingReport {
                 let socket = wrap.socket.as_deref().unwrap_or_default();
                 let profile = profile_for_agent(&child.agent);
                 (|| -> std::io::Result<()> {
-                    let mut stream = UnixStream::connect(socket)?;
+                    let mut stream = connect_for_ring(socket)?;
                     write_delivery(&mut stream, payload.as_bytes(), true, profile.submit_key, SUBMIT_KEYSTROKE_DELAY)
                 })()
             }
@@ -1607,6 +1636,53 @@ mod tests {
 
         let targets = aoide_storage::mail::ring_targets(name).unwrap();
         assert_eq!(targets.armed.len(), 1, "the latch stays armed after a failed write");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A peer that accepts the connection but never reads must not be able
+    /// to wedge a ring's write forever — `.ring.lock` is held across this
+    /// exact call, inside the daemon, so an unbounded write here would park
+    /// every OTHER mailbox's ring behind one hung process. Proves three
+    /// things about `connect_for_ring`/`RING_WRITE_TIMEOUT` directly, no
+    /// full `ring()`/wrap setup needed: the timeout is actually armed on the
+    /// stream, a write into a full, undrained buffer gives up with a
+    /// timeout-shaped error rather than succeeding or hanging, and it gives
+    /// up promptly rather than merely eventually.
+    #[test]
+    fn a_ring_write_to_a_peer_that_never_reads_gives_up_instead_of_holding_the_ring_lock() {
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let root = unique_stage("ring-write-timeout");
+        let socket = root.join("s.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+
+        let stream = connect_for_ring(&socket).unwrap();
+        assert_eq!(
+            stream.write_timeout().unwrap(),
+            Some(RING_WRITE_TIMEOUT),
+            "connect_for_ring must arm the write timeout production relies on"
+        );
+
+        // Accepted but never read from — the peer that wedges a ring.
+        let _peer = listener.accept().unwrap().0;
+
+        // Far larger than a unix socket's send buffer, so the write
+        // genuinely blocks on a peer that never drains it rather than
+        // completing in one syscall.
+        let payload = vec![b'x'; 8 * 1024 * 1024];
+        let started = std::time::Instant::now();
+        let result = write_channel(&stream, &payload);
+        let elapsed = started.elapsed();
+
+        let err = result.expect_err("a write to a peer that never reads must give up, not succeed");
+        assert!(
+            matches!(err.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+            "expected a timeout-shaped error, got: {err:?}"
+        );
+        assert!(
+            elapsed < RING_WRITE_TIMEOUT * 5,
+            "the write must give up well under a generous ceiling instead of hanging, took {elapsed:?}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }
