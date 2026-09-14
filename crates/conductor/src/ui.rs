@@ -82,7 +82,12 @@ pub(crate) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     };
     let left = format!(" {msg}");
 
-    let hint_w = (hint.len() as u16 + 1).min(area.width.saturating_sub(4));
+    // The message carries errors and prompts; the hint is only a convenience,
+    // so the message gets its own width first and the hint takes what's left
+    // -- measured in display cells, never bytes (the hints carry `·`, two
+    // bytes for one cell, which used to starve the message down to a stub).
+    let msg_w = crate::board::cells(&left).min(area.width);
+    let hint_w = (crate::board::cells(hint) + 1).min(area.width.saturating_sub(msg_w));
     let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(hint_w)]).split(area);
     f.render_widget(
         Paragraph::new(Line::from(left)).style(theme::accent_style(&app.palette)),
@@ -1694,6 +1699,41 @@ mod tests {
         assert!(
             out.contains("nothing held"),
             "an empty queue tells the human, not a bare blank pane: {out}"
+        );
+    }
+
+    /// The exact live repro: at 118 columns the Graph hint is 122 bytes but
+    /// only 114 display cells (its eight `·` separators are two bytes each),
+    /// so measuring it with `.len()` and reserving only four columns for the
+    /// message cut "ready" down to "rea" with the hint's own text glued on
+    /// right after. The message must survive intact.
+    #[test]
+    fn status_bar_keeps_the_message_intact_beside_a_long_hint() {
+        let mut a = App::for_test(vec![], vec![], vec![]);
+        a.panel = Panel::Graph;
+        let backend = TestBackend::new(118, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_status(f, f.area(), &a)).unwrap();
+        let out = dump(term.backend().buffer());
+        assert!(
+            out.contains(" ready"),
+            "the message must not be clobbered by the hint: {out:?}"
+        );
+    }
+
+    /// At a width too narrow for both, the message still wins and nothing
+    /// panics -- the hint is the one that gets dropped or clipped.
+    #[test]
+    fn status_bar_keeps_the_message_at_a_narrow_width() {
+        let mut a = App::for_test(vec![], vec![], vec![]);
+        a.panel = Panel::Graph;
+        let backend = TestBackend::new(40, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_status(f, f.area(), &a)).unwrap();
+        let out = dump(term.backend().buffer());
+        assert!(
+            out.contains(" ready"),
+            "the message still renders whole at a narrow width: {out:?}"
         );
     }
 }
