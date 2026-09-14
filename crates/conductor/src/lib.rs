@@ -498,7 +498,13 @@ fn handle_paste(app: &mut App, text: &str) {
 
 fn handle_mouse(app: &mut App, area: ratatui::layout::Rect, mouse: MouseEvent) {
     if let Some(m) = &mut app.context_menu {
-        let rect = board::target_menu_area(area, m.x, m.y, m.actions.len());
+        let rect = board::target_menu_area(
+            area,
+            m.x,
+            m.y,
+            m.actions.len(),
+            board::context_menu_content_width(&m.title, &m.actions),
+        );
         if mouse.kind == MouseEventKind::ScrollUp {
             m.selected = m.selected.saturating_sub(1);
             return;
@@ -612,7 +618,13 @@ fn handle_mouse(app: &mut App, area: ratatui::layout::Rect, mouse: MouseEvent) {
         return;
     }
     if let Some((x, y, choices, index)) = &mut app.mail_target_menu {
-        let rect = board::target_menu_area(area, *x, *y, choices.len());
+        let rect = board::target_menu_area(
+            area,
+            *x,
+            *y,
+            choices.len(),
+            board::target_menu_content_width(choices),
+        );
         if matches!(
             mouse.kind,
             MouseEventKind::ScrollUp | MouseEventKind::ScrollDown

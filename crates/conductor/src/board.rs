@@ -1035,6 +1035,69 @@ mod tests {
             assert_eq!(hit(area, &a, r.x, r.y), Hit::Panel(p));
         }
     }
+
+    // ── Popup menu sizing (target_menu_area) ────────────────────────────
+
+    #[test]
+    fn context_menu_width_matches_its_widest_line_not_a_fixed_62() {
+        use crate::app::ContextAction;
+        let actions = vec![
+            ContextAction::Details,
+            ContextAction::WriteLetter,
+            ContextAction::AddFolder,
+            ContextAction::Resurrect,
+        ];
+        // The widest rendered line here is " @ Write letter" (15 cells).
+        let content_w = context_menu_content_width("demo", &actions);
+        assert_eq!(content_w, 15);
+        let area = Rect::new(0, 0, 120, 40);
+        let menu = target_menu_area(area, 5, 5, actions.len(), content_w);
+        assert_eq!(
+            menu.width,
+            content_w + 2,
+            "box width is content plus borders"
+        );
+        assert_ne!(menu.width, 62, "the old fixed width must be gone");
+    }
+
+    #[test]
+    fn menu_width_is_clamped_to_the_frame_when_content_would_overflow_it() {
+        use crate::app::ContextAction;
+        let long_title = "a-genuinely-long-project-name-that-will-not-fit-in-a-narrow-frame";
+        let content_w = context_menu_content_width(long_title, &[ContextAction::Details]);
+        let area = Rect::new(0, 0, 20, 40);
+        let menu = target_menu_area(area, 0, 0, 1, content_w);
+        assert_eq!(
+            menu.width, area.width,
+            "the box never grows past the frame it lives in"
+        );
+    }
+
+    #[test]
+    fn right_click_menu_near_the_right_edge_still_lands_fully_inside_the_frame() {
+        let mut app = App::for_test(
+            vec![aoide_conduct::graph::Project {
+                name: "demo-project-with-a-longer-name".into(),
+                path: "/demo".into(),
+                ..Default::default()
+            }],
+            vec![],
+            vec![],
+        );
+        let area = Rect::new(0, 0, 120, 40);
+        // Anchor the click one cell from the frame's right edge -- the case
+        // a content-sized box no longer needs to shove leftward for, but
+        // the clamp must still hold it inside when it does.
+        app.open_context_for_project("demo-project-with-a-longer-name".into(), area.width - 1, 5);
+        let m = app.context_menu.as_ref().expect("menu opened");
+        let content_w = context_menu_content_width(&m.title, &m.actions);
+        let rect = target_menu_area(area, m.x, m.y, m.actions.len(), content_w);
+        assert!(
+            rect.right() <= area.right(),
+            "menu stays inside the frame: {rect:?}"
+        );
+        assert!(rect.x >= area.x);
+    }
 }
 
 fn addresses(items: &[aoide_storage::mail::Address]) -> String {
@@ -1270,8 +1333,13 @@ fn draw_mail_draft(f: &mut Frame, app: &App) {
     let hint=d.error.clone().unwrap_or_else(||"Tab / Shift-Tab fields | Ctrl-S send | Esc cancel\n+ To / + Cc selects where tree clicks add recipients".into());
     f.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), g.hint);
 }
-pub fn target_menu_area(area: Rect, x: u16, y: u16, count: usize) -> Rect {
-    let w = area.width.min(62);
+/// A popup box sized to its own content, never a fixed guess: `content_w`
+/// is the widest line the caller will actually render (measured in cells),
+/// and the border adds two. `MIN_MENU_W` keeps a one-word menu from
+/// shrinking to a sliver; the frame's width is still the hard ceiling.
+const MIN_MENU_W: u16 = 14;
+pub fn target_menu_area(area: Rect, x: u16, y: u16, count: usize, content_w: u16) -> Rect {
+    let w = (content_w + 2).max(MIN_MENU_W).min(area.width);
     let h = area.height.min(count as u16 + 2);
     Rect::new(
         x.min(area.right().saturating_sub(w)),
@@ -1280,14 +1348,35 @@ pub fn target_menu_area(area: Rect, x: u16, y: u16, count: usize) -> Rect {
         h,
     )
 }
+
+const WRITE_LETTER_TITLE: &str = " WRITE LETTER TO · Esc close ";
+
+/// The widest line the mail recipient chooser renders: its fixed title or
+/// one `label · address` choice.
+pub(crate) fn target_menu_content_width(choices: &[(String, String)]) -> u16 {
+    std::iter::once(cells(WRITE_LETTER_TITLE))
+        .chain(
+            choices
+                .iter()
+                .map(|(label, address)| cells(&format!("{label} · {address}"))),
+        )
+        .max()
+        .unwrap_or(0)
+}
 fn draw_target_menu(f: &mut Frame, app: &App) {
     let Some((x, y, choices, index)) = &app.mail_target_menu else {
         return;
     };
-    let a = target_menu_area(f.area(), *x, *y, choices.len());
+    let a = target_menu_area(
+        f.area(),
+        *x,
+        *y,
+        choices.len(),
+        target_menu_content_width(choices),
+    );
     f.render_widget(ratatui::widgets::Clear, a);
     f.render_widget(
-        frame(" WRITE LETTER TO · Esc close ").style(theme::surface(&app.palette, 4)),
+        frame(WRITE_LETTER_TITLE).style(theme::surface(&app.palette, 4)),
         a,
     );
     let offset = index.saturating_sub(inner(a).height.saturating_sub(1) as usize);
@@ -1369,11 +1458,48 @@ pub fn field_click(
     end
 }
 
+/// The identity mark beside a context-menu action row -- the one source
+/// both the width measurement and the actual paint read, so sizing the
+/// box can never drift from what it draws.
+fn context_action_symbol(action: crate::app::ContextAction) -> &'static str {
+    use crate::app::ContextAction;
+    match action {
+        ContextAction::Details => "?",
+        ContextAction::WriteLetter => "@",
+        ContextAction::Open => ">",
+        ContextAction::AssignProject => "#",
+        ContextAction::Resurrect => "^",
+        ContextAction::AddFolder => "+",
+    }
+}
+
+/// The widest line a context menu renders: its framed title or one
+/// ` symbol label` action row.
+pub(crate) fn context_menu_content_width(
+    title: &str,
+    actions: &[crate::app::ContextAction],
+) -> u16 {
+    std::iter::once(cells(&format!(" {title} ")))
+        .chain(
+            actions
+                .iter()
+                .map(|a| cells(&format!(" {} {}", context_action_symbol(*a), a.label()))),
+        )
+        .max()
+        .unwrap_or(0)
+}
+
 fn draw_context_menu(f: &mut Frame, app: &App) {
     let Some(m) = &app.context_menu else {
         return;
     };
-    let area = target_menu_area(f.area(), m.x, m.y, m.actions.len());
+    let area = target_menu_area(
+        f.area(),
+        m.x,
+        m.y,
+        m.actions.len(),
+        context_menu_content_width(&m.title, &m.actions),
+    );
     f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(
         frame(&format!(" {} ", m.title)).style(theme::surface(&app.palette, 5)),
@@ -1390,14 +1516,7 @@ fn draw_context_menu(f: &mut Frame, app: &App) {
         .skip(offset)
         .take(inside.height as usize)
     {
-        let symbol = match action {
-            crate::app::ContextAction::Details => "?",
-            crate::app::ContextAction::WriteLetter => "@",
-            crate::app::ContextAction::Open => ">",
-            crate::app::ContextAction::AssignProject => "#",
-            crate::app::ContextAction::Resurrect => "^",
-            crate::app::ContextAction::AddFolder => "+",
-        };
+        let symbol = context_action_symbol(*action);
         f.render_widget(
             Paragraph::new(format!(" {symbol} {}", action.label())).style(if i == m.selected {
                 selected()
