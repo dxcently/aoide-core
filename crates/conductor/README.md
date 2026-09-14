@@ -132,6 +132,9 @@ participant roster includes observed senders, envelope targets, To and Cc.
 Separate thread IDs stay separate even between the same people. Thread
 labels use the earliest available nonempty subject.
 
+The conversation list and the letter list each show a scrollbar when their
+rows overflow the visible height, and none when everything already fits.
+
 Letters without a thread ID appear as explicitly labeled legacy pair
 correspondence. Replying to one uses that original message ID as the thread
 ID and attaches only that original letter, not unrelated pair history.

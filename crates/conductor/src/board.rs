@@ -772,6 +772,7 @@ pub fn draw_mail(f: &mut Frame, area: Rect, app: &App) {
     let offset = app
         .mail_room_sel
         .saturating_sub(room_area.height.saturating_sub(1) as usize);
+    let (room_rows, room_bar) = scrollbar_split(room_area, conversations.len());
     for (i, c) in conversations
         .iter()
         .enumerate()
@@ -795,18 +796,22 @@ pub fn draw_mail(f: &mut Frame, area: Rect, app: &App) {
                 theme::surface(&app.palette, 5)
             }),
             Rect::new(
-                room_area.x,
-                room_area.y + (i - offset) as u16,
-                room_area.width,
+                room_rows.x,
+                room_rows.y + (i - offset) as u16,
+                room_rows.width,
                 1,
             ),
         );
+    }
+    if let Some(bar) = room_bar {
+        draw_scrollbar(f, bar, conversations.len(), offset);
     }
     let (list, detail) = mail_parts(content);
     let letters = app.mail_letters();
     let offset = app
         .mail_sel
         .saturating_sub(list.height.saturating_sub(1) as usize);
+    let (letter_rows, letter_bar) = scrollbar_split(list, letters.len());
     for (i, m) in letters
         .iter()
         .enumerate()
@@ -825,8 +830,16 @@ pub fn draw_mail(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 theme::surface(&app.palette, if i % 2 == 0 { 2 } else { 5 })
             }),
-            Rect::new(list.x, list.y + (i - offset) as u16, list.width, 1),
+            Rect::new(
+                letter_rows.x,
+                letter_rows.y + (i - offset) as u16,
+                letter_rows.width,
+                1,
+            ),
         );
+    }
+    if let Some(bar) = letter_bar {
+        draw_scrollbar(f, bar, letters.len(), offset);
     }
     let title = if app.mail.truncated {
         " LETTER / recent local archive "
@@ -936,19 +949,21 @@ pub fn hit(area: Rect, app: &App, x: u16, y: u16) -> Hit {
     if app.panel == Panel::Mail {
         let (rooms, content) = conversation_parts(body);
         let room_area = inner(rooms);
-        if room_area.contains(pos) {
+        let room_rows = scrollbar_split(room_area, app.mail.conversations().len()).0;
+        if room_rows.contains(pos) {
             return Hit::Conversation(
                 app.mail_room_sel
                     .saturating_sub(room_area.height.saturating_sub(1) as usize)
-                    + (y - room_area.y) as usize,
+                    + (y - room_rows.y) as usize,
             );
         }
         let (list, _) = mail_parts(content);
-        if list.contains(pos) {
+        let letter_rows = scrollbar_split(list, app.mail_letters().len()).0;
+        if letter_rows.contains(pos) {
             return Hit::Row(
                 app.mail_sel
                     .saturating_sub(list.height.saturating_sub(1) as usize)
-                    + (y - list.y) as usize,
+                    + (y - letter_rows.y) as usize,
             );
         }
     }
@@ -1225,6 +1240,200 @@ mod tests {
         // The reserved column itself is the scrollbar, not a row.
         let bar_x = content.right() - 1;
         assert_eq!(hit(area, &app, bar_x, y), Hit::None);
+    }
+
+    // ── Mail-list scrollbars (conversations and letters) ────────────────
+
+    fn distinct_room_letters(n: usize) -> Vec<crate::mailview::MailLetter> {
+        (0..n)
+            .map(|i| crate::mailview::MailLetter {
+                seq: i as u64,
+                msgid: format!("m{i}"),
+                from: format!("node{i}/agent"),
+                to: "node0/human".into(),
+                from_address: aoide_storage::mail::Address {
+                    node: format!("node{i}"),
+                    name: "agent".into(),
+                },
+                to_address: aoide_storage::mail::Address {
+                    node: "node0".into(),
+                    name: "human".into(),
+                },
+                text: format!("hello {i}"),
+                received_at: format!("2026-01-01T00:{i:02}:00Z"),
+                minted_at: format!("2026-01-01T00:{i:02}:00Z"),
+            })
+            .collect()
+    }
+
+    /// One shared legacy pair, so every letter lands in the single
+    /// conversation it belongs to -- the letter list overflows while the
+    /// conversation list stays at one row.
+    fn one_room_many_letters(n: usize) -> Vec<crate::mailview::MailLetter> {
+        (0..n)
+            .map(|i| crate::mailview::MailLetter {
+                seq: i as u64,
+                msgid: format!("m{i}"),
+                from: "node1/agent".into(),
+                to: "node0/human".into(),
+                from_address: aoide_storage::mail::Address {
+                    node: "node1".into(),
+                    name: "agent".into(),
+                },
+                to_address: aoide_storage::mail::Address {
+                    node: "node0".into(),
+                    name: "human".into(),
+                },
+                text: format!("hello {i}"),
+                received_at: format!("2026-01-01T00:{i:02}:00Z"),
+                minted_at: format!("2026-01-01T00:{i:02}:00Z"),
+            })
+            .collect()
+    }
+
+    fn mail_geometry(area: Rect, app: &App) -> (Rect, Rect) {
+        let g = page_geometry(area, app);
+        let (body, _) = body_content(inner(g.body));
+        conversation_parts(body)
+    }
+
+    #[test]
+    fn mail_scrollbars_thumb_tracks_selection_offset() {
+        let area = Rect::new(0, 0, 100, 30);
+
+        let rooms_app = |sel: usize| {
+            let mut a = App::for_test(vec![], vec![], vec![]);
+            a.panel = Panel::Mail;
+            a.mail = crate::mailview::MailBoard {
+                letters: distinct_room_letters(40),
+                ..Default::default()
+            };
+            a.mail_room_sel = sel;
+            a
+        };
+        let (rooms, _) = mail_geometry(area, &rooms_app(0));
+        let room_area = inner(rooms);
+        assert!(
+            rooms_app(0).mail.conversations().len() > room_area.height as usize,
+            "room fixture must overflow"
+        );
+        let room_bar_x = room_area.right() - 1;
+        let room_thumb = |sel: usize| -> u16 {
+            let a = rooms_app(sel);
+            let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, &a)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (room_area.y..room_area.bottom())
+                .find(|&y| buffer[(room_bar_x, y)].symbol() == "█")
+                .expect("room thumb glyph present")
+        };
+        let top = room_thumb(0);
+        let bottom = room_thumb(39);
+        assert!(
+            bottom > top,
+            "room thumb tracks selection: {top} -> {bottom}"
+        );
+
+        let letters_app = |sel: usize| {
+            let mut a = App::for_test(vec![], vec![], vec![]);
+            a.panel = Panel::Mail;
+            a.mail = crate::mailview::MailBoard {
+                letters: one_room_many_letters(40),
+                ..Default::default()
+            };
+            a.mail_sel = sel;
+            a
+        };
+        let (_, content) = mail_geometry(area, &letters_app(0));
+        let (list, _detail) = mail_parts(content);
+        assert!(
+            letters_app(0).mail_letters().len() > list.height as usize,
+            "letter fixture must overflow"
+        );
+        let letter_bar_x = list.right() - 1;
+        let letter_thumb = |sel: usize| -> u16 {
+            let a = letters_app(sel);
+            let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, &a)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (list.y..list.bottom())
+                .find(|&y| buffer[(letter_bar_x, y)].symbol() == "█")
+                .expect("letter thumb glyph present")
+        };
+        let top = letter_thumb(0);
+        let bottom = letter_thumb(39);
+        assert!(
+            bottom > top,
+            "letter thumb tracks selection: {top} -> {bottom}"
+        );
+    }
+
+    #[test]
+    fn mail_scrollbars_absent_when_lists_fit() {
+        let area = Rect::new(0, 0, 100, 30);
+        let mut app = App::for_test(vec![], vec![], vec![]);
+        app.panel = Panel::Mail;
+        app.mail = crate::mailview::MailBoard {
+            letters: distinct_room_letters(2),
+            ..Default::default()
+        };
+        let (rooms, content) = mail_geometry(area, &app);
+        let room_area = inner(rooms);
+        let (list, _) = mail_parts(content);
+        assert!(app.mail.conversations().len() <= room_area.height as usize);
+        assert!(app.mail_letters().len() <= list.height as usize);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for (col_area, x) in [(room_area, room_area.right() - 1), (list, list.right() - 1)] {
+            for y in col_area.y..col_area.bottom() {
+                let symbol = buffer[(x, y)].symbol();
+                assert_ne!(symbol, "█");
+                assert_ne!(symbol, "║");
+            }
+        }
+    }
+
+    #[test]
+    fn mail_row_clicks_still_resolve_the_same_row_with_scrollbars_present() {
+        let area = Rect::new(0, 0, 100, 30);
+        let mut app = App::for_test(vec![], vec![], vec![]);
+        app.panel = Panel::Mail;
+        app.mail = crate::mailview::MailBoard {
+            letters: distinct_room_letters(40),
+            ..Default::default()
+        };
+        app.mail_room_sel = 20;
+        let (rooms, content) = mail_geometry(area, &app);
+        let room_area = inner(rooms);
+        let (list, _) = mail_parts(content);
+        assert!(app.mail.conversations().len() > room_area.height as usize);
+        let room_off = app
+            .mail_room_sel
+            .saturating_sub(room_area.height.saturating_sub(1) as usize);
+        let y = room_area.y + 1;
+        let x = room_area.x + 2;
+        assert_eq!(hit(area, &app, x, y), Hit::Conversation(room_off + 1));
+        let room_bar_x = room_area.right() - 1;
+        assert_eq!(hit(area, &app, room_bar_x, y), Hit::None);
+
+        app.mail = crate::mailview::MailBoard {
+            letters: one_room_many_letters(40),
+            ..Default::default()
+        };
+        app.mail_sel = 20;
+        assert!(app.mail_letters().len() > list.height as usize);
+        let letter_off = app
+            .mail_sel
+            .saturating_sub(list.height.saturating_sub(1) as usize);
+        let y = list.y + 1;
+        let x = list.x + 2;
+        assert_eq!(hit(area, &app, x, y), Hit::Row(letter_off + 1));
+        let letter_bar_x = list.right() - 1;
+        assert_eq!(hit(area, &app, letter_bar_x, y), Hit::None);
     }
 }
 
