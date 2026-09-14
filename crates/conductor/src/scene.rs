@@ -162,9 +162,10 @@ impl Positions {
     /// new retained truth ([`Positions::commit`]).
     ///
     /// A node already retained at the same depth keeps its coordinates. A new
-    /// node takes the fresh layout's slot, pushed down one `lane` at a time
+    /// node takes the fresh layout's slot, pushed clear one `lane` at a time
     /// until it overlaps nothing already fixed — so an arrival never lands on
-    /// top of a card that was already on the canvas.
+    /// top of a card that was already on the canvas. Siblings share a rank
+    /// (the same `y`) and spread across it, so the nudge walks `x`.
     pub fn place(&self, fresh: &[(String, Placed)], card: (i32, i32), lane: i32) -> Vec<Placed> {
         let retained: Vec<Option<Placed>> = fresh
             .iter()
@@ -174,16 +175,16 @@ impl Positions {
         let mut out = Vec::with_capacity(fresh.len());
         for ((_, f), kept) in fresh.iter().zip(&retained) {
             let placed = kept.unwrap_or_else(|| {
-                let mut y = f.y;
+                let mut x = f.x;
                 while taken
                     .iter()
-                    .any(|t| t.x == f.x && y < t.y + card.1 && t.y < y + card.1)
+                    .any(|t| t.y == f.y && x < t.x + card.0 && t.x < x + card.0)
                 {
-                    y += lane.max(1);
+                    x += lane.max(1);
                 }
                 let p = Placed {
-                    x: f.x,
-                    y,
+                    x,
+                    y: f.y,
                     depth: f.depth,
                 };
                 taken.push(p);
@@ -351,28 +352,31 @@ mod tests {
     #[test]
     fn retained_positions_survive_arrivals_and_departures() {
         let mut store = Positions::default();
-        let first = fresh(&[("a", 40, 16, 0), ("b", 84, 16, 1), ("c", 84, 27, 1)]);
+        // `b` and `c` share a rank (same `y`, different depth's `x`): siblings
+        // spread across `x`, so a colliding arrival nudges `x`, not `y`. Their
+        // slots clear CARD.0 (32) apart, so neither needs a nudge yet.
+        let first = fresh(&[("a", 16, 40, 0), ("b", 16, 84, 1), ("c", 54, 84, 1)]);
         let placed = store.place(&first, CARD, LANE);
-        assert_eq!(placed[1].y, 16);
+        assert_eq!(placed[1].x, 16);
         store.commit(first.iter().map(|(id, _)| id.clone()), &placed);
 
-        // `b` departs. The fresh layout would hoist `c` into `b`'s lane —
+        // `b` departs. The fresh layout would hoist `c` into `b`'s slot —
         // the retained store keeps `c` exactly where the operator last saw it.
-        let second = fresh(&[("a", 40, 16, 0), ("c", 84, 16, 1)]);
+        let second = fresh(&[("a", 16, 40, 0), ("c", 16, 84, 1)]);
         let placed = store.place(&second, CARD, LANE);
         assert_eq!(placed[0], store.get("a").unwrap());
-        assert_eq!(placed[1].y, 27, "c keeps its retained lane");
+        assert_eq!(placed[1].x, 54, "c keeps its retained slot");
         store.commit(second.iter().map(|(id, _)| id.clone()), &placed);
         assert_eq!(store.len(), 2, "the departed node leaves the store");
         assert!(store.get("b").is_none());
 
         // A newcomer whose fresh slot is occupied gets pushed clear instead of
         // stacking on the retained card.
-        let third = fresh(&[("a", 40, 16, 0), ("c", 84, 16, 1), ("d", 84, 27, 1)]);
+        let third = fresh(&[("a", 16, 40, 0), ("c", 16, 84, 1), ("d", 54, 84, 1)]);
         let placed = store.place(&third, CARD, LANE);
-        assert_eq!(placed[1].y, 27, "c still retained");
+        assert_eq!(placed[1].x, 54, "c still retained");
         assert!(
-            placed[2].y >= 27 + CARD.1,
+            placed[2].x >= 54 + CARD.0,
             "the newcomer clears the retained card: {:?}",
             placed[2]
         );

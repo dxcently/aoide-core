@@ -13,7 +13,8 @@
 //! `state/stage/graph.json` — so the picture on screen is the document on
 //! disk. Each session has at most one incoming edge (spawned-by wins over
 //! anchors), so the document parses into a forest and the fresh layout is a
-//! tree walk: `column = depth`, parents centred over their descendant leaves.
+//! tree walk: `rank = depth`, parents centred horizontally over their
+//! descendant leaves.
 //!
 //! **The positions are retained, not recomputed.** That tree walk only
 //! proposes; [`crate::scene::Positions`] decides. A card already on the canvas
@@ -43,14 +44,17 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::Frame;
 use std::collections::{HashMap, HashSet, VecDeque};
 
-/// Generous wire gutter separates fixed world cards.
-const GUTTER: i32 = 12;
+/// Vertical gap between depth ranks — just enough room for a wire's stem,
+/// spreader and drop, never a wide gutter, since rank stacks eat screen
+/// height fastest.
+const RANK_GAP: i32 = 3;
 /// Fixed card size in world cells; title, identity, and state each have their
 /// own line. Cards never change size — the camera does.
 const CARD_W: i32 = 32;
 const CARD_H: i32 = 7;
-/// Vertical pitch of one leaf lane in the fresh layout.
-const LANE: i32 = CARD_H + 4;
+/// Horizontal pitch of one leaf slot in the fresh layout — card width plus a
+/// readable gap between siblings.
+const SLOT: i32 = CARD_W + 6;
 /// Empty canvas kept around the forest on every side, so the camera can pan
 /// and zoom PAST the outermost cards instead of clamping to their edges.
 const CANVAS_PAD: (i32, i32) = (40, 16);
@@ -440,11 +444,11 @@ fn place(
     roots: &[String],
     retained: &crate::scene::Positions,
 ) {
-    let mut lane = 0;
-    let mut lanes: HashMap<String, i32> = HashMap::new();
+    let mut slot = 0;
+    let mut slots: HashMap<String, i32> = HashMap::new();
     for root in roots {
-        lay_lanes(root, children, nodes, &mut lane, &mut lanes);
-        lane += LANE;
+        lay_slots(root, children, nodes, &mut slot, &mut slots);
+        slot += SLOT;
     }
     let fresh: Vec<(String, Placed)> = nodes
         .iter()
@@ -452,8 +456,8 @@ fn place(
             (
                 n.id.clone(),
                 Placed {
-                    x: CANVAS_PAD.0 + n.depth as i32 * (CARD_W + GUTTER),
-                    y: CANVAS_PAD.1 + lanes.get(&n.id).copied().unwrap_or(0),
+                    x: CANVAS_PAD.0 + slots.get(&n.id).copied().unwrap_or(0),
+                    y: CANVAS_PAD.1 + n.depth as i32 * (CARD_H + RANK_GAP),
                     depth: n.depth,
                 },
             )
@@ -461,15 +465,16 @@ fn place(
         .collect();
     for (node, placed) in nodes
         .iter_mut()
-        .zip(retained.place(&fresh, (CARD_W, CARD_H), LANE))
+        .zip(retained.place(&fresh, (CARD_W, CARD_H), SLOT))
     {
         node.world = WorldRect::new(placed.x, placed.y, CARD_W, CARD_H);
     }
 }
 
-/// The fresh proposal: leaves take successive lanes, a parent centres over its
-/// first and last descendant leaf. Selection order stays preorder.
-fn lay_lanes(
+/// The fresh proposal: leaves take successive horizontal slots, a parent
+/// centres over its first and last descendant leaf. Selection order stays
+/// preorder.
+fn lay_slots(
     id: &str,
     children: &HashMap<String, Vec<String>>,
     nodes: &[Node],
@@ -491,19 +496,19 @@ fn lay_lanes(
         })
         .cloned()
         .collect();
-    let y = if kids.is_empty() {
-        let y = *next;
-        *next += LANE;
-        y
+    let x = if kids.is_empty() {
+        let x = *next;
+        *next += SLOT;
+        x
     } else {
         let spans: Vec<i32> = kids
             .iter()
-            .map(|child| lay_lanes(child, children, nodes, next, out))
+            .map(|child| lay_slots(child, children, nodes, next, out))
             .collect();
         (spans[0] + spans[spans.len() - 1]) / 2
     };
-    out.insert(id.to_string(), y);
-    y
+    out.insert(id.to_string(), x);
+    x
 }
 
 // ── The view choice: focused component, or the whole forest ─────────────────
@@ -706,7 +711,7 @@ impl Widget for GraphScene<'_> {
         };
         let port = |n: &Node| {
             let r = cam.scale_rect(n.world);
-            (r, r.y + r.h / 2, wire(n))
+            (r, r.x + r.w / 2, wire(n))
         };
         let drawn: HashMap<&str, &Node> =
             self.model.visible().map(|n| (n.id.as_str(), n)).collect();
@@ -723,40 +728,40 @@ impl Widget for GraphScene<'_> {
             if kids.is_empty() {
                 continue;
             }
-            let (pr, py, conn) = port(n);
+            let (pr, px, conn) = port(n);
             let ports: Vec<_> = kids.iter().map(|k| port(k)).collect();
-            let left = ports.iter().map(|(r, _, _)| r.x).min().unwrap();
-            // The junction column sits midway between the parent's right edge
-            // and the leftmost child's left edge — with uniform columns that is
-            // exactly the gutter's centre line.
-            let jx = pr.right().max((pr.right() + left) / 2);
-            let top = ports.iter().map(|(_, y, _)| *y).min().unwrap().min(py);
-            let bottom = ports.iter().map(|(_, y, _)| *y).max().unwrap().max(py);
+            let child_top = ports.iter().map(|(r, _, _)| r.y).min().unwrap();
+            // The junction rank sits midway between the parent's bottom edge
+            // and the topmost child's top edge — with uniform ranks that is
+            // exactly the rank gap's centre line.
+            let jy = pr.bottom().max((pr.bottom() + child_top) / 2);
+            let lo = ports.iter().map(|(_, x, _)| *x).min().unwrap().min(px);
+            let hi = ports.iter().map(|(_, x, _)| *x).max().unwrap().max(px);
             // Cull the whole bundle when no part of it can be on screen.
-            if !WorldRect::new(pr.x, top, jx - pr.x + 1, bottom - top + 1).intersects(&viewport)
+            if !WorldRect::new(lo, pr.y, hi - lo + 1, jy - pr.y + 1).intersects(&viewport)
                 && !ports
                     .iter()
-                    .any(|(r, y, _)| WorldRect::new(jx, *y, r.x - jx + 1, 1).intersects(&viewport))
+                    .any(|(r, x, _)| WorldRect::new(*x, jy, 1, r.y - jy + 1).intersects(&viewport))
             {
                 continue;
             }
-            hline(&mut p, o, pr.right(), jx, py, '─', conn);
-            vline(&mut p, o, jx, top, bottom, '│', conn);
-            for ((r, cy, kc), _) in ports.iter().zip(&kids) {
-                hline(&mut p, o, jx + 1, r.x - 1, *cy, '─', *kc);
+            vline(&mut p, o, px, pr.bottom(), jy, '│', conn);
+            hline(&mut p, o, lo, hi, jy, '─', conn);
+            for ((r, cx, kc), _) in ports.iter().zip(&kids) {
+                vline(&mut p, o, *cx, jy + 1, r.y - 1, '│', *kc);
                 set(
                     &mut p,
                     o,
-                    jx,
-                    *cy,
-                    if top == bottom {
-                        '─'
-                    } else if *cy == top {
+                    *cx,
+                    jy,
+                    if lo == hi {
+                        '│'
+                    } else if *cx == lo {
                         '┌'
-                    } else if *cy == bottom {
-                        '└'
+                    } else if *cx == hi {
+                        '┐'
                     } else {
-                        '├'
+                        '┬'
                     },
                     *kc,
                 );
@@ -764,14 +769,14 @@ impl Widget for GraphScene<'_> {
             set(
                 &mut p,
                 o,
-                jx,
-                py,
-                if top == bottom {
-                    '─'
-                } else if py == top {
-                    '┬'
-                } else if py == bottom {
-                    '┴'
+                px,
+                jy,
+                if lo == hi {
+                    '│'
+                } else if px == lo {
+                    '├'
+                } else if px == hi {
+                    '┤'
                 } else {
                     '┼'
                 },
@@ -1331,7 +1336,7 @@ mod tests {
     // ── The document → the typed model ─────────────────────────────────────
 
     #[test]
-    fn model_lays_out_projects_then_spawned_children_in_columns() {
+    fn model_lays_out_projects_then_spawned_children_in_ranks() {
         let app = App::for_test(
             vec![aoide()],
             vec![
@@ -1349,9 +1354,9 @@ mod tests {
         assert_eq!((proj.depth, root.depth, kid.depth), (0, 1, 2));
         assert!(proj.row < root.row && root.row < kid.row);
         assert_eq!(kid.session_id.as_deref(), Some("kid"));
-        // Columns are world coordinates, one card plus one gutter apart.
-        assert_eq!(root.world.x - proj.world.x, CARD_W + GUTTER);
-        assert_eq!(kid.world.x - root.world.x, CARD_W + GUTTER);
+        // Ranks are world coordinates, one card plus one rank gap apart.
+        assert_eq!(root.world.y - proj.world.y, CARD_H + RANK_GAP);
+        assert_eq!(kid.world.y - root.world.y, CARD_H + RANK_GAP);
         assert_eq!((kid.world.w, kid.world.h), (CARD_W, CARD_H));
     }
 
@@ -1508,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn a_re_parented_session_moves_to_its_new_column() {
+    fn a_re_parented_session_moves_to_its_new_rank() {
         let mut app = App::for_test(
             vec![aoide()],
             vec![
@@ -1521,7 +1526,7 @@ mod tests {
         let was = node(&build_model(&app), "orphan").world;
 
         // The spawn edge resolves late: `orphan` is a child now, and a retained
-        // column would draw it to the LEFT of its own parent.
+        // rank would draw it ABOVE its own parent.
         app.sessions
             .iter_mut()
             .find(|s| s.session_id == "orphan")
@@ -1531,8 +1536,8 @@ mod tests {
         let m = build_model(&app);
         let now = node(&m, "orphan");
         assert_eq!(now.depth, node(&m, "parent").depth + 1);
-        assert_eq!(now.world.x, node(&m, "parent").world.x + CARD_W + GUTTER);
-        assert_ne!(now.world.x, was.x);
+        assert_eq!(now.world.y, node(&m, "parent").world.y + CARD_H + RANK_GAP);
+        assert_ne!(now.world.y, was.y);
     }
 
     // ── The view choice ────────────────────────────────────────────────────
@@ -1827,7 +1832,7 @@ mod tests {
         let mut app = app_base;
         app.graph.view = View::All;
         let base = build_model(&app);
-        // Force a card onto the junction column: the vertical trunk between
+        // Force a card onto the junction rank: the horizontal spreader between
         // `root` and its two children now runs straight through `right`'s
         // rectangle, so this proves the layering rather than assuming it.
         let ids: Vec<String> = base.nodes.iter().map(|n| n.id.clone()).collect();
@@ -1850,8 +1855,8 @@ mod tests {
             .iter()
             .position(|n| n.id.ends_with("right"))
             .unwrap();
-        let junction = placed[root].x + CARD_W + GUTTER / 2;
-        placed[right].x = junction - CARD_W / 2;
+        let junction = placed[root].y + CARD_H + RANK_GAP / 2;
+        placed[right].y = junction - CARD_H / 2;
         app.graph.positions.commit(ids, &placed);
 
         let model = build_model(&app);
@@ -1862,36 +1867,36 @@ mod tests {
         let buf = paint(&app, area);
         let card = model.camera.scale_rect(node(&model, "right").world);
         assert!(
-            (card.x..card.right()).contains(&junction),
+            (card.y..card.bottom()).contains(&junction),
             "the fixture really does park the card on the trunk"
         );
-        // The card owns its interior: the trunk that runs through this column
-        // shows above and below the card and nowhere inside it.
+        // The card owns its interior: the trunk that runs through this rank
+        // shows left and right of the card and nowhere inside it.
         for dy in 1..card.h - 1 {
             for dx in 1..card.w - 1 {
                 let (x, y) = ((card.x - o.0 + dx) as u16, (card.y - o.1 + dy) as u16);
                 let sym = buf[(x, y)].symbol();
                 assert!(
-                    !matches!(sym, "│" | "┬" | "┼" | "├"),
+                    !matches!(sym, "─" | "├" | "┼" | "┬"),
                     "a wire glyph survived inside the card at {dx},{dy}: {sym}\n{}",
                     dump(&buf)
                 );
             }
         }
         // …and the trunk is not gone, only underneath: it still shows in the
-        // same column band one row above the card.
-        let above = (card.x..card.right())
-            .filter(|x| buf[((x - o.0) as u16, (card.y - o.1 - 1) as u16)].symbol() == "│")
+        // same row band one column to the left of the card.
+        let beside = (card.y..card.bottom())
+            .filter(|y| buf[((card.x - o.0 - 1) as u16, (y - o.1) as u16)].symbol() == "─")
             .count();
         assert!(
-            above > 0,
-            "the trunk still runs through this column band:\n{}",
+            beside > 0,
+            "the trunk still runs through this row band:\n{}",
             dump(&buf)
         );
     }
 
     #[test]
-    fn branches_take_separate_lanes_with_a_centred_parent_and_connected_ports() {
+    fn branches_take_separate_slots_with_a_centred_parent_and_connected_ports() {
         let mut app = App::for_test(
             vec![],
             vec![
@@ -1910,9 +1915,9 @@ mod tests {
             node(&model, "right"),
             node(&model, "leaf"),
         );
-        assert_eq!(left.world.y, leaf.world.y);
-        assert!(right.world.y >= left.world.y + LANE);
-        assert_eq!(root.world.y, (left.world.y + right.world.y) / 2);
+        assert_eq!(left.world.x, leaf.world.x);
+        assert!(right.world.x >= left.world.x + SLOT);
+        assert_eq!(root.world.x, (left.world.x + right.world.x) / 2);
 
         // At every scale the card border stays whole where a wire arrives —
         // no port circles punched through it.
@@ -1925,10 +1930,10 @@ mod tests {
             let buf = paint(&app, area);
             for n in model.visible() {
                 let r = model.camera.scale_rect(n.world);
-                let y = (r.y + r.h / 2) as u16;
-                for x in [r.x as u16, (r.right() - 1) as u16] {
+                let x = (r.x + r.w / 2) as u16;
+                for y in [r.y as u16, (r.bottom() - 1) as u16] {
                     assert!(
-                        matches!(buf[(x, y)].symbol(), "│" | "┃"),
+                        matches!(buf[(x, y)].symbol(), "─" | "━"),
                         "zoom {zoom}: card edge at {x},{y} is {:?}",
                         buf[(x, y)].symbol()
                     );
@@ -1938,7 +1943,7 @@ mod tests {
     }
 
     #[test]
-    fn the_junction_sits_in_the_gutter_and_the_wire_reaches_both_cards() {
+    fn the_junction_sits_in_the_rank_gap_and_the_wire_reaches_both_cards() {
         let mut app = App::for_test(
             vec![],
             vec![
@@ -1954,18 +1959,18 @@ mod tests {
         let area = Rect::new(0, 0, ext.0 as u16, ext.1 as u16);
         let buf = paint(&app, area);
         let root = node(&model, "root");
-        let junction = (root.world.x + CARD_W + GUTTER / 2) as u16;
-        let port = (root.world.y + CARD_H / 2) as u16;
-        assert_eq!(buf[(junction, port)].symbol(), "─");
+        let junction = (root.world.y + CARD_H + RANK_GAP / 2) as u16;
+        let port = (root.world.x + CARD_W / 2) as u16;
+        assert_eq!(buf[(port, junction)].symbol(), "│");
         assert_eq!(
-            buf[((root.world.x + CARD_W) as u16, port)].symbol(),
-            "─",
-            "the wire leaves the parent's right edge"
+            buf[(port, (root.world.y + CARD_H) as u16)].symbol(),
+            "│",
+            "the wire leaves the parent's bottom edge"
         );
         assert_eq!(
-            buf[((node(&model, "kid").world.x - 1) as u16, port)].symbol(),
-            "─",
-            "and reaches the child's left edge"
+            buf[(port, (node(&model, "kid").world.y - 1) as u16)].symbol(),
+            "│",
+            "and reaches the child's top edge"
         );
     }
 
@@ -2019,7 +2024,7 @@ mod tests {
         );
         let model = build_model(&app);
         let root = node(&model, "root");
-        assert_eq!(root.world.y, node(&model, "child").world.y);
+        assert_eq!(root.world.x, node(&model, "child").world.x);
         for (bg, fg) in [(0, 15), (15, 0)] {
             let pal = crate::app::Palette {
                 bg: Some(bg),

@@ -61,12 +61,14 @@ as keyboard navigation. Visible action labels explain panel-specific keys.
 Text entry takes precedence over navigation shortcuts. Bracketed paste inserts
 text into the active field without interpreting it as commands.
 
-Graph is a retained scene. Cards are fixed-size rectangles standing at world
+Graph is a retained scene, drawn top-down: depth runs downward through ranks
+and siblings spread across a rank, with a parent centred over the horizontal
+span of its own children. Cards are fixed-size rectangles standing at world
 coordinates the scene keeps: a refresh that adds, ends or re-parents sessions
 leaves every surviving card where it was, and an arriving card takes the first
-free lane below its proposed row. A session that changed parent is the one
-exception — it moves to its new column, because a retained position would draw
-a child left of its parent. Selection names a card by identity rather than by
+free slot beside its proposed one. A session that changed parent is the one
+exception — it moves to its new rank, because a retained position would draw
+a child above its parent. Selection names a card by identity rather than by
 row, so the same card stays selected across a refresh.
 
 `j` / `k` or the arrows step the selection through the visible cards; `h` / `l`

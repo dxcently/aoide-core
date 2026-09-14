@@ -79,7 +79,7 @@ never reconstructs what the last one decided.
 ```text
 stage refresh ─── nodes and edges ───┐
                                      ▼
-                              lane layout ── proposed world rows
+                              tree layout ── proposed world cells
                                      │
 retained positions ──────────────────┼── retained wins, except on depth change
                                      ▼
@@ -94,12 +94,32 @@ retained positions ──────────────────┼─�
 ```
 
 Placement is retained-wins: a surviving card keeps its world rectangle, an
-arriving card is nudged one lane at a time until it collides with nothing, and
+arriving card is nudged one slot at a time until it collides with nothing, and
 a departed card's position is dropped. A node whose depth changed is re-placed
-instead, because a re-parented session genuinely moved and a retained column
-would draw a child left of its parent. Selection is a node identity and the
+instead, because a re-parented session genuinely moved and a retained rank
+would draw a child above its parent. Selection is a node identity and the
 visible order derives from it, so the filtered view and the selection cannot
-disagree about which card is chosen.
+disagree about which card is chosen. Depth runs downward through ranks;
+siblings spread across a rank, and a parent centres over the horizontal span
+of its own children. A wire leaves a parent's bottom edge, spreads along a
+horizontal junction row in the rank gap below it, and drops into each child's
+top edge.
+
+GraphScene renders as a plain `Widget`, never a `StatefulWidget`: the latter
+exists so a widget can write back into state during render, and this crate's
+standing rule runs the other way — render only reads `App::graph`, and input
+handling owns every state change. Recording a card's rectangle during render
+for a later hit test is exactly that kind of write-back, and this scene never
+does it: render and hit testing already run the same `Camera` transform over
+the same retained world, so they agree by construction rather than by one
+frame leaving notes for the next event.
+
+Connectors paint straight into the frame buffer through the clipping
+`Painter`, never through `ratatui`'s `Canvas` widget: `Canvas` draws with
+sub-cell braille and half-block marks, which cannot carry this graph's
+box-drawing junction grammar (`┌ ┐ ┬ ┼` and their mirrors) at cell resolution,
+nor a distinct state colour per edge on a specific cell. Terminal glyphs stay
+fixed-size here, and a `Canvas` has no cell to hold one in.
 
 Focus walks the graph undirected from the selected node and draws that
 component alone; All draws every node. The synthetic root gathering sessions
