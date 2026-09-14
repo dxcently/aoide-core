@@ -157,6 +157,36 @@ pub fn select_index(app: &mut App, i: usize) {
     }
 }
 
+/// Move the selection to the sibling before (`forward = false`) or after
+/// (`forward = true`) it across the rank: a node sharing this one's parent,
+/// in the existing child order. Never wraps at a rank's end, and does
+/// nothing for a root (no parent), an only child, or a sibling the current
+/// view does not draw.
+pub fn select_sibling(app: &mut App, forward: bool) {
+    let model = build_model(app);
+    let Some(id) = model.visible().nth(model.selected).map(|n| n.id.clone()) else {
+        return;
+    };
+    let Some(siblings) = model.children.values().find(|kids| kids.contains(&id)) else {
+        return; // a root has no parent, hence no siblings
+    };
+    let Some(pos) = siblings.iter().position(|s| s == &id) else {
+        return;
+    };
+    let target = if forward {
+        siblings.get(pos + 1)
+    } else {
+        pos.checked_sub(1).and_then(|p| siblings.get(p))
+    };
+    let Some(target_id) = target else {
+        return;
+    };
+    if model.visible().any(|n| &n.id == target_id) {
+        app.graph.selected = target_id.clone();
+        app.graph.camera.pan = None;
+    }
+}
+
 pub fn selected_node(app: &App) -> Option<Node> {
     let model = build_model(app);
     let node = model.visible().nth(model.selected).cloned();

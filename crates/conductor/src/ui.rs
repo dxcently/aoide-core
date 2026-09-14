@@ -106,7 +106,7 @@ fn keymap_hint(panel: Panel) -> &'static str {
         Panel::Home => "click to open · Ctrl-P projects · ? help · q quit",
         Panel::Mail => "↑/↓ letters · PgUp/PgDn read · r refresh · ? help",
         Panel::Graph => {
-            "j/k select · h/l depth · a all/focus · Enter open · s letter · e menu · drag/wheel pan · Ctrl-wheel zoom · p prune"
+            "j/k child/parent · h/l sibling · a all/focus · Enter open · s letter · e menu · drag/wheel pan · Ctrl-wheel zoom · p prune"
         }
         Panel::Session|Panel::Terminals => {
             "j/k select · Enter jump/fold · h/l fold · L link · a add root · d rm · p prune · ? help · q quit"
@@ -870,9 +870,9 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "  Projects: a/r     add folder / resurrect project",
         "  Agents/Terminals: Enter cue window or tail the log if headless",
         "  Esc / q           close the log tail (Enter also closes it)",
-        "  Graph: j/k        select cards · Enter focus · read-only tags",
+        "  Graph: j/k        down/up a rank: child / parent",
         "  Graph: a          whole forest / the picked card's own graph",
-        "  Graph: h/l        move by depth: parent / child",
+        "  Graph: h/l        previous/next sibling · Enter focus · read-only tags",
         "  Graph: e/s        actions menu / write a letter",
         "  Graph: pan        Space or middle drag; wheel/Shift-wheel",
         "  Graph: zoom       Ctrl+wheel steps 50-150%, at the pointer",

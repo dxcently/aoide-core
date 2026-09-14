@@ -32,7 +32,8 @@ kill or resurrect a process.
 | `h` / `l`, Left / Right | Fold or unfold tree groups |
 | `e` / right-click | Actions for a tree, graph, project or session target |
 | `a` in Graph | Whole forest, or only the selected card's own graph |
-| `h` / `l`, Left / Right in Graph | Move the selection by depth, toward the parent or the child |
+| `j` / `k`, Down / Up in Graph | Move the selection down/up a rank, toward a child or the parent |
+| `h` / `l`, Left / Right in Graph | Move the selection to the previous/next sibling across the rank |
 | Enter in Graph | Open or focus the selected session |
 | `s` in Graph | Write a letter to the selected agent |
 | `p` in Graph | Prune ended sessions |
@@ -71,11 +72,12 @@ exception — it moves to its new rank, because a retained position would draw
 a child above its parent. Selection names a card by identity rather than by
 row, so the same card stays selected across a refresh.
 
-`j` / `k` or the arrows step the selection through the visible cards; `h` / `l`
-or Left / Right step it by depth, toward the parent or the child. Enter opens
-or focuses the selected session, `s` writes a letter to the selected agent
-directly without opening the actions menu, and `p` prunes ended sessions —
-the one mutation the panel dispatches on its own.
+`j` / `k` or Down / Up step the selection a rank at a time, toward a child or
+the parent; `h` / `l` or Left / Right step it to the previous or next sibling
+across the rank, and neither wraps at a rank's end. Enter opens or focuses
+the selected session, `s` writes a letter to the selected agent directly
+without opening the actions menu, and `p` prunes ended sessions — the one
+mutation the panel dispatches on its own.
 
 `a` switches the two views. Focus, the default, draws only the connected graph
 the selected card belongs to; All draws the whole forest. Sessions belonging to

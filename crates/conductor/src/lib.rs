@@ -369,29 +369,6 @@ fn handle_key(app: &mut App, key: KeyEvent) -> bool {
         open_context_hit(app, hit, 2, 4);
         return false;
     }
-    if app.panel == Panel::Graph
-        && !app.sidebar_focused
-        && matches!(
-            key.code,
-            KeyCode::Char('h' | 'l') | KeyCode::Left | KeyCode::Right
-        )
-    {
-        let nodes = graphview::node_order(app);
-        let selected = graphview::selected_index(app);
-        if let Some(node) = nodes.get(selected) {
-            if matches!(key.code, KeyCode::Left | KeyCode::Char('h')) {
-                if let Some(i) = nodes[..selected].iter().rposition(|n| n.depth < node.depth) {
-                    graphview::select_index(app, i);
-                }
-            } else if nodes
-                .get(selected + 1)
-                .is_some_and(|n| n.depth > node.depth)
-            {
-                graphview::select_index(app, selected + 1);
-            }
-        }
-        return false;
-    }
     if !app.sidebar_focused
         && matches!(app.panel, Panel::Session | Panel::Terminals)
         && matches!(key.code, KeyCode::Left | KeyCode::Right)

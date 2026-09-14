@@ -2566,22 +2566,41 @@ impl App {
         }
     }
 
-    /// Keys for the Graph panel. Navigation walks the same visible node list
-    /// the scene draws, so `j`/`k` can never point at a node that isn't on
-    /// screen. Enter cues the selected session's window (the same
-    /// [`App::cue_session`] focus jump the roster uses); `a` swaps between the
-    /// focused component and the whole forest; `p` prunes — the one
-    /// graph-wide command — so the visual view is not read-only.
+    /// Keys for the Graph panel walk the same tree the scene draws, never a
+    /// flat list, so each binding names the direction it moves on screen:
+    /// `j`/Down steps to the first child (down a rank), `k`/Up steps to the
+    /// parent (up a rank) — preorder always visits a node immediately before
+    /// its own children, so the parent/child edge is just the nearest node
+    /// whose depth differs by one in the right direction. `h`/Left and
+    /// `l`/Right step to the previous/next sibling sharing this node's
+    /// parent, in the existing child order, and never wrap. Enter cues the
+    /// selected session's window (the same [`App::cue_session`] focus jump
+    /// the roster uses); `a` swaps between the focused component and the
+    /// whole forest; `p` prunes — the one graph-wide command — so the visual
+    /// view is not read-only.
     fn handle_graph_key(&mut self, key: KeyEvent) {
         let nodes = crate::graphview::node_order(self);
         let selected = crate::graphview::selected_index(self);
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                crate::graphview::select_index(self, selected + 1)
+                if let Some(node) = nodes.get(selected) {
+                    if nodes
+                        .get(selected + 1)
+                        .is_some_and(|n| n.depth > node.depth)
+                    {
+                        crate::graphview::select_index(self, selected + 1);
+                    }
+                }
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                crate::graphview::select_index(self, selected.saturating_sub(1))
+                if let Some(node) = nodes.get(selected) {
+                    if let Some(i) = nodes[..selected].iter().rposition(|n| n.depth < node.depth) {
+                        crate::graphview::select_index(self, i);
+                    }
+                }
             }
+            KeyCode::Char('h') | KeyCode::Left => crate::graphview::select_sibling(self, false),
+            KeyCode::Char('l') | KeyCode::Right => crate::graphview::select_sibling(self, true),
             KeyCode::Home | KeyCode::Char('g') => crate::graphview::select_index(self, 0),
             KeyCode::End | KeyCode::Char('G') => {
                 crate::graphview::select_index(self, nodes.len().saturating_sub(1))
@@ -3515,6 +3534,110 @@ mod tests {
                 "hand-rolled audit record names graph.focus: {audit}"
             );
         });
+    }
+
+    /// `j`/`k` walk the tree, not the flat visible list: down to a child,
+    /// up to the parent. A rank's own siblings never move on these keys, and
+    /// the forest root — the one node with no parent at all — never moves on
+    /// `k`.
+    #[test]
+    fn graph_j_and_k_move_down_and_up_a_rank() {
+        let mut app = App::for_test(
+            vec![],
+            vec![
+                session("p", "/x", "working", None),
+                session("a", "/x", "idle", Some("p")),
+                session("b", "/x", "idle", Some("p")),
+                session("c", "/x", "idle", Some("p")),
+            ],
+            vec![],
+        );
+        app.panel = Panel::Graph;
+        app.sync_graph_scene();
+
+        // The default selection falls back to the synthetic root, which pulls
+        // its own forest into Focus: root, p, then p's children in order.
+        let ids: Vec<Option<String>> = crate::graphview::node_order(&app)
+            .iter()
+            .map(|n| n.session_id.clone())
+            .collect();
+        assert_eq!(
+            ids,
+            vec![
+                None,
+                Some("p".into()),
+                Some("a".into()),
+                Some("b".into()),
+                Some("c".into())
+            ],
+            "root, parent, then children in the existing child order"
+        );
+
+        crate::graphview::select_index(&mut app, 2); // a
+        app.handle_key(KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(
+            crate::graphview::selected_session_id(&app).as_deref(),
+            Some("p"),
+            "k from a child selects its parent"
+        );
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('j')));
+        assert_eq!(
+            crate::graphview::selected_session_id(&app).as_deref(),
+            Some("a"),
+            "j from the parent selects its first child"
+        );
+
+        crate::graphview::select_index(&mut app, 0); // the forest root
+        app.handle_key(KeyEvent::from(KeyCode::Char('k')));
+        assert_eq!(
+            crate::graphview::selected_index(&app),
+            0,
+            "a node with no parent does not move on k"
+        );
+    }
+
+    /// `h`/`l` walk the rank, not the tree: the previous/next sibling sharing
+    /// this node's parent, never past either end.
+    #[test]
+    fn graph_h_and_l_step_across_siblings_without_wrapping() {
+        let mut app = App::for_test(
+            vec![],
+            vec![
+                session("p", "/x", "working", None),
+                session("a", "/x", "idle", Some("p")),
+                session("b", "/x", "idle", Some("p")),
+                session("c", "/x", "idle", Some("p")),
+            ],
+            vec![],
+        );
+        app.panel = Panel::Graph;
+        app.sync_graph_scene();
+        crate::graphview::select_index(&mut app, 3); // b, the middle sibling
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('l')));
+        assert_eq!(
+            crate::graphview::selected_session_id(&app).as_deref(),
+            Some("c")
+        );
+        app.handle_key(KeyEvent::from(KeyCode::Char('h')));
+        assert_eq!(
+            crate::graphview::selected_session_id(&app).as_deref(),
+            Some("b"),
+            "l then h returns to the same sibling"
+        );
+
+        app.handle_key(KeyEvent::from(KeyCode::Char('h'))); // b -> a
+        assert_eq!(
+            crate::graphview::selected_session_id(&app).as_deref(),
+            Some("a")
+        );
+        app.handle_key(KeyEvent::from(KeyCode::Char('h'))); // a is already first
+        assert_eq!(
+            crate::graphview::selected_session_id(&app).as_deref(),
+            Some("a"),
+            "the first sibling in the rank does not wrap to the last"
+        );
     }
 
     #[test]
