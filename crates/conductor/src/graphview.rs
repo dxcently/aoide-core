@@ -40,7 +40,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Paragraph, Widget};
+use ratatui::widgets::{Block, BorderType, Padding, Paragraph, Widget};
 use ratatui::Frame;
 use std::collections::{HashMap, HashSet, VecDeque};
 
@@ -697,24 +697,6 @@ pub fn hit_node(area: Rect, app: &App, x: u16, y: u16) -> Option<usize> {
 
 // ── Rendering: the scene, clipped to the viewport ───────────────────────────
 
-/// One painted cell: a symbol and its style.
-#[derive(Clone)]
-struct GCell {
-    ch: char,
-    style: Style,
-    continuation: bool,
-}
-
-impl Default for GCell {
-    fn default() -> Self {
-        GCell {
-            ch: ' ',
-            style: Style::default(),
-            continuation: false,
-        }
-    }
-}
-
 /// The retained graph scene as a widget: edges first, cards on top, every
 /// write clipped to the viewport.
 pub struct GraphScene<'a> {
@@ -814,30 +796,53 @@ impl Widget for GraphScene<'_> {
             );
         }
 
-        // Cards last, so an edge never draws over the card it arrives at.
+        // Cards last, so an edge never draws over the card it arrives at. One
+        // scratch buffer carries each card's real-widget render before the
+        // clipping Painter blits it into the frame; it is resized only when
+        // the zoomed card size actually changes, never per card, since every
+        // card in one frame shares the same camera.
+        let mut scratch = Buffer::empty(Rect::new(0, 0, 1, 1));
         for (i, n) in self.model.visible().enumerate() {
             let r = cam.scale_rect(n.world);
             if !r.intersects(&viewport) {
                 continue; // culled: off camera costs a comparison, not a cell
             }
-            let cells = block_cells_at(n, i == self.selected, self.palette, r.w, r.h);
-            for (dy, row) in cells.iter().enumerate() {
-                for (dx, cell) in row.iter().enumerate() {
-                    if cell.continuation {
-                        continue;
-                    }
-                    let width = Span::raw(cell.ch.to_string()).width() as i32;
-                    set_cell(
-                        &mut p,
-                        o,
-                        r.x + dx as i32,
-                        r.y + dy as i32,
-                        cell.ch,
-                        width.max(1),
-                        cell.style,
-                    );
-                }
+            let (cw, ch) = (r.w.max(2) as u16, r.h.max(2) as u16);
+            let scratch_area = *scratch.area();
+            if scratch_area.width != cw || scratch_area.height != ch {
+                scratch = Buffer::empty(Rect::new(0, 0, cw, ch));
+            } else {
+                scratch.reset();
             }
+            render_card_into(n, i == self.selected, self.palette, &mut scratch);
+            blit_card(&mut p, o, r.x, r.y, &scratch);
+        }
+    }
+}
+
+/// Copies a rendered card's scratch buffer into the frame through the
+/// clipping `Painter`, one glyph at a time and width-aware, so a wide
+/// character is never split across the blit -- its buffer's own trailing
+/// cell (already blanked by `Buffer::set_stringn` when the glyph was drawn)
+/// is skipped rather than independently painted over. The buffer itself is
+/// never clipped; the Painter is what clips this blit to the viewport,
+/// exactly as it clipped the old per-glyph placement.
+fn blit_card(p: &mut Painter, o: (i32, i32), cx: i32, cy: i32, card: &Buffer) {
+    let area = *card.area();
+    for y in 0..area.height {
+        let mut x = 0u16;
+        while x < area.width {
+            let cell = &card[(x, y)];
+            let symbol = cell.symbol();
+            let width = Span::raw(symbol).width().max(1) as i32;
+            p.set(
+                cx + x as i32 - o.0,
+                cy + y as i32 - o.1,
+                symbol,
+                width,
+                cell.style(),
+            );
+            x += width as u16;
         }
     }
 }
@@ -902,19 +907,19 @@ pub fn render(f: &mut Frame, area: Rect, app: &App) {
 
 // ── Card content ────────────────────────────────────────────────────────────
 
-#[cfg(test)]
-fn block_cells(n: &Node, selected: bool, pal: &crate::app::Palette) -> Vec<Vec<GCell>> {
-    block_cells_at(n, selected, pal, n.world.w, n.world.h)
-}
-
-fn block_cells_at(
-    n: &Node,
-    selected: bool,
-    pal: &crate::app::Palette,
-    width: i32,
-    height: i32,
-) -> Vec<Vec<GCell>> {
-    let (width, height) = (width.max(2) as usize, height.max(2) as usize);
+/// Renders one card into `buf`, sized and reset by the caller. A bordered
+/// `Block` -- `BorderType::Thick`/`Plain` are the exact `┏┓┗┛━┃`/`┌┐└┘─│`
+/// glyph sets the hand-drawn border used -- stands in for the old per-corner,
+/// per-edge `put()` loop, and `Buffer::set_line` places each already-fitted
+/// row in place of the old per-glyph placement loop with its own
+/// continuation-cell bookkeeping; `Block`'s own `style` fill and
+/// `Buffer::set_stringn` (via `set_line`) already do that cell-width work.
+/// Chosen over `Paragraph`: the rows are already an ordered, filtered,
+/// enumerated `(text, style)` sequence (dropping an empty row so the ones
+/// below it compact upward), and hand-timing each one's `y` to `set_line`
+/// needs no `Vec<Line>` collection step `Paragraph` would otherwise want.
+fn render_card_into(n: &Node, selected: bool, pal: &crate::app::Palette, buf: &mut Buffer) {
+    let area = *buf.area();
     let surface = theme::surface(
         pal,
         if n.kind != NodeKind::Session {
@@ -942,39 +947,18 @@ fn block_cells_at(
     } else {
         surface.patch(theme::state_style(n.state.as_deref().unwrap_or(""), pal))
     };
-    let mut block = vec![
-        vec![
-            GCell {
-                ch: ' ',
-                style: surface,
-                continuation: false
-            };
-            width
-        ];
-        height
-    ];
-    let (tl, tr, bl, br, h, v) = if selected {
-        ('┏', '┓', '┗', '┛', '━', '┃')
-    } else {
-        ('┌', '┐', '└', '┘', '─', '│')
-    };
-    for x in 1..width - 1 {
-        put(&mut block, x, 0, h, border);
-        put(&mut block, x, height - 1, h, border);
-    }
-    for y in 1..height - 1 {
-        put(&mut block, 0, y, v, border);
-        put(&mut block, width - 1, y, v, border);
-    }
-    for (x, y, ch) in [
-        (0, 0, tl),
-        (width - 1, 0, tr),
-        (0, height - 1, bl),
-        (width - 1, height - 1, br),
-    ] {
-        put(&mut block, x, y, ch, border);
-    }
-    let budget = width.saturating_sub(4);
+    let block = Block::bordered()
+        .border_type(if selected {
+            BorderType::Thick
+        } else {
+            BorderType::Plain
+        })
+        .border_style(border)
+        .style(surface)
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    block.render(area, buf);
+    let budget = inner.width as usize;
     let state = n.state.as_deref().unwrap_or("");
     let role = if n.role.is_empty() {
         if n.harness == "shell" {
@@ -1075,28 +1059,15 @@ fn block_cells_at(
         .into_iter()
         .filter(|(text, _)| !text.is_empty())
         .enumerate()
+        .take(inner.height as usize)
     {
-        let y = idx + 1;
-        if y >= height - 1 {
-            continue;
-        }
-        let mut dx = 0;
-        for ch in text.chars() {
-            let cells = Span::raw(ch.to_string()).width();
-            if cells == 0 {
-                continue;
-            }
-            if dx + cells > budget {
-                break;
-            }
-            put(&mut block, 2 + dx, y, ch, style);
-            for i in 1..cells {
-                block[y][2 + dx + i].continuation = true;
-            }
-            dx += cells;
-        }
+        buf.set_line(
+            inner.x,
+            inner.y + idx as u16,
+            &Line::from(Span::styled(text, style)),
+            inner.width,
+        );
     }
-    block
 }
 
 /// Fit a display-grammar label (`<host>/<role>/<petname> (…<tail4>)`, or the
@@ -1204,45 +1175,76 @@ fn truncate_end(s: &str, budget: usize) -> String {
     format!("{head}…")
 }
 
-fn put(grid: &mut [Vec<GCell>], x: usize, y: usize, ch: char, style: Style) {
-    if let Some(row) = grid.get_mut(y) {
-        if let Some(slot) = row.get_mut(x) {
-            *slot = GCell {
-                ch,
-                style,
-                continuation: false,
-            };
-        }
-    }
+/// Render one card in isolation, at its own retained world size, for tests
+/// that inspect a single card's buffer without a `GraphScene`/`Camera`.
+#[cfg(test)]
+fn block_cells(n: &Node, selected: bool, pal: &crate::app::Palette) -> Buffer {
+    block_cells_at(n, selected, pal, n.world.w, n.world.h)
 }
 
-/// Coalesce each grid row's runs of same-style cells into ratatui spans.
+/// As [`block_cells`], but at an explicit size — used to probe clipping at
+/// sizes the retained world rectangle would not itself produce.
 #[cfg(test)]
-fn grid_to_lines(grid: &[Vec<GCell>]) -> Vec<Line<'static>> {
-    grid.iter()
-        .map(|row| {
+fn block_cells_at(
+    n: &Node,
+    selected: bool,
+    pal: &crate::app::Palette,
+    width: i32,
+    height: i32,
+) -> Buffer {
+    let mut buf = Buffer::empty(Rect::new(0, 0, width.max(2) as u16, height.max(2) as u16));
+    render_card_into(n, selected, pal, &mut buf);
+    buf
+}
+
+/// Coalesce each buffer row's runs of same-style cells into ratatui spans,
+/// walking width-aware so a wide glyph's already-blanked trailing cell (see
+/// `Buffer::set_stringn`) is stepped over rather than independently visited.
+#[cfg(test)]
+fn grid_to_lines(buf: &Buffer) -> Vec<Line<'static>> {
+    let area = *buf.area();
+    (0..area.height)
+        .map(|y| {
             let mut spans: Vec<Span<'static>> = Vec::new();
-            let mut buf = String::new();
+            let mut text = String::new();
             let mut cur: Option<Style> = None;
-            for cell in row {
-                if cell.continuation {
-                    continue;
-                }
+            let mut x = 0u16;
+            while x < area.width {
+                let cell = &buf[(x, y)];
+                let symbol = cell.symbol();
+                let w = Span::raw(symbol).width().max(1) as u16;
+                let style = cell.style();
                 match cur {
-                    Some(s) if s == cell.style => buf.push(cell.ch),
+                    Some(s) if s == style => text.push_str(symbol),
                     _ => {
                         if let Some(s) = cur {
-                            spans.push(Span::styled(std::mem::take(&mut buf), s));
+                            spans.push(Span::styled(std::mem::take(&mut text), s));
                         }
-                        buf.push(cell.ch);
-                        cur = Some(cell.style);
+                        text.push_str(symbol);
+                        cur = Some(style);
                     }
                 }
+                x += w;
             }
             if let Some(s) = cur {
-                spans.push(Span::styled(buf, s));
+                spans.push(Span::styled(text, s));
             }
             Line::from(spans)
+        })
+        .collect()
+}
+
+/// Flatten a buffer's rows into plain strings, one per row, in column order.
+/// The test-only counterpart to `grid_to_lines` for assertions that want raw
+/// text rather than styled spans.
+#[cfg(test)]
+fn buffer_rows(buf: &Buffer) -> Vec<String> {
+    let area = *buf.area();
+    (0..area.height)
+        .map(|y| {
+            (0..area.width)
+                .map(|x| buf[(x, y)].symbol())
+                .collect::<String>()
         })
         .collect()
 }
@@ -1253,6 +1255,7 @@ mod tests {
     use crate::app::App;
     use crate::scene::Placed;
     use aoide_conduct::graph::{Project, SessionRecord};
+    use ratatui::style::Color;
     use serde_json::Map;
 
     fn session(id: &str, cwd: &str, state: &str, parent: Option<&str>) -> SessionRecord {
@@ -1765,7 +1768,10 @@ mod tests {
             );
             let r = model.camera.scale_rect(n.world);
             let cells = block_cells_at(n, true, &app.palette, r.w, r.h);
-            assert_eq!((cells[0].len() as i32, cells.len() as i32), (r.w, r.h));
+            assert_eq!(
+                (cells.area().width as i32, cells.area().height as i32),
+                (r.w, r.h)
+            );
             assert!(grid_to_lines(&cells)
                 .iter()
                 .all(|line| line.width() as i32 == r.w));
@@ -1828,6 +1834,88 @@ mod tests {
         );
         // Nothing painted outside the pane, at any camera position.
         assert!(painted(&buf) <= (area.width * area.height) as usize);
+    }
+
+    #[test]
+    fn a_clipped_card_shows_a_crop_of_the_real_card_never_a_fabricated_border() {
+        // `Block::bordered()` renders into the scratch buffer at the card's
+        // real, unclipped size; clipping happens only in `blit_card`'s own
+        // bounds check as it copies cells out. If clipping were instead done
+        // by handing `Block` a pre-shrunk area, it would draw its OWN border
+        // around whatever rectangle survived the clip -- a border that does
+        // not exist on the real card. Proven here, for all four edges, by
+        // requiring the clipped output to equal an exact crop of the
+        // unclipped card: any fabricated glyph at the cut edge fails this.
+        let app = App::for_test(vec![], vec![session("root", "/x", "working", None)], vec![]);
+        let model = build_model(&app);
+        let n = node(&model, "root");
+        let card = block_cells(n, false, &app.palette);
+        let (cw, ch) = (CARD_W as u16, CARD_H as u16);
+
+        let cases: [(i32, i32, u16, u16); 4] = [
+            (0, 1, cw, ch - 1), // clip the top border row
+            (0, 0, cw, ch - 1), // clip the bottom border row
+            (1, 0, cw - 1, ch), // clip the left border column
+            (0, 0, cw - 1, ch), // clip the right border column
+        ];
+        for (ox, oy, w, h) in cases {
+            let area = Rect::new(0, 0, w, h);
+            let mut buf = Buffer::empty(area);
+            let mut p = Painter::new(&mut buf, area);
+            blit_card(&mut p, (ox, oy), 0, 0, &card);
+            for y in 0..h {
+                for x in 0..w {
+                    let got = buf[(x, y)].symbol();
+                    let want = card[((x as i32 + ox) as u16, (y as i32 + oy) as u16)].symbol();
+                    assert_eq!(
+                        got, want,
+                        "clip offset ({ox},{oy}) at ({x},{y}): expected a crop of the \
+                         real card, not a fabricated edge"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_card_fully_outside_the_viewport_paints_nothing() {
+        let app = App::for_test(vec![], vec![session("root", "/x", "working", None)], vec![]);
+        let model = build_model(&app);
+        let n = node(&model, "root");
+        let card = block_cells(n, false, &app.palette);
+        let area = Rect::new(0, 0, 10, 10);
+
+        for o in [(1000, 1000), (-1000, -1000)] {
+            let mut buf = Buffer::empty(area);
+            let mut p = Painter::new(&mut buf, area);
+            blit_card(&mut p, o, 0, 0, &card);
+            assert_eq!(
+                painted(&buf),
+                0,
+                "a card entirely off camera costs a comparison, never a cell"
+            );
+        }
+    }
+
+    #[test]
+    fn a_wide_glyph_straddling_the_seam_is_dropped_not_half_painted() {
+        // `blit_card` must read each glyph's real display width off the
+        // scratch buffer -- if it instead walked one buffer cell at a time
+        // assuming width 1, a wide glyph's leading half would look like an
+        // ordinary 1-wide glyph to `Painter::set`'s own straddle check and
+        // get drawn alone, splitting it. Building a 1-cell viewport in front
+        // of a 2-wide glyph forces exactly that choice.
+        let mut card = Buffer::empty(Rect::new(0, 0, 4, 1));
+        card.set_stringn(0, 0, "界", 4, Style::default());
+        let area = Rect::new(0, 0, 1, 1);
+        let mut buf = Buffer::empty(area);
+        let mut p = Painter::new(&mut buf, area);
+        blit_card(&mut p, (0, 0), 0, 0, &card);
+        assert_eq!(
+            buf[(0, 0)].symbol(),
+            " ",
+            "a wide glyph that would straddle the seam is dropped whole"
+        );
     }
 
     #[test]
@@ -2046,15 +2134,18 @@ mod tests {
                 ..Default::default()
             };
             let cells = block_cells(root, true, &pal);
-            let text: String = cells.iter().flatten().map(|c| c.ch).collect();
+            let text = buffer_rows(&cells).concat();
             assert!(
                 text.contains("Distinct task title")
                     && text.contains(" (…root)")
                     && text.contains("claude · model-one")
             );
-            assert_eq!(cells[0][0].ch, '┏');
-            assert_eq!(cells[2][2].style.fg, theme::surface(&pal, 0).fg);
-            assert!(cells[2][2].style.bg.is_some());
+            assert_eq!(cells[(0, 0)].symbol(), "┏");
+            // `surface`'s foreground stays constant across layers -- only the
+            // background is layer-mixed -- so layer 0 is as good a probe as
+            // the card's real layer for the (layer-independent) fg value.
+            assert_eq!(cells[(2, 2)].fg, theme::surface(&pal, 0).fg.unwrap());
+            assert_ne!(cells[(2, 2)].bg, Color::Reset);
         }
         let mut wide = root.clone();
         wide.title = "界".repeat(50);
@@ -2089,7 +2180,7 @@ mod tests {
         );
 
         let block = block_cells(node, false, &app.palette);
-        let rendered: String = block.iter().flatten().map(|c| c.ch).collect();
+        let rendered = buffer_rows(&block).concat();
         assert!(
             rendered.contains("working"),
             "state chip survives: {rendered:?}"
@@ -2098,7 +2189,7 @@ mod tests {
             rendered.contains(" (…"),
             "tail4 handle survives: {rendered:?}"
         );
-        assert!(block[3].len() as i32 <= CARD_W, "the row fits the card");
+        assert!(block.area().width as i32 <= CARD_W, "the row fits the card");
     }
 
     #[test]
@@ -2143,7 +2234,8 @@ mod tests {
         select_index(&mut app, 1);
         let model = build_model(&app);
         let cells = block_cells(model.visible().nth(1).unwrap(), true, &app.palette);
-        let line = |y: usize| cells[y].iter().map(|c| c.ch).collect::<String>();
+        let rows = buffer_rows(&cells);
+        let line = |y: usize| rows[y].clone();
         assert!(line(1).contains("Review conductor"));
         assert!(line(2).contains("calm-rook"));
         assert!(line(3).contains("claude · fable"));
@@ -2176,7 +2268,7 @@ mod tests {
         let app = App::for_test(vec![], vec![rec], vec![]);
         let model = build_model(&app);
         let cells = block_cells(node(&model, "r"), false, &app.palette);
-        let text: String = cells.iter().flatten().map(|c| c.ch).collect();
+        let text = buffer_rows(&cells).concat();
         assert_eq!(
             text.matches("claude").count(),
             1,
