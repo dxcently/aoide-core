@@ -61,7 +61,7 @@ impl Panel {
     ];
     pub fn title(self) -> &'static str {
         match self {
-            Panel::Graph => "DAG",
+            Panel::Graph => "GRAPH",
             Panel::Session => "AGENTS",
             Panel::Projects => "PROJECTS",
             Panel::Log => "LOG",

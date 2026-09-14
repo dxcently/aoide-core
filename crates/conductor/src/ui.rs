@@ -10,7 +10,7 @@
 //! SGR. Panels stay pure over `&App`, so a `TestBackend` can render any of them
 //! headless and assert on the buffer (see the tests below).
 //!
-//! Two of the seven panels are the expansion this port carries: `DAG` (the
+//! Two of the seven panels are the expansion this port carries: `GRAPH` (the
 //! visual graph, drawn by [`crate::graphview`]) and `SESSION` (the
 //! terminal roster, now split into a scrolling list + a live detail card with a
 //! focus affordance). The other three — PROJECTS, LOG, STATUS — are ports of the
@@ -867,6 +867,10 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "  Esc / q           close the log tail (Enter also closes it)",
         "  Graph: j/k        select cards · Enter focus · read-only tags",
         "  Graph: a          whole forest / the picked card's own graph",
+        "  Graph: h/l        move by depth: parent / child",
+        "  Graph: e/s        actions menu / write a letter",
+        "  Graph: pan        Space or middle drag; wheel/Shift-wheel",
+        "  Graph: zoom       Ctrl+wheel steps 50-150%, at the pointer",
         "  Mail: h/l         conversations / letters; j/k select",
         "  Mail: n/s/r       new letter / reply / refresh",
         "  Compose: Enter    newline after recipient · Ctrl-S send",
@@ -1008,7 +1012,7 @@ mod tests {
             vec![root, kid],
         );
         let out = render_panel(&app, Panel::Graph, 220, 40);
-        assert!(out.contains("DAG"), "panel title rendered");
+        assert!(out.contains("GRAPH"), "panel title rendered");
         assert!(
             out.contains("PROJECT") && out.contains("aoide"),
             "project node drawn"
@@ -1026,6 +1030,17 @@ mod tests {
             "box-drawing edges present"
         );
         assert!(out.contains("[x]"), "read-only tag chip drawn: {out}");
+    }
+
+    #[test]
+    fn graph_panel_title_is_the_graph_noun_not_dag() {
+        let app = app_with(vec![], vec![]);
+        let out = render_panel(&app, Panel::Graph, 100, 30);
+        assert!(
+            out.contains("GRAPH"),
+            "panel title is the Graph noun: {out}"
+        );
+        assert!(!out.contains("DAG"), "panel title is not DAG: {out}");
     }
 
     #[test]
@@ -1344,7 +1359,7 @@ mod tests {
             "overlay title present"
         );
         assert!(out.contains("cycle views"));
-        assert!(out.contains("read-only tag"), "DAG tag legend documented");
+        assert!(out.contains("read-only tag"), "Graph tag legend documented");
         assert!(
             out.contains("tail the log if headless"),
             "Enter's headless branch is documented: {out}"
@@ -1352,6 +1367,14 @@ mod tests {
         assert!(
             out.contains("close the log tail"),
             "the log-tail overlay's close keys are documented: {out}"
+        );
+        assert!(
+            out.contains("whole forest"),
+            "Graph's `a` view toggle is documented: {out}"
+        );
+        assert!(
+            out.contains("drag") && out.contains("wheel") && out.contains("50-150%"),
+            "Graph's pan and zoom controls are documented: {out}"
         );
     }
 

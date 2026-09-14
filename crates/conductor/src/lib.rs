@@ -22,10 +22,10 @@
 //!   * [`ui`] is the view layer — pure `draw(frame, area, &App)` functions built
 //!     from ratatui widgets. Given the same state they paint the same buffer, so
 //!     every panel is testable with a `TestBackend` (no tty).
-//!   * [`graphview`] lays out and draws the visual DAG; [`theme`] carries the
+//!   * [`graphview`] lays out and draws the visual graph; [`theme`] carries the
 //!     palette → `Style`, the glyph vocabulary, and the small pure formatters.
 //!
-//! The seven panels: DAG (the visual graph), SESSION (the terminal roster),
+//! The seven panels: GRAPH (the visual graph), SESSION (the terminal roster),
 //! PROJECTS, LOG, STATUS, ROSTER (presence — this box plus every registered
 //! node, messaging/presence plan P-C4; selection + compose P-C5), PENDING
 //! (held `graph send`/A2A entries, approve/deny, P-C5). The event stream is

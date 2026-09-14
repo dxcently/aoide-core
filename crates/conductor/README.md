@@ -32,6 +32,9 @@ kill or resurrect a process.
 | `h` / `l`, Left / Right | Fold or unfold tree groups |
 | `e` / right-click | Actions for a tree, graph, project or session target |
 | `a` in Graph | Whole forest, or only the selected card's own graph |
+| `h` / `l`, Left / Right in Graph | Move the selection by depth, toward the parent or the child |
+| Enter in Graph | Open or focus the selected session |
+| `s` in Graph | Write a letter to the selected agent |
 | `?` | Context help |
 | `q` / Ctrl-C | Quit outside text entry / quit globally |
 
@@ -64,6 +67,11 @@ free lane below its proposed row. A session that changed parent is the one
 exception — it moves to its new column, because a retained position would draw
 a child left of its parent. Selection names a card by identity rather than by
 row, so the same card stays selected across a refresh.
+
+`j` / `k` or the arrows step the selection through the visible cards; `h` / `l`
+or Left / Right step it by depth, toward the parent or the child. Enter opens
+or focuses the selected session, and `s` writes a letter to the selected agent
+directly, without opening the actions menu.
 
 `a` switches the two views. Focus, the default, draws only the connected graph
 the selected card belongs to; All draws the whole forest. Sessions belonging to
