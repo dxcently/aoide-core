@@ -20,7 +20,8 @@ Sessions belonging to no project gather in an `Active sessions` group holding
 only live ones; their ended sessions form the one Past node at the root of the
 tree, below every project.
 Opening a historical entry displays its recorded facts; it does not focus,
-kill or resurrect a process.
+kill or resurrect a process. A scrollbar appears at the tree's right edge
+whenever it holds more rows than fit, and stays gone otherwise.
 
 | Key | View or action |
 |---|---|

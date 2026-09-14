@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame,
 };
 
@@ -268,6 +268,35 @@ pub fn tree_offset(app: &App, height: u16) -> usize {
         .max(app.sidebar_sel.saturating_sub(h - 1))
 }
 
+/// Reserves the rightmost column of `area` for a scrollbar, only when
+/// `total` rows do not fit in its height. Draw and hit test both call this,
+/// so a reserved column -- when there is one -- is exactly what was
+/// painted, never a second guess at the same geometry.
+fn scrollbar_split(area: Rect, total: usize) -> (Rect, Option<Rect>) {
+    if area.width == 0 || total <= area.height as usize {
+        return (area, None);
+    }
+    (
+        Rect::new(area.x, area.y, area.width - 1, area.height),
+        Some(Rect::new(area.right() - 1, area.y, 1, area.height)),
+    )
+}
+
+/// A vertical scrollbar built fresh from values the caller already tracks
+/// (`total` rows, the same `offset` the row loop scrolled by) -- ratatui's
+/// `Scrollbar::render` only reads `ScrollbarState`, never writes it back, so
+/// nothing here needs to persist in `App`.
+fn draw_scrollbar(f: &mut Frame, area: Rect, total: usize, offset: usize) {
+    let mut state = ScrollbarState::new(total).position(offset);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None),
+        area,
+        &mut state,
+    );
+}
+
 fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
     let title = if app.sidebar_focused {
         " PROJECTS * "
@@ -296,6 +325,7 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
+    let (rows_area, bar) = scrollbar_split(content, rows.len());
     for (n, row) in rows
         .iter()
         .enumerate()
@@ -391,8 +421,11 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 Style::default().fg(theme::role_color(&app.palette, role))
             }),
-            Rect::new(content.x, y, content.width, 1),
+            Rect::new(rows_area.x, y, rows_area.width, 1),
         );
+    }
+    if let Some(bar) = bar {
+        draw_scrollbar(f, bar, rows.len(), tree_offset(app, content.height));
     }
     if app.history_error.is_some() && content.height > 0 {
         f.render_widget(
@@ -869,8 +902,9 @@ pub fn hit(area: Rect, app: &App, x: u16, y: u16) -> Hit {
         }
     }
     let tree = inner(g.tree);
-    if tree.contains(pos) {
-        return Hit::Tree(tree_offset(app, tree.height) + (y - tree.y) as usize);
+    let tree_rows = scrollbar_split(tree, app.sidebar_rows().len()).0;
+    if tree_rows.contains(pos) {
+        return Hit::Tree(tree_offset(app, tree.height) + (y - tree_rows.y) as usize);
     }
     if app.panel == Panel::Home {
         return home_hit(g.body, app, x, y);
@@ -1097,6 +1131,100 @@ mod tests {
             "menu stays inside the frame: {rect:?}"
         );
         assert!(rect.x >= area.x);
+    }
+
+    // ── Sidebar scrollbar (project tree) ────────────────────────────────
+
+    fn many_projects(n: usize) -> Vec<aoide_conduct::graph::Project> {
+        (0..n)
+            .map(|i| aoide_conduct::graph::Project {
+                name: format!("proj-{i:02}"),
+                path: format!("/p{i}"),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sidebar_scrollbar_thumb_tracks_selection_offset() {
+        let area = Rect::new(0, 0, 100, 20);
+        let probe = {
+            let mut a = App::for_test(vec![], vec![], vec![]);
+            a.panel = Panel::Projects;
+            a
+        };
+        let content = inner(page_geometry(area, &probe).tree);
+        let rows = App::for_test(many_projects(40), vec![], vec![])
+            .sidebar_rows()
+            .len();
+        assert!(rows > content.height as usize, "fixture must overflow");
+        let bar_x = content.right() - 1;
+        let thumb_row = |sel: usize| -> u16 {
+            let mut a = App::for_test(many_projects(40), vec![], vec![]);
+            a.panel = Panel::Projects;
+            a.sidebar_sel = sel;
+            let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| draw_tree(f, page_geometry(area, &a).tree, &a))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (content.y..content.bottom())
+                .find(|&y| buffer[(bar_x, y)].symbol() == "█")
+                .expect("thumb glyph present")
+        };
+        let top = thumb_row(0);
+        let bottom = thumb_row(rows - 1);
+        assert!(
+            bottom > top,
+            "thumb moves down as the selection moves down: {top} -> {bottom}"
+        );
+    }
+
+    #[test]
+    fn sidebar_scrollbar_absent_when_rows_fit() {
+        let mut app = App::for_test(many_projects(3), vec![], vec![]);
+        app.panel = Panel::Projects;
+        let area = Rect::new(0, 0, 100, 20);
+        let content = inner(page_geometry(area, &app).tree);
+        let rows = app.sidebar_rows().len();
+        assert!(rows <= content.height as usize, "fixture must fit");
+        let (rows_area, bar) = scrollbar_split(content, rows);
+        assert!(bar.is_none());
+        assert_eq!(rows_area, content);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_tree(f, page_geometry(area, &app).tree, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let x = content.right() - 1;
+        for y in content.y..content.bottom() {
+            let symbol = buffer[(x, y)].symbol();
+            assert_ne!(symbol, "█");
+            assert_ne!(symbol, "║");
+        }
+    }
+
+    #[test]
+    fn sidebar_row_click_still_resolves_the_same_row_with_a_scrollbar_present() {
+        let mut app = App::for_test(many_projects(40), vec![], vec![]);
+        app.panel = Panel::Projects;
+        let area = Rect::new(0, 0, 100, 20);
+        let content = inner(page_geometry(area, &app).tree);
+        assert!(
+            app.sidebar_rows().len() > content.height as usize,
+            "fixture must overflow"
+        );
+        app.sidebar_sel = 20;
+        let off = tree_offset(&app, content.height);
+        // Two rows down, well clear of the reserved scrollbar column.
+        let y = content.y + 2;
+        let x = content.x + 2;
+        assert_eq!(hit(area, &app, x, y), Hit::Tree(off + 2));
+        // The reserved column itself is the scrollbar, not a row.
+        let bar_x = content.right() - 1;
+        assert_eq!(hit(area, &app, bar_x, y), Hit::None);
     }
 }
 

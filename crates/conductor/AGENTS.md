@@ -100,6 +100,12 @@ Project rows represent projects, not individual roots. Use `Project::roots`
 and existing attribution/grouping helpers. Tree row models are the common
 source for rendering, focus, collapse and activation.
 
+A scrollable list reserves its rightmost column for a scrollbar only when its
+rows overflow the viewport, through `board::scrollbar_split` and
+`draw_scrollbar`; draw and hit test both call `scrollbar_split` so a reserved
+column, when there is one, is exactly what was painted. A new scrollable list
+reuses this pair rather than hand-rolling another offset/thumb calculation.
+
 Tests use isolated paths or injected fixtures. Never read or mutate the
 operator's ambient mail cursors, ledger, registry or terminal during unit
 checks. Add meaningful state-transition and narrow-layout tests for changed
