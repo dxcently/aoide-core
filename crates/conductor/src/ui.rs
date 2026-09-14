@@ -898,14 +898,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "  ? / Esc           close help · q / Ctrl-C quit",
     ];
     let title = " aoide conductor — keys ";
-    let box_w = help
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(20)
-        .max(title.len())
-        + 4;
-    let box_w = (box_w as u16).min(area.width.saturating_sub(2));
+    let box_w = help_box_width(help, title, area);
     let box_h = (help.len() as u16 + 2).min(area.height.saturating_sub(2));
     let rect = centered(box_w, box_h, area);
 
@@ -916,6 +909,21 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     ));
     let lines: Vec<Line> = help.iter().map(|s| Line::from(*s)).collect();
     f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// The help box's width: the widest of its lines and its title, measured in
+/// display cells (`board::cells`, never `len()` -- a byte count disagrees
+/// with cell width the moment a line carries a multi-byte glyph such as the
+/// title's em dash), plus the border and the box's own padding.
+fn help_box_width(help: &[&str], title: &str, area: Rect) -> u16 {
+    let box_w = help
+        .iter()
+        .map(|l| crate::board::cells(l))
+        .max()
+        .unwrap_or(20)
+        .max(crate::board::cells(title))
+        + 4;
+    box_w.min(area.width.saturating_sub(2))
 }
 
 fn centered(w: u16, h: u16, area: Rect) -> Rect {
@@ -1411,6 +1419,25 @@ mod tests {
             out.contains("drag") && out.contains("wheel") && out.contains("50-150%"),
             "Graph's pan and zoom controls are documented: {out}"
         );
+    }
+
+    #[test]
+    fn help_box_width_matches_its_widest_line_in_cells() {
+        // Every help line here is shorter than the title, so the title's em
+        // dash -- three bytes, one display cell -- is what decides the
+        // width. Measuring it as bytes (26) rather than cells (24) would
+        // widen the box by 2 columns; `help_box_width` must not do that.
+        let help = ["short", "also short"];
+        let title = " aoide conductor — keys ";
+        let area = Rect::new(0, 0, 200, 50);
+        let widest_cells = help
+            .iter()
+            .map(|l| crate::board::cells(l))
+            .max()
+            .unwrap()
+            .max(crate::board::cells(title));
+        assert_eq!(crate::board::cells(title), 24, "fixture assumption");
+        assert_eq!(help_box_width(&help, title, area), widest_cells + 4);
     }
 
     /// A throwaway on-disk log the overlay tests point `App::open_tail` at —
