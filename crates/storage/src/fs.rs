@@ -647,11 +647,12 @@ pub fn draft_dir(song: &str, draft: &str) -> std::path::PathBuf {
 /// the codebase routes through here.
 ///
 /// The temp is `<stem>.tmp.<pid>`; on success the rename replaces the target and
-/// removes the temp in one step. A FAILED rename would strand the temp we just
-/// wrote, so we unlink it. And a write INTERRUPTED between create and rename — a
-/// SIGKILL, or a power-cut (a stale `graph.tmp.464255` was found on disk) — can
-/// never clean up after itself, so every successful write also sweeps sibling
-/// temps left by a pid that is no longer alive ([`sweep_stale_temps`]).
+/// removes the temp in one step. A failure in EITHER half — the write dying
+/// partway, or the rename refusing — strands the temp we just made, so both
+/// unlink it. And a write INTERRUPTED between create and rename — a SIGKILL, or a
+/// power-cut (a stale `graph.tmp.464255` was found on disk) — can never clean up
+/// after itself, so every write also sweeps the whole directory for temps left by
+/// a pid that is no longer alive ([`sweep_stale_temps`]).
 ///
 /// Bytes-oriented; [`atomic_write`] is the `&str` convenience wrapper every
 /// existing JSON/text caller uses. Binary payloads (a widget QML file carried
@@ -693,11 +694,13 @@ fn atomic_write_bytes_impl(
         std::fs::create_dir_all(parent)?;
     }
     let tmp = target.with_extension(format!("tmp.{}", std::process::id()));
-    write_temp_file(&tmp, contents, create_mode)?;
-    let res = std::fs::rename(&tmp, &target);
+    // ONE failure path for both halves. A write that dies partway (ENOSPC inside
+    // `write_all`) strands its temp exactly as a failed rename does, and a temp
+    // stranded that way is worse than one the rename left: the file it belongs to
+    // may never be written again (an outbox entry is keyed by a msgid that occurs
+    // once), so nothing would ever come back for it.
+    let res = write_temp_file(&tmp, contents, create_mode).and_then(|()| std::fs::rename(&tmp, &target));
     if res.is_err() {
-        // The rename failed; drop the temp we just wrote so a failed write never
-        // leaks its own `<stem>.tmp.<pid>`.
         let _ = std::fs::remove_file(&tmp);
     }
     sweep_stale_temps(&target);
@@ -888,21 +891,29 @@ fn pid_is_alive(pid: u32) -> bool {
     std::path::Path::new("/proc").join(pid.to_string()).exists()
 }
 
-/// Remove leaked atomic-write temporaries for `path`: siblings named
-/// `<stem>.tmp.<pid>` whose `<pid>` is no longer a live process. An atomic write
-/// interrupted between create and rename (SIGKILL / power-loss) can never unlink
-/// its own temp — a stale `graph.tmp.464255` sat on disk from a prior day — so the
-/// next successful writer of the SAME file sweeps it. Best-effort and total: any
-/// read/parse/remove miss is ignored, and our OWN in-flight temp (live pid) plus
-/// every other file are left untouched, so a concurrent node's write is safe.
+/// Remove leaked atomic-write temporaries from `path`'s DIRECTORY: any sibling
+/// named `<stem>.tmp.<pid>` whose `<pid>` is no longer a live process, whatever
+/// its stem. An atomic write interrupted between create and rename (SIGKILL,
+/// power-loss, a write that failed mid-flight) can never unlink its own temp — a
+/// stale `graph.tmp.464255` sat on disk from a prior day — so the next successful
+/// writer of ANY file in that directory sweeps it.
+///
+/// The sweep is directory-wide, not stem-scoped, because a stem-scoped one only
+/// ever reclaims a temp whose own file gets written again: 1519 zero-byte
+/// `<msgid>.tmp.<pid>` orphans accumulated in one node's `state/outbox/`, each
+/// keyed by a msgid that is minted once and never rewritten, so none of them was
+/// reachable. This costs nothing extra — the `read_dir` was already being paid on
+/// every write; the old predicate simply threw away every orphan but its own.
+///
+/// `.tmp.` is matched as a whole separator, so the deliberately distinct
+/// `<stem>.migrate-tmp.<pid>` and `<stem>.seed.<pid>` temps stay clear of it.
+/// Best-effort and total: any read/parse/remove miss is ignored, and our OWN
+/// in-flight temp (live pid) plus every other file are left untouched, so a
+/// concurrent node's write is safe.
 fn sweep_stale_temps(path: &std::path::Path) {
     let Some(dir) = path.parent() else {
         return;
     };
-    let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
-        return;
-    };
-    let prefix = format!("{stem}.tmp.");
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -911,7 +922,7 @@ fn sweep_stale_temps(path: &std::path::Path) {
         let Some(name) = name.to_str() else {
             continue;
         };
-        let Some(pid_str) = name.strip_prefix(&prefix) else {
+        let Some((_, pid_str)) = name.rsplit_once(".tmp.") else {
             continue;
         };
         // Only a well-formed `<stem>.tmp.<pid>` whose pid is dead is swept; our
@@ -1426,6 +1437,49 @@ mod tests {
         assert!(!leaked.exists(), "a dead pid's leaked temp is swept on the next write");
         assert!(live_node.exists(), "a live pid's in-flight temp is left untouched");
         assert!(target.exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_sweep_reclaims_any_dead_pids_temp_whatever_its_stem_and_a_failed_write_leaves_none() {
+        // The outbox litter this widening exists for: 1519 zero-byte
+        // `<msgid>.tmp.<pid>` orphans, each keyed by a msgid minted once and
+        // never rewritten, so a stem-scoped sweep could never reach any of
+        // them. Any write into the directory has to reclaim them.
+        let dir = std::env::temp_dir().join(format!("aoide-tmpsweep-foreign-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let dead = u32::MAX; // above pid_max — never alive
+        let orphan = dir.join(format!("aaaa1111.tmp.{dead}"));
+        let in_flight = dir.join("bbbb2222.tmp.1"); // pid 1 (init) is always alive
+        // Deliberately distinct temp shapes owned by other writers
+        // (`migrate_state_tree`, `seed_if_absent`) — `.tmp.` is a whole
+        // separator, so neither is ours to remove.
+        let migrate = dir.join(format!("cccc3333.migrate-tmp.{dead}"));
+        let seed = dir.join(format!("dddd4444.seed.{dead}"));
+        for p in [&orphan, &in_flight, &migrate, &seed] {
+            std::fs::write(p, "stranded").unwrap();
+        }
+
+        atomic_write(&dir.join("unrelated.json"), "{}").unwrap();
+
+        assert!(!orphan.exists(), "a dead pid's temp is swept whatever its stem");
+        assert!(in_flight.exists(), "a live pid's in-flight temp is left untouched");
+        assert!(migrate.exists(), "`migrate-tmp.<pid>` is another writer's shape");
+        assert!(seed.exists(), "`seed.<pid>` is another writer's shape");
+
+        // A write that cannot land leaves no temp of its own: renaming onto a
+        // non-empty directory fails, and the same unlink covers it.
+        let blocked = dir.join("blocked.json");
+        std::fs::create_dir_all(&blocked).unwrap();
+        std::fs::write(blocked.join("occupant"), "x").unwrap();
+        assert!(atomic_write(&blocked, "{}").is_err());
+        assert!(
+            !dir.join(format!("blocked.tmp.{}", std::process::id())).exists(),
+            "a failed write never leaves its own temp behind"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }

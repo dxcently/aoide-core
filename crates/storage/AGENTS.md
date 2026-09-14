@@ -247,6 +247,18 @@
   adding a nonce store here — that would duplicate state across a
   crate boundary for no benefit, the same anti-pattern the "no cross-crate
   copying" cross-crate rule already forbids.
+- **`fs::atomic_write`'s temp cleanup is directory-wide, and every failing
+  half unlinks its own temp.** `sweep_stale_temps` reclaims any sibling
+  `<stem>.tmp.<pid>` whose pid is dead, not only temps sharing the target's
+  stem — a stem-scoped sweep can only ever reclaim a temp whose own file is
+  written again, which never happens for a write-once name (an outbox entry
+  is keyed by a msgid minted once; 1519 zero-byte orphans accumulated in one
+  node's `state/outbox/` that way). The `read_dir` was already paid on every
+  write, so widening the predicate costs nothing. Match `.tmp.` as a whole
+  separator: `migrate_state_tree`'s `migrate-tmp.<pid>` and `seed_if_absent`'s
+  `seed.<pid>` are deliberately distinct shapes and must stay out of the
+  sweep. A new temp-file shape in this crate picks a separator that is NOT
+  `.tmp.` unless it wants this sweep to own it.
 - **`fs::atomic_write_private` is the ONE way a sensitive file gets written
   in this crate** (`identity.rs`'s `ed25519.key` is its first caller) — the
   TEMP file is created ALREADY at `0600` (`OpenOptions::mode`, not

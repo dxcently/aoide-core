@@ -33,13 +33,19 @@ use aoide_storage::mail::Envelope;
 use aoide_storage::node_store::Node;
 use serde_json::{json, Value};
 
-/// The most entries [`drain_node`] will attempt in one call, regardless of
+/// The most entries [`drain_node`] will ATTEMPT in one call, regardless of
 /// how many are spooled — bounds one tick's cost when a spool has grown
 /// large (a runaway producer, or simply a backlog), so `drain_all`'s
 /// per-tick cost never scales with total spool depth. An entry that
 /// delivers/retires this pass falls out of the NEXT call's list on its own;
 /// this cap only matters when a single call would otherwise walk the whole
 /// spool.
+///
+/// It counts attempts, so parked (`refused`) entries are filtered out before
+/// it applies. Counting them would starve the spool instead of bounding it:
+/// a parked entry is permanent until `mail outbox rm` retires it, and they
+/// sort oldest-first, so one batch's worth of them at the head would leave
+/// every fresh letter behind them undialled forever.
 const DRAIN_BATCH_CAP: usize = 50;
 
 fn unix_now() -> i64 {
@@ -182,10 +188,15 @@ pub fn drain_node(node_name: &str) -> Result<(), String> {
         }
     }
 
-    for entry in aoide_storage::outbox::list_entries(node_name)?.into_iter().take(DRAIN_BATCH_CAP) {
-        if entry.refused {
-            continue;
-        }
+    // Parked entries are filtered BEFORE the cap, never skipped inside the
+    // loop: they sort oldest-first, so a cap counted over spool positions
+    // would spend a whole batch on entries this pass can never dial and
+    // starve every fresh letter behind them.
+    for entry in aoide_storage::outbox::list_entries(node_name)?
+        .into_iter()
+        .filter(|entry| !entry.refused)
+        .take(DRAIN_BATCH_CAP)
+    {
         match attempt_deposit(node, &entry.envelope) {
             DepositAttempt::TransportFailed(reason) => {
                 // Record the attempt on the entry that actually hit the
@@ -380,6 +391,54 @@ mod tests {
             }
         });
         (listener, port)
+    }
+
+    /// The cap counts ATTEMPTS, not spool positions. Parked entries sort
+    /// oldest-first (they were tried, and every later letter is newer), so a
+    /// cap applied before the refused filter hands one whole batch to a loop
+    /// that skips every member of it — a fresh letter sitting behind
+    /// DRAIN_BATCH_CAP parked ones would never be dialled again, silently,
+    /// forever. Not hypothetical: the live osaka spool is already entirely
+    /// refused entries.
+    #[test]
+    fn a_wall_of_parked_entries_never_starves_a_fresh_letter_out_of_the_batch() {
+        let _g = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("drain-refused-wall");
+
+        let (listener, port) = fake_deposit_server(
+            r#"{"jsonrpc":"2.0","id":1,"result":{"status":"accepted"}}"#,
+        );
+        let mut node = unpaired_node("elsewhere");
+        node.url = format!("http://127.0.0.1:{port}/");
+        aoide_storage::node_store::save_nodes(&[node]).unwrap();
+
+        for i in 0..DRAIN_BATCH_CAP {
+            let mut envelope =
+                aoide_storage::mail::mint_outbound_letter("alice", "elsewhere", "bob", &format!("parked {i}")).unwrap();
+            // Older than anything minted now, so all of these sort ahead of
+            // the fresh letter below whatever the wall clock does.
+            envelope.header.minted_at = "2020-01-01T00:00:00Z".to_string();
+            let mut parked = OutboxEntry::fresh(envelope);
+            parked.refused = true;
+            aoide_storage::outbox::write_entry("elsewhere", &parked).unwrap();
+        }
+
+        let envelope = aoide_storage::mail::mint_outbound_letter("alice", "elsewhere", "bob", "fresh").unwrap();
+        let fresh_msgid = envelope.msgid.clone();
+        aoide_storage::outbox::write_entry("elsewhere", &OutboxEntry::fresh(envelope)).unwrap();
+
+        drain_node("elsewhere").unwrap();
+
+        let entries = aoide_storage::outbox::list_entries("elsewhere").unwrap();
+        let fresh = entries
+            .iter()
+            .find(|e| e.envelope.msgid == fresh_msgid)
+            .expect("the fresh letter is still spooled");
+        assert_eq!(fresh.tries, 1, "a fresh letter behind a full batch of parked entries must still be attempted");
+        assert_eq!(fresh.last_outcome, "accepted");
+
+        drop(listener);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// MAIL.md §Wire/§Transit: a well-formed envelope's rejection is a
