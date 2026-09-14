@@ -702,6 +702,16 @@ fn handle_mouse(app: &mut App, area: ratatui::layout::Rect, mouse: MouseEvent) {
                 app.sidebar_focused = false;
                 return;
             }
+            // Right-click hit-tests the same camera-transformed card geometry
+            // the left click above and render itself use, so the menu opens
+            // on the card under the pointer rather than a row counted from
+            // the top of the pane. A miss opens nothing.
+            MouseEventKind::Down(MouseButton::Right) if canvas.contains(point) => {
+                if let Some(i) = graphview::hit_node(canvas, app, mouse.column, mouse.row) {
+                    open_context_hit(app, board::Hit::Row(i), mouse.column, mouse.row);
+                }
+                return;
+            }
             MouseEventKind::Drag(_) if app.graph.drag.is_some() => {
                 let (sx, sy, ox, oy) = app.graph.drag.unwrap();
                 let (w, h) = graphview::graph_extent(app);
@@ -916,9 +926,15 @@ fn open_context_hit(app: &mut App, hit: board::Hit, x: u16, y: u16) {
             }
         }
         board::Hit::Row(i) if app.panel == Panel::Graph => {
+            // Resolve the node `i` names BEFORE selecting it: selecting a card
+            // outside the current selection's bridged component re-forms the
+            // Focus visible list (the synthetic unanchored root drops out
+            // once a real session anchors it), so looking `i` up again
+            // afterward can name a different card than the one hit.
+            let node = graphview::node_order(app).get(i).cloned();
             graphview::select_index(app, i);
             app.sidebar_focused = false;
-            if let Some(node) = graphview::node_order(app).get(i) {
+            if let Some(node) = node {
                 if let Some(id) = &node.session_id {
                     if let Some(rec) = app.merged().into_iter().find(|r| &r.session_id == id) {
                         app.open_context_for_session(rec, x, y);
@@ -1359,6 +1375,118 @@ mod tests {
         );
         assert!(!app.sidebar_focused);
         assert!(app.last_outcome.is_none());
+    }
+
+    /// A right-click opens the actions menu for the card under the pointer,
+    /// not a row counted from the top of the pane -- the same camera-hit-test
+    /// the left click above uses, and the menu anchors at the click itself.
+    #[test]
+    fn a_right_click_on_a_card_opens_its_own_context_menu() {
+        let mut app = App::for_test(
+            vec![],
+            vec![
+                SessionRecord {
+                    session_id: "parent".into(),
+                    agent: "claude".into(),
+                    cwd: "/x".into(),
+                    state: "working".into(),
+                    ..Default::default()
+                },
+                SessionRecord {
+                    session_id: "child".into(),
+                    agent: "claude".into(),
+                    cwd: "/x".into(),
+                    state: "idle".into(),
+                    parent_session_id: Some("parent".into()),
+                    ..Default::default()
+                },
+            ],
+            vec![],
+        );
+        app.panel = Panel::Graph;
+        app.sidebar_focused = true;
+        app.sync_graph_scene();
+        graphview::select_index(&mut app, 0);
+
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        let g = board::page_geometry(area, &app);
+        let (canvas, _) = board::body_content(board::inner(g.body));
+        let target = (canvas.y..canvas.bottom())
+            .flat_map(|y| (canvas.x..canvas.right()).map(move |x| (x, y)))
+            .find(|&(x, y)| graphview::hit_node(canvas, &app, x, y).is_some_and(|i| i != 0))
+            .expect("a second card is on screen");
+        let expected = graphview::hit_node(canvas, &app, target.0, target.1).unwrap();
+        let expected_id = graphview::node_order(&app)[expected].id.clone();
+        let expected_session = graphview::node_order(&app)[expected]
+            .session_id
+            .clone()
+            .expect("the second card is a session");
+
+        handle_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: target.0,
+                row: target.1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert_eq!(
+            app.graph.selected, expected_id,
+            "the click selects the card it hit"
+        );
+        assert!(!app.sidebar_focused);
+        let menu = app
+            .context_menu
+            .as_ref()
+            .expect("a menu opened on the hit card");
+        assert_eq!((menu.x, menu.y), target, "the menu anchors at the click");
+        match &menu.target {
+            app::ContextTarget::Session(rec) => assert_eq!(rec.session_id, expected_session),
+            other => panic!("expected the clicked session, got {other:?}"),
+        }
+    }
+
+    /// A right-click that misses every card opens nothing, rather than
+    /// resolving to an unrelated row.
+    #[test]
+    fn a_right_click_on_empty_canvas_opens_no_menu() {
+        let mut app = App::for_test(
+            vec![],
+            vec![SessionRecord {
+                session_id: "solo".into(),
+                agent: "claude".into(),
+                cwd: "/x".into(),
+                state: "working".into(),
+                ..Default::default()
+            }],
+            vec![],
+        );
+        app.panel = Panel::Graph;
+        app.sync_graph_scene();
+
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        let g = board::page_geometry(area, &app);
+        let (canvas, _) = board::body_content(board::inner(g.body));
+        let empty = (canvas.y..canvas.bottom())
+            .flat_map(|y| (canvas.x..canvas.right()).map(move |x| (x, y)))
+            .find(|&(x, y)| graphview::hit_node(canvas, &app, x, y).is_none())
+            .expect("the padded canvas has room past the one card");
+
+        handle_mouse(
+            &mut app,
+            area,
+            MouseEvent {
+                kind: MouseEventKind::Down(MouseButton::Right),
+                column: empty.0,
+                row: empty.1,
+                modifiers: KeyModifiers::NONE,
+            },
+        );
+
+        assert!(app.context_menu.is_none());
     }
 
     #[test]
