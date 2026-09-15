@@ -251,6 +251,13 @@ mod tests {
         // `mail.outbox.rm` (+2) — sorting between `mail.mark` and
         // `mail.read`, same mailbase family. Net: 84 + 2 = 86.
         //
+        // The outbox un-park adds `mail.outbox.retry` (+1) — a policy
+        // refusal is a PARKED state, not a kill-list: the `allows` set that
+        // refused a letter is the RECEIVING node's own record of the
+        // sender, so granting it there (`node allow <sender> message on`)
+        // must let the already-spooled letters move. Sorts between
+        // `mail.outbox` and `mail.outbox.rm` (`retry` > `rm`). Net: 87.
+        //
         // Bumped by 1 for `project.edit` (multi-root projects) — the
         // exact-replacement editor for a project's root list, the
         // `project edit` that `records.rs`'s `Project.auto_resume` doc
@@ -277,6 +284,7 @@ mod tests {
             "mail",
             "mail.mark",
             "mail.outbox",
+            "mail.outbox.retry",
             "mail.outbox.rm",
             "mail.read",
             "mail.ring",

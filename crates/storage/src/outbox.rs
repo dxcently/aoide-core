@@ -122,7 +122,10 @@ pub struct OutboxEntry {
     /// transport failure, which backs the LINK off instead (the drain
     /// pseudocode's own distinction). A refused entry stays in the spool
     /// forever (the kill-list: no auto-eviction, no quota, no expiry) but
-    /// a drain skips it on sight; only `mail outbox rm` retires it.
+    /// a drain skips it on sight. **Parked, not condemned**: a policy
+    /// refusal is remediable (the far end's `allows` can be granted), so
+    /// [`unpark_entry`]/[`unpark_refused`] clear this flag and the next
+    /// drain attempts the entry again; only `mail outbox rm` retires it.
     #[serde(default)]
     pub refused: bool,
 }
@@ -386,6 +389,69 @@ pub fn remove_entry(node: &str, msgid: &str) -> Result<bool, String> {
     })
 }
 
+/// Un-park one entry — the operator's answer to a remediable policy
+/// refusal (`aoide mail outbox retry <msgid>`). A refusal is a PARKED
+/// state, not a verdict: the far end's `allows` set can be granted after
+/// the fact (`aoide node allow <sender> <cap> on` ON THE RECEIVING HOST),
+/// so the entry must be retriable without re-minting it (the stored
+/// envelope's signed bytes are what the far end dedups on — see
+/// [`OutboxEntry`]'s own doc).
+///
+/// Clears `refused`, records `last_outcome = "retry requested"` so the
+/// spool's own history says why this entry is suddenly being dialed again,
+/// and deliberately leaves `tries` exactly where it was: the attempt
+/// counter counts ATTEMPTS, and an un-park performs none. `Ok(false)` when
+/// nothing named `msgid` was spooled, or it was there but was not parked
+/// at all (already un-parked, or never refused) — never an error, the same
+/// "a redundant ask is a clean no-op" discipline [`remove_entry`] holds.
+///
+/// Read-modify-write in ONE locked section, through the same
+/// [`write_entry_unlocked`] atomic path every other spool write uses, so a
+/// concurrent drain can never observe a half-updated entry.
+pub fn unpark_entry(node: &str, msgid: &str) -> Result<bool, String> {
+    let node = node.to_string();
+    let msgid = msgid.to_string();
+    with_lock(move || {
+        let path = entry_path(&node, &msgid);
+        let Ok(raw) = std::fs::read_to_string(&path) else { return Ok(false) };
+        let Ok(mut entry) = serde_json::from_str::<OutboxEntry>(&raw) else { return Ok(false) };
+        if !entry.refused {
+            return Ok(false);
+        }
+        entry.refused = false;
+        entry.last_outcome = "retry requested".to_string();
+        write_entry_unlocked(&node, &entry)?;
+        Ok(true)
+    })
+}
+
+/// Un-park EVERY parked entry for `node` — `aoide mail outbox retry
+/// --refused [<node>]`. Returns how many were actually un-parked (0 for a
+/// node with nothing parked, a node that has never spooled anything, or an
+/// unknown node name), never an error for any of those.
+///
+/// One `list_entries` read, then one [`unpark_entry`] per parked row: each
+/// re-reads and re-writes its OWN single entry under the lock, so a drain
+/// running concurrently can neither be starved (no lock is held across the
+/// whole sweep) nor lose an entry it is in the middle of recording (every
+/// mutation is read-modify-write of one file). An entry that vanishes
+/// between the listing and its own un-park (a concurrent `mail outbox rm`,
+/// or a real ack retiring it) simply does not count — no error.
+pub fn unpark_refused(node: &str) -> Result<usize, String> {
+    let parked: Vec<String> = list_entries(node)?
+        .into_iter()
+        .filter(|e| e.refused)
+        .map(|e| e.envelope.msgid)
+        .collect();
+    let mut n = 0;
+    for msgid in parked {
+        if unpark_entry(node, &msgid)? {
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 /// Fallback for [`remove_entry`]'s rare unreadable/unparsable-entry case
 /// (review round 3 NIT): scan `<node>/.ack/` (only that small
 /// subdirectory, never the node's whole spool) for a marker whose
@@ -623,6 +689,84 @@ mod tests {
         assert!(remove_entry("there", "msg-1").unwrap(), "a real entry retires");
         assert!(list_entries("there").unwrap().is_empty());
         assert!(!remove_entry("there", "msg-1").unwrap(), "retiring twice is a clean no-op, not an error");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `aoide mail outbox retry <msgid>`'s storage half: a parked entry
+    /// comes back un-parked with `tries` UNTOUCHED (an un-park is not an
+    /// attempt), its outcome recording why it is being dialed again.
+    #[test]
+    fn unpark_entry_flips_refused_and_preserves_tries() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("outbox-unpark-entry");
+
+        let mut parked = OutboxEntry::fresh(envelope("here", "there", "msg-park"));
+        parked.tries = 4;
+        parked.last_try_at = "2026-09-07T00:00:00Z".to_string();
+        parked.last_outcome = "refused: bad-msgid".to_string();
+        parked.refused = true;
+        write_entry("there", &parked).unwrap();
+
+        assert!(unpark_entry("there", "msg-park").unwrap(), "a parked entry un-parks");
+
+        let after = list_entries("there").unwrap();
+        assert_eq!(after.len(), 1, "an un-park never removes the entry — the spool is the record");
+        assert!(!after[0].refused, "refused is cleared");
+        assert_eq!(after[0].tries, 4, "un-parking is not an attempt — tries is preserved exactly");
+        assert_eq!(after[0].last_try_at, "2026-09-07T00:00:00Z", "the last real attempt's timestamp is untouched");
+        assert_eq!(after[0].last_outcome, "retry requested", "the spool's own history says why it is dialed again");
+        assert_eq!(after[0].envelope.msgid, "msg-park", "the stored envelope is untouched — a retry resends the same signed bytes");
+
+        assert!(!unpark_entry("there", "msg-park").unwrap(), "un-parking an already-live entry is a clean no-op");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unpark_entry_on_an_unknown_msgid_is_ok_false() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("outbox-unpark-unknown");
+
+        assert!(!unpark_entry("there", "never-spooled").unwrap(), "no such msgid is Ok(false), never an error");
+        assert_eq!(unpark_refused("there").unwrap(), 0, "a node with nothing spooled has nothing parked");
+
+        // An entry that was never refused is not "un-parked" either — the
+        // flag was already clear, so there is nothing to report.
+        write_entry("there", &OutboxEntry::fresh(envelope("here", "there", "msg-live"))).unwrap();
+        assert!(!unpark_entry("there", "msg-live").unwrap());
+        assert_eq!(list_entries("there").unwrap()[0].last_outcome, "", "a non-parked entry is never rewritten");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn unpark_refused_sweeps_only_the_parked_entries_of_one_node() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let (_env, dir) = root("outbox-unpark-refused-sweep");
+
+        let mut parked_a = OutboxEntry::fresh(envelope("here", "there", "msg-parked-a"));
+        parked_a.refused = true;
+        parked_a.tries = 1;
+        let mut parked_b = OutboxEntry::fresh(envelope("here", "there", "msg-parked-b"));
+        parked_b.refused = true;
+        write_entry("there", &parked_a).unwrap();
+        write_entry("there", &parked_b).unwrap();
+        write_entry("there", &OutboxEntry::fresh(envelope("here", "there", "msg-never-refused"))).unwrap();
+
+        // Another node's parked entry is NEVER touched by a sweep of this one.
+        let mut elsewhere = OutboxEntry::fresh(envelope("here", "elsewhere", "msg-parked-elsewhere"));
+        elsewhere.refused = true;
+        write_entry("elsewhere", &elsewhere).unwrap();
+
+        assert_eq!(unpark_refused("there").unwrap(), 2, "both parked entries, and only they, un-park");
+        let there = list_entries("there").unwrap();
+        assert_eq!(there.len(), 3, "nothing is removed by a sweep");
+        assert!(there.iter().all(|e| !e.refused), "every parked entry on the node is live again");
+        assert_eq!(there.iter().find(|e| e.envelope.msgid == "msg-parked-a").unwrap().tries, 1);
+        assert_eq!(unpark_refused("there").unwrap(), 0, "a second sweep finds nothing left to un-park");
+
+        assert!(list_entries("elsewhere").unwrap()[0].refused, "another node's parked entry is untouched");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

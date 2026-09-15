@@ -492,7 +492,13 @@ never the inbound/serve half (that's `aoide-server`).
   <msgid>`) is an exact-msgid removal, NOT the mailbase `mail rm`'s
   age-based prune — it walks `nodes_with_outbox` and calls
   `outbox::remove_entry(node, msgid)` on each until one actually held that
-  msgid, erroring `not-found` if none did; neither command WRITES to the
+  msgid, erroring `not-found` if none did. `handle_mail_outbox_retry`
+  (`mail outbox retry <msgid> | --refused [<node>]`) is the un-park: it
+  clears `refused` via `outbox::unpark_entry`/`unpark_refused` (tries and
+  the signed envelope untouched), then calls `mail_wire::drain_node` ONCE
+  per affected node and reports the same `delivery` projection `mail send`
+  does; nothing parked is a clean no-op, not an error. Neither `outbox`
+  nor `outbox rm` WRITES to the
   mailbase (`aoide_storage::mail`) — `handle_mail_outbox`'s own delivery
   projection still reads it (above) —
   `handle_node_allow` (`node allow <name> <cap> on|off`, P-P3, `docs/

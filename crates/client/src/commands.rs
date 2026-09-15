@@ -3707,13 +3707,16 @@ pub fn register_post_graph(r: &mut Registry) {
 
 // ── `aoide mail` (messaging plan P-M1/P-M2, docs/architecture/MAIL.md) ─────
 
-/// `aoide mail[.send|.read|.show|.mark|.rm|.outbox|.outbox.rm]` commands.
+/// `aoide mail[.send|.read|.show|.mark|.rm|.outbox|.outbox.rm|.outbox.retry]`
+/// commands.
 /// Registered here, in `aoide-client`, rather than in `aoide-storage` where
 /// the store itself ([`aoide_storage::mail`]/[`aoide_storage::outbox`])
 /// lives: from P-M2 on, `mail send` can dial another node ([`crate::
 /// mail_wire`]'s outbox drain), and `aoide-storage` sits below
 /// `aoide-client` in the crate DAG and must not depend on it (P-M2
-/// ruling 1). `mail outbox`/`mail outbox rm` are new at P-M2; `--hold`,
+/// ruling 1). `mail outbox`/`mail outbox rm` are new at P-M2, `mail
+/// outbox retry` is the un-park that makes a `refused` entry retriable
+/// rather than a permanent verdict; `--hold`,
 /// `mail route`, and mesh-aware addressing are later phases (MAIL.md
 /// §Phases) and are not registered yet.
 pub fn register_mail(r: &mut Registry) {
@@ -3807,6 +3810,16 @@ pub fn register_mail(r: &mut Registry) {
         implemented: true,
         handler: handle_mail_outbox_rm,
         examples: ["mail outbox rm <msgid>"],
+    ));
+    r.insert(cmd!(
+        path: ["mail", "outbox", "retry"],
+        summary: "Un-park a refused outbox entry and attempt it once more, right away. `refused` is a PARKED state, not a kill-list: a policy refusal is remediable (the RECEIVING node grants `message` with `node allow <sender> message on`), so retry clears the flag — the stored signed envelope, the msgid and the try count all stay put — and drains that node once. `--refused` retries every parked entry for one node, or for every node with an outbox.",
+        args: [arg!("msgid", "string", false, "The parked entry's msgid, as shown by `mail outbox`. Omitted with --refused. With --refused this positional is instead the node to sweep (omit for every node with an outbox).")],
+        flags: [flag!("refused", "bool", "Retry every entry currently parked `refused` for the named node, or for every node with an outbox when no node is named.")],
+        gated: false,
+        implemented: true,
+        handler: handle_mail_outbox_retry,
+        examples: ["mail outbox retry <msgid>", "mail outbox retry --refused", "mail outbox retry --refused yomi-strix"],
     ));
 }
 
@@ -4387,6 +4400,158 @@ fn handle_mail_outbox_rm(inv: &Invocation) -> Outcome {
     }
     Outcome::error(cmd, format!("no outbox entry with msgid {msgid}"))
         .with_data(json!({ "reason": "not-found", "msgid": msgid }))
+}
+
+/// `aoide mail outbox retry <msgid> | --refused [<node>]` — the un-park.
+/// **A policy refusal is a PARKED state, not a kill-list**: the `allows` set
+/// that produced it is the RECEIVING node's record of the sender, so it is
+/// remediable after the fact (`aoide node allow <sender> message on` run ON
+/// THAT HOST) — and once it is, the parked entries must be able to move
+/// without being re-minted (a fresh envelope would mint a fresh msgid and
+/// defeat the far end's own dedup, `OutboxEntry`'s doc).
+///
+/// Both spellings un-park through [`aoide_storage::outbox::unpark_entry`]/
+/// [`aoide_storage::outbox::unpark_refused`] and then call [`crate::mail_wire::
+/// drain_node`] ONCE per affected node, so the operator sees the outcome now
+/// instead of waiting up to a full daemon tick — `data` reports the same
+/// [`delivery_projection`] vocabulary `mail send` reports after its own
+/// best-effort drain ([`post_send_delivery`]), including the `"failed"`/
+/// `"local"` shape when the drain itself hits a genuine local I/O error
+/// (never for "the remote node was unreachable", which the drain records as
+/// an ordinary link outcome).
+///
+/// `--refused` is the sweep: every currently parked entry for the named node,
+/// or for every node with an outbox when no node is named. An entry that
+/// vanishes mid-sweep (a concurrent `mail outbox rm`, or a real ack) simply
+/// does not count, and neither spelling is an error when there is nothing
+/// parked to retry — a redundant ask is a clean no-op, the same discipline
+/// its `rm` sibling holds.
+fn handle_mail_outbox_retry(inv: &Invocation) -> Outcome {
+    const USAGE: &str = "usage: aoide mail outbox retry <msgid> | aoide mail outbox retry --refused [<node>]";
+    let cmd = "mail.outbox.retry";
+    let positional = inv.args.first().map(|s| s.trim()).filter(|s| !s.is_empty()).map(str::to_string);
+    if inv.flag_present("refused") {
+        return retry_refused_entries(cmd, positional.as_deref());
+    }
+    let Some(msgid) = positional else {
+        return Outcome::usage(cmd, USAGE);
+    };
+    let nodes = match aoide_storage::outbox::nodes_with_outbox() {
+        Ok(ns) => ns,
+        Err(e) => return Outcome::error(cmd, format!("state/outbox: {e}")),
+    };
+    for node in &nodes {
+        // In practice at most one node holds `msgid` — an entry always lives
+        // under the exact node its own `to.node` named at spool time — the
+        // same walk `handle_mail_outbox_rm` does, for the same reason.
+        let entries = match aoide_storage::outbox::list_entries(node) {
+            Ok(es) => es,
+            Err(e) => return Outcome::error(cmd, format!("state/outbox: {e}")),
+        };
+        let Some(entry) = entries.iter().find(|e| e.envelope.msgid == msgid) else { continue };
+        if !entry.refused {
+            return Outcome::ok(cmd, format!("{msgid} is not parked — a drain already attempts it"))
+                .with_data(json!({ "reason": "not-refused", "node": node, "msgid": msgid }));
+        }
+        match aoide_storage::outbox::unpark_entry(node, &msgid) {
+            Ok(true) => {}
+            // Vanished between the read above and the un-park (a concurrent
+            // rm or a real ack's own retirement) — nothing left to dial.
+            Ok(false) => continue,
+            Err(e) => return Outcome::error(cmd, format!("state/outbox: {e}")),
+        }
+        let delivery = match crate::mail_wire::drain_node(node) {
+            Ok(()) => post_send_delivery(node, &msgid),
+            Err(e) => delivery_shape("failed", Some(e), Some("local"), None, false),
+        };
+        return Outcome::ok(cmd, format!("un-parked {msgid} for {node} and attempted delivery"))
+            .changed(vec![format!("state/outbox/{node}/{msgid}.json: refused -> false")])
+            .with_data(json!({ "node": node, "msgid": msgid, "delivery": delivery }));
+    }
+    Outcome::error(cmd, format!("no outbox entry with msgid {msgid}"))
+        .with_data(json!({ "reason": "not-found", "msgid": msgid }))
+}
+
+/// [`handle_mail_outbox_retry`]'s `--refused` half. `target` narrows the
+/// sweep to one node (an unknown or empty node is an ordinary "nothing
+/// parked", never an error — the same absent-is-nothing stance `mail outbox`
+/// itself holds); `None` sweeps every node with an outbox.
+fn retry_refused_entries(cmd: &str, target: Option<&str>) -> Outcome {
+    let nodes = match target {
+        Some(n) => vec![n.to_string()],
+        None => match aoide_storage::outbox::nodes_with_outbox() {
+            Ok(ns) => ns,
+            Err(e) => return Outcome::error(cmd, format!("state/outbox: {e}")),
+        },
+    };
+    let mut total = 0usize;
+    let mut changed: Vec<String> = Vec::new();
+    let mut per_node: Vec<Value> = Vec::new();
+    for node in &nodes {
+        // The parked set is read BEFORE the un-park so the report can say
+        // which entries were retried, and whether a vanished one was a
+        // receipt — whose own confirmed deposit IS its confirmation
+        // (ruling 4), the one case an absence legitimately means delivered.
+        let parked: Vec<(String, bool)> = match aoide_storage::outbox::list_entries(node) {
+            Ok(es) => es
+                .into_iter()
+                .filter(|e| e.refused)
+                .map(|e| (e.envelope.msgid, e.envelope.header.kind == aoide_storage::mail::ENTRY_TYPE_RECEIPT))
+                .collect(),
+            Err(e) => return Outcome::error(cmd, format!("state/outbox: {e}")),
+        };
+        if parked.is_empty() {
+            continue;
+        }
+        let unparked = match aoide_storage::outbox::unpark_refused(node) {
+            Ok(n) => n,
+            Err(e) => return Outcome::error(cmd, format!("state/outbox: {e}")),
+        };
+        let drain = crate::mail_wire::drain_node(node);
+        // ONE post-drain read for the whole node, never one per entry — the
+        // same single-read discipline `handle_mail_outbox` holds.
+        let after = aoide_storage::outbox::list_entries(node);
+        let mut rows: Vec<Value> = Vec::new();
+        for (msgid, was_receipt) in &parked {
+            let delivery = match &drain {
+                Err(e) => delivery_shape("failed", Some(e.clone()), Some("local"), None, false),
+                Ok(()) => match &after {
+                    Ok(now) if now.iter().any(|e| e.envelope.msgid == *msgid) => post_send_delivery(node, msgid),
+                    // Gone from the spool: a receipt's own successful deposit
+                    // removes it outright, so that IS delivery; a letter is
+                    // only ever removed by a concurrent `mail outbox rm` or a
+                    // real ack, and neither is something to read from an
+                    // absence (the same rule `post_send_delivery` holds).
+                    Ok(_) if *was_receipt => delivery_shape("delivered", None, None, None, false),
+                    Ok(_) => delivery_status_unavailable("entry no longer spooled"),
+                    Err(e) => delivery_status_unavailable(e),
+                },
+            };
+            rows.push(json!({ "msgid": msgid, "delivery": delivery }));
+        }
+        total += unparked;
+        changed.push(format!("state/outbox/{node}/: {unparked} entr{} un-parked", if unparked == 1 { "y" } else { "ies" }));
+        per_node.push(json!({ "node": node, "unparked": unparked, "retries": rows }));
+    }
+    if total == 0 {
+        return Outcome::ok(cmd, "nothing parked — no refused outbox entries to retry")
+            .with_data(json!({ "unparked": 0, "nodes": [] }));
+    }
+    let body = per_node
+        .iter()
+        .map(|n| {
+            format!(
+                "{}: {} entr{} un-parked, drain attempted",
+                n["node"].as_str().unwrap_or(""),
+                n["unparked"],
+                if n["unparked"] == 1 { "y" } else { "ies" }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    Outcome::ok(cmd, format!("{total} entr{} un-parked\n{body}", if total == 1 { "y" } else { "ies" }))
+        .changed(changed)
+        .with_data(json!({ "unparked": total, "nodes": per_node }))
 }
 
 #[cfg(test)]
@@ -6846,11 +7011,11 @@ mod tests {
     }
 
     #[test]
-    fn register_mail_wires_all_eight_commands() {
+    fn register_mail_wires_all_nine_commands() {
         let mut r = Registry::new();
         register_mail(&mut r);
         let paths: Vec<String> = r.commands().map(|c| c.dotted()).collect();
-        for want in ["mail", "mail.send", "mail.read", "mail.show", "mail.mark", "mail.rm", "mail.outbox", "mail.outbox.rm"] {
+        for want in ["mail", "mail.send", "mail.read", "mail.show", "mail.mark", "mail.rm", "mail.outbox", "mail.outbox.rm", "mail.outbox.retry"] {
             assert!(paths.contains(&want.to_string()), "missing {want}");
         }
     }
