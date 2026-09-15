@@ -1652,8 +1652,9 @@ fn spawn_refusal(resolved: Option<(&aoide_storage::node_store::Node, aoide_stora
         Some((node, NodeRung::Signature)) => (
             -32006,
             format!(
-                "spawn refused: node `{}` is paired and this request is validly signed, but `allows` \
-                 does not include `spawn` — run `node allow {} spawn on`",
+                "spawn refused: node `{}` is paired and this request is validly signed, but THIS \
+                 node's `allows` for it does not include `spawn` — on this (receiving) host run \
+                 `aoide node allow {} spawn on`; the caller's own allows are not consulted",
                 node.name, node.name
             ),
         ),
@@ -1723,23 +1724,29 @@ fn deposit_admitted(resolved: Option<&aoide_storage::node_store::Node>) -> bool 
 /// incomplete-headers/signature-mismatch refusals, CONTRACTS.md §6). Two
 /// shapes only (simpler than [`spawn_refusal`]'s three: no historical
 /// Token-rung caller to distinguish here) — paired-but-not-allowed, told
-/// the exact `node allow` fix; everything else (unpaired, unsigned, no
+/// the exact `node allow` fix AND where it runs (the RECEIVING host: the
+/// `allows` set is the receiver's record of the sender, never the sender's
+/// own) plus the `mail outbox retry --refused` that then moves the parked
+/// letters; everything else (unpaired, unsigned, no
 /// resolution at all) told to pair and allow.
 fn deposit_refusal(resolved: Option<&aoide_storage::node_store::Node>) -> (i64, String) {
     match resolved {
         Some(node) => (
             -32010,
             format!(
-                "mail deposit refused: node `{}` is paired and this request is validly signed, but \
-                 `allows` does not include `message` — run `node allow {} message on`",
-                node.name, node.name
+                "mail deposit refused: node `{}` is paired and this request is validly signed, but THIS \
+                 node's `allows` for it does not include `message` — on this (receiving) host run \
+                 `aoide node allow {} message on`, then on `{}` run `aoide mail outbox retry \
+                 --refused` so its parked letters move; the sender's own allows are not consulted",
+                node.name, node.name, node.name
             ),
         ),
         None => (
             -32010,
             "mail deposit refused: this method requires the caller be identified via a verified, \
              per-request SIGNED request from a paired node — pair first via `aoide pair`, then \
-             `node allow <name> message on`"
+             `node allow <name> message on` ON THE RECEIVING host (the sender's own allows are not \
+             consulted)"
                 .to_string(),
         ),
     }
