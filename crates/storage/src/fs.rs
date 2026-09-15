@@ -609,6 +609,21 @@ pub fn songbook_notes(name: &str) -> std::path::PathBuf {
     songbook_dir(name).join("livery.json")
 }
 
+/// The DECLARED song's notes — the declared twin, `<song>/declared/livery.json`
+/// (CONTRACTS.md §4).
+///
+/// Same content as the active song's committed `livery.json` with the venue's
+/// `aoide.livery.override` applied (a plain file, never a symlink), published
+/// by the quickshell facet's activation seed
+/// (`modules/facets/quickshell/default.nix`) — the file's own `"song"` field
+/// says WHICH song that was. Absent on a host that never activated the facet
+/// (or before its first activation); readers then fall back to the committed
+/// songbook for that song. Shares [`song_dir`]'s `AOIDE_STAGE_DIR`-relative
+/// resolution like every other song-tree path.
+pub fn declared_notes() -> std::path::PathBuf {
+    song_dir().join("declared").join("livery.json")
+}
+
 /// A committed song's drafts root: `<song>/songbook/<name>/drafts/` —
 /// durable scratch for `rice draft save`, gitignored and outside `stage/` (a
 /// draft is NOT the live stage, and NOT committed truth; that distinction is

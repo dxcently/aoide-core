@@ -30,7 +30,7 @@
 //! `stage`/`declarative` both reuse [`super::rice::handle_rice_stage`]
 //! directly (guard-free, `pub(crate)`) when a song name is given — the SAME
 //! side effects a bare `rice stage <name>` has — so `declarative <name>` can
-//! re-pin `stage/livery.json` to that song's committed notes and lock it in
+//! re-pin `stage/livery.json` to that song's declared notes and lock it in
 //! one step, even from the default (unmarked) declarative state, without
 //! tripping its own guard (the marker isn't flipped until AFTER the write
 //! succeeds).
@@ -40,6 +40,12 @@
 //! field ([`current_staged_song`]) and stages that, so unlocking staging
 //! always ALSO enables hot loading of whatever is presently active — only a
 //! genuinely fresh box with no stage file yet falls back to a no-op unlock.
+//! [`handle_mode_declarative`]'s own no-arg form resolves differently, and
+//! deliberately: it goes to the DECLARED song
+//! ([`super::rice::declared_song`], off `song/declared/livery.json`) when the
+//! facet has published one, and only then falls back to the same current-song
+//! rule above — "back to declarative" must mean the venue's declared song, not
+//! whichever song happens to be staged.
 //!
 //! **Leaving `Draft` mode:** both [`handle_mode_stage`] and
 //! [`handle_mode_declarative`] call [`teardown_draft_symlink`] — removing
@@ -81,8 +87,8 @@ pub fn register(r: &mut Registry) {
     ));
     r.insert(cmd!(
         path: ["rice", "mode", "declarative"],
-        summary: "Lock staging: `rice stage`/`cover set` refuse until unlocked again. Optional <name> re-pins stage/livery.json to that song's committed notes first. Leaves `Draft` mode (tearing down its routing symlink) if currently in it.",
-        args: [arg!("name", "string", false, "Song to pin stage/livery.json to before locking; omit to lock as-is.")],
+        summary: "Lock staging: `rice stage`/`cover set` refuse until unlocked again. Optional <name> re-pins stage/livery.json to that song's declared notes first. Leaves `Draft` mode (tearing down its routing symlink) if currently in it.",
+        args: [arg!("name", "string", false, "Song to pin stage/livery.json to before locking; omit to pin the declared song (the currently staged one on a host with no declared twin).")],
         flags: [],
         gated: false,
         implemented: true,
@@ -321,12 +327,16 @@ fn handle_mode_stage(inv: &Invocation) -> Outcome {
 /// `handle_rice_stage`, guard-free), then writes the marker.
 ///
 /// With NO name, this mirrors [`handle_mode_stage`]'s own no-arg auto-resolve
-/// pattern rather than freezing the stage as-is: it resolves "the current
-/// rice" off `stage/livery.json`'s own `"song"` field ([`current_staged_song`]),
-/// re-pins from THAT song's committed notes, then locks — so `rice mode
-/// declarative` with no name discards whatever unsaved live edits sat in the
-/// stage, same as the `<name>` path always has (`rice draft save` first to
-/// keep them, hence the success message below). Only when no song can be
+/// pattern rather than freezing the stage as-is: it resolves "the declared
+/// song" off the facet's declared twin
+/// (`song/declared/livery.json`, [`super::rice::declared_song`],
+/// CONTRACTS.md §4) — the song the VENUE declares for this host — and only
+/// when that twin is absent (a host that never activated the facet) falls
+/// back to [`current_staged_song`], the song `stage/livery.json` is currently
+/// carrying. It re-pins from the resolved song's notes, then locks — so `rice
+/// mode declarative` with no name discards whatever unsaved live edits sat in
+/// the stage, same as the `<name>` path always has (`rice draft save` first
+/// to keep them, hence the success message below). Only when no song can be
 /// resolved at all (a genuinely fresh box with no stage file yet) does this
 /// fall back to a bare lock with nothing to re-pin — the one case where
 /// nothing is discarded, because there was nothing live to discard.
@@ -339,7 +349,9 @@ fn handle_mode_stage(inv: &Invocation) -> Outcome {
 /// the marker — same failure handling the `<name>` path already had.
 fn handle_mode_declarative(inv: &Invocation) -> Outcome {
     let explicit_name = inv.args.first().cloned();
-    let resolved_name = explicit_name.or_else(current_staged_song);
+    let resolved_name = explicit_name
+        .or_else(super::rice::declared_song)
+        .or_else(current_staged_song);
 
     if let Err(e) = teardown_draft_symlink() {
         return Outcome::error("rice.mode.declarative", format!("failed to clear draft routing: {e}"))
@@ -746,6 +758,74 @@ mod tests {
         assert!(
             repinned.contains("\"accent\""),
             "re-pinned from the committed songbook, not frozen as-is: {repinned}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The declared twin (CONTRACTS.md §4) outranks the stage file's own
+    /// breadcrumb: with a DIFFERENT song currently staged, bare `rice mode
+    /// declarative` must land back on the song the VENUE declares — the song
+    /// `song/declared/livery.json` names — not on whatever happens to be
+    /// staged. `staging_song` still survives the lock untouched.
+    #[test]
+    fn declarative_with_no_name_repins_the_declared_song() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("mode-declarative-declared-song");
+        let stage = root.join("stage");
+        let sonata = root.join("songbook").join("sonata");
+        let nocturne = root.join("songbook").join("nocturne");
+        let declared = root.join("declared");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&sonata).unwrap();
+        std::fs::create_dir_all(&nocturne).unwrap();
+        std::fs::create_dir_all(&declared).unwrap();
+        std::fs::write(sonata.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::write(nocturne.join("livery.json"), VALID_NOTES).unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        // The facet's activation seed published the DECLARED twin for sonata…
+        std::fs::write(
+            declared.join("livery.json"),
+            r##"{"palette":{"accent":"#ebbcba","bg":"#0b1021","fg":"#c8d3f5","urgent":"#ff757f"},"schemaVersion":"0","song":"sonata"}"##,
+        )
+        .unwrap();
+        // …while the stage is currently performing nocturne, and a prior
+        // staging session's own memory says `etude`.
+        std::fs::write(
+            stage.join("livery.json"),
+            r##"{"schemaVersion":"0","song":"nocturne","palette":{"bg":"#000"}}"##,
+        )
+        .unwrap();
+        save_mode_marker(&ModeMarker {
+            mode: RiceMode::Staging,
+            song: Some("nocturne".to_string()),
+            draft: None,
+            staging_song: Some("etude".to_string()),
+            since: aoide_storage::time::now_iso_utc(),
+        })
+        .unwrap();
+
+        let out = handle_mode_declarative(&inv(&["rice", "mode", "declarative"], &[]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let repinned: Value =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("livery.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            repinned["song"], "sonata",
+            "re-pinned to the DECLARED song, not the currently staged nocturne"
+        );
+        assert_eq!(
+            repinned["palette"]["accent"], "#ebbcba",
+            "and derived from the declared twin, venue recolour included"
+        );
+        let marker = load_mode_marker();
+        assert_eq!(marker.mode, RiceMode::Declarative);
+        assert_eq!(marker.song, Some("sonata".to_string()));
+        assert_eq!(marker.draft, None);
+        assert_eq!(
+            marker.staging_song,
+            Some("etude".to_string()),
+            "the declarative lock still never touches the staging memory"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

@@ -313,6 +313,49 @@ fn handle_rice_stage_entry(inv: &Invocation) -> Outcome {
     out
 }
 
+/// The song the DECLARED twin (`song/declared/livery.json`, CONTRACTS.md §4)
+/// describes, read straight off that file's own `"song"` field — the one place
+/// a runtime call can learn "the declared song" rather than "the currently
+/// staged song" (`mode.json`'s own `song`, which a staging round-trip
+/// legitimately diverges from). `None` when the twin is absent, unreadable,
+/// not JSON, not an object, carries no string `"song"`, or carries one that
+/// fails [`crate::compose::valid_song_name`].
+///
+/// Only the nix facet's activation seed writes that file
+/// (`modules/facets/quickshell/default.nix`); this crate only ever reads it.
+/// The name-shape guard mirrors [`super::mode::current_staged_song`]'s own
+/// read-side guard — the result is joined into a songbook path by callers, so
+/// a hand-poisoned field must resolve to nothing rather than to something
+/// unsafe.
+pub(crate) fn declared_song() -> Option<String> {
+    let raw = std::fs::read_to_string(shellbridge::declared_notes()).ok()?;
+    let parsed: Value = serde_json::from_str(&raw).ok()?;
+    let song = parsed.get("song")?.as_str()?.to_string();
+    crate::compose::valid_song_name(&song).then_some(song)
+}
+
+/// Resolve the notes file `rice stage <name>` derives from: the declared twin
+/// ([`shellbridge::declared_notes`]) when it exists AND names THIS song off its
+/// own `"song"` field, else the committed
+/// [`shellbridge::songbook_notes(name)`].
+///
+/// The twin is the facet's activation seed: the DECLARED song's committed
+/// notes with the venue's `aoide.livery.override` already applied. Reading it
+/// here is what makes a runtime re-stage reproduce the venue instead of
+/// reverting the desktop to the song's own colours. The `"song"` equality test
+/// is what scopes it — the twin describes exactly ONE song, so staging any
+/// other song must still derive from that song's own committed notes.
+/// `name` is already shape-validated by the caller. Everything downstream is
+/// unchanged: the twin already carries its `"song"` field, and re-inserting
+/// the same value is idempotent.
+fn notes_source(name: &str) -> PathBuf {
+    if declared_song().as_deref() == Some(name) {
+        shellbridge::declared_notes()
+    } else {
+        shellbridge::songbook_notes(name)
+    }
+}
+
 /// `rice stage <name>` — hot-load a committed song live: stage its
 /// `livery.json` (plus a derivable cover) into `<stage>/` so the Quickshell
 /// surfaces hot-reload it, AND best-effort live-apply its geometry + border
@@ -327,7 +370,9 @@ fn handle_rice_stage_entry(inv: &Invocation) -> Outcome {
 /// hyprctl still leaves the stage file updated.
 ///
 /// This is the honest form of the hand-copy agents had been doing: drive the
-/// songbook notes into the stage so the shell has a palette to render.
+/// songbook notes into the stage so the shell has a palette to render — the
+/// DECLARED twin ([`notes_source`], CONTRACTS.md §4) when the facet has
+/// published one for this song, else the song's own committed notes.
 ///
 /// `pub(crate)`, not private: `rice mode`'s `stage`/`declarative` handlers
 /// (`commands/mode.rs`) call this directly to get the SAME live-apply side
@@ -365,7 +410,7 @@ pub(crate) fn handle_rice_stage(inv: &Invocation) -> Outcome {
         .with_data(json!({ "reason": "invalid-name", "name": name }));
     }
 
-    let notes_src = shellbridge::songbook_notes(&name);
+    let notes_src = notes_source(&name);
     let raw = match std::fs::read_to_string(&notes_src) {
         Ok(s) => s,
         Err(e) => {
@@ -964,6 +1009,84 @@ mod tests {
         assert!(out.changed.iter().any(|c| c.ends_with("cover.json")));
         let data = out.data.unwrap();
         assert!(data["cover"].as_str().unwrap().ends_with("covers/dusk.png"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The declared twin (CONTRACTS.md §4) is the venue's copy of the
+    /// declared song's notes — committed notes with `aoide.livery.override`
+    /// applied, published by the quickshell facet's activation seed. Staging
+    /// the DECLARED song must derive from THAT, not from the raw committed
+    /// file, or the first runtime re-stage after activation reverts the
+    /// venue recolour.
+    #[test]
+    fn stage_reads_the_declared_twin_for_the_declared_song() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("stage-declared-twin");
+        let stage = root.join("stage");
+        let song = root.join("songbook").join("sonata");
+        let declared = root.join("declared");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&song).unwrap();
+        std::fs::create_dir_all(&declared).unwrap();
+        std::fs::write(song.join("livery.json"), VALID_NOTES).unwrap();
+        // The twin is the same shape the facet's jq seed writes: committed
+        // notes, `"song"` injected, keys sorted, palette recoloured by the
+        // venue override.
+        std::fs::write(
+            declared.join("livery.json"),
+            r##"{"palette":{"accent":"#ebbcba","bg":"#0b1021","fg":"#c8d3f5","urgent":"#ff757f"},"schemaVersion":"0","song":"sonata"}"##,
+        )
+        .unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["sonata"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let parsed: Value =
+            serde_json::from_str(&std::fs::read_to_string(stage.join("livery.json")).unwrap())
+                .unwrap();
+        assert_eq!(parsed["song"], "sonata");
+        assert_eq!(
+            parsed["palette"]["accent"], "#ebbcba",
+            "the declared twin's venue recolour reached the stage, not the songbook's own accent"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The twin describes exactly ONE song — its own `"song"` field is the
+    /// whole scope. Staging any OTHER song must still derive from that song's
+    /// committed notes, never from the declared twin.
+    #[test]
+    fn stage_ignores_the_declared_twin_for_another_song() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _s = EnvSaver::capture(&["AOIDE_STAGE_DIR"]);
+        let root = unique_tmp("stage-declared-twin-other");
+        let stage = root.join("stage");
+        let sonata = root.join("songbook").join("sonata");
+        let nocturne = root.join("songbook").join("nocturne");
+        let declared = root.join("declared");
+        std::fs::create_dir_all(&stage).unwrap();
+        std::fs::create_dir_all(&sonata).unwrap();
+        std::fs::create_dir_all(&nocturne).unwrap();
+        std::fs::create_dir_all(&declared).unwrap();
+        std::fs::write(sonata.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::write(nocturne.join("livery.json"), VALID_NOTES).unwrap();
+        std::fs::write(
+            declared.join("livery.json"),
+            r##"{"palette":{"accent":"#ebbcba","bg":"#0b1021","fg":"#c8d3f5","urgent":"#ff757f"},"schemaVersion":"0","song":"sonata"}"##,
+        )
+        .unwrap();
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["nocturne"]));
+        assert_eq!(out.status, Status::Ok, "{:?}", out.data);
+        let staged = std::fs::read_to_string(stage.join("livery.json")).unwrap();
+        let parsed: Value = serde_json::from_str(&staged).unwrap();
+        assert_eq!(parsed["song"], "nocturne");
+        assert_eq!(
+            parsed["palette"]["accent"], "#82aaff",
+            "nocturne's own committed accent, not the declared twin's sonata recolour"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

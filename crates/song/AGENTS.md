@@ -48,7 +48,8 @@
   `commands` concern layered over these pure/near-pure engine modules.
 - **`commands::rice::handle_rice_stage` is Staging's write path, NEVER
   Draft's — don't call it from a Draft-mode code path.** It reads the
-  COMMITTED songbook and writes the result into `stage/livery.json`. In
+  COMMITTED songbook (or the declared twin, see the bullet below) and writes
+  the result into `stage/livery.json`. In
   `Staging` mode that file is a plain file, so this is exactly "re-derive
   declared content" — correct by design. While routed into a `Draft`,
   `stage/livery.json` is a SYMLINK into the draft's own file
@@ -60,6 +61,24 @@
   caller needing the widget-sync/hyprctl-apply tail reuses THAT, or the bare
   `crate::live`/`crate::widgets` primitives directly, never
   `handle_rice_stage`.
+- **`song/declared/livery.json` (the declared twin, CONTRACTS.md §4) is
+  READ-ONLY for this crate — only the nix facet writes it.** The quickshell
+  facet's activation seed (`modules/facets/quickshell/default.nix`,
+  `home.activation.aoideSeedStage`) publishes it: the declared song's
+  committed notes with the venue's `aoide.livery.override` applied, `"song"`
+  injected, keys sorted. `commands::rice::notes_source` reads it for
+  `handle_rice_stage`, and `commands::rice::declared_song` exposes its
+  `"song"` field (`rice mode declarative`'s no-`<name>` resolve uses it,
+  ahead of `current_staged_song`). **The declared-song test is `"song"`
+  EQUALITY against the name being staged — never a mode, never a mtime,
+  never "the twin exists so use it".** The twin describes exactly one song;
+  staging any other must derive from that song's own committed notes. A host
+  that never activated the facet has no twin at all, and every reader falls
+  back to the committed songbook — absent is the ordinary no-venue-override
+  case, never an error. Never write this path from Rust: `rice stage` is a
+  runtime writer of the STAGE, and a second Rust writer of the declared twin
+  would race the facet's seed and could never compute the override tier the
+  nix evaluator owns.
 - **`commands::rice::seed_songbook_from_templates` (task #41) is called
   from the STAGING ENTRY POINTS, never from inside `handle_rice_stage`
   itself.** `handle_rice_stage_entry` (`rice stage <name>`) and

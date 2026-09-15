@@ -72,8 +72,19 @@ in `lyra`, not core.
 
 `aoide-protocol`, `aoide-storage` (`aoide_storage::fs::song_dir`/
 `flake_root`/`song_templates_dir`/`songbook_dir`/`songbook_notes`/
-`run_elements_dir`), plus `aoide-test-support` as a dev-dependency.
+`declared_notes`/`run_elements_dir`), plus `aoide-test-support` as a
+dev-dependency.
 `livery`/`live` are otherwise dependency-free leaves.
+
+`declared_notes` (`song/declared/livery.json`, CONTRACTS.md §4) is the
+DECLARED song's own notes, venue override applied — published by the
+quickshell facet's activation seed, read-only here.
+`commands::rice::notes_source` reads it whenever its `"song"` field equals the
+name being staged (never otherwise), so a runtime re-stage of the declared song
+reproduces the venue recolour instead of reverting it;
+`commands::rice::declared_song` is the same field exposed to `rice mode
+declarative`'s no-`<name>` resolve. A host with no such file falls back to
+`songbook_notes` unchanged.
 
 ## How it composes
 
