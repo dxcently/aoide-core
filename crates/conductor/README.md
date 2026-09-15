@@ -20,7 +20,8 @@ Sessions belonging to no project gather in an `Active sessions` group holding
 only live ones; their ended sessions form the one Past node at the root of the
 tree, below every project.
 Opening a historical entry displays its recorded facts; it does not focus,
-kill or resurrect a process.
+kill or resurrect a process. A scrollbar appears at the tree's right edge
+whenever it holds more rows than fit, and stays gone otherwise.
 
 | Key | View or action |
 |---|---|
@@ -31,6 +32,12 @@ kill or resurrect a process.
 | Arrows or `j` / `k` | Select rows in the focused region |
 | `h` / `l`, Left / Right | Fold or unfold tree groups |
 | `e` / right-click | Actions for a tree, graph, project or session target |
+| `a` in Graph | Whole forest, or only the selected card's own graph |
+| `j` / `k`, Down / Up in Graph | Move the selection down/up a rank, toward a child or the parent |
+| `h` / `l`, Left / Right in Graph | Move the selection to the previous/next sibling across the rank |
+| Enter in Graph | Open or focus the selected session |
+| `s` in Graph | Write a letter to the selected agent |
+| `p` in Graph | Prune ended sessions |
 | `?` | Context help |
 | `q` / Ctrl-C | Quit outside text entry / quit globally |
 
@@ -56,18 +63,43 @@ as keyboard navigation. Visible action labels explain panel-specific keys.
 Text entry takes precedence over navigation shortcuts. Bracketed paste inserts
 text into the active field without interpreting it as commands.
 
-In Graph, Space + left drag or middle drag pans the canvas; the wheel pans
-vertically and Shift + wheel pans horizontally. Ctrl + wheel zooms the
-camera through 50%, 75%, 100%, 125% and 150%, anchored at the pointer.
-The forest sits on a padded canvas, so the camera pans and zooms past the
-outermost cards; the camera follows the selection by centring the selected
-card. Wires wear the state colour of the session they lead to, so a working
-agent lights its own connections; project trunks keep the accent. Cards carry
-their identity mark in the heading and no port glyphs.
-Project and session nodes keep their world positions and card dimensions;
-zoom transforms that same layout rather than choosing a different card
-preset. Terminal glyphs stay cell-sized, so labels clip within their visible
-boxes. Rendering, selection and mouse hits share the transformed rectangles.
+Graph is a retained scene, drawn top-down: depth runs downward through ranks
+and siblings spread across a rank, with a parent centred over the horizontal
+span of its own children. Cards are fixed-size rectangles standing at world
+coordinates the scene keeps: a refresh that adds, ends or re-parents sessions
+leaves every surviving card where it was, and an arriving card takes the first
+free slot beside its proposed one. A session that changed parent is the one
+exception — it moves to its new rank, because a retained position would draw
+a child above its parent. Selection names a card by identity rather than by
+row, so the same card stays selected across a refresh.
+
+`j` / `k` or Down / Up step the selection a rank at a time, toward a child or
+the parent; `h` / `l` or Left / Right step it to the previous or next sibling
+across the rank, and neither wraps at a rank's end. Enter opens or focuses
+the selected session, `s` writes a letter to the selected agent directly
+without opening the actions menu, and `p` prunes ended sessions — the one
+mutation the panel dispatches on its own.
+
+`a` switches the two views. Focus, the default, draws only the connected graph
+the selected card belongs to; All draws the whole forest. Sessions belonging to
+no project gather under one synthetic root, and that root is not a connection:
+a session attached to nothing shows itself alone under Focus rather than
+borrowing a forest of strangers.
+
+Space + left drag or middle drag pans the canvas; the wheel pans vertically and
+Shift + wheel pans horizontally. Ctrl + wheel zooms the camera through 50%,
+75%, 100%, 125% and 150%, anchored at the pointer. Until a drag or a pan moves
+it, the camera follows the selection by centring the selected card. The forest
+sits on a padded canvas, so the camera reaches past the outermost cards. Only
+what the camera can see is painted.
+
+Wires run below the cards, so a card covers the wire that crosses it. Each wire
+wears the state colour of the session it leads to, so a working agent lights
+its own connections; project trunks keep the accent. Cards carry their identity
+mark in the heading and no port glyphs. Zoom transforms that same world rather
+than choosing a different card preset. Terminal glyphs stay cell-sized, so
+labels clip within their visible boxes. Rendering, selection and mouse hits
+share one camera transform, so a click and a key resolve the same card.
 
 Actions open a target-specific menu. Arrows or `j` / `k` select an entry,
 Enter applies it and Escape closes the menu.
@@ -99,6 +131,9 @@ who joins later. Letters appear in local received-sequence order; the
 participant roster includes observed senders, envelope targets, To and Cc.
 Separate thread IDs stay separate even between the same people. Thread
 labels use the earliest available nonempty subject.
+
+The conversation list and the letter list each show a scrollbar when their
+rows overflow the visible height, and none when everything already fits.
 
 Letters without a thread ID appear as explicitly labeled legacy pair
 correspondence. Replying to one uses that original message ID as the thread
@@ -152,7 +187,8 @@ visible alongside the previous successful snapshot.
 | `app::App` | Loaded state, selections, folding, history, asynchronous roster refresh and dispatched actions |
 | `board` | Home/workspace composition, navigation, sidebar and shared drawing/hit-test geometry |
 | `ui` | Pure panel/detail/overlay rendering |
-| `graphview` | Graph layout, blocks and connections |
+| `scene` | Camera, view choice, retained world positions and the clipping painter |
+| `graphview` | Graph model, card layout and wires over the retained scene |
 | `mailview` | Non-consuming local letters, signed thread grouping and legacy pair correspondence |
 | `eventview` | Bounded audit reader and full-record event rendering |
 | `logtail` | Read-only headless-session log overlay |

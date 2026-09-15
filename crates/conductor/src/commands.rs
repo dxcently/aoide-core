@@ -37,7 +37,7 @@ fn handle_conductor(inv: &Invocation) -> Outcome {
 pub fn register(r: &mut Registry) {
     r.insert(cmd!(
         path: ["conductor"],
-        summary: "Raise the conductor: the interactive terminal UI to conduct the agent sessions — the session DAG, projects, audit log, and stage status (every action routes through the one dispatcher). Distinct from `aoide conduct`, which wraps a single process into the conductor channel.",
+        summary: "Raise the conductor: the interactive terminal UI to conduct the agent sessions — the session graph, projects, audit log, and stage status (every action routes through the one dispatcher). Distinct from `aoide conduct`, which wraps a single process into the conductor channel.",
         args: [],
         flags: [],
         gated: false,

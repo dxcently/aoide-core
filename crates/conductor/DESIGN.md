@@ -70,17 +70,92 @@ They do not repair an actively appended file. Ledger reads use the storage
 API and refresh on file changes. Network roster reads run asynchronously
 with their existing bounds and cache semantics.
 
-The graph uses an interim fixed world layout of rectangular project and
-session nodes, recomputed on every refresh: it is not the retained scene
-graph (stable world nodes and edges, node dragging, positions preserved
-across refresh), which is designer-owned follow-up work. Its camera scales through 50%, 75%, 100%, 125% and 150%; Ctrl + wheel
-keeps the pointer's world location stable, bounded by the padded canvas
-edges (the camera reaches past the outermost cards). Wires take the state
-colour of the session they lead to; cards carry an identity mark and no
-ports. Zoom
-transforms card rectangles and edges without switching layout presets.
-Terminal glyphs remain cell-sized and labels clip to the transformed card.
-Rendering, hit tests, extents, drag and wheel panning share that geometry.
+## Graph scene
+
+The graph is a retained scene. World coordinates, the camera, the chosen view
+and the selected node's identity live in `App`, outside render, so a frame
+never reconstructs what the last one decided.
+
+```text
+stage refresh ─── nodes and edges ───┐
+                                     ▼
+                              tree layout ── proposed world cells
+                                     │
+retained positions ──────────────────┼── retained wins, except on depth change
+                                     ▼
+                            world rectangles
+                                     │
+             view ── the selected node's component, or every node
+                                     ▼
+                    camera ── pan in scaled cells + zoom step
+                                     │
+                 ┌───────────────────┴───────────────────┐
+        painter clipped to the pane                 hit test, extents
+```
+
+Placement is retained-wins: a surviving card keeps its world rectangle, an
+arriving card is nudged one slot at a time until it collides with nothing, and
+a departed card's position is dropped. A node whose depth changed is re-placed
+instead, because a re-parented session genuinely moved and a retained rank
+would draw a child above its parent. Selection is a node identity and the
+visible order derives from it, so the filtered view and the selection cannot
+disagree about which card is chosen. Depth runs downward through ranks;
+siblings spread across a rank, and a parent centres over the horizontal span
+of its own children. A wire leaves a parent's bottom edge, spreads along a
+horizontal junction row in the rank gap below it, and drops into each child's
+top edge.
+
+GraphScene renders as a plain `Widget`, never a `StatefulWidget`: the latter
+exists so a widget can write back into state during render, and this crate's
+standing rule runs the other way — render only reads `App::graph`, and input
+handling owns every state change. Recording a card's rectangle during render
+for a later hit test is exactly that kind of write-back, and this scene never
+does it: render and hit testing already run the same `Camera` transform over
+the same retained world, so they agree by construction rather than by one
+frame leaving notes for the next event.
+
+Connectors paint straight into the frame buffer through the clipping
+`Painter`, never through `ratatui`'s `Canvas` widget. Every grid a `Canvas`
+`Marker` can select -- Braille, the block/dot/bar `CharGrid`, the
+octant/quadrant/sextant pattern grids, `HalfBlock` -- shares one
+`Grid::paint(x, y, color)` method that takes a colour and nothing else, and
+`CharGrid::save()`, the marker closest to cell resolution, emits a single
+fixed glyph for every painted cell in the whole grid rather than one chosen
+per cell. No `Marker` lets a caller pick a different glyph per dot, so none
+can carry a mixed box-drawing grammar where a junction, a horizontal run and
+a vertical run (`┌ ┐ ┬ ┼` and their mirrors) are three different characters
+at three different cells. `Canvas`'s only path for arbitrary text,
+`Context::print`, does not help either: it accepts a label only when its
+anchor point falls inside the world bounds, then separately clips the
+rendered string against the buffer's right edge in screen space -- two
+partial checks in two coordinate systems, not the one whole-glyph precheck
+this crate's own `Painter` already does before it writes anything. Terminal
+glyphs stay fixed-size here, and neither a `Canvas` grid nor its label path
+has a cell that can hold one.
+
+Ratatui ships no node/edge/tree/DAG widget to reach for instead: `GraphType`
+belongs to `Chart`/`Dataset` and names a Cartesian series style (`Scatter`,
+`Line`, `Bar`, `Area`), a plotting-axis concept with nothing to do with graph
+topology.
+
+Focus walks the graph undirected from the selected node and draws that
+component alone; All draws every node. The synthetic root gathering sessions
+that belong to no project is not a connection, so Focus does not traverse its
+edges unless it is itself the selected node.
+
+The camera's pan is the viewport's top-left in scaled cells, which keeps
+panning a screen gesture at every zoom; an unset pan means the camera follows
+the selection by centring it. Ctrl + wheel steps 50%, 75%, 100%, 125% and 150%
+and holds the pointer's world location fixed, bounded by the padded canvas
+edges. The painter clips every write to the pane and drops a wide glyph that
+would straddle the right edge, so the world outside the camera costs nothing
+and cannot reach the buffer. Edges paint before cards, so a card covers the
+wire crossing it; wires take the state colour of the session they lead to and
+cards carry an identity mark and no ports. Zoom transforms that one world
+rather than switching layout presets, and terminal glyphs stay cell-sized with
+labels clipped to the transformed card. Rendering, hit tests, extents, drag and
+wheel panning run the same transform over the same world, rather than one frame
+recording rectangles for the next event to find.
 
 ## Conversations
 

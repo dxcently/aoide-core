@@ -5,7 +5,7 @@ use ratatui::{
     layout::{Constraint, Layout, Rect},
     style::{Modifier, Style},
     text::Line,
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Block, Borders, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap},
     Frame,
 };
 
@@ -113,7 +113,11 @@ pub fn action_regions(
 ) -> Vec<(Rect, crossterm::event::KeyCode, &'static str)> {
     use crossterm::event::KeyCode;
     let labels: &[(char, &str)] = match panel {
-        Panel::Graph => &[('s', "Write letter"), ('e', "Actions")],
+        Panel::Graph => &[
+            ('a', "All / focus"),
+            ('s', "Write letter"),
+            ('e', "Actions"),
+        ],
         Panel::Projects => &[('a', "Add folder"), ('r', "Resurrect")],
         Panel::Session | Panel::Terminals => &[('\n', "Open / focus")],
         Panel::Roster => &[('s', "Terminal input"), ('r', "Refresh")],
@@ -161,8 +165,9 @@ pub fn draw_actions(f: &mut Frame, area: Rect, app: &App) {
         }
         f.render_widget(
             Paragraph::new(format!(
-                "Canvas {} | Ctrl-wheel zoom | Space+drag pan",
-                crate::graphview::zoom_label(app)
+                "Canvas {} · {} | a all/focus | Space/middle-drag or wheel pan | Ctrl-wheel zoom | p prune",
+                crate::graphview::zoom_label(app),
+                crate::graphview::view_label(app)
             ))
             .style(Style::default().fg(theme::role_color(&app.palette, theme::Role::Terminal))),
             columns[1],
@@ -263,6 +268,35 @@ pub fn tree_offset(app: &App, height: u16) -> usize {
         .max(app.sidebar_sel.saturating_sub(h - 1))
 }
 
+/// Reserves the rightmost column of `area` for a scrollbar, only when
+/// `total` rows do not fit in its height. Draw and hit test both call this,
+/// so a reserved column -- when there is one -- is exactly what was
+/// painted, never a second guess at the same geometry.
+fn scrollbar_split(area: Rect, total: usize) -> (Rect, Option<Rect>) {
+    if area.width == 0 || total <= area.height as usize {
+        return (area, None);
+    }
+    (
+        Rect::new(area.x, area.y, area.width - 1, area.height),
+        Some(Rect::new(area.right() - 1, area.y, 1, area.height)),
+    )
+}
+
+/// A vertical scrollbar built fresh from values the caller already tracks
+/// (`total` rows, the same `offset` the row loop scrolled by) -- ratatui's
+/// `Scrollbar::render` only reads `ScrollbarState`, never writes it back, so
+/// nothing here needs to persist in `App`.
+fn draw_scrollbar(f: &mut Frame, area: Rect, total: usize, offset: usize) {
+    let mut state = ScrollbarState::new(total).position(offset);
+    f.render_stateful_widget(
+        Scrollbar::new(ScrollbarOrientation::VerticalRight)
+            .begin_symbol(None)
+            .end_symbol(None),
+        area,
+        &mut state,
+    );
+}
+
 fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
     let title = if app.sidebar_focused {
         " PROJECTS * "
@@ -291,6 +325,7 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
         );
         return;
     }
+    let (rows_area, bar) = scrollbar_split(content, rows.len());
     for (n, row) in rows
         .iter()
         .enumerate()
@@ -386,8 +421,11 @@ fn draw_tree(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 Style::default().fg(theme::role_color(&app.palette, role))
             }),
-            Rect::new(content.x, y, content.width, 1),
+            Rect::new(rows_area.x, y, rows_area.width, 1),
         );
+    }
+    if let Some(bar) = bar {
+        draw_scrollbar(f, bar, rows.len(), tree_offset(app, content.height));
     }
     if app.history_error.is_some() && content.height > 0 {
         f.render_widget(
@@ -734,6 +772,7 @@ pub fn draw_mail(f: &mut Frame, area: Rect, app: &App) {
     let offset = app
         .mail_room_sel
         .saturating_sub(room_area.height.saturating_sub(1) as usize);
+    let (room_rows, room_bar) = scrollbar_split(room_area, conversations.len());
     for (i, c) in conversations
         .iter()
         .enumerate()
@@ -757,18 +796,22 @@ pub fn draw_mail(f: &mut Frame, area: Rect, app: &App) {
                 theme::surface(&app.palette, 5)
             }),
             Rect::new(
-                room_area.x,
-                room_area.y + (i - offset) as u16,
-                room_area.width,
+                room_rows.x,
+                room_rows.y + (i - offset) as u16,
+                room_rows.width,
                 1,
             ),
         );
+    }
+    if let Some(bar) = room_bar {
+        draw_scrollbar(f, bar, conversations.len(), offset);
     }
     let (list, detail) = mail_parts(content);
     let letters = app.mail_letters();
     let offset = app
         .mail_sel
         .saturating_sub(list.height.saturating_sub(1) as usize);
+    let (letter_rows, letter_bar) = scrollbar_split(list, letters.len());
     for (i, m) in letters
         .iter()
         .enumerate()
@@ -787,8 +830,16 @@ pub fn draw_mail(f: &mut Frame, area: Rect, app: &App) {
             } else {
                 theme::surface(&app.palette, if i % 2 == 0 { 2 } else { 5 })
             }),
-            Rect::new(list.x, list.y + (i - offset) as u16, list.width, 1),
+            Rect::new(
+                letter_rows.x,
+                letter_rows.y + (i - offset) as u16,
+                letter_rows.width,
+                1,
+            ),
         );
+    }
+    if let Some(bar) = letter_bar {
+        draw_scrollbar(f, bar, letters.len(), offset);
     }
     let title = if app.mail.truncated {
         " LETTER / recent local archive "
@@ -864,8 +915,9 @@ pub fn hit(area: Rect, app: &App, x: u16, y: u16) -> Hit {
         }
     }
     let tree = inner(g.tree);
-    if tree.contains(pos) {
-        return Hit::Tree(tree_offset(app, tree.height) + (y - tree.y) as usize);
+    let tree_rows = scrollbar_split(tree, app.sidebar_rows().len()).0;
+    if tree_rows.contains(pos) {
+        return Hit::Tree(tree_offset(app, tree.height) + (y - tree_rows.y) as usize);
     }
     if app.panel == Panel::Home {
         return home_hit(g.body, app, x, y);
@@ -897,19 +949,21 @@ pub fn hit(area: Rect, app: &App, x: u16, y: u16) -> Hit {
     if app.panel == Panel::Mail {
         let (rooms, content) = conversation_parts(body);
         let room_area = inner(rooms);
-        if room_area.contains(pos) {
+        let room_rows = scrollbar_split(room_area, app.mail.conversations().len()).0;
+        if room_rows.contains(pos) {
             return Hit::Conversation(
                 app.mail_room_sel
                     .saturating_sub(room_area.height.saturating_sub(1) as usize)
-                    + (y - room_area.y) as usize,
+                    + (y - room_rows.y) as usize,
             );
         }
         let (list, _) = mail_parts(content);
-        if list.contains(pos) {
+        let letter_rows = scrollbar_split(list, app.mail_letters().len()).0;
+        if letter_rows.contains(pos) {
             return Hit::Row(
                 app.mail_sel
                     .saturating_sub(list.height.saturating_sub(1) as usize)
-                    + (y - list.y) as usize,
+                    + (y - letter_rows.y) as usize,
             );
         }
     }
@@ -1029,6 +1083,357 @@ mod tests {
         for (r, p, _) in home_actions(body) {
             assert_eq!(hit(area, &a, r.x, r.y), Hit::Panel(p));
         }
+    }
+
+    // ── Popup menu sizing (target_menu_area) ────────────────────────────
+
+    #[test]
+    fn context_menu_width_matches_its_widest_line_not_a_fixed_62() {
+        use crate::app::ContextAction;
+        let actions = vec![
+            ContextAction::Details,
+            ContextAction::WriteLetter,
+            ContextAction::AddFolder,
+            ContextAction::Resurrect,
+        ];
+        // The widest rendered line here is " @ Write letter" (15 cells).
+        let content_w = context_menu_content_width("demo", &actions);
+        assert_eq!(content_w, 15);
+        let area = Rect::new(0, 0, 120, 40);
+        let menu = target_menu_area(area, 5, 5, actions.len(), content_w);
+        assert_eq!(
+            menu.width,
+            content_w + 2,
+            "box width is content plus borders"
+        );
+        assert_ne!(menu.width, 62, "the old fixed width must be gone");
+    }
+
+    #[test]
+    fn menu_width_is_clamped_to_the_frame_when_content_would_overflow_it() {
+        use crate::app::ContextAction;
+        let long_title = "a-genuinely-long-project-name-that-will-not-fit-in-a-narrow-frame";
+        let content_w = context_menu_content_width(long_title, &[ContextAction::Details]);
+        let area = Rect::new(0, 0, 20, 40);
+        let menu = target_menu_area(area, 0, 0, 1, content_w);
+        assert_eq!(
+            menu.width, area.width,
+            "the box never grows past the frame it lives in"
+        );
+    }
+
+    #[test]
+    fn right_click_menu_near_the_right_edge_still_lands_fully_inside_the_frame() {
+        let mut app = App::for_test(
+            vec![aoide_conduct::graph::Project {
+                name: "demo-project-with-a-longer-name".into(),
+                path: "/demo".into(),
+                ..Default::default()
+            }],
+            vec![],
+            vec![],
+        );
+        let area = Rect::new(0, 0, 120, 40);
+        // Anchor the click one cell from the frame's right edge -- the case
+        // a content-sized box no longer needs to shove leftward for, but
+        // the clamp must still hold it inside when it does.
+        app.open_context_for_project("demo-project-with-a-longer-name".into(), area.width - 1, 5);
+        let m = app.context_menu.as_ref().expect("menu opened");
+        let content_w = context_menu_content_width(&m.title, &m.actions);
+        let rect = target_menu_area(area, m.x, m.y, m.actions.len(), content_w);
+        assert!(
+            rect.right() <= area.right(),
+            "menu stays inside the frame: {rect:?}"
+        );
+        assert!(rect.x >= area.x);
+    }
+
+    // ── Sidebar scrollbar (project tree) ────────────────────────────────
+
+    fn many_projects(n: usize) -> Vec<aoide_conduct::graph::Project> {
+        (0..n)
+            .map(|i| aoide_conduct::graph::Project {
+                name: format!("proj-{i:02}"),
+                path: format!("/p{i}"),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn sidebar_scrollbar_thumb_tracks_selection_offset() {
+        let area = Rect::new(0, 0, 100, 20);
+        let probe = {
+            let mut a = App::for_test(vec![], vec![], vec![]);
+            a.panel = Panel::Projects;
+            a
+        };
+        let content = inner(page_geometry(area, &probe).tree);
+        let rows = App::for_test(many_projects(40), vec![], vec![])
+            .sidebar_rows()
+            .len();
+        assert!(rows > content.height as usize, "fixture must overflow");
+        let bar_x = content.right() - 1;
+        let thumb_row = |sel: usize| -> u16 {
+            let mut a = App::for_test(many_projects(40), vec![], vec![]);
+            a.panel = Panel::Projects;
+            a.sidebar_sel = sel;
+            let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal
+                .draw(|f| draw_tree(f, page_geometry(area, &a).tree, &a))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            (content.y..content.bottom())
+                .find(|&y| buffer[(bar_x, y)].symbol() == "█")
+                .expect("thumb glyph present")
+        };
+        let top = thumb_row(0);
+        let bottom = thumb_row(rows - 1);
+        assert!(
+            bottom > top,
+            "thumb moves down as the selection moves down: {top} -> {bottom}"
+        );
+    }
+
+    #[test]
+    fn sidebar_scrollbar_absent_when_rows_fit() {
+        let mut app = App::for_test(many_projects(3), vec![], vec![]);
+        app.panel = Panel::Projects;
+        let area = Rect::new(0, 0, 100, 20);
+        let content = inner(page_geometry(area, &app).tree);
+        let rows = app.sidebar_rows().len();
+        assert!(rows <= content.height as usize, "fixture must fit");
+        let (rows_area, bar) = scrollbar_split(content, rows);
+        assert!(bar.is_none());
+        assert_eq!(rows_area, content);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| draw_tree(f, page_geometry(area, &app).tree, &app))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let x = content.right() - 1;
+        for y in content.y..content.bottom() {
+            let symbol = buffer[(x, y)].symbol();
+            assert_ne!(symbol, "█");
+            assert_ne!(symbol, "║");
+        }
+    }
+
+    #[test]
+    fn sidebar_row_click_still_resolves_the_same_row_with_a_scrollbar_present() {
+        let mut app = App::for_test(many_projects(40), vec![], vec![]);
+        app.panel = Panel::Projects;
+        let area = Rect::new(0, 0, 100, 20);
+        let content = inner(page_geometry(area, &app).tree);
+        assert!(
+            app.sidebar_rows().len() > content.height as usize,
+            "fixture must overflow"
+        );
+        app.sidebar_sel = 20;
+        let off = tree_offset(&app, content.height);
+        // Two rows down, well clear of the reserved scrollbar column.
+        let y = content.y + 2;
+        let x = content.x + 2;
+        assert_eq!(hit(area, &app, x, y), Hit::Tree(off + 2));
+        // The reserved column itself is the scrollbar, not a row.
+        let bar_x = content.right() - 1;
+        assert_eq!(hit(area, &app, bar_x, y), Hit::None);
+    }
+
+    // ── Mail-list scrollbars (conversations and letters) ────────────────
+
+    fn distinct_room_letters(n: usize) -> Vec<crate::mailview::MailLetter> {
+        (0..n)
+            .map(|i| crate::mailview::MailLetter {
+                seq: i as u64,
+                msgid: format!("m{i}"),
+                from: format!("node{i}/agent"),
+                to: "node0/human".into(),
+                from_address: aoide_storage::mail::Address {
+                    node: format!("node{i}"),
+                    name: "agent".into(),
+                },
+                to_address: aoide_storage::mail::Address {
+                    node: "node0".into(),
+                    name: "human".into(),
+                },
+                text: format!("hello {i}"),
+                received_at: format!("2026-01-01T00:{i:02}:00Z"),
+                minted_at: format!("2026-01-01T00:{i:02}:00Z"),
+            })
+            .collect()
+    }
+
+    /// One shared legacy pair, so every letter lands in the single
+    /// conversation it belongs to -- the letter list overflows while the
+    /// conversation list stays at one row.
+    fn one_room_many_letters(n: usize) -> Vec<crate::mailview::MailLetter> {
+        (0..n)
+            .map(|i| crate::mailview::MailLetter {
+                seq: i as u64,
+                msgid: format!("m{i}"),
+                from: "node1/agent".into(),
+                to: "node0/human".into(),
+                from_address: aoide_storage::mail::Address {
+                    node: "node1".into(),
+                    name: "agent".into(),
+                },
+                to_address: aoide_storage::mail::Address {
+                    node: "node0".into(),
+                    name: "human".into(),
+                },
+                text: format!("hello {i}"),
+                received_at: format!("2026-01-01T00:{i:02}:00Z"),
+                minted_at: format!("2026-01-01T00:{i:02}:00Z"),
+            })
+            .collect()
+    }
+
+    fn mail_geometry(area: Rect, app: &App) -> (Rect, Rect) {
+        let g = page_geometry(area, app);
+        let (body, _) = body_content(inner(g.body));
+        conversation_parts(body)
+    }
+
+    #[test]
+    fn mail_scrollbars_thumb_tracks_selection_offset() {
+        let area = Rect::new(0, 0, 100, 30);
+
+        let rooms_app = |sel: usize| {
+            let mut a = App::for_test(vec![], vec![], vec![]);
+            a.panel = Panel::Mail;
+            a.mail = crate::mailview::MailBoard {
+                letters: distinct_room_letters(40),
+                ..Default::default()
+            };
+            a.mail_room_sel = sel;
+            a
+        };
+        let (rooms, _) = mail_geometry(area, &rooms_app(0));
+        let room_area = inner(rooms);
+        assert!(
+            rooms_app(0).mail.conversations().len() > room_area.height as usize,
+            "room fixture must overflow"
+        );
+        let room_bar_x = room_area.right() - 1;
+        let room_thumb = |sel: usize| -> u16 {
+            let a = rooms_app(sel);
+            let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, &a)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (room_area.y..room_area.bottom())
+                .find(|&y| buffer[(room_bar_x, y)].symbol() == "█")
+                .expect("room thumb glyph present")
+        };
+        let top = room_thumb(0);
+        let bottom = room_thumb(39);
+        assert!(
+            bottom > top,
+            "room thumb tracks selection: {top} -> {bottom}"
+        );
+
+        let letters_app = |sel: usize| {
+            let mut a = App::for_test(vec![], vec![], vec![]);
+            a.panel = Panel::Mail;
+            a.mail = crate::mailview::MailBoard {
+                letters: one_room_many_letters(40),
+                ..Default::default()
+            };
+            a.mail_sel = sel;
+            a
+        };
+        let (_, content) = mail_geometry(area, &letters_app(0));
+        let (list, _detail) = mail_parts(content);
+        assert!(
+            letters_app(0).mail_letters().len() > list.height as usize,
+            "letter fixture must overflow"
+        );
+        let letter_bar_x = list.right() - 1;
+        let letter_thumb = |sel: usize| -> u16 {
+            let a = letters_app(sel);
+            let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+            let mut terminal = ratatui::Terminal::new(backend).unwrap();
+            terminal.draw(|f| draw(f, &a)).unwrap();
+            let buffer = terminal.backend().buffer();
+            (list.y..list.bottom())
+                .find(|&y| buffer[(letter_bar_x, y)].symbol() == "█")
+                .expect("letter thumb glyph present")
+        };
+        let top = letter_thumb(0);
+        let bottom = letter_thumb(39);
+        assert!(
+            bottom > top,
+            "letter thumb tracks selection: {top} -> {bottom}"
+        );
+    }
+
+    #[test]
+    fn mail_scrollbars_absent_when_lists_fit() {
+        let area = Rect::new(0, 0, 100, 30);
+        let mut app = App::for_test(vec![], vec![], vec![]);
+        app.panel = Panel::Mail;
+        app.mail = crate::mailview::MailBoard {
+            letters: distinct_room_letters(2),
+            ..Default::default()
+        };
+        let (rooms, content) = mail_geometry(area, &app);
+        let room_area = inner(rooms);
+        let (list, _) = mail_parts(content);
+        assert!(app.mail.conversations().len() <= room_area.height as usize);
+        assert!(app.mail_letters().len() <= list.height as usize);
+        let backend = ratatui::backend::TestBackend::new(area.width, area.height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|f| draw(f, &app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        for (col_area, x) in [(room_area, room_area.right() - 1), (list, list.right() - 1)] {
+            for y in col_area.y..col_area.bottom() {
+                let symbol = buffer[(x, y)].symbol();
+                assert_ne!(symbol, "█");
+                assert_ne!(symbol, "║");
+            }
+        }
+    }
+
+    #[test]
+    fn mail_row_clicks_still_resolve_the_same_row_with_scrollbars_present() {
+        let area = Rect::new(0, 0, 100, 30);
+        let mut app = App::for_test(vec![], vec![], vec![]);
+        app.panel = Panel::Mail;
+        app.mail = crate::mailview::MailBoard {
+            letters: distinct_room_letters(40),
+            ..Default::default()
+        };
+        app.mail_room_sel = 20;
+        let (rooms, content) = mail_geometry(area, &app);
+        let room_area = inner(rooms);
+        let (list, _) = mail_parts(content);
+        assert!(app.mail.conversations().len() > room_area.height as usize);
+        let room_off = app
+            .mail_room_sel
+            .saturating_sub(room_area.height.saturating_sub(1) as usize);
+        let y = room_area.y + 1;
+        let x = room_area.x + 2;
+        assert_eq!(hit(area, &app, x, y), Hit::Conversation(room_off + 1));
+        let room_bar_x = room_area.right() - 1;
+        assert_eq!(hit(area, &app, room_bar_x, y), Hit::None);
+
+        app.mail = crate::mailview::MailBoard {
+            letters: one_room_many_letters(40),
+            ..Default::default()
+        };
+        app.mail_sel = 20;
+        assert!(app.mail_letters().len() > list.height as usize);
+        let letter_off = app
+            .mail_sel
+            .saturating_sub(list.height.saturating_sub(1) as usize);
+        let y = list.y + 1;
+        let x = list.x + 2;
+        assert_eq!(hit(area, &app, x, y), Hit::Row(letter_off + 1));
+        let letter_bar_x = list.right() - 1;
+        assert_eq!(hit(area, &app, letter_bar_x, y), Hit::None);
     }
 }
 
@@ -1265,8 +1670,13 @@ fn draw_mail_draft(f: &mut Frame, app: &App) {
     let hint=d.error.clone().unwrap_or_else(||"Tab / Shift-Tab fields | Ctrl-S send | Esc cancel\n+ To / + Cc selects where tree clicks add recipients".into());
     f.render_widget(Paragraph::new(hint).wrap(Wrap { trim: false }), g.hint);
 }
-pub fn target_menu_area(area: Rect, x: u16, y: u16, count: usize) -> Rect {
-    let w = area.width.min(62);
+/// A popup box sized to its own content, never a fixed guess: `content_w`
+/// is the widest line the caller will actually render (measured in cells),
+/// and the border adds two. `MIN_MENU_W` keeps a one-word menu from
+/// shrinking to a sliver; the frame's width is still the hard ceiling.
+const MIN_MENU_W: u16 = 14;
+pub fn target_menu_area(area: Rect, x: u16, y: u16, count: usize, content_w: u16) -> Rect {
+    let w = (content_w + 2).max(MIN_MENU_W).min(area.width);
     let h = area.height.min(count as u16 + 2);
     Rect::new(
         x.min(area.right().saturating_sub(w)),
@@ -1275,14 +1685,35 @@ pub fn target_menu_area(area: Rect, x: u16, y: u16, count: usize) -> Rect {
         h,
     )
 }
+
+const WRITE_LETTER_TITLE: &str = " WRITE LETTER TO · Esc close ";
+
+/// The widest line the mail recipient chooser renders: its fixed title or
+/// one `label · address` choice.
+pub(crate) fn target_menu_content_width(choices: &[(String, String)]) -> u16 {
+    std::iter::once(cells(WRITE_LETTER_TITLE))
+        .chain(
+            choices
+                .iter()
+                .map(|(label, address)| cells(&format!("{label} · {address}"))),
+        )
+        .max()
+        .unwrap_or(0)
+}
 fn draw_target_menu(f: &mut Frame, app: &App) {
     let Some((x, y, choices, index)) = &app.mail_target_menu else {
         return;
     };
-    let a = target_menu_area(f.area(), *x, *y, choices.len());
+    let a = target_menu_area(
+        f.area(),
+        *x,
+        *y,
+        choices.len(),
+        target_menu_content_width(choices),
+    );
     f.render_widget(ratatui::widgets::Clear, a);
     f.render_widget(
-        frame(" WRITE LETTER TO · Esc close ").style(theme::surface(&app.palette, 4)),
+        frame(WRITE_LETTER_TITLE).style(theme::surface(&app.palette, 4)),
         a,
     );
     let offset = index.saturating_sub(inner(a).height.saturating_sub(1) as usize);
@@ -1364,11 +1795,48 @@ pub fn field_click(
     end
 }
 
+/// The identity mark beside a context-menu action row -- the one source
+/// both the width measurement and the actual paint read, so sizing the
+/// box can never drift from what it draws.
+fn context_action_symbol(action: crate::app::ContextAction) -> &'static str {
+    use crate::app::ContextAction;
+    match action {
+        ContextAction::Details => "?",
+        ContextAction::WriteLetter => "@",
+        ContextAction::Open => ">",
+        ContextAction::AssignProject => "#",
+        ContextAction::Resurrect => "^",
+        ContextAction::AddFolder => "+",
+    }
+}
+
+/// The widest line a context menu renders: its framed title or one
+/// ` symbol label` action row.
+pub(crate) fn context_menu_content_width(
+    title: &str,
+    actions: &[crate::app::ContextAction],
+) -> u16 {
+    std::iter::once(cells(&format!(" {title} ")))
+        .chain(
+            actions
+                .iter()
+                .map(|a| cells(&format!(" {} {}", context_action_symbol(*a), a.label()))),
+        )
+        .max()
+        .unwrap_or(0)
+}
+
 fn draw_context_menu(f: &mut Frame, app: &App) {
     let Some(m) = &app.context_menu else {
         return;
     };
-    let area = target_menu_area(f.area(), m.x, m.y, m.actions.len());
+    let area = target_menu_area(
+        f.area(),
+        m.x,
+        m.y,
+        m.actions.len(),
+        context_menu_content_width(&m.title, &m.actions),
+    );
     f.render_widget(ratatui::widgets::Clear, area);
     f.render_widget(
         frame(&format!(" {} ", m.title)).style(theme::surface(&app.palette, 5)),
@@ -1385,14 +1853,7 @@ fn draw_context_menu(f: &mut Frame, app: &App) {
         .skip(offset)
         .take(inside.height as usize)
     {
-        let symbol = match action {
-            crate::app::ContextAction::Details => "?",
-            crate::app::ContextAction::WriteLetter => "@",
-            crate::app::ContextAction::Open => ">",
-            crate::app::ContextAction::AssignProject => "#",
-            crate::app::ContextAction::Resurrect => "^",
-            crate::app::ContextAction::AddFolder => "+",
-        };
+        let symbol = context_action_symbol(*action);
         f.render_widget(
             Paragraph::new(format!(" {symbol} {}", action.label())).style(if i == m.selected {
                 selected()

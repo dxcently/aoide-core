@@ -8,11 +8,24 @@
 - Rendering stays pure. `ui`, `board` and graph views draw from state;
   input handling owns state changes and dispatch. Mouse hit testing and
   drawing share geometry and row ordering, including scrolling and narrow
-  layouts. An action must mean the same thing by mouse and keyboard.
-- Graph zoom is a camera transform of fixed world rectangles at 50/75/100/125/150%.
-  Pointer-anchored zoom, pan limits, render and hit tests share geometry.
+  layouts. A popup is sized from its own measured content, and the draw
+  path and the hit test call the same sizing function so the click target
+  is always the drawn rectangle. An action must mean the same thing by
+  mouse and keyboard.
+- The graph is a retained scene. World positions, camera, view and the selected
+  node's identity live in `App::graph`; a frame reads them and never rebuilds
+  the world. Placement keeps a surviving node's rectangle, re-places a node
+  whose depth changed, and drops a departed one. Selection is a node identity,
+  never a row index, so a refresh cannot move it.
+- Graph zoom is a camera transform of those fixed world rectangles at
+  50/75/100/125/150%. Pointer-anchored zoom, pan limits, render and hit tests
+  share one transform; never let render record rectangles for a later hit test.
   Terminal glyphs stay fixed-size and clip inside cards; never relayout
   entities into alternative card presets when zoom changes.
+- The painter clips; the world outside the camera is never drawn. Edges paint
+  before cards. Focus draws the selected node's connected component and All
+  draws every node, and the synthetic root gathering unattached sessions is not
+  an edge Focus may traverse.
 - One identity mark per kind, from `theme::mark`; never a second glyph for
   the same kind, never a mark wider than one cell, never `@` (addresses).
   Colour comes from a `Role`, not from the glyph. Measure labels with
@@ -86,6 +99,12 @@ are scoped to their handlers; text input and overlays take priority.
 Project rows represent projects, not individual roots. Use `Project::roots`
 and existing attribution/grouping helpers. Tree row models are the common
 source for rendering, focus, collapse and activation.
+
+A scrollable list reserves its rightmost column for a scrollbar only when its
+rows overflow the viewport, through `board::scrollbar_split` and
+`draw_scrollbar`; draw and hit test both call `scrollbar_split` so a reserved
+column, when there is one, is exactly what was painted. A new scrollable list
+reuses this pair rather than hand-rolling another offset/thumb calculation.
 
 Tests use isolated paths or injected fixtures. Never read or mutate the
 operator's ambient mail cursors, ledger, registry or terminal during unit

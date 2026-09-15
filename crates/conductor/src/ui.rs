@@ -10,7 +10,7 @@
 //! SGR. Panels stay pure over `&App`, so a `TestBackend` can render any of them
 //! headless and assert on the buffer (see the tests below).
 //!
-//! Two of the seven panels are the expansion this port carries: `DAG` (the
+//! Two of the seven panels are the expansion this port carries: `GRAPH` (the
 //! visual graph, drawn by [`crate::graphview`]) and `SESSION` (the
 //! terminal roster, now split into a scrolling list + a live detail card with a
 //! focus affordance). The other three — PROJECTS, LOG, STATUS — are ports of the
@@ -82,15 +82,31 @@ pub(crate) fn draw_status(f: &mut Frame, area: Rect, app: &App) {
     };
     let left = format!(" {msg}");
 
-    let hint_w = (hint.len() as u16 + 1).min(area.width.saturating_sub(4));
-    let cols = Layout::horizontal([Constraint::Min(0), Constraint::Length(hint_w)]).split(area);
+    // The message carries errors and prompts; the hint is only a convenience,
+    // so the message gets its own width first and the hint takes what's left
+    // -- measured in display cells, never bytes (the hints carry `·`, two
+    // bytes for one cell, which used to starve the message down to a stub).
+    // A one-column gap is reserved between them so a hint that fills its
+    // whole share of the width can never abut the message; the hint is what
+    // gets clipped (or dropped entirely) when that gap can't fit.
+    let msg_w = crate::board::cells(&left).min(area.width);
+    let gap: u16 = 1;
+    let hint_room = area.width.saturating_sub(msg_w).saturating_sub(gap);
+    let hint_w = (crate::board::cells(hint) + 1).min(hint_room);
+    let gap_w = area.width - msg_w - hint_w;
+    let cols = Layout::horizontal([
+        Constraint::Length(msg_w),
+        Constraint::Length(gap_w),
+        Constraint::Length(hint_w),
+    ])
+    .split(area);
     f.render_widget(
         Paragraph::new(Line::from(left)).style(theme::accent_style(&app.palette)),
         cols[0],
     );
     f.render_widget(
         Paragraph::new(Line::from(hint).style(theme::dim()).right_aligned()),
-        cols[1],
+        cols[2],
     );
 }
 
@@ -101,7 +117,7 @@ fn keymap_hint(panel: Panel) -> &'static str {
         Panel::Home => "click to open · Ctrl-P projects · ? help · q quit",
         Panel::Mail => "↑/↓ letters · PgUp/PgDn read · r refresh · ? help",
         Panel::Graph => {
-            "j/k select · Space+drag pan · wheel scroll · Enter open"
+            "j/k child/parent · h/l sibling · a all/focus · Enter open · s letter · e menu · drag/wheel pan · Ctrl-wheel zoom · p prune"
         }
         Panel::Session|Panel::Terminals => {
             "j/k select · Enter jump/fold · h/l fold · L link · a add root · d rm · p prune · ? help · q quit"
@@ -167,7 +183,7 @@ pub(crate) fn draw_body(f: &mut Frame, area: Rect, app: &App) {
     match app.panel {
         Panel::Home => crate::board::draw_home(f, inner, app),
         Panel::Mail => crate::board::draw_mail(f, inner, app),
-        Panel::Graph => graphview::render(f, inner, app, app.graph_sel),
+        Panel::Graph => graphview::render(f, inner, app),
         Panel::Session | Panel::Terminals if app.history_selected.is_some() => {
             crate::board::draw_history(f, inner, app)
         }
@@ -865,7 +881,13 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "  Projects: a/r     add folder / resurrect project",
         "  Agents/Terminals: Enter cue window or tail the log if headless",
         "  Esc / q           close the log tail (Enter also closes it)",
-        "  Graph: j/k        select blocks · Enter focus · read-only tags",
+        "  Graph: j/k        down/up a rank: child / parent",
+        "  Graph: a          whole forest / the picked card's own graph",
+        "  Graph: h/l        previous/next sibling · Enter focus · read-only tags",
+        "  Graph: e/s        actions menu / write a letter",
+        "  Graph: pan        Space or middle drag; wheel/Shift-wheel",
+        "  Graph: zoom       Ctrl+wheel steps 50-150%, at the pointer",
+        "  Graph: p          prune ended sessions",
         "  Mail: h/l         conversations / letters; j/k select",
         "  Mail: n/s/r       new letter / reply / refresh",
         "  Compose: Enter    newline after recipient · Ctrl-S send",
@@ -876,14 +898,7 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
         "  ? / Esc           close help · q / Ctrl-C quit",
     ];
     let title = " aoide conductor — keys ";
-    let box_w = help
-        .iter()
-        .map(|l| l.chars().count())
-        .max()
-        .unwrap_or(20)
-        .max(title.len())
-        + 4;
-    let box_w = (box_w as u16).min(area.width.saturating_sub(2));
+    let box_w = help_box_width(help, title, area);
     let box_h = (help.len() as u16 + 2).min(area.height.saturating_sub(2));
     let rect = centered(box_w, box_h, area);
 
@@ -894,6 +909,21 @@ fn draw_help(f: &mut Frame, area: Rect, app: &App) {
     ));
     let lines: Vec<Line> = help.iter().map(|s| Line::from(*s)).collect();
     f.render_widget(Paragraph::new(lines).block(block), rect);
+}
+
+/// The help box's width: the widest of its lines and its title, measured in
+/// display cells (`board::cells`, never `len()` -- a byte count disagrees
+/// with cell width the moment a line carries a multi-byte glyph such as the
+/// title's em dash), plus the border and the box's own padding.
+fn help_box_width(help: &[&str], title: &str, area: Rect) -> u16 {
+    let box_w = help
+        .iter()
+        .map(|l| crate::board::cells(l))
+        .max()
+        .unwrap_or(20)
+        .max(crate::board::cells(title))
+        + 4;
+    box_w.min(area.width.saturating_sub(2))
 }
 
 fn centered(w: u16, h: u16, area: Rect) -> Rect {
@@ -976,7 +1006,7 @@ mod tests {
         );
         a.panel = panel;
         a.dag_sel = app.dag_sel;
-        a.graph_sel = app.graph_sel;
+        a.graph.selected = app.graph.selected.clone();
         a.log = app.log.clone();
         let backend = TestBackend::new(w, h);
         let mut term = Terminal::new(backend).unwrap();
@@ -1006,8 +1036,15 @@ mod tests {
             }],
             vec![root, kid],
         );
-        let out = render_panel(&app, Panel::Graph, 220, 40);
-        assert!(out.contains("DAG"), "panel title rendered");
+        // Three ranks (project → root → kid) stand 3×CARD_H + 2×RANK_GAP =
+        // 27 world rows tall, and the camera centres the default selection
+        // (the topmost card) rather than top-aligning — so the pane itself
+        // must be tall enough to pull the origin to 0 and still clear the
+        // bottom-most card. 50 rows of graph content does that with room to
+        // spare; the other 10 are this panel's header/nav/border/action
+        // row/status-bar chrome.
+        let out = render_panel(&app, Panel::Graph, 220, 60);
+        assert!(out.contains("GRAPH"), "panel title rendered");
         assert!(
             out.contains("PROJECT") && out.contains("aoide"),
             "project node drawn"
@@ -1025,6 +1062,36 @@ mod tests {
             "box-drawing edges present"
         );
         assert!(out.contains("[x]"), "read-only tag chip drawn: {out}");
+        assert!(
+            out.contains("all/focus"),
+            "status bar keymap hint carries the view toggle: {out}"
+        );
+        assert!(
+            out.contains("prune"),
+            "status bar keymap hint carries prune: {out}"
+        );
+        // Both fixture sessions are titleless with no model, so each card's
+        // detail row alone carries its harness ("claude"); the tree also
+        // names each session's harness once. Four total, not six -- a card
+        // with an empty title must not ALSO echo the harness on its own
+        // title-fallback row above the detail row that already has it.
+        assert_eq!(
+            out.matches("claude").count(),
+            4,
+            "harness printed once per card, not doubled by an empty-title \
+             fallback: {out}"
+        );
+    }
+
+    #[test]
+    fn graph_panel_title_is_the_graph_noun_not_dag() {
+        let app = app_with(vec![], vec![]);
+        let out = render_panel(&app, Panel::Graph, 100, 30);
+        assert!(
+            out.contains("GRAPH"),
+            "panel title is the Graph noun: {out}"
+        );
+        assert!(!out.contains("DAG"), "panel title is not DAG: {out}");
     }
 
     #[test]
@@ -1184,10 +1251,25 @@ mod tests {
             }],
             vec![root, sub],
         );
-        let out = render_panel(&app, Panel::Graph, 220, 40);
+        // Same 3-rank project → root → subagent chain as
+        // `graph_panel_draws_nodes_edges_and_tags`; see that test's comment
+        // for the viewport arithmetic.
+        let out = render_panel(&app, Panel::Graph, 220, 60);
         assert!(
             out.contains("claude · m"),
             "subagent chip carries its model tag: {out}"
+        );
+        // Both sessions are titleless, so each card's harness lives only in
+        // its detail row ("claude" alone for the root, "claude · m" for the
+        // subagent); the tree names each session's harness once more. Four
+        // total, not six -- an empty title must not also echo the harness
+        // on its own title-fallback row above a detail row that already
+        // carries it.
+        assert_eq!(
+            out.matches("claude").count(),
+            4,
+            "harness printed once per card, not doubled by an empty-title \
+             fallback: {out}"
         );
     }
 
@@ -1343,7 +1425,7 @@ mod tests {
             "overlay title present"
         );
         assert!(out.contains("cycle views"));
-        assert!(out.contains("read-only tag"), "DAG tag legend documented");
+        assert!(out.contains("read-only tag"), "Graph tag legend documented");
         assert!(
             out.contains("tail the log if headless"),
             "Enter's headless branch is documented: {out}"
@@ -1352,6 +1434,33 @@ mod tests {
             out.contains("close the log tail"),
             "the log-tail overlay's close keys are documented: {out}"
         );
+        assert!(
+            out.contains("whole forest"),
+            "Graph's `a` view toggle is documented: {out}"
+        );
+        assert!(
+            out.contains("drag") && out.contains("wheel") && out.contains("50-150%"),
+            "Graph's pan and zoom controls are documented: {out}"
+        );
+    }
+
+    #[test]
+    fn help_box_width_matches_its_widest_line_in_cells() {
+        // Every help line here is shorter than the title, so the title's em
+        // dash -- three bytes, one display cell -- is what decides the
+        // width. Measuring it as bytes (26) rather than cells (24) would
+        // widen the box by 2 columns; `help_box_width` must not do that.
+        let help = ["short", "also short"];
+        let title = " aoide conductor — keys ";
+        let area = Rect::new(0, 0, 200, 50);
+        let widest_cells = help
+            .iter()
+            .map(|l| crate::board::cells(l))
+            .max()
+            .unwrap()
+            .max(crate::board::cells(title));
+        assert_eq!(crate::board::cells(title), 24, "fixture assumption");
+        assert_eq!(help_box_width(&help, title, area), widest_cells + 4);
     }
 
     /// A throwaway on-disk log the overlay tests point `App::open_tail` at —
@@ -1661,6 +1770,86 @@ mod tests {
         assert!(
             out.contains("nothing held"),
             "an empty queue tells the human, not a bare blank pane: {out}"
+        );
+    }
+
+    /// The exact live repro: at 118 columns the Graph hint is 122 bytes but
+    /// only 114 display cells (its eight `·` separators are two bytes each),
+    /// so measuring it with `.len()` and reserving only four columns for the
+    /// message cut "ready" down to "rea" with the hint's own text glued on
+    /// right after. The message must survive intact.
+    #[test]
+    fn status_bar_keeps_the_message_intact_beside_a_long_hint() {
+        let mut a = App::for_test(vec![], vec![], vec![]);
+        a.panel = Panel::Graph;
+        let backend = TestBackend::new(118, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_status(f, f.area(), &a)).unwrap();
+        let out = dump(term.backend().buffer());
+        assert!(
+            out.contains(" ready"),
+            "the message must not be clobbered by the hint: {out:?}"
+        );
+    }
+
+    /// At a width too narrow for both, the message still wins and nothing
+    /// panics -- the hint is the one that gets dropped or clipped.
+    #[test]
+    fn status_bar_keeps_the_message_at_a_narrow_width() {
+        let mut a = App::for_test(vec![], vec![], vec![]);
+        a.panel = Panel::Graph;
+        let backend = TestBackend::new(40, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_status(f, f.area(), &a)).unwrap();
+        let out = dump(term.backend().buffer());
+        assert!(
+            out.contains(" ready"),
+            "the message still renders whole at a narrow width: {out:?}"
+        );
+    }
+
+    /// The exact live repro, one step further: the prior fix stopped the
+    /// hint from truncating the message but left zero columns between the
+    /// two, so at 118 columns they rendered as the glued nonsense
+    /// "readyj/k...". The message must survive AND a gap must separate it
+    /// from the hint.
+    #[test]
+    fn status_bar_never_glues_the_message_to_the_hint_at_118_columns() {
+        let mut a = App::for_test(vec![], vec![], vec![]);
+        a.panel = Panel::Graph;
+        let backend = TestBackend::new(118, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_status(f, f.area(), &a)).unwrap();
+        let out = dump(term.backend().buffer());
+        assert!(
+            out.contains(" ready"),
+            "the message must render intact: {out:?}"
+        );
+        assert!(
+            !out.contains("readyj"),
+            "the message and the hint's first word must not abut: {out:?}"
+        );
+        let after_message = out.find(" ready").unwrap() + " ready".len();
+        assert_eq!(
+            out.as_bytes().get(after_message),
+            Some(&b' '),
+            "a blank column separates the message from the hint: {out:?}"
+        );
+    }
+
+    /// A width too narrow for the hint at all: the message still renders
+    /// whole and nothing panics -- the hint is what disappears entirely.
+    #[test]
+    fn status_bar_keeps_the_message_at_a_very_narrow_width() {
+        let mut a = App::for_test(vec![], vec![], vec![]);
+        a.panel = Panel::Graph;
+        let backend = TestBackend::new(30, 1);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw_status(f, f.area(), &a)).unwrap();
+        let out = dump(term.backend().buffer());
+        assert!(
+            out.contains(" ready"),
+            "the message still renders whole at a very narrow width: {out:?}"
         );
     }
 }
