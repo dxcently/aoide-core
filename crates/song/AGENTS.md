@@ -31,14 +31,20 @@
   in neither the frozen baseline nor B's own scan), and `StagingEngine.qml`
   falls back to resolving A's widgets against some OTHER song's slot with no
   error anywhere (the exact regression a review caught live); (3) `name`'s
-  own entry, ALWAYS from a fresh scan, never the baked file OR the overlay,
-  even for a song that is itself shipped in the templates — this is what
+  own entry, from a fresh scan whenever `name` HAS a directory in the host
+  songbook, never the baked file OR the overlay, even for a song that is
+  itself shipped in the templates — this is what
   self-heals the STAGED song on every call, mirroring the real `nix eval`
   path's own posture for that one song, while layer 2 is what preserves
   every OTHER still-live song across calls (the nix path doesn't need a
   layer 2 at all — its eval is already total). A song whose songbook
   directory is removed is NOT overlaid — that is the prune, not a bug; don't
   add a "keep it anyway" fallback that would leave an immortal stale key.
+  The inverse is also fixed: a shipped song with NO host-songbook directory
+  (staged from the declared twin before any seed) keeps its BAKED entry —
+  layer 3 has nothing to scan there, and an empty patch deleted sonata from
+  osaka's manifest and blanked every surface. Directory present → scan
+  wins; directory absent → baseline stands.
 - **`livery`/`live` stay dependency-free leaves.** `compose`/`cover` are the
   ones allowed to pull in `aoide-storage` (Phase 5b); don't push a storage
   dependency down into `livery`/`live` without re-deriving why that

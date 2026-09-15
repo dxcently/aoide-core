@@ -34,7 +34,8 @@ in `lyra`, not core.
   which reads the shipped/env templates dir's (`fs::song_templates_dir`)
   prebaked `manifest.json`/`registry.json` as the baseline for every OTHER
   committed song and patches in the currently-staged song's own entry from
-  a direct, nix-free scan (`scan_own_entry`) — the only shape `rice
+  a direct, nix-free scan (`scan_own_entry`) when that song has a host-songbook
+  directory (a shipped song without one keeps its baked entry) — the only shape `rice
   compose` can ever produce (no `_widgets/` shelf). `snapshot_widget_bodies`
   (`lyra reload` design, settled 2026-08-31) captures the same
   `songbook/<song>/widgets/` tree `sync_song_widgets` copies FROM — never

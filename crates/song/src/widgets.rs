@@ -263,7 +263,10 @@ fn eval_songbook(name: &str, run_qml: &Path) -> Result<SongbookEval, WidgetSyncE
 ///      ACTUAL committed songbook directory ([`scan_own_entry`]) — always
 ///      wins over both the baseline and the overlay, so THIS call's song is
 ///      never served stale. A template song staged again picks up a local
-///      edit this way too.
+///      edit this way too. Skipped when `name` has NO directory in the host
+///      songbook (a shipped song staged from the declared twin before any
+///      seed): there is nothing to scan, and the baked baseline entry is
+///      the truth — an empty patch would delete it.
 ///
 /// Net effect: this self-heals the CURRENTLY-staged song on every call and
 /// preserves every other still-live song's entry in between — not the
@@ -367,24 +370,31 @@ fn eval_songbook_from_templates(
     overlay_surviving_entries(&mut registry, &run_qml.join("songs").join("registry.json"));
 
     // Layer 3: patch — `name`'s own entry always wins over both the
-    // baseline and the overlay.
-    let (own_manifest, own_registry) = scan_own_entry(name)?;
-    let manifest_obj = manifest.as_object_mut().expect("checked is_object above");
-    // Only songs with at least one slot appear in manifest.json (the same
-    // asymmetry `lib/songbook.nix`'s own comment documents) — an empty scan
-    // removes any stale entry for `name` rather than writing `{}`.
-    match own_manifest.as_object() {
-        Some(m) if !m.is_empty() => {
-            manifest_obj.insert(name.to_string(), own_manifest);
+    // baseline and the overlay — but only when there IS a songbook directory
+    // to scan. A shipped song staged straight from the declared twin
+    // (`song/declared/livery.json`) on a host whose runtime songbook never
+    // seeded it has nothing local to scan, and its baked baseline entry is
+    // the truth; an empty patch here deleted sonata from osaka's manifest
+    // and blanked every surface.
+    if aoide_storage::fs::songbook_dir(name).is_dir() {
+        let (own_manifest, own_registry) = scan_own_entry(name)?;
+        let manifest_obj = manifest.as_object_mut().expect("checked is_object above");
+        // Only songs with at least one slot appear in manifest.json (the same
+        // asymmetry `lib/songbook.nix`'s own comment documents) — an empty
+        // scan removes any stale entry for `name` rather than writing `{}`.
+        match own_manifest.as_object() {
+            Some(m) if !m.is_empty() => {
+                manifest_obj.insert(name.to_string(), own_manifest);
+            }
+            _ => {
+                manifest_obj.remove(name);
+            }
         }
-        _ => {
-            manifest_obj.remove(name);
-        }
+        let registry_obj = registry.as_object_mut().expect("checked is_object above");
+        // registry.json keeps EVERY committed song, `{}` when it declares
+        // nothing — always inserted, never conditionally removed.
+        registry_obj.insert(name.to_string(), own_registry);
     }
-    let registry_obj = registry.as_object_mut().expect("checked is_object above");
-    // registry.json keeps EVERY committed song, `{}` when it declares
-    // nothing — always inserted, never conditionally removed.
-    registry_obj.insert(name.to_string(), own_registry);
 
     Ok(SongbookEval { manifest, registry })
 }

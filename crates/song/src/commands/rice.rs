@@ -2087,6 +2087,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// osaka, 2026-09-15: the declared twin lets `rice stage sonata` run on a
+    /// host whose runtime songbook never seeded sonata. The manifest/registry
+    /// regeneration must then keep sonata's BAKED baseline entry — the layer-3
+    /// patch has no directory to scan, and replacing the entry with an empty
+    /// scan deleted sonata from the manifest and blanked every surface.
+    #[test]
+    fn stage_from_templates_keeps_a_shipped_songs_baked_entry_when_its_songbook_dir_is_absent() {
+        let _g = aoide_test_support::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _s = EnvSaver::capture(&[
+            "AOIDE_STAGE_DIR",
+            "AOIDE_FLAKE_ROOT",
+            "AOIDE_SONG_TEMPLATES",
+            crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR,
+        ]);
+        std::env::remove_var(crate::widgets::SONGBOOK_EVAL_FIXTURE_VAR);
+        let (root, stage, run_qml, flake_root) = templates_fallback_tmp("templates-baked-survives");
+        std::env::set_var("AOIDE_STAGE_DIR", &stage);
+        std::env::set_var("AOIDE_FLAKE_ROOT", &flake_root);
+        std::env::set_var("AOIDE_SONG_TEMPLATES", root.join("templates"));
+
+        let baked_manifest = json!({ "sonata": { "bar": { "owner": "sonata", "file": "bar.qml" } } });
+        let baked_registry = json!({ "sonata": { "bar": { "kind": "bar", "order": 0 } } });
+        std::fs::write(root.join("templates").join("manifest.json"), baked_manifest.to_string()).unwrap();
+        std::fs::write(root.join("templates").join("registry.json"), baked_registry.to_string()).unwrap();
+
+        let declared = shellbridge::declared_notes();
+        std::fs::create_dir_all(declared.parent().unwrap()).unwrap();
+        std::fs::write(
+            &declared,
+            r##"{"palette":{"accent":"#ebbcba","bg":"#191724","fg":"#e0def4","urgent":"#eb6f92"},"schemaVersion":"0","song":"sonata"}"##,
+        )
+        .unwrap();
+        assert!(!shellbridge::songbook_dir("sonata").is_dir(), "no runtime songbook entry for sonata");
+
+        let out = handle_rice_stage(&inv(&["rice", "stage"], &["sonata"]));
+        assert_eq!(out.status, Status::Ok, "stage sonata from the declared twin: {:?}", out.data);
+
+        let manifest: Value = serde_json::from_str(
+            &std::fs::read_to_string(run_qml.join("songs").join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest["sonata"], baked_manifest["sonata"], "baked manifest entry survives: {manifest:?}");
+        let registry: Value = serde_json::from_str(
+            &std::fs::read_to_string(run_qml.join("songs").join("registry.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(registry["sonata"], baked_registry["sonata"], "baked registry entry survives: {registry:?}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn stage_from_templates_prunes_a_composed_songs_entry_once_its_songbook_dir_is_gone() {
         // The other half of the same fix: the overlay must NOT keep an
