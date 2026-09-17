@@ -120,14 +120,37 @@
   domain: a killed terminal's PROCESS liveness, owned entirely by `reap`.
   `health.rs` watches a different failure class with nothing in common but
   the word "liveness" — a quickshell process that is very much alive (no
-  crash, no exit) but has silently lost its Wayland output and rendered
-  onto Qt's internal placeholder screen. Different subject (screen
-  attachment, not a session), different predicate (a live `hyprctl layers`
-  zero-surface reading, then a journal placeholder-screen line to decide
-  whether a restart is the known cure, not a pid/window-address probe),
-  different crate (`lyra`-only, vs `conduct`'s core-only `reap`). Don't fold this into `reap` or generalize `reap` to
+  crash, no exit) but has silently lost its Wayland output and rendered onto
+  Qt's internal placeholder screen. Different subject (screen attachment,
+  not a session), different predicate (a live `hyprctl layers` reading
+  compared against the song's DECLARED surface set, then a journal
+  placeholder-screen line to decide whether a restart is the known cure, not
+  a pid/window-address probe), different crate (`lyra`-only, vs `conduct`'s
+  core-only `reap`). Don't fold this into `reap` or generalize `reap` to
   cover it — the two mechanisms check unrelated things on unrelated
   subjects, and merging them would only muddy both.
+- **`health.rs`'s bad-state predicate is `surfaces_fall_short` against the
+  published `run/qml/songs/surfaces.json`, and `shell_has_zero_layers` is
+  only the fallback for a host that published nothing.** The two are not
+  interchangeable and both must stay: a total count cannot see a PARTIAL
+  loss (the wallpaper recovering while the bar and dock stay bound to a dead
+  output is exactly the incident that motivated the declared set), while a
+  declared set cannot exist on a host where another shell owns a surface.
+  `run_healthcheck`'s tail — the journal gate, the marker, the retry ladder,
+  the flapping notification — is shared by both paths and must stay that
+  way. **`surfaces_fall_short` must never return `true` when the expectation
+  is empty, when `layers`/`monitors` is unreadable, or when
+  `real_monitor_count` is 0** — the last is the load-bearing one: with no
+  real output there is nowhere to paint, a restart reproduces the
+  placeholder state, and standing down is what keeps a blackout from turning
+  the watchdog into a restart loop. Hyprland's synthesized `FALLBACK` output
+  is excluded from BOTH the demand and the coverage; counting it in one and
+  not the other is an off-by-one that fires on every blackout. Keep the four
+  predicate functions pure (`&Value` in, data out, no filesystem, no shell)
+  with `published_surfaces` the single impure reader — that split is what
+  makes the judgement unit-testable and is why an absent or malformed
+  published file must read as "no expectation declared", never as an
+  unhealthy desktop.
 - **`elements::seed_tree` takes explicit paths and touches no global
   state — `elements::seed_song` is the only env-resolving wrapper around
   it.** Every other elements test exercises `seed_tree`/`render_files`/

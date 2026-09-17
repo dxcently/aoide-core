@@ -14,51 +14,76 @@
 //! gap with a periodic check (`aoide-quickshell-healthcheck.timer`).
 //!
 //! Two signals, asked in the order below, because they answer different
-//! questions. `hyprctl layers` showing zero `aoide-*` surfaces anywhere is
-//! the CURRENT state, and it is the user-visible failure itself: the desktop
-//! is blank. Quickshell's own journal line (`There are no outputs - creating
-//! placeholder screen`, emitted by Qt's QPA layer at the exact moment of the
-//! failure) names a MECHANISM, and only one — it confirms the event happened
-//! but not whether it is still true, so a blip that self-healed before this
-//! runs would still show the line.
+//! questions. `hyprctl layers` missing the surfaces the shell is supposed to
+//! have mapped is the CURRENT state, and it is the user-visible failure
+//! itself: the desktop is blank — or half-blank, which is the case that
+//! matters here. Quickshell's own journal line (`There are no outputs -
+//! creating placeholder screen`, emitted by Qt's QPA layer at the exact
+//! moment of the failure) names a MECHANISM, and only one — it confirms the
+//! event happened but not whether it is still true, so a blip that self-healed
+//! before this runs would still show the line.
 //!
-//! So the surface count decides health on its own, and the journal line
-//! decides only whether this watchdog may act: zero surfaces with the line
-//! present is the placeholder lockup, restartable on the ladder below; zero
-//! surfaces without it is [`HealthOutcome::Blank`], reported and left alone.
-//! Asking the journal first instead would let one unrecognized mechanism
-//! report a blank desktop as healthy — incident #40, a pre-QML deadlock in
-//! the `QApplication` constructor that emits no QPA line, went unseen for 22
-//! minutes on two hosts that way.
+//! So the mapped-surface predicate decides health on its own, and the journal
+//! line decides only whether this watchdog may act: surfaces missing with the
+//! line present is the placeholder lockup, restartable on the ladder below;
+//! surfaces missing without it is [`HealthOutcome::Blank`], reported and left
+//! alone. Asking the journal first instead would let one unrecognized
+//! mechanism report a blank desktop as healthy — incident #40, a pre-QML
+//! deadlock in the `QApplication` constructor that emits no QPA line, went
+//! unseen for 22 minutes on two hosts that way.
 //!
 //! The journal read is scoped to the unit's own `ActiveEnterTimestamp`, so
 //! an old, already-recovered-from occurrence can never re-trigger after a
 //! restart moves that timestamp forward. That same timestamp is what keeps
-//! the surface count honest across a reload: zero surfaces is also true for
-//! the first second or two after any normal start, and a restart resets the
-//! window the journal is read over.
+//! the predicate honest across a reload: "nothing painted yet" is also true
+//! for the first second or two after any normal start, and a restart resets
+//! the window the journal is read over.
 //!
-//! That count sums the shell's OWN surfaces system-wide rather than
-//! checking any one monitor: none of `modules/facets/quickshell/qml/`'s
-//! `PanelWindow`s are per-screen (no `Variants`, no `Quickshell.screens`, no
-//! `screen:` binding anywhere in that tree — each is declared once,
-//! unconditionally), so this shell always paints exactly one output. On a
-//! multi-monitor host every other enabled monitor legitimately and
-//! permanently carries zero layers forever, by design — a per-monitor "is
-//! any enabled monitor empty" test would read that as stuck and restart a
-//! healthy desktop. Summing `aoide-`-namespaced surfaces across every
-//! monitor and every level instead makes the signal monitor-count-agnostic:
-//! zero total means the shell is painting nothing anywhere, which is the
-//! actual failure; nonzero means it is painting something, somewhere, on
-//! whichever single output it owns.
+//! That predicate used to be a bare total: any `aoide-*` surface, anywhere,
+//! on any monitor, at any layer. It cannot see a PARTIAL loss, and a partial
+//! loss is exactly what happens. When one output blips, the surfaces that
+//! recover and the surfaces that do not are decided per-surface — a
+//! `Variants { model: Quickshell.screens }` delegate is rebuilt against the
+//! new screen list and re-homes itself, while a singleton bound to one now
+//! dead output stays bound to it forever. Verified live on osaka: the
+//! per-screen wallpaper recovered and the bar and dock did not, so the total
+//! count stayed nonzero and this watchdog called that desktop healthy for
+//! hours. A count can only ever answer "is anything painted", and the
+//! question that matters is "is what SHOULD be painted, painted".
 //!
-//! No QML-side fix exists for this: `Quickshell.screens` is populated below
-//! QML by `QGuiApplication`'s wayland platform plugin, so no in-process
-//! `Quickshell.reload()`/`onScreensChanged` handler can reach or reset the
-//! stuck QPA state — only a full process re-exec does, which is exactly
-//! what [`run_healthcheck`]'s restart provides.
+//! Answering that question needs a set to compare against, and the set
+//! cannot be hardcoded here: on a host where waybar owns the bar, expecting
+//! `aoide-bar` would restart a healthy desktop every fifteen minutes
+//! forever. So it is DECLARED by the active song
+//! (`aoide.arrangement.surfaces`) and published to
+//! `run/qml/songs/surfaces.json` by the quickshell facet's build
+//! (CONTRACTS.md §5). When that file is present this checks the declared
+//! namespaces against what is actually mapped, per monitor where the
+//! declaration says per-monitor; when it is absent or unreadable, no
+//! expectation is declared and the old total count decides, unchanged. A
+//! host that declares nothing pays for nothing.
+//!
+//! The per-monitor comparison is why `hyprctl monitors` is read at all — a
+//! `perMonitor` namespace must be mapped once on EVERY real output, and
+//! counting surfaces instead of distinct monitors would let two copies on
+//! one head satisfy a two-head expectation. Hyprland synthesizes a
+//! `FALLBACK` output while every real head is off, which is excluded from
+//! both sides: with no real output there is nothing to paint on, restarting
+//! reproduces the placeholder state, and the shell is expected to come back
+//! on its own when a head returns.
+//!
+//! No QML-side fix exists for the placeholder lockup itself:
+//! `Quickshell.screens` is populated below QML by `QGuiApplication`'s
+//! wayland platform plugin, so no in-process `Quickshell.reload()`/
+//! `onScreensChanged` handler can reach or reset the stuck QPA state — only
+//! a full process re-exec does, which is exactly what
+//! [`run_healthcheck`]'s restart provides. This is separate from the
+//! per-surface recovery above: a `Variants` delegate re-homes across a blip,
+//! but nothing in QML recovers a QPA backend that has already fallen onto
+//! the placeholder screen.
 
 use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -89,17 +114,21 @@ pub enum HealthOutcome {
     /// No lockup detected (including: the service isn't running at all —
     /// nothing to watch).
     Healthy,
-    /// Painting nothing, and this watchdog cannot say why: zero `aoide-*`
-    /// layer surfaces anywhere, but no placeholder-screen line in the
-    /// journal since the unit went active. The desktop is blank — the same
-    /// user-visible failure [`Restarted`](HealthOutcome::Restarted) exists
-    /// for — but the one mechanism this watchdog knows how to attribute is
-    /// absent, so it reports and does not act. Incident #40 was exactly this
-    /// shape: a pre-QML deadlock in the `QApplication` constructor, which
-    /// emits no QPA line at all, and it sat unreported for 22 minutes on two
-    /// hosts. Naming that state is this variant's whole job — a blank
-    /// desktop with no recognized mechanism must never collapse into
-    /// [`Healthy`](HealthOutcome::Healthy).
+    /// The shell isn't painting the desktop it should be, and this watchdog
+    /// cannot say why: either the declared surface set falls short of what
+    /// `run/qml/songs/surfaces.json` says should be mapped, or — with no
+    /// expectation published — zero `aoide-*` layer surfaces anywhere exist,
+    /// and in both cases there is no placeholder-screen line in the journal
+    /// since the unit went active. Either way the user sees a desktop that is
+    /// missing something it declared — blank, or half-painted with a bar or
+    /// dock gone — which is the same user-visible failure
+    /// [`Restarted`](HealthOutcome::Restarted) exists for, but the one
+    /// mechanism this watchdog knows how to attribute is absent, so it
+    /// reports and does not act. Incident #40 was exactly this shape: a
+    /// pre-QML deadlock in the `QApplication` constructor, which emits no QPA
+    /// line at all, and it sat unreported for 22 minutes on two hosts. Naming
+    /// that state is this variant's whole job — a desktop that is not what it
+    /// declared must never collapse into [`Healthy`](HealthOutcome::Healthy).
     Blank,
     /// Confirmed stuck; the service was restarted.
     Restarted,
@@ -126,8 +155,8 @@ impl HealthOutcome {
         match self {
             HealthOutcome::Healthy => "quickshell is healthy".to_string(),
             HealthOutcome::Blank => {
-                "quickshell is painting nothing, and no placeholder-screen line explains it; \
-                 not restarting"
+                "quickshell is not painting what it should be, and no placeholder-screen line \
+                 explains it; not restarting"
                     .to_string()
             }
             HealthOutcome::Restarted => {
@@ -153,9 +182,11 @@ pub(crate) fn journal_shows_placeholder(journal_tail: &str) -> bool {
 }
 
 /// Pure: total `aoide-`-namespaced layer-shell surfaces `hyprctl layers -j`
-/// reports, summed across every monitor and every level. This is the
-/// shell's own footprint, not any one output's — see the module header for
-/// why a per-monitor count is the wrong shape on a multi-monitor host.
+/// reports, summed across every monitor and every level. Only the
+/// no-expectation fallback in [`run_healthcheck`] uses this — see the module
+/// header for why a total count cannot see the partial loss that
+/// [`surfaces_fall_short`] exists to catch, and for why summing across every
+/// monitor is the right shape for the fallback specifically.
 pub(crate) fn total_aoide_layers(layers: &Value) -> usize {
     let Some(monitors) = layers.as_object() else {
         return 0;
@@ -181,6 +212,15 @@ pub(crate) fn total_aoide_layers(layers: &Value) -> usize {
 /// separates the placeholder lockup, which is restartable, from
 /// [`HealthOutcome::Blank`], which is only reported.
 ///
+/// This is the NO-EXPECTATION fallback: [`run_healthcheck`] asks it only
+/// when nothing published `run/qml/songs/surfaces.json`, so a host that
+/// declares no surfaces keeps exactly the behaviour it had before that file
+/// existed. When an expectation IS declared, [`surfaces_fall_short`] decides
+/// instead — and on a multi-monitor host the two differ deliberately: this
+/// reads healthy as soon as ONE surface exists anywhere, which is precisely
+/// the blind spot it is kept for the no-expectation case only (module
+/// header).
+///
 /// Requires `layers` to actually be the object `hyprctl -j layers` returns
 /// — a failed/malformed call comes back as [`Value::Null`] from
 /// `hyprctl_json` and must read as "unconfirmed", never as a blank desktop,
@@ -190,6 +230,170 @@ pub(crate) fn total_aoide_layers(layers: &Value) -> usize {
 /// [`HealthOutcome::Blank`].
 pub(crate) fn shell_has_zero_layers(layers: &Value) -> bool {
     layers.is_object() && total_aoide_layers(layers) == 0
+}
+
+/// Pure: the published expectation's namespaces, each mapped to its
+/// `perMonitor` flag — `None` when `v` is not the object
+/// [`published_surfaces`] would have handed over, i.e. not an object
+/// carrying a `surfaces` object. Read straight off the generated
+/// `run/qml/songs/surfaces.json` (CONTRACTS.md §5), whose keys are already
+/// the RESOLVED layer-shell namespaces (`aoide-<slot>`) precisely so this
+/// function derives nothing of its own and compares them directly against
+/// the compositor's own layer list.
+///
+/// An EMPTY `surfaces` object is `Some(empty)`, never `None`, and the two are
+/// not the same thing: `None` means "nothing was published, fall back to the
+/// old count", while an empty map means "this song declared nothing and
+/// therefore expects nothing" — which [`surfaces_fall_short`] must read as
+/// healthy. Collapsing them would make a song with an empty declaration
+/// restart forever, since no namespace could ever satisfy it.
+///
+/// A missing `perMonitor` on one entry reads as `false` — "exactly one,
+/// wherever it lands" — matching the nix option's own default, so a
+/// hand-written or forward-compatible file that omits the flag is treated as
+/// the weaker demand rather than as malformed.
+pub(crate) fn parse_expectation(v: &Value) -> Option<BTreeMap<String, bool>> {
+    let surfaces = v.get("surfaces")?.as_object()?;
+    Some(
+        surfaces
+            .iter()
+            .map(|(ns, entry)| (ns.clone(), entry.get("perMonitor").and_then(Value::as_bool).unwrap_or(false)))
+            .collect(),
+    )
+}
+
+/// Pure: how many REAL outputs are worth demanding a surface on, from
+/// `hyprctl monitors -j`. Entries that are `"disabled": true` are off, and
+/// one named `FALLBACK` is the placeholder Hyprland synthesizes while every
+/// real head is off — neither is somewhere a surface could be painted, so
+/// neither is counted. (Hyprland's own output list carries the literal name
+/// `FALLBACK` for that synthetic monitor.)
+///
+/// `None` when `monitors` is not an array — a malformed or failed `hyprctl`
+/// (which comes back as [`Value::Null`] from `hyprctl_json`) means the real
+/// output count is UNCONFIRMED, and unconfirmed must never be mistaken for
+/// zero. The two differ in what they demand: zero real outputs is a reason to
+/// stand down entirely (see [`surfaces_fall_short`]), while `None` is a
+/// reason not to judge at all, so this returns the distinction rather than
+/// flattening both to a number.
+pub(crate) fn real_monitor_count(monitors: &Value) -> Option<usize> {
+    let entries = monitors.as_array()?;
+    Some(entries.iter().filter(|m| is_real_monitor(m)).count())
+}
+
+/// `hyprctl monitors -j` gives each output as an object; an entry that is not
+/// an object at all (malformed, or a shape a future hyprctl changes) is not
+/// evidence of a real head, so it is skipped rather than demanded on —
+/// counting it would push the demand above what actually exists, which is the
+/// direction that restarts a healthy desktop. The two exclusions proper are
+/// `"disabled": true` and the literal name `FALLBACK`; both checks are exact,
+/// so an output that merely lacks a `name` counts, since nothing says it is
+/// the synthesized one.
+fn is_real_monitor(m: &Value) -> bool {
+    if !m.is_object() {
+        return false;
+    }
+    if m.get("disabled").and_then(Value::as_bool).unwrap_or(false) {
+        return false;
+    }
+    m.get("name").and_then(Value::as_str) != Some("FALLBACK")
+}
+
+/// Pure: for each `aoide-*` namespace present in `hyprctl layers -j`, the
+/// number of DISTINCT real monitors it is mapped on. Skipping `FALLBACK`
+/// here as well as in [`real_monitor_count`] is what keeps the two sides of
+/// the comparison measuring the same thing: a surface drawn onto the
+/// synthesized placeholder output is not painted on a real head, so counting
+/// it would satisfy a demand that nothing actually meets. Counting them in
+/// one place and not the other is an off-by-one that fires on every blackout.
+///
+/// Distinct monitors, not total surfaces: a namespace with two surfaces on a
+/// SINGLE head covers one head, and must not satisfy a two-head `perMonitor`
+/// expectation. Each monitor contributes its namespace once, via the set
+/// collected per monitor before the tally.
+pub(crate) fn namespace_coverage(layers: &Value) -> BTreeMap<String, usize> {
+    let Some(monitors) = layers.as_object() else {
+        return BTreeMap::new();
+    };
+    let mut coverage: BTreeMap<String, usize> = BTreeMap::new();
+    for (monitor_name, monitor) in monitors {
+        if monitor_name == "FALLBACK" {
+            continue;
+        }
+        // One monitor's own set first, so duplicate surfaces of the same
+        // namespace on this one output collapse to a single head's worth of
+        // coverage before anything is tallied.
+        let namespaces: BTreeSet<&str> = monitor
+            .get("levels")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|levels| levels.values())
+            .filter_map(Value::as_array)
+            .flatten()
+            .filter_map(|surface| surface.get("namespace").and_then(Value::as_str))
+            .filter(|ns| ns.starts_with("aoide-"))
+            .collect();
+        for ns in namespaces {
+            *coverage.entry(ns.to_string()).or_insert(0) += 1;
+        }
+    }
+    coverage
+}
+
+/// Pure: does the desktop fall short of the published expectation? `true` is
+/// the NEW bad-state predicate — the shell is not painting what it declared —
+/// and it is what [`run_healthcheck`] asks when
+/// `run/qml/songs/surfaces.json` exists.
+///
+/// A declared namespace is "genuinely missing" when its [`namespace_coverage`]
+/// is below what the declaration demands: `perMonitor` demands coverage equal
+/// to [`real_monitor_count`] (one mapped surface on every real output),
+/// anything else demands coverage of at least one (exactly one, wherever it
+/// lands — this asks only that it exists, since a single surface legitimately
+/// lives on whichever output it was placed on).
+///
+/// Standing down, never restarting, is the answer in every case where the
+/// comparison cannot be made in good faith:
+///
+/// - an EMPTY expectation declares nothing, so nothing can fall short — a
+///   song that says nothing is never unhealthy;
+/// - `layers` not being an object, or `monitors` not being an array, is a
+///   failed/unconfirmed system call (both come back as [`Value::Null`] from
+///   `hyprctl_json`), and this watchdog never acts on a reading it does not
+///   have;
+/// - [`real_monitor_count`] of 0 is the single most important guard here.
+///   With no real output there is nowhere to paint, so a restart would
+///   reproduce the placeholder state and could loop against a blackout —
+///   which is exactly the harm this whole watchdog exists to avoid causing.
+///   The shell is expected to come back on its own when a head returns.
+///
+/// The `perMonitor`-with-zero-monitors case is folded into that last guard
+/// deliberately, rather than demanding coverage equal to zero for every
+/// namespace (which would be vacuously satisfied): a host in blackout must
+/// read the same for both kinds of declaration, and that reading is "stand
+/// down".
+pub(crate) fn surfaces_fall_short(
+    exp: &BTreeMap<String, bool>,
+    layers: &Value,
+    monitors: &Value,
+) -> bool {
+    if exp.is_empty() {
+        return false;
+    }
+    if !layers.is_object() {
+        return false;
+    }
+    let Some(real_monitors) = real_monitor_count(monitors) else {
+        return false;
+    };
+    if real_monitors == 0 {
+        return false;
+    }
+    let coverage = namespace_coverage(layers);
+    exp.iter().any(|(ns, per_monitor)| {
+        let covered = coverage.get(ns).copied().unwrap_or(0);
+        if *per_monitor { covered < real_monitors } else { covered == 0 }
+    })
 }
 
 /// Pure: restart timestamps (unix epoch seconds) from a marker file's
@@ -348,6 +552,33 @@ fn hyprctl_json(subcommand: &str) -> Value {
         .unwrap_or(Value::Null)
 }
 
+/// The published expected-paint declaration, read from the live deployed
+/// tree: `run/qml/songs/surfaces.json` beside `manifest.json` and
+/// `registry.json` (CONTRACTS.md §5). The path resolves through
+/// [`aoide_storage::fs::run_qml_dir`] like every other reader of that tree
+/// (`crate::ipc`'s `shell.qml` lookup is the sibling case) rather than
+/// spelling `$AOIDE_ROOT` or `~/.aoide` here — the runtime root is one
+/// relocatable seam, and a second spelling would be the one that drifts.
+///
+/// EVERY failure mode is `None`: absent (a host whose facet predates this
+/// file, or one that never deployed it), unreadable, or not valid JSON. `None`
+/// means "no expectation declared", which sends [`run_healthcheck`] down the
+/// total-count fallback — the same behaviour this watchdog had before the
+/// declaration existed. That is the whole reason failures are swallowed
+/// rather than surfaced: this is a build-time statement of intent, not stage
+/// state, and a host that never published one must keep working, never report
+/// unhealthy for the absence of a file nothing in this crate writes.
+///
+/// The one impure function here — it reads the filesystem — and deliberately
+/// the only one: everything it hands to [`parse_expectation`] and
+/// [`surfaces_fall_short`] is a plain [`Value`] so the judgement itself stays
+/// unit-testable against literal fixtures.
+fn published_surfaces() -> Option<Value> {
+    let path = aoide_storage::fs::run_qml_dir().join("songs").join("surfaces.json");
+    let bytes = std::fs::read(&path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
 fn restart_service() {
     let _ = Command::new("systemctl").args(["--user", "restart", "aoide-quickshell.service"]).status();
 }
@@ -382,6 +613,13 @@ fn notify_still_flapping() {
 /// as [`HealthOutcome::Healthy`] (nothing confirmed stuck), the same
 /// guarded-optional posture the rest of this crate takes toward system
 /// services it doesn't own.
+///
+/// The bad-state predicate: [`surfaces_fall_short`] against the published
+/// expectation when there is one, [`shell_has_zero_layers`] when there is
+/// not. Everything downstream of that decision — the journal gate, the
+/// marker, the retry ladder, the flapping notification — is identical for
+/// both, which is deliberate: which surfaces should be mapped is a
+/// declaration, but what to DO about a desktop that lost them is not.
 pub fn run_healthcheck() -> HealthOutcome {
     if crate::reap::quickshell_service_main_pid().is_none() {
         return HealthOutcome::Healthy;
@@ -389,15 +627,28 @@ pub fn run_healthcheck() -> HealthOutcome {
     let Some(since) = active_enter_timestamp() else {
         return HealthOutcome::Healthy;
     };
-    // Current state first, cause second. The surface count is the only
-    // signal that speaks to NOW (module header), so it decides `Healthy` on
-    // its own; the journal line only chooses between acting and reporting
-    // once the desktop is already known to be blank. Reading them the other
+    // Current state first, cause second. The mapped-surface predicate is the
+    // only signal that speaks to NOW (module header), so it decides `Healthy`
+    // on its own; the journal line only chooses between acting and reporting
+    // once the desktop is already known to fall short. Reading them the other
     // way round is what made incident #40 invisible, and it spends a full
     // `journalctl` read on every healthy tick; this order pays that only
     // when something is actually wrong.
+    //
+    // Which predicate, though, depends on whether anything was declared. With
+    // a published expectation the declared set decides, and `hyprctl monitors`
+    // is read because a `perMonitor` namespace is judged against the real
+    // output count. With none, the old total count decides and the monitors
+    // call is never made at all — a host that declares nothing pays nothing
+    // for a mechanism it opted out of.
     let layers = hyprctl_json("layers");
-    if !shell_has_zero_layers(&layers) {
+    let published = published_surfaces();
+    let expectation = published.as_ref().and_then(parse_expectation);
+    let bad = match expectation {
+        Some(exp) => surfaces_fall_short(&exp, &layers, &hyprctl_json("monitors")),
+        None => shell_has_zero_layers(&layers),
+    };
+    if !bad {
         return HealthOutcome::Healthy;
     }
     if !journal_shows_placeholder(&journal_tail_since(&since)) {
@@ -495,13 +746,13 @@ mod tests {
         assert!(shell_has_zero_layers(&layers));
     }
 
-    // Regression for the multi-monitor false positive: none of
-    // `modules/facets/quickshell/qml`'s `PanelWindow`s bind to a screen (no
-    // `Variants`, no `Quickshell.screens`, no `screen:` anywhere in that
-    // tree), so this shell always paints exactly one output. A second
-    // enabled, connected monitor that legitimately and permanently carries
-    // zero layers must read HEALTHY, not stuck — the old per-monitor
-    // predicate flagged this host as stuck forever.
+    // The NO-EXPECTATION fallback's own regression, from before a
+    // declaration existed: this predicates sums surfaces across every
+    // monitor, so a second enabled output that legitimately and permanently
+    // carries zero layers must not read as stuck. It stays correct for what
+    // it now is — the fallback a host that publishes no expectation keeps —
+    // and the per-monitor demand that WOULD flag this host lives in
+    // `surfaces_fall_short`, asked only when a song declares one.
     #[test]
     fn two_monitor_host_with_one_painted_and_one_legitimately_empty_is_healthy() {
         assert!(!shell_has_zero_layers(&two_monitor_one_painted()));
@@ -526,6 +777,325 @@ mod tests {
         // `HealthOutcome::Blank`, since this signal is asked first.
         assert!(!shell_has_zero_layers(&Value::Null));
         assert_eq!(total_aoide_layers(&Value::Null), 0);
+    }
+
+    // ── The declared-expectation predicate ────────────────────────────────
+    //
+    // The published shape, verbatim from the quickshell facet's own output
+    // (`modules/facets/quickshell/default.nix`'s `surfacesJsonFile`,
+    // CONTRACTS.md §5): one object, NOT keyed by song, whose keys are the
+    // already-RESOLVED layer-shell namespaces. That resolution is why nothing
+    // here derives `aoide-<slot>` itself.
+    fn sonata_expectation() -> Value {
+        json!({
+            "song": "sonata",
+            "surfaces": {
+                "aoide-bar": { "perMonitor": true },
+                "aoide-wallpaper": { "perMonitor": true },
+                "aoide-dock": { "perMonitor": false }
+            }
+        })
+    }
+
+    fn two_real_monitors() -> Value {
+        json!([
+            { "name": "DP-1", "disabled": false },
+            { "name": "HDMI-A-1", "disabled": false }
+        ])
+    }
+
+    #[test]
+    fn parse_expectation_reads_namespaces_to_their_per_monitor_flag() {
+        let exp = parse_expectation(&sonata_expectation()).unwrap();
+        assert_eq!(exp.get("aoide-bar"), Some(&true));
+        assert_eq!(exp.get("aoide-wallpaper"), Some(&true));
+        assert_eq!(exp.get("aoide-dock"), Some(&false));
+        assert_eq!(exp.len(), 3);
+    }
+
+    #[test]
+    fn parse_expectation_is_none_without_a_surfaces_object() {
+        assert_eq!(parse_expectation(&Value::Null), None);
+        assert_eq!(parse_expectation(&json!("aoide-bar")), None);
+        assert_eq!(parse_expectation(&json!([1, 2])), None);
+        // An object, but not this file's shape — a bare namespace map under
+        // some other key is not a declaration this reads.
+        assert_eq!(parse_expectation(&json!({ "song": "sonata" })), None);
+        assert_eq!(parse_expectation(&json!({ "surfaces": "aoide-bar" })), None);
+    }
+
+    // An empty declaration is `Some`, NOT `None`, and the difference is
+    // load-bearing: `None` means "nothing published, keep the old count",
+    // while an empty map means "this song declared nothing and expects
+    // nothing". Collapsing them would make a song with an empty declaration
+    // un-satisfiable and restart forever.
+    #[test]
+    fn parse_expectation_keeps_an_empty_declaration_distinct_from_no_declaration() {
+        let empty = parse_expectation(&json!({ "song": "nocturne", "surfaces": {} })).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    // A hand-written or forward-compatible entry omitting the flag reads as
+    // the WEAKER demand, matching the nix option's own `perMonitor = false`
+    // default, rather than as malformed.
+    #[test]
+    fn parse_expectation_defaults_a_missing_per_monitor_to_false() {
+        let exp = parse_expectation(&json!({ "surfaces": { "aoide-dock": {} } })).unwrap();
+        assert_eq!(exp.get("aoide-dock"), Some(&false));
+    }
+
+    #[test]
+    fn real_monitor_count_excludes_disabled_outputs() {
+        let monitors = json!([
+            { "name": "DP-1", "disabled": false },
+            { "name": "HDMI-A-1", "disabled": true },
+            { "name": "DP-2", "disabled": false }
+        ]);
+        assert_eq!(real_monitor_count(&monitors), Some(2));
+    }
+
+    // Hyprland synthesizes an output literally named `FALLBACK` while every
+    // real head is off. Counting it would demand a surface on a monitor that
+    // does not exist, so the count is zero — the stand-down case.
+    #[test]
+    fn real_monitor_count_excludes_the_synthesized_fallback_output() {
+        let monitors = json!([{ "name": "FALLBACK", "disabled": false }]);
+        assert_eq!(real_monitor_count(&monitors), Some(0));
+        assert_eq!(real_monitor_count(&json!([])), Some(0));
+    }
+
+    // `None`, not `Some(0)`: a failed `hyprctl` is UNCONFIRMED, and
+    // unconfirmed must never be flattened into the "no real output, stand
+    // down" reading — they mean different things to the caller.
+    #[test]
+    fn real_monitor_count_is_none_when_hyprctl_did_not_answer() {
+        assert_eq!(real_monitor_count(&Value::Null), None);
+        assert_eq!(real_monitor_count(&json!({ "DP-1": {} })), None);
+        assert_eq!(real_monitor_count(&json!("DP-1")), None);
+    }
+
+    // A non-object entry is not evidence of a head. Counting it would push
+    // the demand above what exists, which is the direction that restarts a
+    // healthy desktop — so it is skipped, and an output merely lacking a
+    // `name` (nothing says it is the synthesized one) still counts.
+    #[test]
+    fn real_monitor_count_skips_non_object_entries_but_not_nameless_ones() {
+        let monitors = json!([1, "DP-1", { "disabled": false }, { "name": "DP-1" }]);
+        assert_eq!(real_monitor_count(&monitors), Some(2));
+    }
+
+    #[test]
+    fn namespace_coverage_counts_one_per_monitor_with_that_namespace() {
+        let layers = json!({
+            "DP-1": {
+                "levels": {
+                    "0": [{"namespace": "aoide-wallpaper"}],
+                    "2": [{"namespace": "aoide-bar"}, {"namespace": "aoide-dock"}]
+                }
+            },
+            "HDMI-A-1": {
+                "levels": { "0": [{"namespace": "aoide-wallpaper"}], "2": [] }
+            }
+        });
+        let coverage = namespace_coverage(&layers);
+        assert_eq!(coverage.get("aoide-wallpaper"), Some(&2));
+        assert_eq!(coverage.get("aoide-bar"), Some(&1));
+        assert_eq!(coverage.get("aoide-dock"), Some(&1));
+    }
+
+    // Distinct monitors, not total surfaces. The dock's own column can hold
+    // the same namespace at two levels on one head; that is still one head
+    // covered, and it must not satisfy a two-head `perMonitor` demand.
+    #[test]
+    fn namespace_coverage_collapses_duplicate_surfaces_on_one_head() {
+        let layers = json!({
+            "DP-1": {
+                "levels": {
+                    "0": [{"namespace": "aoide-wallpaper"}],
+                    "2": [{"namespace": "aoide-wallpaper"}]
+                }
+            }
+        });
+        assert_eq!(namespace_coverage(&layers).get("aoide-wallpaper"), Some(&1));
+    }
+
+    // Same exclusion as `real_monitor_count`: a surface drawn onto the
+    // synthesized placeholder output is not painted on a real head. Counting
+    // it on one side and not the other is an off-by-one that fires the
+    // watchdog on every blackout.
+    #[test]
+    fn namespace_coverage_skips_the_synthesized_fallback_output() {
+        let layers = json!({
+            "FALLBACK": { "levels": { "0": [{"namespace": "aoide-wallpaper"}] } },
+            "DP-1": { "levels": { "0": [{"namespace": "aoide-bar"}] } }
+        });
+        let coverage = namespace_coverage(&layers);
+        assert_eq!(coverage.get("aoide-wallpaper"), None);
+        assert_eq!(coverage.get("aoide-bar"), Some(&1));
+    }
+
+    #[test]
+    fn namespace_coverage_ignores_non_aoide_namespaces_and_malformed_layers() {
+        let layers = json!({
+            "DP-1": { "levels": { "0": [{"namespace": "waybar"}, {"namespace": "aoide-bar"}] } }
+        });
+        let coverage = namespace_coverage(&layers);
+        assert_eq!(coverage.get("aoide-bar"), Some(&1));
+        assert_eq!(coverage.get("waybar"), None);
+        // A failed `hyprctl layers` is an empty map, never a panic.
+        assert!(namespace_coverage(&Value::Null).is_empty());
+    }
+
+    // The actual incident: two real heads, the per-screen wallpaper recovered
+    // on both, the bar stayed mapped on only one. The bar and the dock
+    // survived the blip bound to the dead output, and the old TOTAL count saw
+    // three surviving `aoide-*` surfaces and called this desktop healthy for
+    // hours. Against the declaration, `aoide-bar` covers one head where two
+    // are demanded — genuinely missing.
+    #[test]
+    fn the_incident_a_per_monitor_namespace_mapped_on_only_one_of_two_heads_falls_short() {
+        let layers = json!({
+            "DP-1": {
+                "levels": {
+                    "0": [{"namespace": "aoide-wallpaper"}],
+                    "2": [{"namespace": "aoide-bar"}]
+                }
+            },
+            "HDMI-A-1": {
+                "levels": { "0": [{"namespace": "aoide-wallpaper"}], "2": [] }
+            }
+        });
+        // Precondition: the OLD predicate reads this desktop as healthy,
+        // which is the whole defect — the new one must not.
+        assert!(!shell_has_zero_layers(&layers));
+        let exp = parse_expectation(&sonata_expectation()).unwrap();
+        assert!(surfaces_fall_short(&exp, &layers, &two_real_monitors()));
+    }
+
+    #[test]
+    fn a_declared_non_per_monitor_namespace_mapped_nowhere_falls_short() {
+        let layers = json!({
+            "DP-1": {
+                "levels": {
+                    "0": [{"namespace": "aoide-wallpaper"}],
+                    "2": [{"namespace": "aoide-bar"}]
+                }
+            },
+            "HDMI-A-1": {
+                "levels": { "0": [{"namespace": "aoide-wallpaper"}], "2": [{"namespace": "aoide-bar"}] }
+            }
+        });
+        // Everything per-monitor is satisfied on both heads; only the dock —
+        // declared `perMonitor = false`, demanding exactly one, wherever it
+        // lands — is absent, and its absence alone is the verdict.
+        let exp = parse_expectation(&sonata_expectation()).unwrap();
+        assert!(surfaces_fall_short(&exp, &layers, &two_real_monitors()));
+    }
+
+    #[test]
+    fn a_fully_satisfied_declaration_does_not_fall_short() {
+        let layers = json!({
+            "DP-1": {
+                "levels": {
+                    "0": [{"namespace": "aoide-wallpaper"}],
+                    "2": [{"namespace": "aoide-bar"}, {"namespace": "aoide-dock"}]
+                }
+            },
+            "HDMI-A-1": {
+                "levels": {
+                    "0": [{"namespace": "aoide-wallpaper"}],
+                    "2": [{"namespace": "aoide-bar"}]
+                }
+            }
+        });
+        let exp = parse_expectation(&sonata_expectation()).unwrap();
+        assert!(!surfaces_fall_short(&exp, &layers, &two_real_monitors()));
+    }
+
+    // One real head plus the synthesized `FALLBACK` output, everything mapped
+    // on the real one. The fallback must be excluded from BOTH the demand
+    // (the count) and the coverage: a perMonitor namespace mapped once on the
+    // one real head satisfies a one-head expectation, and a namespace drawn
+    // on the phantom does not count.
+    #[test]
+    fn one_real_head_plus_fallback_is_satisfied_when_the_real_head_is_covered() {
+        let layers = json!({
+            "HDMI-A-1": {
+                "levels": {
+                    "0": [{"namespace": "aoide-wallpaper"}],
+                    "2": [{"namespace": "aoide-bar"}, {"namespace": "aoide-dock"}]
+                }
+            },
+            "FALLBACK": { "levels": { "0": [], "1": [], "2": [], "3": [] } }
+        });
+        let monitors = json!([
+            { "name": "HDMI-A-1", "disabled": false },
+            { "name": "FALLBACK", "disabled": false }
+        ]);
+        let exp = parse_expectation(&sonata_expectation()).unwrap();
+        assert!(!surfaces_fall_short(&exp, &layers, &monitors));
+    }
+
+    // ── Standing down: every case where the predicate must NOT be true ────
+    //
+    // A song that declares nothing is never unhealthy — nothing can fall
+    // short of an empty demand.
+    #[test]
+    fn an_empty_expectation_never_falls_short() {
+        let layers = json!({
+            "DP-1": { "levels": { "0": [], "1": [], "2": [], "3": [] } },
+            "HDMI-A-1": { "levels": { "0": [], "1": [], "2": [], "3": [] } }
+        });
+        assert!(!surfaces_fall_short(&BTreeMap::new(), &layers, &two_real_monitors()));
+    }
+
+    #[test]
+    fn an_unreadable_layers_reading_never_falls_short() {
+        let exp = parse_expectation(&sonata_expectation()).unwrap();
+        assert!(!surfaces_fall_short(&exp, &Value::Null, &two_real_monitors()));
+        assert!(!surfaces_fall_short(&exp, &json!([1, 2]), &two_real_monitors()));
+        assert!(!surfaces_fall_short(&exp, &json!("DP-1"), &two_real_monitors()));
+    }
+
+    #[test]
+    fn an_unreadable_monitors_reading_never_falls_short() {
+        let exp = parse_expectation(&sonata_expectation()).unwrap();
+        assert!(!surfaces_fall_short(&exp, &json!({}), &Value::Null));
+        assert!(!surfaces_fall_short(&exp, &json!({}), &json!({ "DP-1": {} })));
+    }
+
+    // THE single most important guard in this predicate. With no real output
+    // enabled there is nothing to paint on: restarting reproduces the
+    // placeholder state and could loop straight through a blackout — the
+    // exact harm this watchdog exists to avoid causing. Standing down is
+    // correct because the shell is expected to reattach on its own when a
+    // head returns.
+    #[test]
+    fn zero_real_monitors_never_falls_short_even_with_nothing_mapped() {
+        let exp = parse_expectation(&sonata_expectation()).unwrap();
+        // Every declared namespace absent from `hyprctl layers`.
+        let blank_layers = json!({});
+        // No monitors at all: a display that has gone to sleep, a laptop lid
+        // shut, a dock unplugged.
+        assert!(!surfaces_fall_short(&exp, &blank_layers, &json!([])));
+        // Every real head disabled.
+        let all_disabled = json!([
+            { "name": "DP-1", "disabled": true },
+            { "name": "HDMI-A-1", "disabled": true }
+        ]);
+        assert!(!surfaces_fall_short(&exp, &blank_layers, &all_disabled));
+        // Only Hyprland's synthesized placeholder output remains — the exact
+        // state a blip leaves behind, and the one a restart cannot fix.
+        let fallback_only = json!([{ "name": "FALLBACK", "disabled": false }]);
+        assert!(!surfaces_fall_short(&exp, &blank_layers, &fallback_only));
+    }
+
+    // The empty expectation and the zero-monitor guard must compose: a song
+    // declaring nothing on a host in blackout is the most stand-down case
+    // there is.
+    #[test]
+    fn an_empty_expectation_on_a_blacked_out_host_never_falls_short() {
+        assert!(!surfaces_fall_short(&BTreeMap::new(), &Value::Null, &json!([])));
     }
 
     #[test]
@@ -764,12 +1334,17 @@ mod tests {
         assert_eq!(HealthOutcome::Restarted.tag(), "restarted");
         assert!(HealthOutcome::Restarted.message().contains("restarted"));
 
-        // A blank desktop must never render as the healthy one — that
-        // collapse is what left incident #40 unreported for 22 minutes.
+        // A desktop that is not what it declared must never render as the
+        // healthy one — that collapse is what left incident #40 unreported
+        // for 22 minutes, and separately what let a half-painted desktop read
+        // healthy for hours. The wording must not assert a blank desktop
+        // either: this variant now also covers a shell painting SOMETHING,
+        // just not the declared set.
         assert_eq!(HealthOutcome::Blank.tag(), "blank");
         let blank = HealthOutcome::Blank.message();
-        assert!(blank.contains("painting nothing"), "{blank}");
+        assert!(blank.contains("not painting what it should be"), "{blank}");
         assert!(blank.contains("not restarting"), "{blank}");
+        assert!(!blank.contains("painting nothing"), "{blank}");
 
         let deferred = HealthOutcome::Deferred { next_attempt_in_secs: 847, recent_restarts: 4 };
         assert_eq!(deferred.tag(), "deferred");
