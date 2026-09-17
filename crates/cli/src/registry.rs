@@ -263,7 +263,7 @@ mod tests {
         // `project edit` that `records.rs`'s `Project.auto_resume` doc
         // used to say did not exist.
         //
-        // Bumped by 1 for `session.trace` (P-EIDOLON slice E6) — the read
+        // Bumped by 1 for `session.trace` (P-EIDOLON slice E5) — the read
         // surface over a harness's own TRACE file
         // (`docs/architecture/EIDOLON-TRACE.md`): `aoide session trace <id>
         // [--tail N] [--follow] [--json]` renders the run step by step.
