@@ -28,18 +28,38 @@
 //!     I/O: `codex_app.rs`'s own module doc).
 //!
 //! Readiness (E2, folded in per the brief: "the state a record carries is
-//! written by the same reconciler in the same function"): a TUI owner's
-//! `busy` (`meta.json`) is a real fact — `true` → `"working"`, `false` →
-//! `"idle"`. A non-TUI owner's `busy` is eidolon's own producer-side defect
-//! P3 (`crates/cli/src/main.rs:1550` never calls `set_busy`) — permanently
-//! `false` — so such a record carries the literal `state:"unknown"` rather
-//! than a guessed working/idle: `aoide_protocol::canonical_state("unknown")`
-//! folds that to `"idle"` (the vocabulary's own "absence of evidence" arm),
-//! which is deliberate, not a gap — the safety property belongs to the
-//! transport (E3), never to inventing a sixth state. `awaiting`/`error`/
-//! `cancel` are never producible here: eidolon's pending-approval and
-//! streaming events live only on the in-process `Event` bus
-//! (`core/src/event.rs:1-7`), never in `meta.json`.
+//! written by the same reconciler in the same function"). Two rules, in this
+//! order:
+//!
+//!   * **The trace decides, when there is one** (P-EIDOLON slice E6,
+//!     `docs/architecture/EIDOLON-TRACE.md`'s "State rule"). eidolon mirrors
+//!     its journal as `<log>.jsonl`, one JSON record per line, and names it
+//!     from `meta.json.trace`; the LAST record the tail holds decides:
+//!     `TurnSettled` → `idle`, `Cancelled` → `stopped` (the canonical
+//!     vocabulary's own "the turn ended by a stop" — there is no `cancel`
+//!     state to emit, `aoide_protocol::state::canonical_state`), `AskUser`
+//!     with `answer: null` → `awaiting`, anything else → `working` (a turn is
+//!     open). [`eidolon_state_from_trace`] is that rule, pure over lines.
+//!     **Nothing here falls back to `busy` when a trace exists** — a trace
+//!     that says `working` is not overruled by a TUI's `busy:false`, and a
+//!     trace whose last record Aoide cannot read is still evidence a turn
+//!     happened, so the fold refuses (see the function's own doc) rather than
+//!     consulting the weaker signal.
+//!   * **No trace → the presence rule, unchanged.** A TUI owner's `busy`
+//!     (`meta.json`) is a real fact — `true` → `"working"`, `false` →
+//!     `"idle"`. A non-TUI owner's `busy` is eidolon's own producer-side
+//!     defect P3 (`crates/cli/src/main.rs:1550` never calls `set_busy`) —
+//!     permanently `false` — so such a record carries the literal
+//!     `state:"unknown"` rather than a guessed working/idle:
+//!     `aoide_protocol::canonical_state("unknown")` folds that to `"idle"`
+//!     (the vocabulary's own "absence of evidence" arm), which is deliberate,
+//!     not a gap — the safety property belongs to the transport (E3), never
+//!     to inventing a sixth state. This is the older-eidolon shape: still
+//!     enrolled, still readable, just with no trace to read.
+//!
+//! The union of the two rules still never produces `error`: eidolon's
+//! `PolicyVerdict` lives only on the in-process `Event` bus
+//! (`core/src/event.rs:1-7`), and no trace variant Aoide reads means one.
 //!
 //! TUI-vs-not is read off the presence pid's own argv, via the SAME parsed
 //! `ps -axo pid=,ppid=,command=` table `codex_app.rs` already owns
@@ -78,6 +98,17 @@ pub(crate) struct EidolonSession {
     /// No subcommand, or an explicit `tui` token, on the presence pid's own
     /// argv (`main.rs:313-320`) — read off the process table, not guessed.
     pub tui: bool,
+    /// The tail of the file `meta.json.trace` names, ALREADY READ by the
+    /// GATHER step through [`aoide_protocol::agents::eidolon_trace_tail`]
+    /// (the one trace reader) — this module's pure core never touches a file
+    /// itself, the same split `tui`'s own resolution already holds.
+    ///
+    /// `None` when the presence names no trace (an older eidolon) or names
+    /// one that is not there: the presence rule applies, unchanged. `Some`
+    /// (possibly EMPTY) whenever a trace really is the authority here — an
+    /// empty or undecidable trace must never fall back to `busy`, which is
+    /// exactly the distinction this `Option` carries.
+    pub trace: Option<Vec<String>>,
 }
 
 /// One gather of the live presence set — keeps a FAILED or INCOMPLETE
@@ -175,7 +206,7 @@ pub(crate) fn reconcile_eidolon_sessions(
 
     for (id, t) in &desired {
         let parent = resolve_parent(t.pid, &sessions, &ancestry_of);
-        let state = eidolon_state(t.busy, t.tui);
+        let state = eidolon_state(t.busy, t.tui, t.trace.as_deref());
         if let Some(rec) = sessions.iter_mut().find(|s| s.session_id.as_str() == *id) {
             if rec.pid != Some(t.pid) {
                 rec.pid = Some(t.pid);
@@ -237,11 +268,32 @@ pub(crate) fn reconcile_eidolon_sessions(
     (sessions, changed)
 }
 
-/// A TUI owner's `busy` is a real fact (P3); anything else carries the
-/// literal `"unknown"` — never a guessed `working`/`idle` for a shape
-/// eidolon's own producer cannot report on. `awaiting`/`error`/`cancel` are
-/// not in this function's range at all: they cannot be produced.
-fn eidolon_state(busy: bool, tui: bool) -> &'static str {
+/// The state a live presence becomes — the reconciler's whole state rule, in
+/// one place and pure.
+///
+/// **A trace, when there is one, decides entirely** (`trace: Some`): its LAST
+/// record, folded by [`eidolon_state_from_trace`], is the state — the
+/// presence's `busy`/TUI-ness never overrules it, and never fills in for a
+/// trace that is empty or whose last record Aoide cannot read (that fold
+/// returns `None`, and this function then carries the literal `"unknown"`,
+/// the vocabulary's own absence-of-evidence arm, rather than a guess from a
+/// weaker signal). This is the whole point of the trace: a headless run,
+/// where `busy` was never a fact at all, finally has a real state.
+///
+/// **No trace** (`trace: None` — an older eidolon, or a presence naming a
+/// trace that is not there): today's presence rule, unchanged. A TUI owner's
+/// `busy` is a real fact (P3) and maps to `working`/`idle`; anything else
+/// carries the literal `"unknown"`, never a guessed `working`/`idle` for a
+/// shape eidolon's own producer cannot report on. `error` is not in this
+/// function's range at all: it cannot be produced (see the module doc).
+pub(crate) fn eidolon_state(
+    busy: bool,
+    tui: bool,
+    trace: Option<&[String]>,
+) -> &'static str {
+    if let Some(lines) = trace {
+        return eidolon_state_from_trace(lines).unwrap_or("unknown");
+    }
     if !tui {
         return "unknown";
     }
@@ -250,6 +302,56 @@ fn eidolon_state(busy: bool, tui: bool) -> &'static str {
     } else {
         "idle"
     }
+}
+
+/// The trace's own state rule, pure over the tail's lines — the LAST readable
+/// record decides, per `docs/architecture/EIDOLON-TRACE.md`:
+///
+///   * `TurnSettled` → `"idle"` (the turn is over; the same resting state a
+///     `busy:false` TUI owner reads, and what `session trace` renders as the
+///     stop reason + usage)
+///   * `Cancelled` → `"stopped"` — the canonical vocabulary's own "the turn
+///     ENDED, recently" (`aoide_protocol::state::canonical_state`); there is
+///     no `cancel` state in the five-value set and this function never emits
+///     a token outside it
+///   * `AskUser` with `answer: null` → `"awaiting"` (a prompt is open and
+///     nothing has answered it; `answer` set means it was answered, so the
+///     turn is back in flight)
+///   * anything else → `"working"` (a turn is open)
+///
+/// `None` when the fold has no evidence: an empty tail, or a last record
+/// whose `kind` Aoide cannot read at all (a line from a NEWER eidolon, a
+/// torn write). The two are deliberately distinguished from `"working"` —
+/// "a turn is open" is a claim about a record we read, not the absence of
+/// one — so a caller can carry the vocabulary's own `"unknown"` instead.
+///
+/// A line that fails to PARSE (a torn tail, a hand-edit) is skipped rather
+/// than treated as the end of the trace: the last record that IS readable is
+/// the last thing we know happened.
+pub(crate) fn eidolon_state_from_trace(lines: &[String]) -> Option<&'static str> {
+    let mut found: Option<&'static str> = None;
+    for line in lines {
+        let Some(record) = aoide_protocol::agents::eidolon_trace_record(line) else {
+            continue; // a torn tail or a hand-edit — not evidence against anything
+        };
+        let state = match record.kind.as_str() {
+            "TurnSettled" => "idle",
+            "Cancelled" => "stopped",
+            "AskUser" => match record
+                .payload
+                .as_ref()
+                .and_then(|p| p.get("answer"))
+                .map(|a| !a.is_null())
+                .unwrap_or(false)
+            {
+                false => "awaiting",
+                true => "working",
+            },
+            _ => "working",
+        };
+        found = Some(state);
+    }
+    found
 }
 
 /// The nearest ancestor of `pid` (self-first) that is itself a conducted wrap
@@ -311,6 +413,13 @@ struct PresenceMeta {
     model: String,
     title: String,
     busy: bool,
+    /// `docs/architecture/EIDOLON-TRACE.md`'s one new presence field: the
+    /// absolute path of the session's own trace file. `#[serde(default)]`
+    /// because an OLDER eidolon simply does not write it — the whole
+    /// backward-compat story of this field is that its absence is ordinary,
+    /// not an error.
+    #[serde(default)]
+    trace: Option<String>,
 }
 
 /// Does the presence socket at `path` answer `{"op":"ping"}` with
@@ -445,10 +554,35 @@ fn eidolon_presence_sessions_with(process_table: impl Fn() -> Option<String>) ->
                 title: meta.title,
                 busy: meta.busy,
                 tui,
+                trace: read_presence_trace(meta.trace.as_deref()),
             }
         })
         .collect();
     PresenceScan::Observed(sessions)
+}
+
+/// The trace tail a presence's own `meta.json.trace` names, read HERE (the
+/// gather's I/O) so the reconciler above stays pure over it — the same split
+/// [`self::process_table`]'s own `tui` resolution holds.
+///
+/// `None` — the presence rule applies — when the field is absent or blank (an
+/// older eidolon), or the path names no readable TRACE file at all: the one
+/// reader is [`aoide_protocol::agents::eidolon_trace_tail`], which answers
+/// `None` for anything that is not a `.jsonl`, so a presence that points at
+/// its own `meta.json` or at a `.eid` journal is "no trace", not a stream of
+/// nonsense. `Some(vec![])` for a trace that exists and holds nothing yet:
+/// that IS the authority, and an empty trace must never fall back to `busy`
+/// (a headless run's `busy` is permanently false — the exact non-fact the
+/// trace exists to replace).
+///
+/// A read failure is not a scan failure: a trace that cannot be read right
+/// now says nothing about whether the session is live, so the pass carries on
+/// with `None` for that one session rather than voiding every observation
+/// (`PresenceScan::Unknown` is reserved for evidence Aoide genuinely cannot
+/// gather; a missing optional file is ordinary).
+fn read_presence_trace(trace: Option<&str>) -> Option<Vec<String>> {
+    let path = Path::new(trace?.trim());
+    aoide_protocol::agents::eidolon_trace_tail(path)
 }
 
 /// Guards [`audit_scan_unknown_once`] to one audit line per process, the
@@ -534,6 +668,16 @@ mod tests {
             title: "ng".to_string(),
             busy,
             tui,
+            // No trace -- an older eidolon, the presence rule's own shape.
+            trace: None,
+        }
+    }
+
+    /// The same presence, but carrying a TRACE — the authority from here on.
+    fn traced(id: &str, pid: u32, lines: &[&str]) -> EidolonSession {
+        EidolonSession {
+            trace: Some(lines.iter().map(|s| s.to_string()).collect()),
+            ..presence(id, pid, "/home/khoa", false, true)
         }
     }
 
@@ -627,6 +771,32 @@ mod tests {
     }
 
     #[test]
+    fn a_traced_presence_lands_its_state_on_the_record() {
+        let (out, changed) = reconcile_eidolon_sessions(
+            vec![],
+            &PresenceScan::Observed(vec![traced(
+                "user-trace",
+                4242,
+                &[TRACE_PROMPT, TRACE_ASSISTANT],
+            )]),
+            no_ancestry,
+        );
+        assert!(changed);
+        let r = out.iter().find(|s| s.session_id == "user-trace").unwrap();
+        assert_eq!(
+            r.state, "working",
+            "a headless run's open turn, read off the trace"
+        );
+        // And the reverse: the same presence id, a settled trace.
+        let (out, _) = reconcile_eidolon_sessions(
+            out,
+            &PresenceScan::Observed(vec![traced("user-trace", 4242, &[TRACE_SETTLED])]),
+            no_ancestry,
+        );
+        assert_eq!(out[0].state, "idle");
+    }
+
+    #[test]
     fn a_second_reconcile_changes_nothing_and_re_mints_no_petname() {
         let scan =
             PresenceScan::Observed(vec![presence("user-0001", 4242, "/home/khoa", false, true)]);
@@ -707,30 +877,218 @@ mod tests {
 
     #[test]
     fn busy_and_tui_map_to_the_three_state_shape_with_the_unknown_trap_pinned() {
-        assert_eq!(eidolon_state(true, true), "working");
-        assert_eq!(eidolon_state(false, true), "idle");
+        assert_eq!(eidolon_state(true, true, None), "working");
+        assert_eq!(eidolon_state(false, true, None), "idle");
         // A non-TUI owner (P3: busy is permanently false) carries the
         // LITERAL "unknown" -- and canonical_state folds it to "idle", not a
         // deferred/awaiting verdict. Both assertions live in this one test
         // so the trap stays pinned together.
-        assert_eq!(eidolon_state(false, false), "unknown");
+        assert_eq!(eidolon_state(false, false, None), "unknown");
         assert_eq!(
-            eidolon_state(true, false),
+            eidolon_state(true, false, None),
             "unknown",
             "a non-TUI owner's busy is never trusted"
         );
         assert_eq!(canonical_state("unknown"), "idle");
     }
 
+    // ── the state rule (P-EIDOLON slice E6) ─────────────────────────────
+    //
+    // The sample lines below are the ones `docs/architecture/
+    // EIDOLON-TRACE.md` states as the contract; every value is synthetic and
+    // the SHAPE is what is pinned.
+
+    const TRACE_START: &str = r#"{"id":0,"parent":null,"ts_ms":1789603005561,"kind":{"SessionStart":{"model":"ollama:deepseek-v4.1-flash","cwd":"/home/khoa/Aoide","system":null}}}"#;
+    const TRACE_PROMPT: &str = r##"{"id":1,"parent":0,"ts_ms":1789603005570,"kind":{"UserMessage":{"role":"user","content":[{"type":"text","text":"# Brief A: …"}]}}}"##;
+    const TRACE_ASSISTANT: &str = r#"{"id":2,"parent":1,"ts_ms":1789603009102,"kind":{"AssistantMessage":{"role":"assistant","content":[{"type":"thinking","thinking":"…","signature":"…"},{"type":"text","text":"Let me read the slot catalog first."},{"type":"tool_use","id":"call_8vr43zri","name":"read","input":{"path":"modules/facets/quickshell/qml/slots.md"}}]}}}"#;
+    const TRACE_RESULT: &str = r#"{"id":3,"parent":2,"ts_ms":1789603009140,"kind":{"ToolResult":{"tool_use_id":"call_8vr43zri","content":"     1\t# Per-song widget slots — catalog","is_error":false}}}"#;
+    const TRACE_BUDGET: &str = r#"{"id":120,"parent":119,"ts_ms":1789606380000,"kind":{"TurnBudget":{"calls_left":8}}}"#;
+    const TRACE_SETTLED: &str = r#"{"id":131,"parent":130,"ts_ms":1789606421000,"kind":{"TurnSettled":{"stop_reason":"end_turn","usage":{"input_tokens":9570000,"output_tokens":71900,"cache_creation_input_tokens":0,"cache_read_input_tokens":9430000}}}}"#;
+    const TRACE_CANCELLED: &str = r#"{"id":77,"parent":76,"ts_ms":1789626990000,"kind":"Cancelled"}"#;
+    const TRACE_ASK_OPEN: &str = r#"{"id":40,"parent":39,"ts_ms":1789626500000,"kind":{"AskUser":{"call_id":"call_x","prompt":"Overwrite?","answer":null}}}"#;
+    const TRACE_ASK_ANSWERED: &str = r#"{"id":40,"parent":39,"ts_ms":1789626500500,"kind":{"AskUser":{"call_id":"call_x","prompt":"Overwrite?","answer":"yes"}}}"#;
+    const TRACE_CONTEXT: &str = r#"{"id":41,"parent":40,"ts_ms":1789626501000,"kind":{"ContextSize":{"tokens":134700}}}"#;
+    const TRACE_EXTERNAL: &str = r#"{"id":55,"parent":54,"ts_ms":1789626700000,"kind":{"ExternalMessage":{"from":"orchestrator","channel":null,"text":"STOP: write the report now"}}}"#;
+
+    fn lines(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
     #[test]
-    fn awaiting_error_and_cancel_are_never_produced() {
+    fn a_settled_turn_reads_idle_and_a_cancel_reads_stopped() {
+        assert_eq!(eidolon_state_from_trace(&lines(&[TRACE_SETTLED])), Some("idle"));
+        assert_eq!(eidolon_state_from_trace(&lines(&[TRACE_CANCELLED])), Some("stopped"));
+        // `stopped` is the canonical vocabulary's own turn-ended-by-a-stop
+        // token -- never `done` (the session did not exit) and never a
+        // sixth "cancel" state.
+        assert_eq!(canonical_state("stopped"), "stopped");
+        assert_ne!(canonical_state("stopped"), "done");
+    }
+
+    #[test]
+    fn an_unanswered_ask_reads_awaiting_and_an_answered_one_is_working() {
+        assert_eq!(eidolon_state_from_trace(&lines(&[TRACE_ASK_OPEN])), Some("awaiting"));
+        assert_eq!(
+            eidolon_state_from_trace(&lines(&[TRACE_ASK_ANSWERED])),
+            Some("working"),
+            "an answered prompt means the turn is back in flight"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_is_open_reads_working() {
+        for line in [TRACE_START, TRACE_PROMPT, TRACE_ASSISTANT, TRACE_RESULT, TRACE_BUDGET, TRACE_CONTEXT, TRACE_EXTERNAL] {
+            assert_eq!(
+                eidolon_state_from_trace(&lines(&[line])),
+                Some("working"),
+                "anything else with a turn open is working: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_record_decides_not_the_most_interesting_one() {
+        // The prompt/assistant/budget records are all "working"; the settled
+        // record after them is what the session actually is.
+        assert_eq!(
+            eidolon_state_from_trace(&lines(&[
+                TRACE_START, TRACE_PROMPT, TRACE_ASSISTANT, TRACE_BUDGET, TRACE_SETTLED
+            ])),
+            Some("idle")
+        );
+        // ...and a NEW turn after that flips it back.
+        assert_eq!(
+            eidolon_state_from_trace(&lines(&[TRACE_SETTLED, TRACE_PROMPT, TRACE_ASSISTANT])),
+            Some("working")
+        );
+        // A cancel after a settled turn is the cancel.
+        assert_eq!(
+            eidolon_state_from_trace(&lines(&[TRACE_SETTLED, TRACE_CANCELLED])),
+            Some("stopped")
+        );
+    }
+
+    #[test]
+    fn a_trace_with_no_readable_evidence_is_none_never_a_guess() {
+        assert_eq!(eidolon_state_from_trace(&[]), None, "an empty trace says nothing");
+        // Unparseable and non-trace lines are skipped, so a tail made only of
+        // them still answers `None` rather than inventing an open turn.
+        assert_eq!(
+            eidolon_state_from_trace(&lines(&["{ not json", "", "[1,2]"])),
+            None
+        );
+        // A torn line BEFORE a good record does not erase it...
+        assert_eq!(
+            eidolon_state_from_trace(&lines(&["{ torn", TRACE_SETTLED])),
+            Some("idle")
+        );
+        // ...and a torn line after one does not become the last record.
+        assert_eq!(
+            eidolon_state_from_trace(&lines(&[TRACE_SETTLED, "{ torn"])),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn a_trace_outranks_busy_in_every_direction_and_never_falls_back_to_it() {
+        // A headless run: `busy` is permanently false and `tui` false -- and
+        // the trace says a turn is OPEN. This is the whole reason the trace
+        // exists; the weaker signal must not overrule it.
+        assert_eq!(
+            eidolon_state(false, false, Some(&lines(&[TRACE_ASSISTANT]))),
+            "working"
+        );
+        // The reverse: a TUI reporting busy:true while the trace shows the
+        // turn settled. The record says idle.
+        assert_eq!(
+            eidolon_state(true, true, Some(&lines(&[TRACE_SETTLED]))),
+            "idle"
+        );
+        assert_eq!(
+            eidolon_state(true, true, Some(&lines(&[TRACE_CANCELLED]))),
+            "stopped"
+        );
+        assert_eq!(
+            eidolon_state(false, true, Some(&lines(&[TRACE_ASK_OPEN]))),
+            "awaiting"
+        );
+        // An EMPTY trace is still authority: `busy:false` on a TUI owner
+        // would have read "idle" on the presence rule, and the trace's own
+        // no-evidence answer (`unknown`, folded to idle) is what shows.
+        assert_eq!(eidolon_state(false, true, Some(&[])), "unknown");
+        assert_eq!(canonical_state(eidolon_state(false, true, Some(&[]))), "idle");
+    }
+
+    #[test]
+    fn the_state_rule_never_emits_a_token_outside_the_canonical_vocabulary() {
+        let corpus = [
+            TRACE_START, TRACE_PROMPT, TRACE_ASSISTANT, TRACE_RESULT, TRACE_BUDGET, TRACE_SETTLED,
+            TRACE_CANCELLED, TRACE_ASK_OPEN, TRACE_ASK_ANSWERED, TRACE_CONTEXT, TRACE_EXTERNAL,
+        ];
+        // Every prefix of the corpus, so every "last record" arm is walked.
+        // The FOLD's own range is exactly the canonical five -- it never
+        // produces the absence-of-evidence literal; that literal is the
+        // caller's (`eidolon_state`'s) fallback for "the trace said nothing",
+        // and the composition is asserted below.
+        for n in 1..=corpus.len() {
+            let tail = lines(&corpus[..n]);
+            let state = eidolon_state_from_trace(&tail).expect("a readable record is evidence");
+            assert!(
+                matches!(state, "working" | "awaiting" | "stopped" | "idle"),
+                "prefix of len {n} produced {state:?}"
+            );
+            assert_eq!(canonical_state(state), state, "already canonical: {state:?}");
+        }
+        assert_eq!(eidolon_state_from_trace(&[]), None, "no records, no verdict");
+
+        // The composition adds exactly ONE more value, and only for "the
+        // trace said nothing": the module's long-standing absence-of-evidence
+        // literal, which the vocabulary folds to `idle`.
+        let composed = eidolon_state(false, false, Some(&[]));
+        assert_eq!(composed, "unknown");
+        assert_eq!(canonical_state(composed), "idle");
+    }
+
+    #[test]
+    fn awaiting_and_cancel_are_reachable_now_but_error_never_is() {
+        // The state rule's range, exhaustively over every (busy, tui, trace)
+        // shape this module can construct -- `error` is the one canonical
+        // token nothing here may ever produce (PolicyVerdict never leaves
+        // eidolon's in-process bus).
+        let tails: [Option<Vec<String>>; 5] = [
+            None,
+            Some(Vec::new()),
+            Some(lines(&[TRACE_ASK_OPEN])),
+            Some(lines(&[TRACE_CANCELLED])),
+            Some(lines(&[TRACE_SETTLED])),
+        ];
+        let mut seen = std::collections::BTreeSet::new();
         for busy in [true, false] {
             for tui in [true, false] {
-                let s = eidolon_state(busy, tui);
-                assert!(
-                    !matches!(s, "awaiting" | "error" | "cancel"),
-                    "eidolon_state({busy}, {tui}) produced the taught-absent {s:?}"
-                );
+                for tail in &tails {
+                    let s = eidolon_state(busy, tui, tail.as_deref());
+                    assert_ne!(s, "error", "eidolon_state({busy}, {tui}) produced error");
+                    seen.insert(s);
+                }
+            }
+        }
+        // The reachable set is exactly the four canonical states plus the
+        // absence-of-evidence literal -- `awaiting` and `stopped` ARE
+        // reachable now, which is what the trace changed.
+        assert!(seen.contains("awaiting"));
+        assert!(seen.contains("stopped"));
+        assert!(!seen.contains("done"), "no trace record means the session exited");
+    }
+
+    #[test]
+    fn error_is_still_never_produced() {
+        let settled = lines(&[TRACE_SETTLED]);
+        for busy in [true, false] {
+            for tui in [true, false] {
+                for trace in [None, Some(settled.as_slice())] {
+                    let s = eidolon_state(busy, tui, trace);
+                    assert_ne!(s, "error", "eidolon_state({busy}, {tui}) produced error");
+                }
             }
         }
     }
@@ -867,8 +1225,105 @@ mod tests {
                 assert_eq!(s.cwd, "/home/khoa");
                 assert!(s.tui, "no subcommand on the table row is the TUI");
                 assert!(!s.busy);
+                assert_eq!(
+                    s.trace, None,
+                    "an older eidolon writes no `trace` field -- the presence rule applies"
+                );
             }
             PresenceScan::Unknown(f) => panic!("expected Observed, got Unknown({f:?})"),
+        }
+        std::fs::remove_dir_all(root).ok();
+    }
+
+    /// The gather's half of the state rule: a presence that names a trace
+    /// hands the reconciler that trace's LINES, read through the one reader
+    /// (`aoide_protocol::agents::eidolon_trace_tail`) — and a presence that
+    /// names nothing, or names something that is not a trace, hands it
+    /// `None` (the presence rule's own shape).
+    #[test]
+    fn the_gather_reads_a_presences_trace_and_ignores_a_non_trace_path() {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        let _guard = crate::env_lock().lock().unwrap_or_else(|e| e.into_inner());
+        let _env = EnvVars::save(&["XDG_RUNTIME_DIR"]);
+        let root = unique_stage("eidolon-presence-trace");
+        std::env::set_var("XDG_RUNTIME_DIR", &root);
+        let presence_dir = presence_root();
+
+        // One presence whose `trace` points at a real `.jsonl`, one whose
+        // `trace` points at its own `meta.json` (not a trace at all), one
+        // whose `trace` points at a file that is not there, and one that
+        // writes no `trace` key at all.
+        let trace_path = root.join("sessions").join("1000000000000.jsonl");
+        std::fs::create_dir_all(trace_path.parent().unwrap()).unwrap();
+        std::fs::write(&trace_path, format!("{TRACE_PROMPT}\n{TRACE_ASSISTANT}\n")).unwrap();
+
+        let mut sockets = Vec::new();
+        for (id, trace, pid) in [
+            ("has-trace", Some(trace_path.to_string_lossy().to_string()), 4201u32),
+            ("meta-stand-in", Some("__META__".to_string()), 4202),
+            ("trace-gone", Some(root.join("sessions/nope.jsonl").to_string_lossy().to_string()), 4203),
+            ("no-trace-field", None, 4204),
+        ] {
+            let dir = presence_dir.join(id);
+            std::fs::create_dir_all(&dir).unwrap();
+            let mut meta = serde_json::json!({
+                "id": id, "pid": pid, "log": format!("/tmp/eid/sessions/{id}.eid"),
+                "cwd": "/home/khoa", "repo": null, "model": "ollama:x",
+                "started_ms": 0, "title": "t", "busy": false
+            });
+            let trace = match trace.as_deref() {
+                Some("__META__") => Some(dir.join("meta.json").to_string_lossy().to_string()),
+                other => other.map(str::to_string),
+            };
+            if let Some(t) = trace {
+                meta["trace"] = serde_json::json!(t);
+            }
+            std::fs::write(dir.join("meta.json"), meta.to_string()).unwrap();
+
+            let listener = UnixListener::bind(dir.join("sock")).unwrap();
+            sockets.push(std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut buf = [0u8; 256];
+                let _ = stream.read(&mut buf);
+                let _ = stream.write_all(br#"{"ok":true}"#);
+            }));
+        }
+
+        let table = [
+            "4201 1 eidolon",
+            "4202 1 eidolon",
+            "4203 1 eidolon",
+            "4204 1 eidolon",
+        ]
+        .join("\n");
+        let scan = eidolon_presence_sessions_with(|| Some(format!("{table}\n")));
+        for handle in sockets {
+            handle.join().unwrap();
+        }
+
+        let sessions = match scan {
+            PresenceScan::Observed(s) => s,
+            PresenceScan::Unknown(f) => panic!("expected Observed, got Unknown({f:?})"),
+        };
+        assert_eq!(sessions.len(), 4);
+        let by_id = |id: &str| sessions.iter().find(|s| s.id == id).unwrap();
+
+        let traced = by_id("has-trace").trace.as_ref().expect("the trace was read");
+        assert_eq!(traced.len(), 2, "one line per record");
+        assert_eq!(
+            eidolon_state_from_trace(traced),
+            Some("working"),
+            "an open turn, off the trace that presence named"
+        );
+
+        for id in ["meta-stand-in", "trace-gone", "no-trace-field"] {
+            assert_eq!(
+                by_id(id).trace,
+                None,
+                "{id}: not a trace -- the presence rule, never a stream of nonsense"
+            );
         }
         std::fs::remove_dir_all(root).ok();
     }

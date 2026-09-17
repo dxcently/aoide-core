@@ -262,6 +262,16 @@ mod tests {
         // exact-replacement editor for a project's root list, the
         // `project edit` that `records.rs`'s `Project.auto_resume` doc
         // used to say did not exist.
+        //
+        // Bumped by 1 for `session.trace` (P-EIDOLON slice E6) — the read
+        // surface over a harness's own TRACE file
+        // (`docs/architecture/EIDOLON-TRACE.md`): `aoide session trace <id>
+        // [--tail N] [--follow] [--json]` renders the run step by step.
+        // Registered from `aoide-conduct` beside `session.pending.list`, its
+        // own neighbourhood, so the sort slot is between `session.reap` and
+        // `session.start`. Read-only — no stage write, no daemon, no lock —
+        // so it sits outside the L4 dual-writer family entirely. Net: 81 + 1
+        // = 82.
         let mut expected: Vec<&str> = vec![
             "a2a.serve",
             "adapter.melete",
@@ -351,6 +361,7 @@ mod tests {
             "session.prune",
             "session.reap",
             "session.start",
+            "session.trace",
             "context",
             "soundcheck",
             "spawn",

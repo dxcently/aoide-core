@@ -573,8 +573,28 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   eidolon's own producer-side defect (never set outside the TUI) so such a
   record carries the literal `state:"unknown"` — `aoide_protocol::
   canonical_state` folds that to `"idle"`, its own "no evidence" arm, never
-  a sixth state invented here. `windowAddress`/`workspace` are left empty
-  for the existing `resolve_pending_session_windows` sweep to fill, exactly
+  a sixth state invented here. **The TRACE decides when there is one
+  (P-EIDOLON slice E6, `docs/architecture/EIDOLON-TRACE.md`):** eidolon
+  mirrors its journal as `<log>.jsonl`, one JSON record per line, and names
+  it from `meta.json.trace`. `read_presence_trace` (the gather's I/O,
+  delegating to `aoide_protocol::agents::eidolon_trace_tail`, the ONE trace
+  reader) reads that tail; `eidolon_state(busy, tui, trace)` then consults it
+  FIRST and returns `eidolon_state_from_trace`'s fold outright when it is
+  `Some` — the LAST readable record decides: `TurnSettled` → `idle`,
+  `Cancelled` → `stopped` (the canonical vocabulary's "the turn ended by a
+  stop"; there is no `cancel` state to emit), `AskUser` with `answer: null` →
+  `awaiting`, anything else → `working`. **Nothing falls back to `busy` when
+  a trace exists**, including for a trace that is empty or whose last record
+  Aoide cannot read (that fold returns `None` and the record carries the
+  literal `"unknown"`): a headless run's `busy` is permanently `false` — the
+  exact non-fact the trace exists to replace. `None` from
+  `read_presence_trace` (an absent/blank field, an older eidolon, a
+  non-`.jsonl` path, a vanished file) is the one case the presence rule
+  above still governs. A read failure is not a scan failure: a trace that
+  cannot be read right now says nothing about liveness, so the pass carries
+  on with `None` for that one session rather than voiding every observation.
+  `windowAddress`/`workspace` are left empty
+  for the existing `resolve_pending_sessions_windows` sweep to fill, exactly
   as codex's own module leaves them.
 
   Discovery is read-only over `$XDG_RUNTIME_DIR/eidolon/<id>/{meta.json,
@@ -625,14 +645,41 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   replace keeps its existing roots rather than being wiped); `removehost`
   runs `project remove <name> --host <host>` and requires exactly one host.
   Every other socket command stays fire-and-forget.
-- `commands` — this crate's CLI commands: 19 paths registered in one
-  `register()` call (`conduct/src/commands/graph.rs`, still that file's name
+- `commands` — this crate's CLI commands, registered from one `register()`
+  call (`conduct/src/commands/graph.rs`, still that file's name
   post-cutover) — the `graph` family narrowed at task #101 R1 to the bare
   render plus `graph link`, while `send`/`spawn`/`resurrect` went bare and
   `session *`/`project *` promoted to their own top-level groups — plus
   `conduct`, `hooks install`, `node list` (the standalone `who` command that
   used to round out this list is retired, session-surface redesign,
   command-defrag lane X, 2026-08-28 — folded into bare `session`/`--hosts`).
+  `session trace` joined the `session` family at P-EIDOLON slice E6, beside
+  `session pending list`; the exact path set and its count live in `cli`'s
+  golden snapshot, never here.
+- **`session trace <id> [--tail N] [--follow] [--json]` (P-EIDOLON slice
+  E6, `docs/architecture/EIDOLON-TRACE.md`)** — `graph/trace.rs::
+  session_trace`, the read surface over a harness's own TRACE: the whole run,
+  record by record, where every other session command reads the roster or
+  acts on a session. Human form is one line per record,
+  `#<id>  <hh:mm:ss local>  <kind>  <summary>` — an assistant message shows
+  its thinking (dimmed, cut to 80) then its text then each `→ tool(name)`,
+  a tool result shows its first line prefixed `!` when it errored, a settled
+  turn shows its stop reason and input/output tokens; `--json` passes the
+  raw lines through unchanged, `--follow` re-reads every 500ms until Ctrl-C
+  (CLI-only), `--tail N` shows the last N (default 50). **Read-only, and so
+  outside every other discipline in this file:** no stage write, no stage
+  lock, no `daemon_dispatch` — unlike the L4 session-WRITE family above,
+  there is nothing to route. `<id>` resolves through
+  `aoide_storage::addr::resolve`, the SAME resolver `send --to` and bare
+  `session`'s filter use (a `node/<rest>` target is a taught refusal: a
+  trace is a file on the node that wrote it, and the hub preference is
+  `send`'s routing rule, not a reader's); the trace is reached through the
+  harness CAPABILITY `TranscriptSpec::trace` and its path through
+  `TranscriptSpec::locate`, never by naming a harness by string. A session
+  whose harness keeps no trace, whose presence names none, or whose agent
+  has no registered profile is a taught error naming which — never an empty
+  listing; a trace that EXISTS and holds no records yet is an honest `0
+  record(s)`.
 - **The durable session ledger + resurrect (P-D8, `docs/architecture/
   AOIDED.md`'s "L5"):** `graph/doc.rs::ledger_session_exit` is the ONE
   shared call both `session_store.rs::do_session_end_inner` (a clean

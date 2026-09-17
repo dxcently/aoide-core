@@ -235,6 +235,24 @@ pub fn register(r: &mut Registry) {
         examples: ["session pending list"],
     ));
     r.insert(cmd!(
+        path: ["session", "trace"],
+        summary: "Render a session's TRACE, one line per record — the run, step by step (docs/architecture/EIDOLON-TRACE.md: eidolon mirrors its journal as one JSON record per line and names that file from its own presence metadata; it is the one harness that does today). <id> resolves like `send --to` (id / tail4 / petname). Human form is `#<id>  <hh:mm:ss local>  <kind>  <summary>` — an assistant message shows its thinking (dimmed, cut) then its text then each `→ tool(name)`, a tool result shows its first line prefixed `!` when it errored, a settled turn shows its stop reason and tokens. --tail N shows the last N records (default 50); --follow re-reads for new lines until Ctrl-C (CLI-only); --json passes the raw trace lines through unchanged, byte for byte. A session whose harness keeps no trace (or whose presence names none) is a taught error naming which of the two it is, never an empty listing. Read-only: no stage write, no daemon, no lock.",
+        args: [arg!("id", "string", true, "Session to render: a local session id, its tail4, or its petname (resolved by the same resolver `send --to` uses).")],
+        flags: [
+            flag!("tail", "int", "Show only the last N records (default 50). A non-numeric or zero value is a usage error, never a silently empty listing."),
+            flag!("follow", "bool", "Re-read the trace every 500ms and print new records as they land; blocks until Ctrl-C. CLI-only — a follow that parks a connection makes no sense over MCP/A2A/the daemon socket."),
+        ],
+        gated: false,
+        implemented: true,
+        handler: crate::graph::session_trace,
+        examples: [
+            "session trace brave-otter",
+            "session trace 7d23 --tail 20",
+            "session trace Aoide-7d23 --follow",
+            "session trace brave-otter --json",
+        ],
+    ));
+    r.insert(cmd!(
         path: ["session", "pending", "approve"],
         summary: "Approve one held pending entry: re-drive it through the one gated injection door (`send`, in-process, --yes) and remove it from the queue. A malformed or out-of-range id fails cleanly, leaving the entry untouched.",
         args: [arg!("id", "string", true, "Pending entry id — its position from `session pending list`.")],

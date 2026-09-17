@@ -119,7 +119,21 @@ other crate in this workspace sits above.
   `say`/`tool`/`context_tokens` are named-absent rather than filled — and
   it is the one profile so far with `native_send: Some(...)`, since a
   message to it never needs the pty composer a keystroke path would
-  otherwise reach.
+  otherwise reach. `TranscriptSpec::trace` (`Option<fn(&Path) ->
+  Option<Vec<String>>>`) is the new HARNESS CAPABILITY on the same table —
+  `Some` only for a harness that mirrors its journal as one JSON record per
+  line and names that file from its own presence metadata (eidolon, via
+  `eidolon_trace_tail`); `None` for every harness whose only on-disk turn log
+  is its transcript. It is what lets a consumer that needs a trace test for
+  one without ever naming a harness by string (`if agent == "eidolon"` is
+  exactly the scatter this table exists to avoid) — `aoide session trace` is
+  its first caller. `eidolon_transcript_locate` returns that trace when the
+  presence names one that exists (else `meta.json`, the stand-in it always
+  returned), and `eidolon_transcript_tail` routes on the extension — so
+  every extractor reads either shape. `TraceRecord`/`eidolon_trace_record`
+  parse ONE trace line into its variant name and payload, the shape
+  `docs/architecture/EIDOLON-TRACE.md` fixes (eidolon owns it; Aoide reads
+  it) — the same parse `conduct`'s state fold reads, never a second one.
 - `bin` — sibling-binary resolution (`core_bin`/`rice_bin`; env override →
   sibling-of-`current_exe` → bare `PATH` name), plus `on_path` (P-I2,
   ONBOARD.md decision 3): the proactive `PATH` probe the resolver's own

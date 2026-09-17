@@ -333,6 +333,41 @@
   `EIDOLON_PROFILE` through that same one path, with no eidolon-specific
   branch added to `profile_for` itself.
 
+- **The LAST trace record decides an eidolon record's state — never
+  inferred from the presence `meta.json` while a trace exists
+  (P-EIDOLON E6, `docs/architecture/EIDOLON-TRACE.md`).**
+  `eidolon.rs::eidolon_state(busy, tui, trace)` consults the trace FIRST and
+  returns its fold outright when `trace` is `Some` (possibly EMPTY): the
+  presence's `busy`/TUI-ness never overrules it, and never fills in for a
+  trace that is empty or whose last record Aoide cannot read —
+  `eidolon_state_from_trace` returns `None` there and the function carries
+  the literal `"unknown"` (the vocabulary's own absence-of-evidence arm)
+  rather than a guess from a weaker signal. `read_presence_trace` is the one
+  place the presence's `trace` field becomes lines (delegating to
+  `aoide_protocol::agents::eidolon_trace_tail`, the ONE trace reader); a
+  non-`.jsonl` path, a missing file, or an absent key is `None` — the older-
+  eidolon shape, which is exactly when the presence rule below applies. Don't
+  reorder the two rules, and don't soften the `None`/`Some(empty)`
+  distinction: it is what makes a headless run (whose `busy` is permanently
+  false, eidolon's own producer-side defect) finally carry a real state.
+- **`session trace` is read-only and sits outside every session-WRITE
+  discipline.** `graph/trace.rs::session_trace` takes no stage lock, never
+  calls `aoide_client::daemon::daemon_dispatch` (the L4 dual-writer prefix
+  every `session start/phase/end`, `session hook`, `session reap` and
+  `session grant exempt` carries), and writes nothing — it loads
+  `sessions.json`, reads a trace file and prints. Don't fold it into that
+  family "for consistency": there is nothing to route to the daemon.
+  `<id>` resolves through `aoide_storage::addr::resolve`, the SAME resolver
+  `send --to` and bare `session`'s filter use (never a second one, and no
+  hub preference — that is a routing rule for `send`, not a rule for reading
+  a file that lives on this box, so a `node/<rest>` target is a taught
+  refusal rather than a remote read). The trace is reached through the
+  harness CAPABILITY `TranscriptSpec::trace`, never by naming a harness by
+  string, and the path through `TranscriptSpec::locate` — the same locator
+  the reaper's transcript refresh calls. `--follow` is CLI-only (a follow
+  that parks a connection makes no sense over MCP/A2A/the daemon socket),
+  with the `events tail`/`secrets watch` signal-loop shape.
+
 - **`session bind` assigns continuity, never authority.** Keep the operation
   daemon-owned and local-only; no missing-daemon fallback. It does not load
   optional Mneme config, change grants, or replace executor-specific mail

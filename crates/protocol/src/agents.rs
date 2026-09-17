@@ -68,6 +68,22 @@ pub struct TranscriptSpec {
     pub subagents_dir: fn(session_id: &str, cwd: Option<&str>) -> Option<PathBuf>,
     /// Find the sub-agent transcript in `dir` for a `sub:<tuid>` node key.
     pub find_subagent: fn(dir: &Path, tuid: &str) -> Option<PathBuf>,
+    /// The harness's own TRACE reader — `Some` only for a harness that
+    /// mirrors its journal as one JSON record per line and names that file
+    /// from its presence metadata (eidolon:
+    /// [`eidolon_trace_tail`], `docs/architecture/EIDOLON-TRACE.md`); `None`
+    /// for every harness whose only on-disk turn log is its transcript.
+    ///
+    /// This is the CAPABILITY test a caller that needs a trace must make —
+    /// `aoide session trace` is the first one — so no consumer ever names a
+    /// harness by string (`if agent == "eidolon"` is exactly the scatter
+    /// this table exists to avoid; see this crate's `AGENTS.md`). The
+    /// returned lines are whole JSONL lines off the END of the file, the
+    /// same shape every other `tail` here returns; `None` means the path is
+    /// not a trace file at all (the presence stand-in `locate` falls back
+    /// to), which a caller must be able to tell apart from a trace that is
+    /// merely empty right now.
+    pub trace: Option<fn(path: &Path) -> Option<Vec<String>>>,
 }
 
 /// The on-disk format of an agent's hook-settings file.
@@ -292,20 +308,19 @@ fn one_line_clip(s: &str, max: usize) -> String {
     }
 }
 
-/// Read the last ~32 KiB of the transcript as whole JSONL lines (a leading
-/// partial line dropped). Empty on any read error. Transcripts grow unbounded,
-/// so only the tail is scanned — enough for the freshest `say` +
-/// `custom-title`.
-fn transcript_tail(path: &Path) -> Vec<String> {
+/// Read the last `budget` bytes of a JSONL file as whole lines (a leading
+/// partial line dropped). Empty on any read error. Every one of these files
+/// grows unbounded, so only a tail is ever scanned — enough for the freshest
+/// records, never the whole history.
+fn transcript_tail_bounded(path: &Path, budget: u64) -> Vec<String> {
     use std::io::{Read, Seek, SeekFrom};
-    const TAIL: u64 = 32 * 1024;
     let Ok(mut f) = std::fs::File::open(path) else {
         return Vec::new();
     };
     let Ok(len) = f.metadata().map(|m| m.len()) else {
         return Vec::new();
     };
-    let start = len.saturating_sub(TAIL);
+    let start = len.saturating_sub(budget);
     if f.seek(SeekFrom::Start(start)).is_err() {
         return Vec::new();
     }
@@ -319,6 +334,14 @@ fn transcript_tail(path: &Path) -> Vec<String> {
         lines.remove(0); // the seek likely split a line — drop the partial head
     }
     lines
+}
+
+/// The transcript tail every profile's [`TranscriptSpec::tail`] reads: the
+/// last 32 KiB as whole JSONL lines — enough for the freshest `say` +
+/// `custom-title`.
+fn transcript_tail(path: &Path) -> Vec<String> {
+    const TAIL: u64 = 32 * 1024;
+    transcript_tail_bounded(path, TAIL)
 }
 
 /// The agent's latest words: the last matching assistant `text` block in the
@@ -685,6 +708,8 @@ pub static CLAUDE_PROFILE: AgentProfile = AgentProfile {
         context_tokens: transcript_context_tokens,
         subagents_dir,
         find_subagent: find_subagent_transcript,
+        // No mirrored trace — claude's own transcript IS its turn log.
+        trace: None,
     },
     hook_settings: SettingsSpec {
         relative_path: ".claude/settings.json",
@@ -1092,6 +1117,8 @@ pub static KIMI_PROFILE: AgentProfile = AgentProfile {
         context_tokens: kimi_context_tokens,
         subagents_dir: kimi_subagents_dir,
         find_subagent: kimi_find_subagent,
+        // No mirrored trace: kimi's own wire log IS its turn record.
+        trace: None,
     },
     hook_settings: SettingsSpec {
         relative_path: ".kimi-code/config.toml",
@@ -1419,6 +1446,8 @@ pub static PI_PROFILE: AgentProfile = AgentProfile {
         context_tokens: pi_context_tokens,
         subagents_dir: pi_subagents_dir,
         find_subagent: pi_find_subagent,
+        // No mirrored trace: pi's transcript IS its turn record.
+        trace: None,
     },
     hook_settings: SettingsSpec {
         relative_path: ".pi/agent/extensions/aoide-pi-session.ts",
@@ -1477,23 +1506,118 @@ fn eidolon_hook_event(_: &str) -> HookClass {
     HookClass::Unknown
 }
 
-// ── eidolon presence layout ─────────────────────────────────────────────────
+// ── eidolon: presence layout, and the trace ─────────────────────────────────
 //
-// Eidolon has no hook transcript at all: its durable turn log
+// Eidolon is written to disk twice. Its durable turn log
 // (`~/.local/share/eidolon/sessions/<epoch-ms>.eid`) is a bitcode-framed
 // binary journal (`core/src/session/log.rs:1-38`) — opened read-write by the
 // harness's own `log` subcommand, which repairs a torn tail in place, and
-// unparseable without eidolon's own decoder, so it is not a safe read
-// target here. What IS safe, small, and already JSON is the swarm presence
-// file every launch registers:
+// unparseable without eidolon's own decoder, so it is not a safe read target
+// here. Beside it, eidolon mirrors that same journal as ONE JSON RECORD PER
+// LINE in `<log>.jsonl` — the TRACE, whose shape and state rule are the
+// contract `docs/architecture/EIDOLON-TRACE.md` states (producer: eidolon;
+// reader: Aoide, and this file is the reader's half). And every launch
+// registers a swarm presence file:
 // `$XDG_RUNTIME_DIR/eidolon/<id>/meta.json` — a single flat object
-// (id/pid/log/cwd/repo/model/started_ms/title/busy, `presence.rs:33-53`,
-// `swarm/src/lib.rs:16-31`). The id is deterministic from `(cwd, log)`
-// (`presence.rs:399-421`), never a timestamp, and that id IS this profile's
-// `session_id` — so `locate` below needs no search, no cwd bucket, no
-// directory scan: the id names its own file directly.
+// (id/pid/log/cwd/repo/model/started_ms/title/busy + the trace's own path,
+// `presence.rs:33-53`, `swarm/src/lib.rs:16-31`). The id is deterministic
+// from `(cwd, log)` (`presence.rs:399-421`), never a timestamp, and that id
+// IS this profile's `session_id` — so `locate` below needs no search, no cwd
+// bucket, no directory scan: the id names its own file directly.
+//
+// Two trace-aware consequences for everything below. `locate` returns the
+// TRACE when `meta.json` names one (`"trace": "<path>"`, the one new
+// presence field) and the presence file itself otherwise — an older eidolon
+// still enrolled, still readable, just with nothing but metadata to show.
+// And `tail` routes on which of the two it was handed: a `.jsonl` takes the
+// ordinary line tail, `meta.json` keeps the compacting single-line read.
+// Every extractor then reads BOTH line shapes, discriminated by the one
+// structural fact that separates them — a trace line carries a top-level
+// `kind`, a presence line does not.
 
-/// Resolve an eidolon session's presence file directly:
+/// The last `Record` of a trace, in the shape a consumer renders or folds it
+/// from: the externally-tagged `kind`'s variant NAME plus that variant's
+/// payload. `docs/architecture/EIDOLON-TRACE.md` fixes this shape — eidolon
+/// owns it, Aoide reads it — so it lives here, beside every other piece of
+/// eidolon's on-disk contract, rather than being re-derived by each consumer.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TraceRecord {
+    /// The record's own journal id, rendered as a string (`0`, `131`) — the
+    /// `#<id>` a trace reader shows per line. Read leniently: a numeric or
+    /// string spelling is taken verbatim, and anything else (a missing or
+    /// malformed `id`) reads `"?"`, never a failure to parse the record.
+    pub id: String,
+    /// `ts_ms` — eidolon's own clock at append. `None` when the line carries
+    /// no readable one.
+    pub ts_ms: Option<i64>,
+    /// The `kind`'s variant name: a struct/tuple variant is a one-key object
+    /// (`{"TurnSettled":{"stop_reason":…}}` → `"TurnSettled"`), a unit
+    /// variant a bare string (`"Cancelled"` → `"Cancelled"`).
+    pub kind: String,
+    /// That variant's payload object, or `None` for a unit variant (which
+    /// carries none) — never an invented empty object.
+    pub payload: Option<Value>,
+}
+
+/// Parse ONE trace line into its [`TraceRecord`], or `None` when the line is
+/// not a trace record at all — a presence `meta.json` line (see
+/// [`eidolon_transcript_tail`]), a malformed line, or a `kind` that is
+/// neither a string nor a one-key object.
+pub fn eidolon_trace_record(line: &str) -> Option<TraceRecord> {
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    let kind = v.get("kind")?;
+    let name = trace_kind_name(kind)?.to_string();
+    Some(TraceRecord {
+        id: trace_id(v.get("id")).unwrap_or_else(|| "?".to_string()),
+        ts_ms: v.get("ts_ms").and_then(Value::as_i64),
+        payload: trace_variant(&v, trace_kind_name(kind)?).cloned(),
+        kind: name,
+    })
+}
+
+/// A trace line's own `id`, in whichever of the two spellings the journal
+/// uses — the sample contract writes a number, and nothing about the shape
+/// promises it stays one.
+fn trace_id(id: Option<&Value>) -> Option<String> {
+    match id? {
+        Value::String(s) if !s.is_empty() => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// The variant NAME of a trace line's `kind`, or `None` when `kind` is not
+/// one of the two shapes eidolon's externally-tagged `RecordKind` serializes
+/// to.
+fn trace_kind_name(kind: &Value) -> Option<&str> {
+    match kind {
+        Value::String(s) => Some(s.as_str()),
+        Value::Object(o) if o.len() == 1 => o.keys().next().map(String::as_str),
+        _ => None,
+    }
+}
+
+/// The PAYLOAD of trace variant `name` on this line — `None` for a unit
+/// variant (no payload), a line of another kind, or a non-trace line.
+fn trace_variant<'a>(line: &'a Value, name: &str) -> Option<&'a Value> {
+    let kind = line.get("kind")?;
+    if trace_kind_name(kind) != Some(name) {
+        return None;
+    }
+    match kind {
+        Value::Object(o) => o.get(name),
+        _ => None,
+    }
+}
+
+/// The content blocks of a trace `AssistantMessage`/`UserMessage` payload;
+/// an absent or non-array `content` reads as no blocks.
+fn trace_content(payload: &Value) -> &[Value] {
+    const NONE: &[Value] = &[];
+    payload.get("content").and_then(Value::as_array).map(Vec::as_slice).unwrap_or(NONE)
+}
+
+/// Resolve an eidolon session's readable file directly:
 /// `$XDG_RUNTIME_DIR/eidolon/<session_id>/meta.json`, falling back to
 /// `std::env::temp_dir()` exactly as eidolon's own `Presence::root()` does
 /// (`presence.rs:104-110`) — a caller that only ever consulted
@@ -1510,8 +1634,17 @@ fn eidolon_hook_event(_: &str) -> HookClass {
 /// alone derives the ONE path this session can mean, so a hint that agreed
 /// would change nothing and a hint that disagreed would be pointing at some
 /// OTHER session's file — never followed either way. `cwd` is accepted and
-/// unused for the same reason. `None` when the file does not exist (a stale
-/// or torn-down presence dir looks the same as one that never existed).
+/// unused for the same reason.
+///
+/// The TRACE WINS when the presence file names one that exists: the trace is
+/// the whole run, record by record, where `meta.json` is a handful of facts
+/// about it. `meta.json` is returned instead — never a miss — for an older
+/// eidolon whose presence carries no `trace` field, or one whose trace file
+/// is not there (a torn-down or never-created trace): the presence file is
+/// still a real, readable description of the session, and the extractors
+/// below read either shape. `None` only when the presence file itself does
+/// not exist (a stale or torn-down presence dir looks the same as one that
+/// never existed).
 fn eidolon_transcript_locate(
     session_id: &str,
     _cwd: Option<&str>,
@@ -1520,7 +1653,37 @@ fn eidolon_transcript_locate(
     let root = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
-    let path = root.join("eidolon").join(session_id).join("meta.json");
+    let meta = root.join("eidolon").join(session_id).join("meta.json");
+    if !meta.is_file() {
+        return None;
+    }
+    if let Some(trace) = eidolon_presence_trace(&meta) {
+        return Some(trace);
+    }
+    Some(meta)
+}
+
+/// `meta.json`'s own `trace` field, when it names an EXISTING file: the one
+/// new presence field (`docs/architecture/EIDOLON-TRACE.md`, "meta.json"),
+/// absent on an older eidolon. Read with the same 4 KiB cap
+/// [`eidolon_meta_line`] uses — the field is one path — and parsed leniently:
+/// an unreadable, unparseable, blank, or non-string value is simply "no
+/// trace", because the caller has a complete fallback (the presence file
+/// itself) and must never fail a session's whole refresh on it.
+fn eidolon_presence_trace(meta_path: &Path) -> Option<PathBuf> {
+    use std::io::Read;
+    const CAP: u64 = 4096;
+    let f = std::fs::File::open(meta_path).ok()?;
+    let mut buf = Vec::new();
+    if f.take(CAP).read_to_end(&mut buf).is_err() {
+        return None;
+    }
+    let value = serde_json::from_slice::<Value>(&buf).ok()?;
+    let trace = value.get("trace").and_then(Value::as_str)?.trim();
+    if trace.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trace);
     path.is_file().then_some(path)
 }
 
@@ -1532,17 +1695,16 @@ fn eidolon_transcript_locate(
 /// JSON on disk, so a line-splitting tail would hand every extractor below
 /// a fragment (`"{"` on one "line", `"title": "…"` on the next) that parses
 /// as nothing. Parsing once here, at the tail boundary, and recompacting is
-/// what lets `eidolon_extract_title`/`eidolon_extract_model` stay identical
-/// in shape to every other profile's per-line `serde_json::from_str`
-/// extractor. 4 KiB is generous headroom over every real recording (the
-/// longest fields are a home-relative log path and a title, both well under
-/// a hundred bytes, and pretty-printing only adds whitespace) while still
-/// bounding a corrupt or pathological file instead of reading it whole.
-/// Empty on ANY read error, non-UTF-8 content, or a JSON parse failure
-/// (including a file truncated by the byte cap) — never a partial or
-/// best-effort line, matching the brief's "never infer from a missing or
-/// partial tail" discipline.
-fn eidolon_transcript_tail(path: &Path) -> Vec<String> {
+/// what lets the extractors below stay identical in shape to every other
+/// profile's per-line `serde_json::from_str` extractor. 4 KiB is generous
+/// headroom over every real recording (the longest fields are a log path,
+/// the trace path, and a title, all well under a hundred bytes, and
+/// pretty-printing only adds whitespace) while still bounding a corrupt or
+/// pathological file instead of reading it whole. Empty on ANY read error,
+/// non-UTF-8 content, or a JSON parse failure (including a file truncated by
+/// the byte cap) — never a partial or best-effort line, matching the
+/// "never infer from a missing or partial tail" discipline.
+fn eidolon_meta_line(path: &Path) -> Vec<String> {
     use std::io::Read;
     const CAP: u64 = 4096;
     let Ok(f) = std::fs::File::open(path) else {
@@ -1561,25 +1723,167 @@ fn eidolon_transcript_tail(path: &Path) -> Vec<String> {
     vec![value.to_string()]
 }
 
-/// Always `None`: `meta.json` carries no turn content, and the journal that
-/// does (`.eid`) is unsafe to read directly (see the layout note above) and
-/// unparseable without eidolon's own bitcode decoder. Unsupported until the
-/// producer's `--jsonl` export lands (P-EIDOLON brief §3, slice E5) — named,
-/// not silently guessed absent.
-fn eidolon_extract_say(_lines: &[String], _skip_sidechain: bool) -> Option<String> {
-    None
+/// Eidolon's tail, routed on WHICH file [`eidolon_transcript_locate`] handed
+/// back: the trace (`<stem>.jsonl`, one record per line) takes the ordinary
+/// line tail every other profile uses — the shared [`transcript_tail`], same
+/// 32 KiB window, because a trace line is a JSONL line like any other's —
+/// while the presence `meta.json` keeps [`eidolon_meta_line`]'s compacting
+/// read (it is one pretty-printed object, not a stream of lines). The
+/// extension is the discriminator, not the caller: `locate` is the only
+/// thing that picks between the two files, and this function is the only
+/// reader of either.
+fn eidolon_transcript_tail(path: &Path) -> Vec<String> {
+    if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        return transcript_tail(path);
+    }
+    eidolon_meta_line(path)
 }
 
-/// Always `None`, same reason as [`eidolon_extract_say`]: no tool-call
-/// record exists in `meta.json`, and the journal that has one needs the
-/// slice-E5 producer export to read safely.
-fn eidolon_extract_tool(_lines: &[String], _skip_sidechain: bool) -> Option<String> {
-    None
+/// Read a session's trace as whole JSONL lines off its END — the reader
+/// [`TranscriptSpec::trace`] exposes, and the one `aoide session trace`
+/// renders. `None` unless the path IS an existing trace file: the presence
+/// stand-in `locate` returns for an eidolon with no trace (or any future
+/// harness whose profile carries no trace at all) is not one, and neither is
+/// a path a torn-down session already deleted. Saying so is what lets a
+/// caller teach the difference between "this harness keeps no trace" and
+/// "this trace is empty right now" instead of showing nothing and shrugging:
+/// a trace that EXISTS and holds no records yet is `Some(empty)`, never
+/// `None`.
+///
+/// The budget is [`TRACE_TAIL_BYTES`] (1 MiB), not the transcript tail's
+/// 32 KiB: a trace record is a WHOLE assistant message including its
+/// thinking blocks, so a handful of records can fill the smaller window —
+/// enough for the state fold (the last record decides) and for the freshest
+/// `say`/`tool`, but not for `session trace`'s own `--tail N`, whose default
+/// is 50 records. One bounded line-tail implementation
+/// ([`transcript_tail_bounded`]) with two callers choosing different
+/// budgets, never a second reader.
+pub fn eidolon_trace_tail(path: &Path) -> Option<Vec<String>> {
+    if path.extension().and_then(|e| e.to_str()) != Some("jsonl") || !path.is_file() {
+        return None;
+    }
+    Some(transcript_tail_bounded(path, TRACE_TAIL_BYTES))
 }
 
-/// The session's NAME: `meta.json.title`, eidolon's own session title field
-/// (set at launch, and by the TUI's rename). `None` when absent or blank.
+/// How far back [`eidolon_trace_tail`] reads: enough for `session trace`'s
+/// default 50 records of thinking-bearing assistant messages, still a bound
+/// rather than a whole-file read on a trace that runs for hours.
+const TRACE_TAIL_BYTES: u64 = 1024 * 1024;
+
+/// The agent's latest words: the last `AssistantMessage` record's last
+/// `text` content block, cleaned to a single line (≤160 chars) — the trace
+/// line shape `docs/architecture/EIDOLON-TRACE.md` fixes. `thinking` blocks
+/// are deliberately NOT folded in here: a trace's reasoning is rendered by
+/// `aoide session trace` as its own dimmed step, never summarised into the
+/// one field that stands for what the agent SAID. `None` when the tail holds
+/// no assistant text — including for a presence `meta.json` line, which
+/// carries none (no `kind`, so it is not an assistant message at all).
+///
+/// `skip_sidechain` is a claude-ism eidolon has no concept of (P5: no
+/// sub-agent transcripts — swarm peers are independent top-level processes);
+/// accepted and ignored, matching pi/kimi's own precedent.
+fn eidolon_extract_say(lines: &[String], _skip_sidechain: bool) -> Option<String> {
+    const SAY_MAX: usize = 160;
+    let mut found: Option<String> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let Some(msg) = trace_variant(&v, "AssistantMessage") else {
+            continue;
+        };
+        for block in trace_content(msg).iter().rev() {
+            if block.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            let Some(t) = block.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            let t = t.trim();
+            if !t.is_empty() {
+                found = Some(one_line_clip(t, SAY_MAX));
+                break;
+            }
+        }
+    }
+    found
+}
+
+/// The tool call IN FLIGHT: the last `tool_use` block of the trace, held
+/// until the `ToolResult` naming that same call id lands — so a finished
+/// call leaves this `None` (the session is not doing anything) rather than a
+/// stale row, and a call whose result is still outstanding shows the tool
+/// actually running. Read off the same tail the other extractors share, and
+/// shaped through the harness-neutral [`tool_label`] every other profile's
+/// tool extractor uses (claude's `tool_use`, pi's `toolCall` and kimi's
+/// `tool.call` all land there too), so a card reads identically whichever
+/// agent filled it. `None` for a presence `meta.json` line, which carries no
+/// tool records at all.
+fn eidolon_extract_tool(lines: &[String], _skip_sidechain: bool) -> Option<String> {
+    // (the call's own id, its one-line label) — cleared only by the result
+    // that answers that exact id.
+    let mut pending: Option<(String, String)> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if let Some(msg) = trace_variant(&v, "AssistantMessage") {
+            for block in trace_content(msg) {
+                if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+                    continue;
+                }
+                let Some(name) = block.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                // eidolon journals the call's arguments as a JSON STRING (its own
+                // block form); an object form is read as-is.
+                let input = block.get("input").map(|v| match v {
+                    Value::String(s) => serde_json::from_str::<Value>(s).unwrap_or_else(|_| v.clone()),
+                    other => other.clone(),
+                });
+                let Some(label) = tool_label(name, input.as_ref()) else {
+                    continue;
+                };
+                let id = block.get("id").and_then(Value::as_str).unwrap_or_default().to_string();
+                pending = Some((id, label));
+            }
+        }
+        if let Some(result) = trace_variant(&v, "ToolResult") {
+            let answered = result.get("tool_use_id").and_then(Value::as_str).unwrap_or_default();
+            if pending.as_ref().is_some_and(|(id, _)| id == answered) {
+                pending = None;
+            }
+        }
+    }
+    pending.map(|(_, label)| label)
+}
+
+/// The session's NAME: the FIRST `UserMessage` record's first `text` block —
+/// the first thing asked, which is what names a run for a human reading a
+/// roster. Falling back to `meta.json.title`, eidolon's own session title
+/// field (set at launch, and by the TUI's rename), when the tail holds no
+/// user message (a presence line, or a trace whose head the window has long
+/// since scrolled past). `None` when neither is there.
 fn eidolon_extract_title(lines: &[String]) -> Option<String> {
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        let Some(msg) = trace_variant(&v, "UserMessage") else {
+            continue;
+        };
+        for block in trace_content(msg) {
+            if block.get("type").and_then(Value::as_str) != Some("text") {
+                continue;
+            }
+            if let Some(t) = block.get("text").and_then(Value::as_str) {
+                let t = t.trim();
+                if !t.is_empty() {
+                    return Some(one_line_clip(t, 48));
+                }
+            }
+        }
+    }
     let mut found: Option<String> = None;
     for line in lines {
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
@@ -1595,33 +1899,54 @@ fn eidolon_extract_title(lines: &[String]) -> Option<String> {
     found
 }
 
-/// The session's active model: `meta.json.model`, provider-prefixed with a
-/// COLON as eidolon itself writes it (live-verified: `"claude-cli:opus"`).
-/// Returned verbatim, unstripped — `model_ceiling` below feeds this same
-/// string straight into the shared lookup with no prefix surgery, so the
-/// display value and the ceiling lookup's input are the same string.
-/// `skip_sidechain` is a claude-ism eidolon has no concept of (P5: no
-/// sub-agent transcripts — swarm peers are independent top-level
-/// processes); accepted and ignored, matching pi/kimi's own precedent.
+/// The session's active model: the LAST `SessionStart`/`ModelChanged`
+/// record's `model` — a resumed run can switch models mid-flight, and the
+/// freshest record is the one in force — else `meta.json.model`, which
+/// eidolon itself writes provider-prefixed with a COLON (live-verified:
+/// `"claude-cli:opus"`). Returned verbatim, unstripped — `model_ceiling`
+/// below feeds this same string straight into the shared lookup with no
+/// prefix surgery, so the display value and the ceiling lookup's input are
+/// the same string. `skip_sidechain` as [`eidolon_extract_say`].
 fn eidolon_extract_model(lines: &[String], _skip_sidechain: bool) -> Option<String> {
     let mut found: Option<String> = None;
     for line in lines {
         let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
             continue;
         };
-        if let Some(m) = v.get("model").and_then(Value::as_str) {
-            let m = m.trim();
-            if !m.is_empty() {
-                found = Some(m.to_string());
+        let started = trace_variant(&v, "SessionStart").or_else(|| trace_variant(&v, "ModelChanged"));
+        if let Some(model) = started
+            .and_then(|p| p.get("model"))
+            .or_else(|| v.get("model"))
+            .and_then(Value::as_str)
+        {
+            let model = model.trim();
+            if !model.is_empty() {
+                found = Some(model.to_string());
             }
         }
     }
     found
 }
 
-/// Always `None`: `meta.json` carries no usage/token data at all.
-fn eidolon_context_tokens(_lines: &[String]) -> Option<u64> {
-    None
+/// The session's context-window fill: the LAST `ContextSize` record's
+/// `tokens` (`{"ContextSize":{"tokens":134700}}`). `None` when the tail holds
+/// no such record — including a presence `meta.json` line, which carries no
+/// usage data at all. This is the one token number the trace states outright
+/// (`TurnSettled`'s `usage` is the turn's own accounting, not the window's
+/// fill, and is rendered by `aoide session trace` rather than folded in).
+fn eidolon_context_tokens(lines: &[String]) -> Option<u64> {
+    let mut found: Option<u64> = None;
+    for line in lines {
+        let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
+            continue;
+        };
+        if let Some(tokens) = trace_variant(&v, "ContextSize").and_then(|p| p.get("tokens")) {
+            if let Some(tokens) = tokens.as_u64() {
+                found = Some(tokens);
+            }
+        }
+    }
+    found
 }
 
 /// Eidolon has no sub-agent transcripts: swarm peers are independent
@@ -1673,14 +1998,15 @@ fn eidolon_native_send(to: &str) -> Vec<String> {
 }
 
 /// The Eidolon profile (P-EIDOLON brief rev 3, slice E1a) — bounded
-/// metadata only. Eidolon has no hook file and fires no event that reaches
-/// the door ([`eidolon_hook_event`] below is `Unknown` for everything, and
-/// `normalize_payload` is the identity no-op — both moot rather than
-/// absent, since nothing ever calls them for a harness `hook_settings`
-/// never wires a real file for), so this profile fills far less than
-/// claude/kimi/pi's own: everything it CAN report comes from the swarm
-/// presence file (`meta.json`), and every field it cannot fill is a taught
-/// refusal, not a guess:
+/// metadata plus the TRACE. Eidolon has no hook file and fires no event that
+/// reaches the door ([`eidolon_hook_event`] below is `Unknown` for
+/// everything, and `normalize_payload` is the identity no-op — both moot
+/// rather than absent, since nothing ever calls them for a harness
+/// `hook_settings` never wires a real file for), so this profile fills less
+/// than claude/kimi/pi's own: everything it reports comes off disk, from the
+/// swarm presence file (`meta.json`) and — when the presence names one — the
+/// trace beside the journal. Every field it cannot fill is a taught refusal,
+/// not a guess:
 /// - `permission_vocab: &[]`, `subagent_tools: &[]` — no notification
 ///   vocabulary and no sub-agent-spawning tool exist to name.
 /// - `permission_keys: None` — the interactive permission prompt is the
@@ -1711,17 +2037,19 @@ fn eidolon_native_send(to: &str) -> Vec<String> {
 ///   on describing the OLD log).
 /// - `native_send: Some(eidolon_native_send)` — see its own doc: the one
 ///   profile where a message never needs the pty composer at all.
-/// - `transcript.say`/`tool`/`context_tokens`: always `None` — eidolon's
-///   turn content lives in the bitcode-framed `.eid` journal
-///   (`core/src/session/log.rs:1-38`), not in `meta.json`, and reading that
-///   journal safely needs the producer's own `--jsonl` export (P-EIDOLON
-///   brief §3's "producer export"), unimplemented until slice E5.
-/// - state `awaiting`/`error`/`cancel` are UNOBSERVABLE by this profile, not
-///   merely unfilled: eidolon's `AskUser`/`PolicyVerdict`/`Cancelled`
-///   events never leave its in-process bus (`core/src/event.rs:1-8`), so no
-///   slice built on this profile alone can ever assert them — a fact for
-///   the reconciler that consumes this profile, not something this file
-///   can fix.
+/// - `transcript.locate` returns the TRACE when the presence file names one,
+///   else `meta.json`; `transcript.trace` is `Some(eidolon_trace_tail)` —
+///   the capability test `aoide session trace` makes, and the only reason no
+///   consumer needs to name this harness by string. Every extractor is
+///   `None` for a shape its file does not carry: `say`/`tool`/`context_tokens`
+///   off a bare `meta.json` (a presence line holds no turn records), `title`
+///   and `model` off either (`meta.json`'s own fields are the fallback).
+/// - state `error` is UNOBSERVABLE by this profile: eidolon's
+///   `PolicyVerdict` never leaves its in-process bus
+///   (`core/src/event.rs:1-8`). `awaiting`/`idle`/`working`/`stopped` ARE
+///   observable — from the trace's own last record, by the reconciler in
+///   `aoide-conduct`'s `graph/eidolon.rs`, which is where the state rule
+///   lives (`docs/architecture/EIDOLON-TRACE.md`).
 pub static EIDOLON_PROFILE: AgentProfile = AgentProfile {
     name: "eidolon",
     hook_event_map: eidolon_hook_event,
@@ -1746,6 +2074,11 @@ pub static EIDOLON_PROFILE: AgentProfile = AgentProfile {
         context_tokens: eidolon_context_tokens,
         subagents_dir: eidolon_subagents_dir,
         find_subagent: eidolon_find_subagent,
+        // The one profile whose harness mirrors its journal as JSONL — see
+        // `eidolon_trace_tail`'s own doc, and `TranscriptSpec::trace`'s for
+        // why the capability lives on the spec rather than a name compare at
+        // the call site.
+        trace: Some(eidolon_trace_tail),
     },
     // Eidolon has no hook file at all — its config is Nix-owned and
     // read-only to the harness (`~/eidolon/AGENTS.md`: "Configuration is
@@ -2758,7 +3091,263 @@ mod tests {
     }
 
     #[test]
-    fn eidolon_transcript_tail_and_extractors_fill_only_name_and_model() {
+    fn a_presence_carries_no_trace_reader_but_some_profiles_carry_none() {
+        // `trace` is the CAPABILITY seam: eidolon's own reader answers about
+        // eidolon's trace and nobody else claims one, so a consumer
+        // (`aoide session trace`) never names a harness by string.
+        assert!(EIDOLON_PROFILE.transcript.trace.is_some());
+        assert!(CLAUDE_PROFILE.transcript.trace.is_none());
+        assert!(KIMI_PROFILE.transcript.trace.is_none());
+        assert!(PI_PROFILE.transcript.trace.is_none());
+        // And the reader refuses a path that is not a trace file at all --
+        // the presence stand-in `locate` falls back to. That distinction is
+        // the whole reason it returns `Option`: "keeps no trace" and "an
+        // empty trace" are different answers.
+        let meta = std::env::temp_dir()
+            .join(format!("aoide_eidolon_trace_shape_{}.json", std::process::id()));
+        std::fs::write(&meta, r#"{"id":"x","busy":false}"#).unwrap();
+        assert_eq!(
+            (EIDOLON_PROFILE.transcript.trace.expect("eidolon keeps a trace"))(&meta),
+            None,
+            "a `meta.json` stand-in is not a trace"
+        );
+        let _ = std::fs::remove_file(&meta);
+    }
+
+    /// The trace fixtures: the sample lines `docs/architecture/
+    /// EIDOLON-TRACE.md` states as the contract. Every value is synthetic;
+    /// the SHAPE is what is pinned here, not any real session.
+    const TRACE_SESSION_START: &str = r#"{"id":0,"parent":null,"ts_ms":1789603005561,"kind":{"SessionStart":{"model":"ollama:deepseek-v4.1-flash","cwd":"/home/khoa/Aoide","system":null}}}"#;
+    const TRACE_USER_MESSAGE: &str = r##"{"id":1,"parent":0,"ts_ms":1789603005570,"kind":{"UserMessage":{"role":"user","content":[{"type":"text","text":"# Brief A: read the slot catalog first"}]}}}"##;
+    const TRACE_MODEL_CHANGED: &str = r#"{"id":2,"parent":1,"ts_ms":1789603009102,"kind":{"ModelChanged":{"model":"claude-cli:opus"}}}"#;
+    const TRACE_ASSISTANT: &str = r#"{"id":3,"parent":2,"ts_ms":1789603009140,"kind":{"AssistantMessage":{"role":"assistant","content":[{"type":"thinking","thinking":"the slots catalogue is the thing to read","signature":"sig"},{"type":"text","text":"Let me read the slot catalog first."},{"type":"tool_use","id":"call_8vr43zri","name":"read","input":{"path":"modules/facets/quickshell/qml/slots.md"}}]}}}"#;
+    const TRACE_TOOL_RESULT: &str = r#"{"id":4,"parent":3,"ts_ms":1789603009200,"kind":{"ToolResult":{"tool_use_id":"call_8vr43zri","content":"     1\t# Per-song widget slots — catalog","is_error":false}}}"#;
+    const TRACE_TOOL_RESULT_ERR: &str = r#"{"id":5,"parent":4,"ts_ms":1789603009300,"kind":{"ToolResult":{"tool_use_id":"call_8vr43zri","content":"qmllint: 3 errors","is_error":true}}}"#;
+    const TRACE_SETTLED: &str = r#"{"id":131,"parent":130,"ts_ms":1789606421000,"kind":{"TurnSettled":{"stop_reason":"end_turn","usage":{"input_tokens":9570000,"output_tokens":71900,"cache_creation_input_tokens":0,"cache_read_input_tokens":9430000}}}}"#;
+    const TRACE_CANCELLED: &str = r#"{"id":77,"parent":76,"ts_ms":1789626990000,"kind":"Cancelled"}"#;
+    const TRACE_ASK_USER: &str = r#"{"id":40,"parent":39,"ts_ms":1789626500000,"kind":{"AskUser":{"call_id":"call_x","prompt":"Overwrite?","answer":null}}}"#;
+    const TRACE_CONTEXT_SIZE: &str = r#"{"id":41,"parent":40,"ts_ms":1789626501000,"kind":{"ContextSize":{"tokens":134700}}}"#;
+
+    #[test]
+    fn the_model_comes_from_the_last_session_start_or_model_changed() {
+        let spec = &EIDOLON_PROFILE.transcript;
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            (spec.model)(&lines(&[TRACE_SESSION_START]), true).as_deref(),
+            Some("ollama:deepseek-v4.1-flash")
+        );
+        // A mid-run switch wins -- the freshest record is the one in force.
+        assert_eq!(
+            (spec.model)(&lines(&[TRACE_SESSION_START, TRACE_MODEL_CHANGED]), true).as_deref(),
+            Some("claude-cli:opus")
+        );
+        // A trace with no model record at all, and a presence line (which
+        // carries `model` but no `kind`), both still answer.
+        assert!((spec.model)(&lines(&[TRACE_CANCELLED]), true).is_none());
+        let presence = lines(&[r#"{"id":"x","model":"claude-cli:opus","busy":false,"title":"t"}"#]);
+        assert_eq!((spec.model)(&presence, true).as_deref(), Some("claude-cli:opus"));
+    }
+
+    #[test]
+    fn the_title_comes_from_the_first_user_message_then_the_presence_title() {
+        let spec = &EIDOLON_PROFILE.transcript;
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            (spec.title)(&lines(&[TRACE_USER_MESSAGE, TRACE_ASSISTANT])).as_deref(),
+            Some("# Brief A: read the slot catalog first"),
+            "the first thing asked names the run"
+        );
+        // No user message in the window (a presence line, or a trace whose
+        // head has scrolled past) falls back to meta.json's own title.
+        assert_eq!(
+            (spec.title)(&lines(&[r#"{"id":"x","title":"demo session","busy":false}"#])).as_deref(),
+            Some("demo session")
+        );
+        assert!((spec.title)(&lines(&[TRACE_ASSISTANT])).is_none());
+    }
+
+    #[test]
+    fn say_reads_the_last_assistant_text_block_and_never_the_thinking() {
+        let spec = &EIDOLON_PROFILE.transcript;
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            (spec.say)(&lines(&[TRACE_ASSISTANT]), true).as_deref(),
+            Some("Let me read the slot catalog first."),
+            "the text block, not the thinking block beside it"
+        );
+        let thinking_only = r#"{"id":9,"parent":8,"ts_ms":1,"kind":{"AssistantMessage":{"role":"assistant","content":[{"type":"thinking","thinking":"the slots catalogue is the thing to read","signature":"sig"}]}}}"#;
+        assert!(
+            (spec.say)(&lines(&[thinking_only]), true).is_none(),
+            "thinking is never folded into say"
+        );
+        // A presence line carries no assistant message at all.
+        assert!((spec.say)(&lines(&[TRACE_USER_MESSAGE]), true).is_none());
+    }
+
+    #[test]
+    fn tool_is_the_call_still_in_flight_and_clears_when_its_result_lands() {
+        let spec = &EIDOLON_PROFILE.transcript;
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            (spec.tool)(&lines(&[TRACE_ASSISTANT]), true).as_deref(),
+            Some("read: modules/facets/quickshell/qml/slots.md"),
+            "the label shape every other profile's tool extractor produces"
+        );
+        assert!(
+            (spec.tool)(&lines(&[TRACE_ASSISTANT, TRACE_TOOL_RESULT]), true).is_none(),
+            "the call returned -- nothing is in flight"
+        );
+        // A result for a DIFFERENT call id never clears this one.
+        let other = r#"{"id":6,"parent":5,"ts_ms":1,"kind":{"ToolResult":{"tool_use_id":"call_someone_else","content":"x","is_error":false}}}"#;
+        assert!(
+            (spec.tool)(&lines(&[TRACE_ASSISTANT, other]), true).is_some(),
+            "only the matching tool_use_id answers the call"
+        );
+        // A failed result still answers it.
+        assert!((spec.tool)(&lines(&[TRACE_ASSISTANT, TRACE_TOOL_RESULT_ERR]), true).is_none());
+        // The live trace form: `input` is the arguments as a JSON string, and the
+        // subject is still read out of it.
+        let live = r#"{"id":2,"parent":1,"ts_ms":1789637113212,"kind":{"AssistantMessage":{"role":"assistant","content":[{"type":"tool_use","id":"call_zj1fckx4","name":"bash","input":"{\"command\":\"echo trace-ok\"}"}]}}}"#;
+        assert_eq!((spec.tool)(&lines(&[live]), true).as_deref(), Some("bash: echo trace-ok"));
+    }
+
+    #[test]
+    fn context_tokens_read_the_last_context_size_record() {
+        let spec = &EIDOLON_PROFILE.transcript;
+        let lines = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!((spec.context_tokens)(&lines(&[TRACE_CONTEXT_SIZE])), Some(134_700));
+        let later = r#"{"id":42,"parent":41,"ts_ms":2,"kind":{"ContextSize":{"tokens":200000}}}"#;
+        assert_eq!(
+            (spec.context_tokens)(&lines(&[TRACE_CONTEXT_SIZE, later])),
+            Some(200_000),
+            "the freshest reading wins"
+        );
+        // A settled turn's usage is NOT the window fill -- no ContextSize,
+        // no contextTokens.
+        assert_eq!((spec.context_tokens)(&lines(&[TRACE_ASSISTANT, TRACE_SETTLED])), None);
+    }
+
+    #[test]
+    fn every_extractor_is_none_on_an_empty_line_slice_and_shrugs_at_junk() {
+        let spec = &EIDOLON_PROFILE.transcript;
+        let empty: Vec<String> = Vec::new();
+        assert!((spec.say)(&empty, true).is_none());
+        assert!((spec.tool)(&empty, true).is_none());
+        assert!((spec.title)(&empty).is_none());
+        assert!((spec.model)(&empty, true).is_none());
+        assert!((spec.context_tokens)(&empty).is_none());
+
+        let junk = vec!["{ not json".to_string(), "".to_string(), "[1,2]".to_string()];
+        assert!((spec.say)(&junk, true).is_none());
+        assert!((spec.tool)(&junk, true).is_none());
+        assert!((spec.title)(&junk).is_none());
+        assert!((spec.model)(&junk, true).is_none());
+        assert!((spec.context_tokens)(&junk).is_none());
+    }
+
+    #[test]
+    fn the_trace_tail_reads_whole_lines_and_refuses_a_non_trace_path() {
+        let dir = std::env::temp_dir().join(format!("aoide_eidolon_trace_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let trace = dir.join("1789603005561.jsonl");
+        std::fs::write(
+            &trace,
+            format!("{TRACE_SESSION_START}\n{TRACE_USER_MESSAGE}\n{TRACE_ASSISTANT}\n{TRACE_SETTLED}\n"),
+        )
+        .unwrap();
+
+        let spec = &EIDOLON_PROFILE.transcript;
+        // `tail` routes on the file, not on the caller: a `.jsonl` is
+        // line-split (unlike the compacting meta read).
+        let lines = (spec.tail)(&trace);
+        assert_eq!(lines.len(), 4, "one line per record");
+        assert_eq!((spec.title)(&lines).as_deref(), Some("# Brief A: read the slot catalog first"));
+        assert_eq!((spec.say)(&lines, true).as_deref(), Some("Let me read the slot catalog first."));
+        assert_eq!((spec.model)(&lines, true).as_deref(), Some("ollama:deepseek-v4.1-flash"));
+        // The tool call was answered by nothing in this tail -- still in flight.
+        assert_eq!(
+            (spec.tool)(&lines, true).as_deref(),
+            Some("read: modules/facets/quickshell/qml/slots.md")
+        );
+
+        // The trace reader agrees, and reads the same bytes.
+        let read = (spec.trace.expect("eidolon keeps a trace"))(&trace).expect("a .jsonl IS a trace");
+        assert_eq!(read, lines);
+
+        // An empty trace is `Some(empty)` -- "nothing yet", never "no trace".
+        let blank = dir.join("blank.jsonl");
+        std::fs::write(&blank, "").unwrap();
+        assert_eq!((spec.trace.expect("…"))(&blank), Some(Vec::<String>::new()));
+        assert_eq!((spec.tail)(&blank), Vec::<String>::new());
+
+        // A `.eid` journal, and the presence stand-in, are both NOT traces.
+        let journal = dir.join("1789603005561.eid");
+        std::fs::write(&journal, b"\x00\x01binary").unwrap();
+        assert_eq!((spec.trace.expect("…"))(&journal), None);
+        assert_eq!((spec.trace.expect("…"))(&dir.join("1789603005561.json")), None);
+
+        // A missing trace file is NOT a trace -- `None`, so a caller can
+        // teach "no trace" rather than render an empty one. (A path that
+        // exists and holds nothing IS `Some(empty)`; see `blank` above.)
+        assert_eq!((spec.trace.expect("…"))(&dir.join("gone.jsonl")), None);
+        assert_eq!((spec.trace.expect("…"))(&dir.join("gone.eid")), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_trace_tail_drops_a_partial_leading_line_when_the_window_cuts_mid_record() {
+        let dir =
+            std::env::temp_dir().join(format!("aoide_eidolon_trace_cut_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let trace = dir.join("cut.jsonl");
+        // Comfortably past the 1 MiB window, so the seek lands mid-record.
+        let filler = format!(
+            "{}\n",
+            r#"{"id":1,"parent":0,"ts_ms":1,"kind":{"ContextSize":{"tokens":1}}}"#
+        )
+        .repeat(20_000);
+        std::fs::write(&trace, format!("{filler}{TRACE_SETTLED}\n")).unwrap();
+
+        let lines = (EIDOLON_PROFILE.transcript.trace.expect("…"))(&trace).expect("a trace");
+        assert!(!lines.is_empty());
+        // Whatever the window cut, the FIRST line is never a fragment: every
+        // line in the result parses as a complete record.
+        for line in &lines {
+            assert!(
+                eidolon_trace_record(line).is_some(),
+                "a partial leading line must be dropped, not handed back: {line}"
+            );
+        }
+        assert_eq!(lines.last().map(String::as_str), Some(TRACE_SETTLED));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_trace_record_names_its_variant_for_both_tag_shapes() {
+        let unit = eidolon_trace_record(TRACE_CANCELLED).expect("a unit-variant line is a record");
+        assert_eq!(unit.kind, "Cancelled");
+        assert_eq!(unit.payload, None, "a unit variant carries no payload");
+
+        let settled = eidolon_trace_record(TRACE_SETTLED).expect("a struct-variant line is a record");
+        assert_eq!(settled.kind, "TurnSettled");
+        assert_eq!(
+            settled.payload.as_ref().and_then(|p| p.get("stop_reason")).and_then(Value::as_str),
+            Some("end_turn")
+        );
+
+        // A presence line has no `kind`; a malformed line parses as nothing.
+        assert!(eidolon_trace_record(r#"{"id":"x","model":"m","busy":false}"#).is_none());
+        assert!(eidolon_trace_record("{ not json").is_none());
+        assert!(eidolon_trace_record(r#"{"id":0,"kind":7}"#).is_none());
+        assert!(eidolon_trace_record(r#"{"id":0,"kind":{"A":1,"B":2}}"#).is_none());
+    }
+
+    #[test]
+    fn eidolon_transcript_tail_and_extractors_read_a_presence_stand_in() {
         let path =
             std::env::temp_dir().join(format!("aoide_eidolon_meta_{}.json", std::process::id()));
         // Synthetic fixture, PRETTY-PRINTED (multi-line) -- eidolon writes

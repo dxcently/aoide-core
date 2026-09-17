@@ -55,6 +55,12 @@ mod session_store;
 mod spawn;
 #[cfg(test)]
 pub(crate) mod testutil;
+// `session trace <id> [--tail N] [--follow] [--json]` — the read surface
+// over a harness's TRACE (eidolon's, today:
+// `docs/architecture/EIDOLON-TRACE.md`), where every other session command
+// reads the roster or acts on a session. Read-only: no stage write, no
+// daemon, no lock.
+mod trace;
 mod grant;
 mod manage;
 mod undying;
@@ -91,6 +97,10 @@ pub use self::model::{
     SessionRecord, SessionsFile,
 };
 pub use self::pending::{pending_approve, pending_deny, pending_list};
+// `session trace` — the run, step by step, off a harness's own trace file
+// (`docs/architecture/EIDOLON-TRACE.md`). Read-only, so it sits outside the
+// L4 dual-writer family entirely.
+pub use self::trace::session_trace;
 pub use self::permit::{answer_summons, session_permit, summons_card_id};
 pub use self::send::{pending_path, session_hook, session_send};
 pub use self::session_store::{session_bind, session_end, session_phase, session_start};
