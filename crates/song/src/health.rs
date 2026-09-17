@@ -59,9 +59,13 @@
 //! `run/qml/songs/surfaces.json` by the quickshell facet's build
 //! (CONTRACTS.md §5). When that file is present this checks the declared
 //! namespaces against what is actually mapped, per monitor where the
-//! declaration says per-monitor; when it is absent or unreadable, no
-//! expectation is declared and the old total count decides, unchanged. A
-//! host that declares nothing pays for nothing.
+//! declaration says per-monitor; when it is absent, unreadable, or names no
+//! surface at all, nothing is declared and the old total count decides,
+//! unchanged. The empty case matters: the facet publishes the file on every
+//! host, so a song that declares nothing ships `{"surfaces": {}}`, and that
+//! must be the old check — not a check with nothing to assert, which would
+//! read a blank desktop as healthy on exactly the hosts that never opted in.
+//! A host that declares nothing pays for nothing.
 //!
 //! The per-monitor comparison is why `hyprctl monitors` is read at all — a
 //! `perMonitor` namespace must be mapped once on EVERY real output, and
@@ -241,12 +245,11 @@ pub(crate) fn shell_has_zero_layers(layers: &Value) -> bool {
 /// function derives nothing of its own and compares them directly against
 /// the compositor's own layer list.
 ///
-/// An EMPTY `surfaces` object is `Some(empty)`, never `None`, and the two are
-/// not the same thing: `None` means "nothing was published, fall back to the
-/// old count", while an empty map means "this song declared nothing and
-/// therefore expects nothing" — which [`surfaces_fall_short`] must read as
-/// healthy. Collapsing them would make a song with an empty declaration
-/// restart forever, since no namespace could ever satisfy it.
+/// This is a faithful read of the file and nothing more: an EMPTY `surfaces`
+/// object is `Some(empty)`, distinct from `None`, because the file really was
+/// published with nothing in it. What the check does with that is decided
+/// one step up, in [`asserted_expectation`], which folds the empty case into
+/// the no-declaration fallback — the parser does not get to make that call.
 ///
 /// A missing `perMonitor` on one entry reads as `false` — "exactly one,
 /// wherever it lands" — matching the nix option's own default, so a
@@ -260,6 +263,23 @@ pub(crate) fn parse_expectation(v: &Value) -> Option<BTreeMap<String, bool>> {
             .map(|(ns, entry)| (ns.clone(), entry.get("perMonitor").and_then(Value::as_bool).unwrap_or(false)))
             .collect(),
     )
+}
+
+/// Pure: the expectation the check asserts, or `None` when there is nothing
+/// to assert. Three cases collapse into `None` on purpose — no file, an
+/// unreadable or malformed one, and a file whose `surfaces` object is EMPTY —
+/// because all three mean the same thing to the watchdog: this song declared
+/// no surface, so the old total count decides, exactly as before the
+/// declaration existed (CONTRACTS.md §5, `aoide.arrangement.surfaces`).
+///
+/// The empty case is not hypothetical. The quickshell facet publishes the
+/// file unconditionally, so every host whose song declares nothing carries a
+/// published `{"surfaces": {}}`. Handing that to [`surfaces_fall_short`] would
+/// be a check with nothing to fail — a blank desktop read as healthy — on
+/// precisely the hosts that never opted into the declared check, which is
+/// the inverse of "a host that declares nothing keeps today's behaviour".
+pub(crate) fn asserted_expectation(published: Option<&Value>) -> Option<BTreeMap<String, bool>> {
+    published.and_then(parse_expectation).filter(|exp| !exp.is_empty())
 }
 
 /// Pure: how many REAL outputs are worth demanding a surface on, from
@@ -636,15 +656,16 @@ pub fn run_healthcheck() -> HealthOutcome {
     // when something is actually wrong.
     //
     // Which predicate, though, depends on whether anything was declared. With
-    // a published expectation the declared set decides, and `hyprctl monitors`
-    // is read because a `perMonitor` namespace is judged against the real
-    // output count. With none, the old total count decides and the monitors
-    // call is never made at all — a host that declares nothing pays nothing
-    // for a mechanism it opted out of.
+    // a published, non-empty expectation the declared set decides, and
+    // `hyprctl monitors` is read because a `perMonitor` namespace is judged
+    // against the real output count. With none — no file, or a file that
+    // names no surface, which is what every non-declaring song publishes —
+    // the old total count decides and the monitors call is never made at
+    // all: a host that declares nothing pays nothing for a mechanism it
+    // opted out of, and keeps the check it had.
     let layers = hyprctl_json("layers");
     let published = published_surfaces();
-    let expectation = published.as_ref().and_then(parse_expectation);
-    let bad = match expectation {
+    let bad = match asserted_expectation(published.as_ref()) {
         Some(exp) => surfaces_fall_short(&exp, &layers, &hyprctl_json("monitors")),
         None => shell_has_zero_layers(&layers),
     };
@@ -824,15 +845,42 @@ mod tests {
         assert_eq!(parse_expectation(&json!({ "surfaces": "aoide-bar" })), None);
     }
 
-    // An empty declaration is `Some`, NOT `None`, and the difference is
-    // load-bearing: `None` means "nothing published, keep the old count",
-    // while an empty map means "this song declared nothing and expects
-    // nothing". Collapsing them would make a song with an empty declaration
-    // un-satisfiable and restart forever.
+    // The parser reports the file faithfully: an empty declaration is
+    // `Some(empty)`, not `None`, because a file with nothing in it really was
+    // published. Whether that is something to assert is `asserted_expectation`'s
+    // call, below — the parser does not fold it.
     #[test]
     fn parse_expectation_keeps_an_empty_declaration_distinct_from_no_declaration() {
         let empty = parse_expectation(&json!({ "song": "nocturne", "surfaces": {} })).unwrap();
         assert!(empty.is_empty());
+    }
+
+    // ── asserted_expectation: what the check actually asserts ─────────────
+    //
+    // The facet publishes the file on EVERY host, so a song that declares
+    // nothing ships `{"surfaces": {}}` — the shape every non-declaring song
+    // carries. That must be the old count, not a check with nothing to fail:
+    // a blank desktop on such a host is exactly the incident the watchdog
+    // exists for, and a "declared" branch with an empty set would call it
+    // healthy.
+    #[test]
+    fn an_empty_published_declaration_is_nothing_to_assert() {
+        let published = json!({ "song": "etude", "surfaces": {} });
+        assert_eq!(asserted_expectation(Some(&published)), None);
+    }
+
+    #[test]
+    fn nothing_published_is_nothing_to_assert() {
+        assert_eq!(asserted_expectation(None), None);
+        let malformed = json!({ "song": "etude" });
+        assert_eq!(asserted_expectation(Some(&malformed)), None);
+    }
+
+    #[test]
+    fn a_populated_declaration_is_asserted() {
+        let published = json!({ "song": "sonata", "surfaces": { "aoide-bar": { "perMonitor": true } } });
+        let exp = asserted_expectation(Some(&published)).unwrap();
+        assert_eq!(exp.get("aoide-bar"), Some(&true));
     }
 
     // A hand-written or forward-compatible entry omitting the flag reads as
@@ -1038,8 +1086,9 @@ mod tests {
 
     // ── Standing down: every case where the predicate must NOT be true ────
     //
-    // A song that declares nothing is never unhealthy — nothing can fall
-    // short of an empty demand.
+    // Nothing can fall short of an empty demand. `asserted_expectation`
+    // never hands the predicate an empty set (that case is the old count),
+    // so this is the predicate's own guard, kept so it stays total.
     #[test]
     fn an_empty_expectation_never_falls_short() {
         let layers = json!({

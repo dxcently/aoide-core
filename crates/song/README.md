@@ -49,14 +49,16 @@ in `lyra`, not core.
   `surfaces_fall_short` against the declaration published to
   `run/qml/songs/surfaces.json` by the quickshell facet's build
   (`CONTRACTS.md §5`, `aoide.arrangement.surfaces`), read through
-  `aoide_storage::fs::run_qml_dir`; an absent or unreadable file means no
+  `aoide_storage::fs::run_qml_dir` and folded by `asserted_expectation`: an
+  absent, unreadable, or EMPTY declaration (the facet publishes the file on
+  every host, so every non-declaring song ships `{"surfaces": {}}`) means no
   expectation is declared and `shell_has_zero_layers` — the older total
   `aoide-*` count — decides exactly as before. A total count cannot see a
   PARTIAL loss (the wallpaper recovering while the bar and dock stay bound
   to a dead output is the incident that motivated the declared set), and a
   declared set cannot exist on a host where another shell owns a surface,
-  so both predicates stay. The four judgement functions are pure (`&Value`
-  in, data out); only `published_surfaces` touches the filesystem.
+  so both predicates stay. The judgement functions are pure (`&Value` in,
+  data out); only `published_surfaces` touches the filesystem.
 - `commands` — this crate's CLI commands: `rice *`, `livery *`, `cover set`,
   `element seed`, `rice take`/`take.*`/`rice back`, `quickshell healthcheck`,
   and `reload` (`lyra reload` design, settled 2026-08-31 — the one

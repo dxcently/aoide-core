@@ -145,12 +145,17 @@
   placeholder state, and standing down is what keeps a blackout from turning
   the watchdog into a restart loop. Hyprland's synthesized `FALLBACK` output
   is excluded from BOTH the demand and the coverage; counting it in one and
-  not the other is an off-by-one that fires on every blackout. Keep the four
+  not the other is an off-by-one that fires on every blackout. Keep the
   predicate functions pure (`&Value` in, data out, no filesystem, no shell)
   with `published_surfaces` the single impure reader — that split is what
   makes the judgement unit-testable and is why an absent or malformed
   published file must read as "no expectation declared", never as an
-  unhealthy desktop.
+  unhealthy desktop. **An EMPTY published declaration is the same case,
+  folded by `asserted_expectation`, not by the parser**: the facet publishes
+  the file on every host, so `{"surfaces": {}}` is what every non-declaring
+  song ships, and it must reach `shell_has_zero_layers` — routing it to
+  `surfaces_fall_short` gives a check with nothing to fail, which reads a
+  blank desktop as healthy on exactly the hosts that never opted in.
 - **`elements::seed_tree` takes explicit paths and touches no global
   state — `elements::seed_song` is the only env-resolving wrapper around
   it.** Every other elements test exercises `seed_tree`/`render_files`/
