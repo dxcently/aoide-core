@@ -73,6 +73,7 @@ use super::model::{
     canonical_state, load_stage, sessions_path, write_stage, SessionRecord, SessionsFile,
     STAGE_GRAPH_VERSION,
 };
+use aoide_protocol::agents::agent_profile;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -139,6 +140,24 @@ pub(crate) enum ScanFailure {
     /// At least one presence socket answered and [`process_table`] returned
     /// `None` — no `ps` on `PATH`.
     ProcessTableUnavailable,
+}
+
+/// One eidolon record the reconciler DROPPED on a pass — its presence stopped
+/// being observed (`Observed`, never `Unknown`), so the roster lost it. The
+/// additive return [`sync_eidolon_sessions`] hands the ping-back
+/// (`graph/pingback.rs`, E5b): a child whose process went away with its turn
+/// still open is the one event its trace can no longer ever report, so the
+/// sweep has to say it itself. `trace` is the path the harness CAPABILITY
+/// resolves for that id right now (`TranscriptSpec::locate` — the same locator
+/// every other trace reader uses), so the dropped child's tail is read the
+/// SAME way a live child's is, never by a second derivation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DroppedEidolon {
+    pub session_id: String,
+    pub petname: Option<String>,
+    pub parent_session_id: Option<String>,
+    pub agent: String,
+    pub trace: Option<PathBuf>,
 }
 
 /// Reconcile `agent:"eidolon"` records against a [`PresenceScan`] — the PURE
@@ -623,34 +642,72 @@ fn audit_scan_unknown_once(failure: &ScanFailure) {
 /// only when something changed. Mirrors
 /// [`super::codex_app::sync_codex_app_threads`]'s shape. An `Unknown` scan
 /// takes NO stage lock and writes NOTHING.
-pub(crate) fn sync_eidolon_sessions() -> bool {
+///
+/// Returns `(changed, dropped)`: the second half is ADDITIVE (E5b) and names
+/// every `agent:"eidolon"` record this pass removed from the roster — its id,
+/// petname, parent edge, agent and the trace the harness CAPABILITY resolves
+/// for it. The reconciler itself stays the pure core it always was (the drop
+/// is its `retain`); this wrapper simply remembers what that retain took, so
+/// the ping-back can report a child that died with its turn open — the one
+/// event the child's own trace can no longer ever record. Every existing
+/// caller's BEHAVIOUR is unchanged: the boolean means exactly what it did.
+pub(crate) fn sync_eidolon_sessions() -> (bool, Vec<DroppedEidolon>) {
     let scan = eidolon_presence_sessions();
     if let PresenceScan::Unknown(failure) = &scan {
         audit_scan_unknown_once(failure);
-        return false;
+        return (false, Vec::new());
     }
     aoide_storage::fs::with_stage_lock(|| {
         let mut file: SessionsFile = match load_stage(&sessions_path()) {
             Ok(f) => f,
-            Err(_) => return false,
+            Err(_) => return (false, Vec::new()),
         };
+        let before: Vec<SessionRecord> = file.sessions.clone();
         let (sessions, changed) =
             reconcile_eidolon_sessions(std::mem::take(&mut file.sessions), &scan, |pid| {
                 aoide_storage::attest::pid_ancestry(pid as i32)
             });
+        let dropped = dropped_this_pass(&before, &sessions);
         file.sessions = sessions;
         if !changed {
-            return false;
+            return (false, dropped);
         }
         if file.schema_version.is_empty() {
             file.schema_version = STAGE_GRAPH_VERSION.to_string();
         }
         if write_stage(&sessions_path(), &file).is_ok() {
             let _ = restage_graph();
-            return true;
+            return (true, dropped);
         }
-        false
+        (false, dropped)
     })
+}
+
+/// Which `agent:"eidolon"` records the pass just removed — the difference
+/// between the roster the lock was taken over and the one the reconciler
+/// handed back, for the eidolon records only (a non-eidolon record is never
+/// this module's to drop, and `reconcile_eidolon_sessions` never touches one).
+/// The trace path is resolved HERE, after the drop, through the harness
+/// CAPABILITY (`TranscriptSpec::locate`) — the ONE locator, so a dropped
+/// child's tail is reached the same way a live child's is — with the record's
+/// own `logPath` as the hint: a clean exit removes the presence dir before
+/// the next tick, and the journal the presence named is then the only path
+/// that still reaches the `.jsonl` beside it.
+fn dropped_this_pass(before: &[SessionRecord], after: &[SessionRecord]) -> Vec<DroppedEidolon> {
+    let live: HashSet<&str> = after.iter().map(|s| s.session_id.as_str()).collect();
+    before
+        .iter()
+        .filter(|s| s.agent == "eidolon" && !live.contains(s.session_id.as_str()))
+        .map(|s| DroppedEidolon {
+            session_id: s.session_id.clone(),
+            petname: s.petname.clone(),
+            parent_session_id: s.parent_session_id.clone(),
+            agent: s.agent.clone(),
+            trace: agent_profile(&s.agent).and_then(|p| {
+                (p.transcript.locate)(&s.session_id, Some(&s.cwd), s.log_path.as_deref())
+            }),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -682,6 +739,37 @@ mod tests {
     }
 
     /// No ancestry chain matches anything on the roster — a top-level record.
+    /// The drop list hands the ping-back a trace it can still read AFTER the
+    /// presence is gone: the record's own `logPath` is the locator's hint,
+    /// and the `.jsonl` beside that `.eid` is what comes back — a clean exit
+    /// removes the presence dir before the next tick, so this is the ordinary
+    /// path for a headless run that settled and left.
+    #[test]
+    fn a_dropped_record_resolves_its_trace_from_its_own_journal_path() {
+        let dir = std::env::temp_dir().join(format!("aoide_dropped_trace_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let eid = dir.join("1789660635924.eid");
+        let jsonl = dir.join("1789660635924.jsonl");
+        std::fs::write(&eid, b"").unwrap();
+        std::fs::write(&jsonl, "{\"id\":0}\n").unwrap();
+        let id = format!("fixture-dropped-{}", std::process::id());
+        let mut rec = crate::graph::testutil::session(&id, "/w", "working", "2026-09-17T00:00:00Z", Some("wrap-1"));
+        rec.agent = "eidolon".to_string();
+        rec.petname = Some("brave-otter".to_string());
+        rec.log_path = Some(eid.to_str().unwrap().to_string());
+
+        let dropped = dropped_this_pass(std::slice::from_ref(&rec), &[]);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].session_id, id);
+        assert_eq!(dropped[0].parent_session_id.as_deref(), Some("wrap-1"));
+        assert_eq!(dropped[0].trace.as_deref(), Some(jsonl.as_path()), "the journal's sibling, with no presence left");
+
+        // Still on the roster: not dropped, nothing to report.
+        assert!(dropped_this_pass(std::slice::from_ref(&rec), std::slice::from_ref(&rec)).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     fn no_ancestry(_pid: u32) -> Vec<i32> {
         Vec::new()
     }

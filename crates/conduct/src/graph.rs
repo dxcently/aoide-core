@@ -48,6 +48,12 @@ pub(crate) mod identity;
 mod model;
 mod node_list;
 mod pending;
+// The ping-back (P-EIDOLON slice E5b, EIDOLON-TRACE.md's "Second slice"):
+// the reaper tick's own reader of an eidolon child's trace, delivering ONE
+// line about the child to the parent that spawned it — the doorbell's path
+// (raw injection, no gate, no session_send), gated on `Door::Daemon`, with a
+// per-child at-most-once cursor in `state/stage/pingback.json`.
+mod pingback;
 mod permit;
 mod resurrect;
 mod send;
@@ -92,6 +98,11 @@ pub use self::doc::{build_graph, render, resolve_graph_document};
 // itself, callable in-process by any door that has this crate (the daemon
 // on a Stop hook, the CLI on `mail ring`, `aoide-server`'s deposit arm).
 pub use self::doorbell::{mail_ring, ring, RingReport};
+// The ping-back (P-EIDOLON slice E5b): a parent hears the children it spawned.
+// `reap.rs` (a SIBLING of this module) is its one caller, from the sweep's
+// post-lock collector block — so this stays `pub(crate)`, never crossing the
+// crate boundary.
+pub(crate) use self::pingback::pingback;
 pub use self::model::{
     anchor_for, effective_project_for, project_for, canonical_state, merged_sessions, HookRecord, HooksFile, Project, ProjectsFile,
     SessionRecord, SessionsFile,

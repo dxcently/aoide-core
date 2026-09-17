@@ -461,7 +461,12 @@ fn set_session_name_if_unset(id: &str, name: &str) {
 /// resolved [`resolve_sender`] attribution (when present) is folded into the
 /// audit MESSAGE — never into `untrusted_data`, which stays exactly the
 /// injected text — so the audit trail names who claimed to send it.
-fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
+///
+/// `pub(in crate::graph)`: the ping-back (`graph/pingback.rs`, P-EIDOLON
+/// slice E5b) audits its own automated line through this SAME helper — one
+/// audit shape for anything that reaches a session's input, the sibling
+/// `audit_pending`/`audit_resurrect` precedent.
+pub(in crate::graph) fn audit_send(inv: &Invocation, status: &str, message: &str, text: &str) {
     let log = inv
         .flags
         .get("audit-log")

@@ -681,6 +681,67 @@
   accepted under the manifest's host-local, operator-authored trust model
   (the operator who writes a spec already controls their own disk), not a
   gap to close with a `canonicalize` call here.
+- **A parent automatically hears the children it spawned, and that line is
+  the DAEMON's own, never a `send` (P-EIDOLON E5b, `docs/architecture/
+  EIDOLON-TRACE.md`'s "Second slice"; the User's ruling, 2026-09-17).**
+  `graph/pingback.rs::pingback` is the one implementation: called from
+  `reap()` on the POST-LOCK side, AFTER `sync_eidolon_sessions()`, with its
+  result deliberately NOT folded into `outcome.changed` (the
+  `refresh_live_agents` rule — telling a parent something must not toast the
+  desktop every twelve seconds; each delivery prints its own
+  `[aoide/reap]` line instead), and only under `Door::Daemon` — every other
+  door returns silently and lets the daemon's own tick do it. It is NOT
+  routed through `session_send`: `send.rs` attests the sender from the
+  running process's `/proc` ancestry, so inside the daemon the attested
+  sender is the daemon and never the child, which is exactly why the
+  reciprocal rule cannot be `sender_is_parent` made symmetric (do NOT thread
+  a peercred pid into `send.rs` for it). The line is delivered the
+  DOORBELL's way instead — `doorbell.rs`'s `connect_for_ring`/`write_channel`
+  for a live channel socket (one write, close, no keystroke), else
+  `send.rs::write_delivery` + the target's own profile submit key for a
+  headless wrap, an interactive wrap with no channel skipped
+  `interactive-composer` — with no gate, no `pending.json` entry, no
+  provenance prefix, no `names_the_node` title rename (the line starts with
+  `[`, and must never be routed through `session_send` for it), and no
+  mailbase receipt. One audit line per delivery through `send.rs::audit_send`
+  (widened `pub(in crate::graph)` for it, the `audit_pending`/
+  `audit_resurrect` sibling precedent), gate label `autogate-child`, the
+  delivered line as `untrusted_data`.
+  **At-most-once, claimed before the delivery.** The per-child cursor is
+  `state/stage/pingback.json` (`<child id> → {seen, silentAt?}`): a short
+  `with_stage_lock` critical section reads it, decides, and writes the
+  advanced cursor (temp-then-rename) — the socket write happens AFTER, with
+  no lock held, bounded by `connect_for_ring`'s own write timeout. A crash
+  between the two loses a line, which is the safe direction (a duplicate is
+  noise in a parent's composer); a child whose `agent:"eidolon"` record is
+  gone drops out of the file on the same pass. Do NOT move the delivery
+  inside that critical section, and do not add a second lock.
+  **Never a shell parent.** A target whose `rec.agent` is `""`/`"shell"` or
+  names no registered harness profile is skipped and counted
+  (`shell-parent`) — a line submitted into a bare shell would RUN as a
+  command. The same applies to `not-conductable`, `parent-done` and
+  `no-parent-record`.
+  **`died mid-turn` is the sync's own additive return.**
+  `sync_eidolon_sessions` returns `(bool, Vec<DroppedEidolon>)` — the bool
+  means exactly what it did before, so every existing caller is unchanged in
+  behaviour; the second half names the records that pass removed (id,
+  petname, parent edge, agent, and the trace `TranscriptSpec::locate`
+  resolves for it). Do NOT add a second liveness probe for the dead-pid row:
+  `reap` is the only sweep (`AGENTS.md`'s standing rule), so the ping-back
+  consumes that sweep's own drop list and probes nothing itself.
+- **The ping-back reuses `graph/trace.rs`'s renderers and the roster's own
+  extractors, never a second formatter.** `one_line_clip`/
+  `tool_result_summary` (widened `pub(in crate::graph)`) render the clipped
+  phrase and the tool label `session trace` already shows; `say` comes from
+  the harness CAPABILITY `TranscriptSpec::say` — the very function that fills
+  the roster's `say` field — and the trace path from `TranscriptSpec::
+  locate` + `TranscriptSpec::trace`, never `if agent == "eidolon"`. The
+  silence row reuses `graph/eidolon.rs::eidolon_state_from_trace` for "the
+  turn is still open": one state fold in this crate, not two. Quoted text is
+  untrusted model output (house rule 4): one line, control characters
+  stripped, clipped to 80 chars with `…`, and a leading `/`/`!` gets a
+  prefixed space so it can never read as a command or an escape at a
+  parent's prompt.
 - **`reap` (toast-free) and `reap_and_announce` (the registered CLI/daemon
   handler) are deliberately two functions, not one.** `reap_and_announce`
   spawns a REAL `notify-send` on the live desktop whenever the sweep
@@ -1598,6 +1659,11 @@
 - `doorbell.rs` changes update `docs/architecture/MAIL.md`'s "Delivery and
   the doorbell" section — that document is the design's canonical prose
   statement, this file only the invariants an editor must hold.
+- `pingback.rs` changes update `docs/architecture/EIDOLON-TRACE.md`'s
+  "Second slice" section (the ping-back's canonical prose statement), the
+  `state/stage/pingback.json` shape in `CONTRACTS.md` §4, and
+  `docs/Aoide-Wiki/concepts/orchestration/Conductor-Channel.md`'s
+  "Child-of-target (reciprocal)" paragraph.
 - A change to shellbridge's `sessionaction`/`projectaction` whitelists or
   reply shape updates `ShellBridge.qml`'s protocol comment and
   `concepts/cli/Doors-and-Nodes.md`'s socket-command list, in the same

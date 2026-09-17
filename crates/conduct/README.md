@@ -170,6 +170,26 @@ every terminal a tracked, conductable session (root `AGENTS.md`, "Conducting
   connection but never reads can no longer hold `.ring.lock` open
   forever; a timed-out write is an ordinary `write-failed` skip, latch
   untouched, same as any other write failure.
+- **`graph::pingback`** (P-EIDOLON slice E5b, `docs/architecture/
+  EIDOLON-TRACE.md`'s "Second slice") is where a parent hears the children it
+  spawned: the reaper tick reads each `agent:"eidolon"` child's trace tail,
+  picks the highest-priority new event since the child's own cursor and
+  renders ONE line (`[eidolon <petname>] settled …` / `cancelled …` / `died
+  mid-turn …` / `asking: …` / `wrapping up · …` / `failing · …` / `silent N
+  min · …`), then hands it to the child's `parentSessionId` the DOORBELL's
+  way — a live channel socket if one connects, else `send.rs::
+  write_delivery` + the target's submit key for a headless wrap — with no
+  gate, no pending entry, no provenance prefix, no title rename and no
+  mailbase receipt. It runs post-lock in `reap()`, after
+  `sync_eidolon_sessions()` (whose additive `Vec<DroppedEidolon>` return is
+  the `died mid-turn` row), only under `Door::Daemon`, and its result is
+  never folded into `outcome.changed`. The per-child cursor lives at
+  `state/stage/pingback.json` and is CLAIMED inside one short
+  `with_stage_lock` section before the socket write, so a line is delivered
+  at most once. It reuses `graph/trace.rs`'s renderers, the roster's own
+  `TranscriptSpec::say`, and `graph/eidolon.rs::eidolon_state_from_trace` —
+  never a second formatter, extractor or state fold. A bare-shell parent is
+  skipped, never injected into.
 - **The undying mark (P-C2/P-C3, durable-sessions plan; renamed from "carry"
   at command-defrag lane U1, 2026-08-27; relocated under `session grant` at
   the session-surface redesign, command-defrag lane X, 2026-08-28):**

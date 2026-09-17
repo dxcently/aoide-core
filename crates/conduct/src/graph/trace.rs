@@ -78,7 +78,7 @@ extern "C" fn on_sigint(_signum: libc::c_int) {
 /// this crate carries (`protocol/src/agents.rs`, `graph/codex_capture.rs`) —
 /// the SHARED copy is private to `protocol/agents`, and this is display-only
 /// text, not a second reading of any record.
-fn one_line_clip(s: &str, max: usize) -> String {
+pub(in crate::graph) fn one_line_clip(s: &str, max: usize) -> String {
     let flat = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() <= max {
         flat
@@ -92,7 +92,7 @@ fn one_line_clip(s: &str, max: usize) -> String {
 /// Clip to `max` chars at a char boundary with a trailing ellipsis, KEEPING
 /// the text's own internal whitespace — the tool-result first line, where a
 /// tab or a column of spaces is part of what the result printed.
-fn clip_keep_ws(s: &str, max: usize) -> String {
+pub(in crate::graph) fn clip_keep_ws(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
         s.to_string()
     } else {
@@ -179,7 +179,7 @@ fn assistant_summary(payload: Option<&Value>, dim: bool) -> String {
 /// `ToolResult`: the result's FIRST line cut to [`TEXT_MAX`], prefixed `!`
 /// when `is_error`. `content` is a string in eidolon's own sample shape; an
 /// array of blocks (a shape nothing forbids) falls back to its first `text`.
-fn tool_result_summary(payload: Option<&Value>, prefix: &str) -> String {
+pub(in crate::graph) fn tool_result_summary(payload: Option<&Value>, prefix: &str) -> String {
     let Some(p) = payload else {
         return String::new();
     };

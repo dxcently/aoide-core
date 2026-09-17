@@ -68,7 +68,7 @@ use aoide_protocol::Invocation;
 use aoide_protocol::agents::{agent_profile, AgentProfile, CLAUDE_PROFILE};
 use crate::graph::{
     canonical_state, codex_home, drop_sessions, hooks_path, hyprctl_clients, ledger_session_exit,
-    lineage_of, load_stage, normalize_addr, now_iso_utc, prune_done, refresh_subagent_says,
+    lineage_of, load_stage, normalize_addr, now_iso_utc, pingback, prune_done, refresh_subagent_says,
     refresh_transcript_fields, restage_graph, sessions_path, stage_error, sync_codex_app_threads,
     sync_eidolon_sessions, upsert_hook, write_stage, HookRecord, HooksFile, SessionRecord,
     SessionsFile, STAGE_GRAPH_VERSION,
@@ -1089,9 +1089,23 @@ pub fn reap(inv: &Invocation) -> Outcome {
     }
     // Reconcile eidolon presence sessions the same way, right beside the
     // codex-app reconcile above — same "roster change joins `changed`" rule.
-    if sync_eidolon_sessions() {
+    // The additive half (E5b) is what that sync DROPPED this pass — a child
+    // whose presence stopped answering — which is the ping-back's one input it
+    // cannot read off the roster itself.
+    let (eidolon_changed, eidolon_dropped) = sync_eidolon_sessions();
+    if eidolon_changed {
         outcome.changed.push("reconciled eidolon presence sessions".to_string());
     }
+    // The ping-back (P-EIDOLON slice E5b, EIDOLON-TRACE.md's "Second slice"):
+    // a parent hears the children it spawned. Run here — post-lock, AFTER the
+    // eidolon sync above, so the roster and the dropped set it reads are the
+    // ones that sync just produced — and only under `Door::Daemon` (the
+    // boundary every automated line shares; `pingback` itself returns silently
+    // for any other door). Its result is deliberately NOT folded into
+    // `changed`, the same rule the refresh below holds: telling a parent
+    // something must not toast the desktop every twelve seconds. Each actual
+    // delivery prints its own `[aoide/reap]` line from inside `pingback`.
+    let _pingback_report = pingback(inv, &eidolon_dropped);
     // The refresh is reported but deliberately NOT folded into `changed`: that
     // vec is the sweep's ledger (what entered or left the roster), and it is
     // what decides whether the timer toasts. An agent merely speaking must not

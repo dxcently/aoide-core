@@ -1629,12 +1629,12 @@ fn trace_content(payload: &Value) -> &[Value] {
 /// disambiguate by `cwd` — two live sessions sharing one cwd still resolve
 /// to two distinct files, one per session id, never a collision, and never
 /// widened to match on `cwd` the way claude/pi's locators do. `hinted` is
-/// accepted for signature parity with every other profile's locator, but it
-/// is honoured only when it already names this exact same file: the id
-/// alone derives the ONE path this session can mean, so a hint that agreed
-/// would change nothing and a hint that disagreed would be pointing at some
-/// OTHER session's file — never followed either way. `cwd` is accepted and
-/// unused for the same reason.
+/// the record's own `logPath` — the `.eid` journal the presence named while
+/// it was alive — and it matters only once the presence is GONE (below):
+/// while the presence stands, the id alone derives the ONE path this session
+/// can mean, so a hint that agreed would change nothing and a hint that
+/// disagreed would be pointing at some OTHER session's file — never
+/// followed. `cwd` is accepted and unused for the same reason.
 ///
 /// The TRACE WINS when the presence file names one that exists: the trace is
 /// the whole run, record by record, where `meta.json` is a handful of facts
@@ -1642,25 +1642,45 @@ fn trace_content(payload: &Value) -> &[Value] {
 /// eidolon whose presence carries no `trace` field, or one whose trace file
 /// is not there (a torn-down or never-created trace): the presence file is
 /// still a real, readable description of the session, and the extractors
-/// below read either shape. `None` only when the presence file itself does
-/// not exist (a stale or torn-down presence dir looks the same as one that
-/// never existed).
+/// below read either shape. When the presence file itself does not exist —
+/// eidolon removes its dir on a clean exit, so a run that settled and left
+/// between two reaper ticks looks exactly like one that never existed — the
+/// hint's own trace is the answer ([`eidolon_journal_trace`]: the `.jsonl`
+/// beside the hinted `.eid`, when it exists), and `None` otherwise.
 fn eidolon_transcript_locate(
     session_id: &str,
     _cwd: Option<&str>,
-    _hinted: Option<&str>,
+    hinted: Option<&str>,
 ) -> Option<PathBuf> {
     let root = std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir);
     let meta = root.join("eidolon").join(session_id).join("meta.json");
     if !meta.is_file() {
-        return None;
+        return eidolon_journal_trace(hinted);
     }
     if let Some(trace) = eidolon_presence_trace(&meta) {
         return Some(trace);
     }
     Some(meta)
+}
+
+/// The trace beside a journal — `<stem>.jsonl` next to `<stem>.eid`, the
+/// contract's own layout (`docs/architecture/EIDOLON-TRACE.md`, "File") —
+/// for a session whose presence is GONE. Eidolon removes its presence dir on
+/// a clean exit, so a headless run that settled and exited between two
+/// reaper ticks has no `meta.json` left to name its trace; the roster
+/// record's own `logPath` (the `.eid` the presence named while it was alive)
+/// is the one path that still reaches it, and this is the only reader of it.
+/// `None` unless the hint is a `.eid` whose sibling exists: a hint of any
+/// other shape is never followed.
+fn eidolon_journal_trace(hinted: Option<&str>) -> Option<PathBuf> {
+    let journal = Path::new(hinted?.trim());
+    if journal.extension().and_then(|e| e.to_str()) != Some("eid") {
+        return None;
+    }
+    let trace = journal.with_extension("jsonl");
+    trace.is_file().then_some(trace)
 }
 
 /// `meta.json`'s own `trace` field, when it names an EXISTING file: the one
@@ -3399,6 +3419,39 @@ mod tests {
         assert_eq!((spec.tail)(&malformed), Vec::<String>::new());
 
         let _ = std::fs::remove_file(&malformed);
+    }
+
+    #[test]
+    fn eidolon_transcript_locate_follows_the_journal_hint_only_once_the_presence_is_gone() {
+        // No presence dir for this id under ANY runtime root (a clean exit
+        // removed it): the hinted `.eid`'s sibling `.jsonl` is the trace.
+        let id = format!("fixture-gone-{}", std::process::id());
+        let dir = std::env::temp_dir().join(format!("aoide_eidolon_journal_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let eid = dir.join("1789660635924.eid");
+        let jsonl = dir.join("1789660635924.jsonl");
+        std::fs::write(&eid, b"").unwrap();
+        let spec = &EIDOLON_PROFILE.transcript;
+
+        // A journal with no trace beside it resolves to nothing — never the
+        // `.eid` itself, which is bitcode no extractor can read.
+        assert_eq!((spec.locate)(&id, Some("/w"), Some(eid.to_str().unwrap())), None);
+
+        std::fs::write(&jsonl, "{\"id\":0}\n").unwrap();
+        assert_eq!(
+            (spec.locate)(&id, Some("/w"), Some(eid.to_str().unwrap())),
+            Some(jsonl.clone()),
+            "the presence is gone, the journal's sibling is the trace"
+        );
+
+        // A hint of any other shape is never followed: the trace itself, a
+        // directory, an unrelated file.
+        assert_eq!((spec.locate)(&id, None, Some(jsonl.to_str().unwrap())), None);
+        assert_eq!((spec.locate)(&id, None, Some(dir.to_str().unwrap())), None);
+        assert_eq!((spec.locate)(&id, None, None), None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

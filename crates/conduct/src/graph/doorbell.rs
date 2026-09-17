@@ -101,7 +101,12 @@ fn nudge_line(name: &str) -> String {
 /// inducible on a real unix socket; the error path is proven against a
 /// fake writer, and [`ring_locked`]'s shared `match` on the result is the
 /// block the PTY transport's failure test already covers.
-fn write_channel(mut stream: impl std::io::Write, payload: &[u8]) -> std::io::Result<()> {
+///
+/// `pub(in crate::graph)`: the ping-back (`graph/pingback.rs`, P-EIDOLON
+/// slice E5b) is the SECOND production caller of this one channel write —
+/// the same one-write-then-close transport, never a second implementation
+/// of it.
+pub(in crate::graph) fn write_channel(mut stream: impl std::io::Write, payload: &[u8]) -> std::io::Result<()> {
     stream.write_all(payload)?;
     stream.flush()
 }
@@ -129,7 +134,12 @@ const RING_WRITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2
 /// doc for why the bound exists) so neither can regress back to a plain,
 /// unbounded `UnixStream::connect`. A future third ring transport connects
 /// through this too, never a fresh `UnixStream::connect` call of its own.
-fn connect_for_ring(path: impl AsRef<std::path::Path>) -> std::io::Result<UnixStream> {
+///
+/// `pub(in crate::graph)`, like [`write_channel`]: the ping-back's own
+/// delivery (`graph/pingback.rs`, E5b) is the second production caller, and
+/// it must inherit this SAME bound — its write lands in a parent's composer
+/// and has no business parking the daemon's tick behind a wedged peer.
+pub(in crate::graph) fn connect_for_ring(path: impl AsRef<std::path::Path>) -> std::io::Result<UnixStream> {
     let stream = UnixStream::connect(path)?;
     stream.set_write_timeout(Some(RING_WRITE_TIMEOUT))?;
     Ok(stream)

@@ -34,7 +34,10 @@ Orient through four tiers, in order:
 
 Conducting (aoide's headline): command another session with
   aoide send --id <id> [--submit] [--yes] -- <text>
-(held PENDING by default; --yes or an autogate policy delivers).
+(held PENDING by default; --yes or an autogate policy delivers). The
+reciprocal also holds: a parent automatically hears the children it spawned —
+the daemon delivers ONE line off a child's own trace (settled, cancelled,
+asking, wrapping up, failing, silent), never prompted and never pending.
 
 Command surface — every OPERATOR group this binary registered at boot, with
 its command count (a stub is registered but not yet implemented; hook-
