@@ -737,11 +737,14 @@
   the roster's `say` field — and the trace path from `TranscriptSpec::
   locate` + `TranscriptSpec::trace`, never `if agent == "eidolon"`. The
   silence row reuses `graph/eidolon.rs::eidolon_state_from_trace` for "the
-  turn is still open": one state fold in this crate, not two. Quoted text is
-  untrusted model output (house rule 4): one line, control characters
-  stripped, clipped to 80 chars with `…`, and a leading `/`/`!` gets a
-  prefixed space so it can never read as a command or an escape at a
-  parent's prompt.
+  turn is still open": one state fold in this crate, not two. Every
+  child-authored fragment goes through ONE `clean` (house rule 4): one line,
+  control characters stripped (a `\r` is an Enter at a headless PTY),
+  clipped to 80 chars with `…` — the tool label on the failing/silence lines
+  included, not only what the grammar quotes; quoted fragments additionally
+  get a prefixed space before a leading `/`/`!` so they can never read as a
+  command or an escape at a parent's prompt. A new fragment that carries the
+  child's words joins `clean`, never a second stripper.
 - **`reap` (toast-free) and `reap_and_announce` (the registered CLI/daemon
   handler) are deliberately two functions, not one.** `reap_and_announce`
   spawns a REAL `notify-send` on the live desktop whenever the sweep
