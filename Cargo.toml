@@ -3,7 +3,7 @@
 # lives at `crates/cli`, single-charter crates under `crates/*`.
 [workspace]
 resolver = "2"
-members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/song", "crates/conductor", "crates/test-support", "crates/cli", "crates/upkeep", "crates/screen", "crates/lyra", "crates/secrets"]
+members = ["crates/protocol", "crates/storage", "crates/conduct", "crates/client", "crates/server", "crates/conductor", "crates/test-support", "crates/cli", "crates/upkeep", "crates/secrets"]
 
 # The one release-version source for the whole workspace (User-directed:
 # prebeta is 0.0.X, the patch bumps by one at the end of each completed
@@ -30,51 +30,17 @@ serde_json = "1"
 libc = "0.2"
 crossterm = { version = "0.29", default-features = false, features = ["events"] }
 ratatui = "0.30"
-# `screen::synth`'s pointer-synthesis backend (Phase A of the
-# pointer-emulation workstream, khoa, 2026-08-17): default features only —
-# wayland-backend's pure-Rust `rs` implementation, its own wire-protocol
-# codec with no C library involved at all. NOT the `system` feature (which
-# would link, or with the separate `dlopen` feature ALSO on, dynamically
-# load, the real libwayland-client.so) — `dlopen` only toggles link-vs-dlopen
-# for the `system` backend and does nothing here, since `system` itself is
-# off. No pkg-config, no `default.nix` change (`nix build` proves this: the
-# vendored `cargoLock.lockFile` build never touches a system Wayland lib).
-# Consumer: `aoide-screen` (moved out of `aoide-conduct` at P-A1 of the
-# binary-split workstream — the technical rationale above is unchanged, only
-# the crate that reaches for it moved).
-wayland-client = "0.31"
-wayland-protocols-wlr = { version = "0.3", features = ["client"] }
-# `screen::diff`'s decode boundary (Phase E of the pointer-emulation
-# workstream, khoa, 2026-08-17): the first image-DECODING dependency this
-# workspace carries (`capture.rs`'s own `expected_image_size` doc used to
-# promise "no image-decoding dependency" — that promise is now scoped to the
-# capture path only, `screen::diff` is the sole consumer). png+jpeg only —
-# every format `screen shot` can actually produce (`capture::Format`); no
-# other codec this crate has any use for. Consumer: `aoide-screen` (moved out
-# of `aoide-conduct` at P-A1 — same scoping, new crate).
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 aoide-protocol = { path = "crates/protocol" }
 aoide-storage = { path = "crates/storage" }
 aoide-conduct = { path = "crates/conduct" }
 aoide-client = { path = "crates/client" }
 aoide-server = { path = "crates/server" }
-aoide-song = { path = "crates/song" }
 aoide-conductor = { path = "crates/conductor" }
 aoide-test-support = { path = "crates/test-support" }
 # `aoide soundcheck` — the mechanical-integrity command's WORKING-tree half
 # (soundcheck design doc, FORK 3, advisor-confirmed new crate: repo hygiene
 # is not `aoide-storage`'s "durable session data" charter).
 aoide-upkeep = { path = "crates/upkeep" }
-# `aoide screen` — the screen command family (info/shot/point/ocr/diff/send),
-# extracted out of `aoide-conduct` at P-A1 of the binary-split workstream:
-# the sole home of this workspace's wayland-client/wayland-protocols-wlr/
-# image dependencies (see those entries above for the technical rationale).
-aoide-screen = { path = "crates/screen" }
-# `lyra` — the graphical/rice binary (P-A4 of the binary-split workstream):
-# its own composition root over the rice/screen/shellbridge/herald bundle,
-# assembled from the SAME domain crates `aoide-cli` already depends on
-# (`aoide-song`, `aoide-conduct`, `aoide-screen`) — nothing here is a copy.
-aoide-lyra = { path = "crates/lyra" }
 # `ed25519-dalek`/`getrandom` — the pairing workstream's instance identity
 # (P-P1, `docs/architecture/PAIRING.md`'s "Identity" section, consumer
 # `aoide-storage::identity`): cryptography is never hand-rolled here (User

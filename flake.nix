@@ -55,10 +55,6 @@
         {
           default = aoide;
           inherit aoide aoide-static;
-          # The paint binary under its own name. Same derivation, the `rice`
-          # output default.nix:138 moves it into — a consumer names `lyra`
-          # instead of writing the `aoide^out,rice` output selector.
-          lyra = aoide.rice;
         }
       );
 
@@ -142,11 +138,6 @@
               age # secrets age backend — without it the crate's age-gated tests self-skip
               zenity # secrets watch --popup — the code-entry dialog
               libnotify # notify-send, herald's local fallback
-              # Paint-side probes (crates/screen — wayland-session tools,
-              # inert off-desktop but standalone and version-insensitive):
-              grim # screen shot
-              slurp # screen region pick
-              tesseract # screen ocr
               # This flake's own .nix files (checks.fmt upstream is
               # nixfmt-only; same formatter here).
               nixfmt
